@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<profiles xmlns="http://www.eprosima.com">
+  <participant profile_name="velaros_qemu_host" is_default_profile="true">
+    <rtps>
+      <name>velaros_qemu_host</name>
+      <defaultUnicastLocatorList>
+        <locator>
+          <udpv4>
+            <address>0.0.0.0</address>
+            <port>7411</port>
+          </udpv4>
+        </locator>
+      </defaultUnicastLocatorList>
+      <default_external_unicast_locators>
+        <udpv4 externality="1" cost="0" mask="24">
+          <address>10.0.2.2</address>
+          <port>7411</port>
+        </udpv4>
+      </default_external_unicast_locators>
+      <builtin>
+        <avoid_builtin_multicast>true</avoid_builtin_multicast>
+        <metatrafficUnicastLocatorList>
+          <locator>
+            <udpv4>
+              <address>0.0.0.0</address>
+              <port>7410</port>
+            </udpv4>
+          </locator>
+        </metatrafficUnicastLocatorList>
+        <initialPeersList>
+          <locator>
+            <udpv4>
+              <address>127.0.0.1</address>
+              <port>17410</port>
+            </udpv4>
+          </locator>
+        </initialPeersList>
+        <metatraffic_external_unicast_locators>
+          <udpv4 externality="1" cost="0" mask="24">
+            <address>10.0.2.2</address>
+            <port>7410</port>
+          </udpv4>
+        </metatraffic_external_unicast_locators>
+      </builtin>
+      <participantID>0</participantID>
+    </rtps>
+  </participant>
+</profiles>

@@ -1,0 +1,15 @@
+############################################################################
+# chip/k1/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+############################################################################
+
+include common/Make.defs
+
+CHIP_ASRCS += k1_head.S
+CHIP_CSRCS += k1_start.c k1_irq.c k1_irq_dispatch.c
+CHIP_CSRCS += k1_timerisr.c k1_console.c
+
+ifeq ($(CONFIG_K1_PLIC),y)
+CHIP_CSRCS += k1_plic.c
+endif

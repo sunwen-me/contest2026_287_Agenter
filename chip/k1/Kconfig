@@ -1,0 +1,58 @@
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+if ARCH_CHIP_RISCV_CUSTOM
+
+comment "SpacemiT K1 options"
+
+config K1_SBI_TIMEBASE_FREQUENCY
+	int "SBI timer frequency"
+	default 24000000
+	---help---
+		The K1 timebase frequency reported by the MUSE Pi Pro device tree.
+
+config K1_UART_POLL_USEC
+	int "Console receive polling interval (microseconds)"
+	default 1000
+	range 1 1000000
+	---help---
+		Delay between receive-ready checks in the blocking polling console.
+
+config K1_PRESERVE_BOOT_UART
+	bool
+	default y
+	---help---
+		Safety invariant for initial K1 bring-up: keep the console UART
+		configuration inherited from U-Boot and never write the UART
+		interrupt-enable register from S-mode.
+
+config K1_EARLY_BOOT_LOG
+	bool "Early boot progress and synchronous exception log"
+	default y
+	depends on K1_PRESERVE_BOOT_UART
+	---help---
+		Print boot progress before nx_start and dump the saved trap state for
+		synchronous exceptions. The output uses the polling UART inherited
+			from U-Boot and is safe before the scheduler and syslog are ready.
+
+config K1_PLIC
+	bool "K1 PLIC hart 0 S-mode context (experimental)"
+	default n
+	depends on !SMP
+	---help---
+		Enable the K1 PLIC implementation for hart 0 S-mode context 1.
+		The context mapping is taken from the MUSE Pi Pro device tree, whose
+		interrupts-extended list orders M-mode then S-mode for each hart.
+		Keep this disabled until polling UART and SBI timer pass first-board
+		bring-up.
+
+config K1_INITIAL_BRINGUP
+	bool
+	default y
+	select ALARM_ARCH
+	select ONESHOT
+	select ONESHOT_COUNT
+	select ONESHOT_FAST_DIVISION
+
+endif

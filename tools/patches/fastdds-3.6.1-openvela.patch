@@ -1,0 +1,564 @@
+diff --git a/fastdds/CMakeLists.txt b/fastdds/CMakeLists.txt
+index 906f977..bc4f821 100644
+--- a/fastdds/CMakeLists.txt
++++ b/fastdds/CMakeLists.txt
+@@ -33,6 +33,8 @@ if(CONFIG_FASTDDS)
+   set(BUILD_SHARED_LIBS OFF)
+   set(SECURITY 0)
+   set(TINYXML2_SOURCE_DIR "${EXTERNAL_DIR}/tinyxml2/tinyxml2")
++  set(TINYXML2_INCLUDE_DIR "${TINYXML2_SOURCE_DIR}")
++  set(TINYXML2_FROM_SOURCE ON)
+   set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${LIB_FASTDDS_DIR}/cmake/modules)
+ 
+   set(FASTDDS_FLAGS
+@@ -42,6 +44,11 @@ if(CONFIG_FASTDDS)
+       -Wno-error=deprecated-declarations
+       -fexceptions
+       -U__VXWORKS__
++      -DBOOST_HAS_UNISTD_H
++      -DBOOST_HAS_GETTIMEOFDAY
++      -DBOOST_HAS_PTHREADS
++      -DASIO_HAS_UNISTD_H
++      -DASIO_HAS_PTHREADS
+       -Wno-shadow
+       -Wno-undef
+       -Wno-unused-parameter
+@@ -89,13 +96,14 @@ if(CONFIG_FASTDDS)
+       ${DATA_INSTALL_DIR}/${PROJECT_NAME}
+       CACHE PATH "Installation directory for licenses")
+   set(Asio_INCLUDE_DIR ${EXTERNAL_DIR}/asio/asio/asio/include)
++  set(CMAKE_DL_LIBS "")
+   set(CMAKE_DL_LIBS
+       ""
+-      CACHE STRING "Disable dl.so")
++      CACHE STRING "Disable dl.so" FORCE)
+   set(FOONATHAN_MEMORY_BUILD_TOOLS OFF)
+ 
+   set(CMAKE_CXX_FLAGS
+-      "${CMAKE_CXX_FLAGS} -I${NUTTX_DIR}/libs/libxx/libcxx/libcxx/include -I${NUTTX_DIR}/include -I${CMAKE_BINARY_DIR}/include"
++      "${CMAKE_CXX_FLAGS} -D_LIBCPP_HAS_THREAD_API_PTHREAD -fexceptions -frtti -I${NUTTX_DIR}/libs/libxx/libcxx/libcxx/include -I${CMAKE_BINARY_DIR}/include/libcxx_config -I${NUTTX_DIR}/include -I${CMAKE_BINARY_DIR}/include"
+   )
+   add_subdirectory(${BUILD_MEMORY_SRC_DIR})
+   nuttx_add_external_library(foonathan_memory)
+@@ -117,14 +125,15 @@ if(CONFIG_FASTDDS)
+ 
+   function(add_example_src_file arg)
+     set(DDS_EXAMPLE_SOURCES
+-        ${arg}/HelloWorld_main.cpp ${arg}/HelloWorldPublisher.cpp
+-        ${arg}/HelloWorldSubscriber.cpp ${arg}/HelloWorldPubSubTypes.cxx
++        ${arg}/main.cpp ${arg}/Application.cpp
++        ${arg}/PublisherApp.cpp ${arg}/ListenerSubscriberApp.cpp
++        ${arg}/WaitsetSubscriberApp.cpp ${arg}/HelloWorldPubSubTypes.cxx
+         ${arg}/HelloWorldTypeObjectSupport.cxx
+         PARENT_SCOPE)
+   endfunction()
+ 
+   if(CONFIG_FASTDDS_HelloWorldExample)
+-    set(DDS_EXAMPLE_DIR ${LIB_FASTDDS_DIR}/examples/cpp/dds/HelloWorldExample)
++    set(DDS_EXAMPLE_DIR ${LIB_FASTDDS_DIR}/examples/cpp/hello_world)
+     add_example_src_file(${DDS_EXAMPLE_DIR})
+ 
+   elseif(CONFIG_FASTDDS_HelloWorldExampleTCP)
+@@ -175,7 +184,6 @@ if(CONFIG_FASTDDS)
+       fastcdr
+       foonathan_memory
+       fastdds
+-      fastdds::optionparser
+       STACKSIZE
+       2097152
+       PRIORITY
+diff --git a/fastdds/Fast-CDR/CMakeLists.txt b/fastdds/Fast-CDR/CMakeLists.txt
+index 62d7f55..c2c8284 100644
+--- a/fastdds/Fast-CDR/CMakeLists.txt
++++ b/fastdds/Fast-CDR/CMakeLists.txt
+@@ -18,7 +18,7 @@
+ cmake_minimum_required(VERSION 3.20)
+ 
+ # Set CMAKE_BUILD_TYPE to Release by default.
+-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
++if(NOT NUTTX AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+     message(STATUS "Setting build type to 'Release' as none was specified.")
+     set(CMAKE_BUILD_TYPE Release CACHE STRING
+         "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel."
+diff --git a/fastdds/Fast-DDS/CMakeLists.txt b/fastdds/Fast-DDS/CMakeLists.txt
+index 98511a14a..8f4d2ce2d 100644
+--- a/fastdds/Fast-DDS/CMakeLists.txt
++++ b/fastdds/Fast-DDS/CMakeLists.txt
+@@ -18,7 +18,7 @@
+ cmake_minimum_required(VERSION 3.22) # TODO 3.28
+ 
+ # Set CMAKE_BUILD_TYPE to Release by default.
+-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
++if(NOT NUTTX AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+     message(STATUS "Setting build type to 'Release' as none was specified.")
+     set(CMAKE_BUILD_TYPE Release CACHE STRING
+         "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel."
+@@ -176,7 +176,7 @@ endif()
+ # Set warnings as errors if the thread sanitizer is not being used
+ ###############################################################################
+ string(FIND ${CMAKE_CXX_FLAGS} "-fsanitize=thread" SANITIZER_THREAD)
+-if (${SANITIZER_THREAD} EQUAL -1)
++if (${SANITIZER_THREAD} EQUAL -1 AND NOT NUTTX)
+     message(STATUS "Setting warnings as errors...")
+     set(CMAKE_COMPILE_WARNING_AS_ERROR ON)
+ endif()
+@@ -242,8 +242,12 @@ eprosima_find_package(fastcdr 2 REQUIRED)
+ eprosima_find_thirdparty(Asio asio VERSION 1.13.0)
+ eprosima_find_thirdparty(TinyXML2 tinyxml2)
+ 
+-find_package(foonathan_memory REQUIRED)
+-message(STATUS "Found foonathan_memory: ${foonathan_memory_DIR}")
++if(NOT TARGET foonathan_memory)
++    find_package(foonathan_memory REQUIRED)
++    message(STATUS "Found foonathan_memory: ${foonathan_memory_DIR}")
++else()
++    message(STATUS "Using in-tree foonathan_memory target")
++endif()
+ find_package(ThirdpartyBoost REQUIRED)
+ 
+ if(ANDROID)
+diff --git a/fastdds/Fast-DDS/cmake/modules/FindAtomic.cmake b/fastdds/Fast-DDS/cmake/modules/FindAtomic.cmake
+index 35ca4af42..4d3cc0517 100644
+--- a/fastdds/Fast-DDS/cmake/modules/FindAtomic.cmake
++++ b/fastdds/Fast-DDS/cmake/modules/FindAtomic.cmake
+@@ -7,6 +7,14 @@ if(TARGET eProsima_atomic)
+     return()
+ endif()
+ 
++if(NUTTX)
++    # A standalone configure-time link cannot use the NuttX linker script.
++    # Validate atomic operations in the real firmware compilation instead.
++    add_library(eProsima_atomic INTERFACE)
++    set(Atomic_FOUND TRUE CACHE BOOL "Atomic support supplied by NuttX" FORCE)
++    return()
++endif()
++
+ set(Atomic_FOUND FALSE CACHE BOOL "The atomic module testing has already been performed")
+ 
+ set(ATOMIC_TEST_CODE
+diff --git a/fastdds/Fast-DDS/cmake/modules/FindThirdpartyBoost.cmake b/fastdds/Fast-DDS/cmake/modules/FindThirdpartyBoost.cmake
+index 43354c0e5..b394fafa1 100644
+--- a/fastdds/Fast-DDS/cmake/modules/FindThirdpartyBoost.cmake
++++ b/fastdds/Fast-DDS/cmake/modules/FindThirdpartyBoost.cmake
+@@ -11,6 +11,14 @@ set(THIRDPARTY_BOOST_INCLUDE_DIR
+     "Path to thirdparty/boost"
+ )
+ 
++if(NUTTX)
++    # The initial openvela port uses UDP only; Boost.Interprocess requires
++    # host SysV SHM and librt APIs that are intentionally not part of it.
++    set(IS_THIRDPARTY_BOOST_OK FALSE)
++    set(IS_THIRDPARTY_BOOST_SUPPORTED FALSE)
++    return()
++endif()
++
+ find_package(Threads REQUIRED)
+ 
+ if(WIN32 OR APPLE OR ANDROID OR QNXNTO)
+diff --git a/fastdds/Fast-DDS/cmake/modules/FindThreads.cmake b/fastdds/Fast-DDS/cmake/modules/FindThreads.cmake
+index 8a1f2197b..4bc0553a1 100644
+--- a/fastdds/Fast-DDS/cmake/modules/FindThreads.cmake
++++ b/fastdds/Fast-DDS/cmake/modules/FindThreads.cmake
+@@ -45,6 +45,20 @@ This module is not needed for C++11 and later if threading is done using
+ 
+ include (CheckLibraryExists)
+ include (CheckSymbolExists)
++
++if(NUTTX)
++  # NuttX exposes pthread APIs through the system runtime, without a separate
++  # libpthread or host-style -pthread linker option.
++  set(CMAKE_THREAD_LIBS_INIT "")
++  set(CMAKE_USE_PTHREADS_INIT 1)
++  set(Threads_FOUND TRUE)
++  set(THREADS_FOUND TRUE)
++  if(NOT TARGET Threads::Threads)
++    add_library(Threads::Threads INTERFACE IMPORTED)
++  endif()
++  return()
++endif()
++
+ set(Threads_FOUND FALSE)
+ set(CMAKE_REQUIRED_QUIET_SAVE ${CMAKE_REQUIRED_QUIET})
+ set(CMAKE_REQUIRED_QUIET ${Threads_FIND_QUIETLY})
+@@ -219,4 +233,3 @@ if(THREADS_FOUND AND NOT TARGET Threads::Threads)
+     set_property(TARGET Threads::Threads PROPERTY INTERFACE_LINK_LIBRARIES "${CMAKE_THREAD_LIBS_INIT}")
+   endif()
+ endif()
+-
+diff --git a/fastdds/Fast-DDS/examples/cpp/hello_world/ListenerSubscriberApp.cpp b/fastdds/Fast-DDS/examples/cpp/hello_world/ListenerSubscriberApp.cpp
+index df742c556..17f1a4f91 100644
+--- a/fastdds/Fast-DDS/examples/cpp/hello_world/ListenerSubscriberApp.cpp
++++ b/fastdds/Fast-DDS/examples/cpp/hello_world/ListenerSubscriberApp.cpp
+@@ -24,11 +24,16 @@
+ 
+ #include <fastdds/dds/core/status/SubscriptionMatchedStatus.hpp>
+ #include <fastdds/dds/domain/DomainParticipantFactory.hpp>
++#include <fastdds/dds/domain/qos/DomainParticipantQos.hpp>
+ #include <fastdds/dds/subscriber/DataReader.hpp>
+ #include <fastdds/dds/subscriber/qos/DataReaderQos.hpp>
+ #include <fastdds/dds/subscriber/qos/SubscriberQos.hpp>
+ #include <fastdds/dds/subscriber/SampleInfo.hpp>
+ #include <fastdds/dds/subscriber/Subscriber.hpp>
++#if defined(__NuttX__)
++#include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
++#include <fastdds/utils/IPLocator.hpp>
++#endif
+ 
+ #include "CLIParser.hpp"
+ #include "HelloWorldPubSubTypes.hpp"
+@@ -55,7 +60,32 @@ ListenerSubscriberApp::ListenerSubscriberApp(
+ {
+     // Create the participant
+     auto factory = DomainParticipantFactory::get_instance();
++#if defined(__NuttX__)
++    DomainParticipantQos participant_qos = PARTICIPANT_QOS_DEFAULT;
++    auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
++    eprosima::fastdds::rtps::ThreadSettings thread_settings;
++    thread_settings.stack_size = 64 * 1024;
++    udp_transport->interfaceWhiteList.push_back("127.0.0.1");
++    udp_transport->default_reception_threads(thread_settings);
++    participant_qos.transport().use_builtin_transports = false;
++    participant_qos.transport().user_transports.push_back(udp_transport);
++    participant_qos.builtin_controllers_sender_thread(thread_settings);
++    participant_qos.timed_events_thread(thread_settings);
++    participant_qos.discovery_server_thread(thread_settings);
++    participant_qos.typelookup_service_thread(thread_settings);
++    participant_qos.wire_protocol().participant_id = 0;
++    participant_qos.wire_protocol().builtin.avoid_builtin_multicast = true;
++    for (uint32_t port : {7410u, 7412u})
++    {
++        eprosima::fastdds::rtps::Locator_t peer;
++        eprosima::fastdds::rtps::IPLocator::createLocator(
++            LOCATOR_KIND_UDPv4, "127.0.0.1", port, peer);
++        participant_qos.wire_protocol().builtin.initialPeersList.push_back(peer);
++    }
++    participant_ = factory->create_participant(0, participant_qos, nullptr, StatusMask::none());
++#else
+     participant_ = factory->create_participant_with_default_profile(nullptr, StatusMask::none());
++#endif
+     if (participant_ == nullptr)
+     {
+         throw std::runtime_error("Participant initialization failed");
+diff --git a/fastdds/Fast-DDS/examples/cpp/hello_world/PublisherApp.cpp b/fastdds/Fast-DDS/examples/cpp/hello_world/PublisherApp.cpp
+index 9efba3089..5cd8a752d 100644
+--- a/fastdds/Fast-DDS/examples/cpp/hello_world/PublisherApp.cpp
++++ b/fastdds/Fast-DDS/examples/cpp/hello_world/PublisherApp.cpp
+@@ -23,10 +23,15 @@
+ #include <stdexcept>
+ 
+ #include <fastdds/dds/domain/DomainParticipantFactory.hpp>
++#include <fastdds/dds/domain/qos/DomainParticipantQos.hpp>
+ #include <fastdds/dds/publisher/DataWriter.hpp>
+ #include <fastdds/dds/publisher/Publisher.hpp>
+ #include <fastdds/dds/publisher/qos/DataWriterQos.hpp>
+ #include <fastdds/dds/publisher/qos/PublisherQos.hpp>
++#if defined(__NuttX__)
++#include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
++#include <fastdds/utils/IPLocator.hpp>
++#endif
+ 
+ #include "HelloWorldPubSubTypes.hpp"
+ 
+@@ -56,7 +61,32 @@ PublisherApp::PublisherApp(
+ 
+     // Create the participant
+     auto factory = DomainParticipantFactory::get_instance();
++#if defined(__NuttX__)
++    DomainParticipantQos participant_qos = PARTICIPANT_QOS_DEFAULT;
++    auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
++    eprosima::fastdds::rtps::ThreadSettings thread_settings;
++    thread_settings.stack_size = 64 * 1024;
++    udp_transport->interfaceWhiteList.push_back("127.0.0.1");
++    udp_transport->default_reception_threads(thread_settings);
++    participant_qos.transport().use_builtin_transports = false;
++    participant_qos.transport().user_transports.push_back(udp_transport);
++    participant_qos.builtin_controllers_sender_thread(thread_settings);
++    participant_qos.timed_events_thread(thread_settings);
++    participant_qos.discovery_server_thread(thread_settings);
++    participant_qos.typelookup_service_thread(thread_settings);
++    participant_qos.wire_protocol().participant_id = 1;
++    participant_qos.wire_protocol().builtin.avoid_builtin_multicast = true;
++    for (uint32_t port : {7410u, 7412u})
++    {
++        eprosima::fastdds::rtps::Locator_t peer;
++        eprosima::fastdds::rtps::IPLocator::createLocator(
++            LOCATOR_KIND_UDPv4, "127.0.0.1", port, peer);
++        participant_qos.wire_protocol().builtin.initialPeersList.push_back(peer);
++    }
++    participant_ = factory->create_participant(0, participant_qos, nullptr, StatusMask::none());
++#else
+     participant_ = factory->create_participant_with_default_profile(nullptr, StatusMask::none());
++#endif
+     if (participant_ == nullptr)
+     {
+         throw std::runtime_error("Participant initialization failed");
+diff --git a/fastdds/Fast-DDS/examples/cpp/hello_world/main.cpp b/fastdds/Fast-DDS/examples/cpp/hello_world/main.cpp
+index edfb6ff46..27b12c84c 100644
+--- a/fastdds/Fast-DDS/examples/cpp/hello_world/main.cpp
++++ b/fastdds/Fast-DDS/examples/cpp/hello_world/main.cpp
+@@ -38,6 +38,9 @@ void signal_handler(
+     stop_app_handler(signum);
+ }
+ 
++#if defined(__NuttX__)
++extern "C"
++#endif
+ int main(
+         int argc,
+         char** argv)
+@@ -94,11 +97,13 @@ int main(
+                 };
+ 
+         signal(SIGINT, signal_handler);
++#if !defined(__NuttX__)
+         signal(SIGTERM, signal_handler);
+     #ifndef _WIN32
+         signal(SIGQUIT, signal_handler);
+         signal(SIGHUP, signal_handler);
+     #endif // _WIN32
++#endif // !defined(__NuttX__)
+ 
+         thread.join();
+     }
+diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp b/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
+index 11b2210c0..c74fbc78f 100644
+--- a/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
++++ b/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
+@@ -116,7 +116,6 @@ ReturnCode_t DomainParticipantFactory::delete_participant(
+         {
+             return RETCODE_PRECONDITION_NOT_MET;
+         }
+-
+         VectorIt vit = participants_.find(part->get_domain_id());
+ 
+         if (vit != participants_.end())
+diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/type_representation/TypeObjectRegistry.cpp b/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/type_representation/TypeObjectRegistry.cpp
+index 256d0e5e5..867c59007 100644
+--- a/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/type_representation/TypeObjectRegistry.cpp
++++ b/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/type_representation/TypeObjectRegistry.cpp
+@@ -304,15 +304,14 @@ ReturnCode_t TypeObjectRegistry::get_type_identifiers(
+     {
+         return eprosima::fastdds::dds::RETCODE_PRECONDITION_NOT_MET;
+     }
+-    try
+-    {
+-        std::lock_guard<std::mutex> data_guard(type_object_registry_mutex_);
+-        type_identifiers = local_type_identifiers_.at(type_name);
+-    }
+-    catch (std::exception&)
++    std::lock_guard<std::mutex> data_guard(type_object_registry_mutex_);
++    auto type_it = local_type_identifiers_.find(type_name);
++    if (type_it == local_type_identifiers_.end())
+     {
+         return eprosima::fastdds::dds::RETCODE_NO_DATA;
+     }
++
++    type_identifiers = type_it->second;
+     return eprosima::fastdds::dds::RETCODE_OK;
+ }
+ 
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomain.cpp b/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomain.cpp
+index 3b9c8c38e..07c6d8fd6 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomain.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomain.cpp
+@@ -27,6 +27,10 @@
+ #include <string>
+ #include <thread>
+ 
++#if !defined(_WIN32)
++#include <sys/wait.h>
++#endif
++
+ #include <fastdds/dds/log/Log.hpp>
+ #include <fastdds/LibrarySettings.hpp>
+ #include <fastdds/log/LogResources.hpp>
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPChannelResource.cpp b/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPChannelResource.cpp
+index 303eff91d..bcf155d86 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPChannelResource.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPChannelResource.cpp
+@@ -16,6 +16,11 @@
+ 
+ #include "../network/asio.hpp"
+ 
++#if defined(__NuttX__)
++#include <cerrno>
++#include <poll.h>
++#endif
++
+ #include <fastdds/rtps/attributes/ThreadSettings.hpp>
+ 
+ #include <rtps/messages/MessageReceiver.h>
+@@ -92,6 +97,46 @@ bool UDPChannelResource::Receive(
+         uint32_t& receive_buffer_size,
+         Locator& remote_locator)
+ {
++#if defined(__NuttX__)
++    // NuttX does not reliably wake recvfrom() when another thread closes the
++    // socket. Poll with a finite timeout so clear() can always join this
++    // thread after setting ChannelResource::alive_ to false.
++    pollfd descriptor {};
++    descriptor.fd = socket()->native_handle();
++    descriptor.events = POLLIN;
++    int poll_result = ::poll(&descriptor, 1, 100);
++    if (poll_result <= 0 || (descriptor.revents & POLLIN) == 0)
++    {
++        receive_buffer_size = 0;
++        return false;
++    }
++
++    asio::ip::udp::endpoint sender_endpoint;
++    asio::error_code error;
++    size_t bytes = socket()->receive_from(
++        asio::buffer(receive_buffer, receive_buffer_capacity), sender_endpoint, 0, error);
++
++    if (error)
++    {
++        receive_buffer_size = 0;
++        const int value = error.value();
++        if (value != EAGAIN && value != EWOULDBLOCK && value != EINTR)
++        {
++            EPROSIMA_LOG_WARNING(
++                RTPS_MSG_OUT,
++                "Error receiving data: " << error.message() << " - " << message_receiver()
++                                          << " (" << this << ")");
++        }
++        return false;
++    }
++
++    receive_buffer_size = static_cast<uint32_t>(bytes);
++    if (receive_buffer_size > 0)
++    {
++        transport_->endpoint_to_locator(sender_endpoint, remote_locator);
++    }
++    return receive_buffer_size > 0;
++#else
+     try
+     {
+         asio::ip::udp::endpoint senderEndpoint;
+@@ -116,6 +161,7 @@ bool UDPChannelResource::Receive(
+                                                                     << " (" << this << ")");
+         return false;
+     }
++#endif
+ }
+ 
+ void UDPChannelResource::release()
+@@ -129,8 +175,8 @@ void UDPChannelResource::release()
+     asio::error_code ec;
+     socket()->shutdown(asio::socket_base::shutdown_type::shutdown_receive, ec);
+ 
+-#if defined(__APPLE__)
+-    // On OSX shutdown does not seem to unblock the listening thread, but close does.
++#if defined(__APPLE__) || defined(__NuttX__)
++    // On these platforms shutdown does not unblock the listening thread, but close does.
+     socket()->close();
+ #endif // if defined(__APPLE__)
+ }
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPTransportInterface.cpp b/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPTransportInterface.cpp
+index 710ec3497..73c61b283 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPTransportInterface.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPTransportInterface.cpp
+@@ -90,8 +90,13 @@ bool UDPTransportInterface::CloseInputChannel(
+     for (UDPChannelResource* channel : channel_resources)
+     {
+         channel->disable();
++#if defined(__NuttX__)
++        channel->clear();
++        channel->release();
++#else
+         channel->release();
+         channel->clear();
++#endif
+         delete channel;
+     }
+ 
+diff --git a/fastdds/Fast-DDS/src/cpp/utils/SystemInfo.cpp b/fastdds/Fast-DDS/src/cpp/utils/SystemInfo.cpp
+index b44d015d6..7ba53d3fe 100644
+--- a/fastdds/Fast-DDS/src/cpp/utils/SystemInfo.cpp
++++ b/fastdds/Fast-DDS/src/cpp/utils/SystemInfo.cpp
+@@ -354,6 +354,9 @@ std::mutex SystemInfo::interfaces_mtx_;
+ #elif defined(_POSIX_SOURCE) || defined(__QNXNTO__) || defined(__ANDROID__)
+ #include "threading/threading_pthread.ipp"
+ #include "thread_impl/thread_impl_pthread.ipp"
++#elif defined(__NuttX__)
++#include "threading/threading_empty.ipp"
++#include "thread_impl/thread_impl_pthread.ipp"
+ #else
+ #include "threading/threading_empty.ipp"
+ #endif // Platform selection
+diff --git a/fastdds/Fast-DDS/src/cpp/utils/thread.hpp b/fastdds/Fast-DDS/src/cpp/utils/thread.hpp
+index 8c0793335..a89a5597a 100644
+--- a/fastdds/Fast-DDS/src/cpp/utils/thread.hpp
++++ b/fastdds/Fast-DDS/src/cpp/utils/thread.hpp
+@@ -16,7 +16,7 @@
+ #define UTILS__THREAD_HPP_
+ 
+ // thread.hpp declarations
+-#if defined(_WIN32) || defined(__APPLE__) || defined(_POSIX_SOURCE) || defined(__QNXNTO__) || defined(__ANDROID__)
++#if defined(_WIN32) || defined(__APPLE__) || defined(_POSIX_SOURCE) || defined(__QNXNTO__) || defined(__ANDROID__) || defined(__NuttX__)
+ #include "thread_impl/thread_impl_custom.hpp"
+ #else
+ #include "thread_impl/thread_impl_basic.hpp"
+diff --git a/fastdds/Fast-DDS/thirdparty/boost/include/boost/interprocess/detail/workaround.hpp b/fastdds/Fast-DDS/thirdparty/boost/include/boost/interprocess/detail/workaround.hpp
+index 397d9f7d8..b6298f251 100644
+--- a/fastdds/Fast-DDS/thirdparty/boost/include/boost/interprocess/detail/workaround.hpp
++++ b/fastdds/Fast-DDS/thirdparty/boost/include/boost/interprocess/detail/workaround.hpp
+@@ -33,7 +33,7 @@
+    //////////////////////////////////////////////////////
+    //Check for XSI shared memory objects. They are available in nearly all UNIX platforms
+    //////////////////////////////////////////////////////
+-   #if !defined(__QNXNTO__) && !defined(__ANDROID__) && !defined(__HAIKU__) && !(__VXWORKS__)
++   #if !defined(__QNXNTO__) && !defined(__ANDROID__) && !defined(__HAIKU__) && !defined(__NuttX__) && !(__VXWORKS__)
+       #define BOOST_INTERPROCESS_XSI_SHARED_MEMORY_OBJECTS
+    #endif
+ 
+diff --git a/fastdds/memory/CMakeLists.txt b/fastdds/memory/CMakeLists.txt
+index 89e3e90..593a5bd 100644
+--- a/fastdds/memory/CMakeLists.txt
++++ b/fastdds/memory/CMakeLists.txt
+@@ -21,7 +21,7 @@ set(FOONATHAN_MEMORY_VERSION "$CACHE{FOONATHAN_MEMORY_VERSION_MAJOR}.$CACHE{FOON
+ set(CMAKE_DEBUG_POSTFIX "-dbg")
+ 
+ # installation destinations
+-if(UNIX OR VXWORKS)
++if(UNIX OR VXWORKS OR NUTTX)
+     include(GNUInstallDirs)
+ 
+     set(FOONATHAN_MEMORY_INC_INSTALL_DIR "${CMAKE_INSTALL_INCLUDEDIR}")
+@@ -70,4 +70,3 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" "${CMAKE_CURRENT_SOURCE_DIR}
+ install(EXPORT foonathan_memoryTargets DESTINATION ${FOONATHAN_MEMORY_CMAKE_CONFIG_INSTALL_DIR}
+                                        FILE foonathan_memory-config.cmake)
+ 
+-
+diff --git a/fastdds/memory/cmake/atomic.cmake b/fastdds/memory/cmake/atomic.cmake
+index 6785397..459a1ea 100644
+--- a/fastdds/memory/cmake/atomic.cmake
++++ b/fastdds/memory/cmake/atomic.cmake
+@@ -32,7 +32,13 @@ function(check_working_cxx_atomic varname)
+ 	endif()
+ 	set(${varname} FALSE PARENT_SCOPE)
+ endfunction()
+-check_working_cxx_atomic(HAVE_CXX_ATOMIC)
++if(NUTTX)
++    # NuttX generates the libc++ configuration after configure-time probes.
++    # The real firmware build validates std::atomic support.
++    set(HAVE_CXX_ATOMIC TRUE)
++else()
++    check_working_cxx_atomic(HAVE_CXX_ATOMIC)
++endif()
+ if(NOT HAVE_CXX_ATOMIC)
+ 	set(old_CMAKE_REQUIRED_LIBRARIES "${CMAKE_REQUIRED_LIBRARIES}")
+ 	list(APPEND CMAKE_REQUIRED_LIBRARIES "-latomic")
+diff --git a/fastdds/memory/src/virtual_memory.cpp b/fastdds/memory/src/virtual_memory.cpp
+index 7c8ca00..0ac7b09 100644
+--- a/fastdds/memory/src/virtual_memory.cpp
++++ b/fastdds/memory/src/virtual_memory.cpp
+@@ -74,7 +74,7 @@ void foonathan::memory::virtual_memory_decommit(void* memory, std::size_t no_pag
+     (void)result;
+ }
+ #elif defined(__unix__) || defined(__APPLE__) || defined(__VXWORKS__)                              \
+-    || defined(__QNXNTO__) // POSIX systems
++    || defined(__QNXNTO__) || defined(__NuttX__) // POSIX systems
+ #include <sys/mman.h>
+ #include <unistd.h>
+ 

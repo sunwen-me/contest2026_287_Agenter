@@ -1,0 +1,96 @@
+diff --git a/src/cxa_exception_storage.cpp b/src/cxa_exception_storage.cpp
+index 3a3233a..2cab70b 100644
+--- a/src/cxa_exception_storage.cpp
++++ b/src/cxa_exception_storage.cpp
+@@ -45,6 +45,10 @@ extern "C" {
+ #include "abort_message.h"
+ #include "fallback_malloc.h"
+ 
++#if defined(__NuttX__)
++#include <nuttx/tls_task.h>
++#endif
++
+ #if defined(__ELF__) && defined(_LIBCXXABI_LINK_PTHREAD_LIB)
+ #pragma comment(lib, "pthread")
+ #endif
+@@ -55,6 +59,44 @@ extern "C" {
+ 
+ namespace __cxxabiv1 {
+ namespace {
++#if defined(__NuttX__)
++    int key_slot_ = -1;
++    std::__libcpp_exec_once_flag key_slot_flag_ = _LIBCPP_EXEC_ONCE_INITIALIZER;
++    std::__libcpp_mutex_t key_mutex_ = _LIBCPP_MUTEX_INITIALIZER;
++
++    void create_key_slot_() {
++        key_slot_ = task_tls_alloc(nullptr);
++        if (key_slot_ < 0)
++            abort_message("cannot allocate NuttX task TLS slot for __cxa_get_globals()");
++    }
++
++    void _LIBCPP_TLS_DESTRUCTOR_CC destruct_(void *p) {
++        __free_with_fallback(p);
++    }
++
++    std::__libcpp_tls_key task_group_key_() {
++        if (0 != std::__libcpp_execute_once(&key_slot_flag_, create_key_slot_))
++            abort_message("cannot initialize NuttX task TLS slot for __cxa_get_globals()");
++
++        if (0 != std::__libcpp_mutex_lock(&key_mutex_))
++            abort_message("cannot lock NuttX task TLS key for __cxa_get_globals()");
++
++        uintptr_t encoded_key = task_tls_get_value(key_slot_);
++        if (encoded_key == 0) {
++            std::__libcpp_tls_key key;
++            if (0 != std::__libcpp_tls_create(&key, destruct_))
++                abort_message("cannot create task-group key for __cxa_get_globals()");
++            encoded_key = static_cast<uintptr_t>(key) + 1;
++            if (0 != task_tls_set_value(key_slot_, encoded_key))
++                abort_message("cannot store task-group key for __cxa_get_globals()");
++        }
++
++        if (0 != std::__libcpp_mutex_unlock(&key_mutex_))
++            abort_message("cannot unlock NuttX task TLS key for __cxa_get_globals()");
++
++        return static_cast<std::__libcpp_tls_key>(encoded_key - 1);
++    }
++#else
+     std::__libcpp_tls_key key_;
+     std::__libcpp_exec_once_flag flag_ = _LIBCPP_EXEC_ONCE_INITIALIZER;
+ 
+@@ -68,6 +110,7 @@ namespace {
+         if (0 != std::__libcpp_tls_create(&key_, destruct_))
+             abort_message("cannot create thread specific key for __cxa_get_globals()");
+     }
++#endif
+ } // namespace
+ 
+ extern "C" {
+@@ -81,7 +124,11 @@ extern "C" {
+                 __calloc_with_fallback(1, sizeof(__cxa_eh_globals)));
+             if (NULL == retVal)
+                 abort_message("cannot allocate __cxa_eh_globals");
++#if defined(__NuttX__)
++            if (0 != std::__libcpp_tls_set(task_group_key_(), retVal))
++#else
+             if (0 != std::__libcpp_tls_set(key_, retVal))
++#endif
+                abort_message("std::__libcpp_tls_set failure in __cxa_get_globals()");
+         }
+         return retVal;
+@@ -92,10 +139,15 @@ extern "C" {
+     // to the Itanium ABI and is taken advantage of in several places in
+     // libc++abi.
+     __cxa_eh_globals *__cxa_get_globals_fast() {
++#if defined(__NuttX__)
++        return static_cast<__cxa_eh_globals*>(
++            std::__libcpp_tls_get(task_group_key_()));
++#else
+         // First time through, create the key.
+         if (0 != std::__libcpp_execute_once(&flag_, construct_))
+             abort_message("execute once failure in __cxa_get_globals_fast()");
+         return static_cast<__cxa_eh_globals*>(std::__libcpp_tls_get(key_));
++#endif
+     }
+ } // extern "C"
+ } // namespace __cxxabiv1

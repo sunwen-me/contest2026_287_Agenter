@@ -1,0 +1,110 @@
+/****************************************************************************
+ * board/k1/muse_pi_pro/scripts/ld.script
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ****************************************************************************/
+
+#include <nuttx/config.h>
+
+PHDRS
+{
+  text PT_LOAD FLAGS(5);
+  data PT_LOAD FLAGS(6);
+}
+
+SECTIONS
+{
+  . = CONFIG_RAM_START;
+
+  .text :
+    {
+      _stext = .;
+      *(.text)
+      *(.text.*)
+      *(.gnu.warning)
+      *(.stub)
+      *(.gnu.linkonce.t.*)
+      *(.init)
+      *(.fini)
+      _etext = .;
+    } :text
+
+  .init_section :
+    {
+      _sinit = ABSOLUTE(.);
+      KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)
+             SORT_BY_INIT_PRIORITY(.ctors.*)))
+      KEEP(*(.init_array .ctors))
+      _einit = ABSOLUTE(.);
+    } :text
+
+  .rodata :
+    {
+      _srodata = .;
+      *(.rodata)
+      *(.rodata1)
+      *(.rodata.*)
+      *(.srodata)
+      *(.srodata.*)
+      *(.gnu.linkonce.r*)
+      _erodata = .;
+    } :text
+
+  .note.gnu.build-id :
+    {
+      *(.note.gnu.build-id)
+    } :text
+
+  . = ALIGN(4096);
+  _eronly = ABSOLUTE(.);
+
+  .tdata :
+    {
+      _stdata = ABSOLUTE(.);
+      *(.tdata .tdata.* .gnu.linkonce.td.*)
+      _etdata = ABSOLUTE(.);
+    } :data
+
+  .tbss :
+    {
+      _stbss = ABSOLUTE(.);
+      *(.tbss .tbss.* .gnu.linkonce.tb.* .tcommon)
+      _etbss = ABSOLUTE(.);
+    } :data
+
+  .data :
+    {
+      _sdata = .;
+      PROVIDE(__global_pointer$ = _sdata + 0x800);
+      *(.data)
+      *(.data1)
+      *(.data.*)
+      *(.sdata)
+      *(.sdata.*)
+      *(.gnu.linkonce.d*)
+      . = ALIGN(8);
+      _edata = .;
+    } :data
+
+  .bss :
+    {
+      _sbss = .;
+      *(.bss)
+      *(.bss.*)
+      *(.sbss)
+      *(.sbss.*)
+      *(.gnu.linkonce.b*)
+      *(COMMON)
+      . = ALIGN(64);
+      _ebss = .;
+    } :data
+
+  .stab 0 : { *(.stab) }
+  .stabstr 0 : { *(.stabstr) }
+  .comment 0 : { *(.comment) }
+  .debug_abbrev 0 : { *(.debug_abbrev) }
+  .debug_info 0 : { *(.debug_info) }
+  .debug_line 0 : { *(.debug_line) }
+  .debug_pubnames 0 : { *(.debug_pubnames) }
+  .debug_aranges 0 : { *(.debug_aranges) }
+}
