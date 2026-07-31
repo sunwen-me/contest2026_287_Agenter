@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Machine-readable source lock for the VelaROS DDS baseline.
+
+FASTDDS_URL=https://github.com/eProsima/Fast-DDS.git
+FASTDDS_VERSION=3.6.1
+FASTDDS_REV=4e81e8b71bcd6e7c5213c000503cba8e49d6022a
+
+FASTCDR_URL=https://github.com/eProsima/Fast-CDR.git
+FASTCDR_VERSION=2.3.6
+FASTCDR_REV=d7219391608ae8cd7971e761206dc020098bacb3
+
+FOONATHAN_MEMORY_URL=https://github.com/foonathan/memory.git
+FOONATHAN_MEMORY_VERSION=0.7.4
+FOONATHAN_MEMORY_REV=79d054caaa491d9b6ed7cc65a3a84b495578e6c1
+
+ASIO_URL=https://github.com/chriskohlhoff/asio.git
+ASIO_VERSION=1.34.2
+ASIO_REV=ed6aa8a13d51dfc6c00ae453fc9fb7df5d6ea963
+
+# Fast DDS v3.6.1 records this TinyXML2 submodule revision.  The openvela
+# integration intentionally uses the workspace's packaged TinyXML2 9.0.0.
+FASTDDS_TINYXML2_REV=8c8293ba8969a46947606a93ff0cb5a083aab47a
+OPENVELA_TINYXML2_VERSION=9.0.0
+
+# libc++abi is supplied by the openvela manifest rather than restored by this
+# script.  Pin its manifest checkout so the task-group TLS patch is auditable.
+OPENVELA_LIBCXXABI_REV=3d27ac1876a09b61b5f6516b5e19d361571f6823
+
+ROS_DISTRO=lyrical
+ROS_RELEASE_DATE=2026-05-22
+ROS_FASTDDS_PACKAGE_VERSION=3.6.1-3resolute.20260603.151311
+ROS_FASTCDR_PACKAGE_VERSION=2.3.6-1resolute.20260603.150437
+ROS_RMW_FASTRTPS_CPP_PACKAGE_VERSION=9.4.8-1resolute.20260606.004157
+ROS_RCL_PACKAGE_VERSION=10.4.4
+ROS_RCLCPP_PACKAGE_VERSION=32.0.0

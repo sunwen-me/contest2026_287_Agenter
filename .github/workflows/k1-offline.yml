@@ -1,0 +1,30 @@
+name: K1 offline checks
+
+on:
+  push:
+    paths:
+      - "board/k1/**"
+      - "chip/k1/**"
+      - "docs/K1_*.md"
+      - "tools/**"
+      - "contest2026_287_Agenter.xml"
+      - ".github/workflows/k1-offline.yml"
+  pull_request:
+    paths:
+      - "board/k1/**"
+      - "chip/k1/**"
+      - "docs/K1_*.md"
+      - "tools/**"
+      - "contest2026_287_Agenter.xml"
+      - ".github/workflows/k1-offline.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate K1 repository sources
+        run: tools/ci_k1.sh --static-only

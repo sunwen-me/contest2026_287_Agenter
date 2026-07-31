@@ -1,0 +1,77 @@
+diff --git a/rosidl_buffer_backend_registry/include/rosidl_buffer_backend_registry/buffer_backend_registry.hpp b/rosidl_buffer_backend_registry/include/rosidl_buffer_backend_registry/buffer_backend_registry.hpp
+index 37bed2b..0ce6af2 100644
+--- a/rosidl_buffer_backend_registry/include/rosidl_buffer_backend_registry/buffer_backend_registry.hpp
++++ b/rosidl_buffer_backend_registry/include/rosidl_buffer_backend_registry/buffer_backend_registry.hpp
+@@ -63,7 +63,9 @@ private:
+   void load_plugins();
+ 
+   std::vector<std::string> plugin_backend_classes_;
++#ifndef __NuttX__
+   std::unique_ptr<pluginlib::ClassLoader<rosidl::BufferBackend>> loader_;
++#endif
+ };
+ 
+ }  // namespace rosidl_buffer_backend_registry
+diff --git a/rosidl_buffer_backend_registry/src/buffer_backend_registry.cpp b/rosidl_buffer_backend_registry/src/buffer_backend_registry.cpp
+index 3820b23..0cc05e2 100644
+--- a/rosidl_buffer_backend_registry/src/buffer_backend_registry.cpp
++++ b/rosidl_buffer_backend_registry/src/buffer_backend_registry.cpp
+@@ -17,7 +17,9 @@
+ #include <algorithm>
+ #include <stdexcept>
+ 
+-#include <pluginlib/class_loader.hpp>
++#ifndef __NuttX__
++#  include <pluginlib/class_loader.hpp>
++#endif
+ #include "rcutils/logging_macros.h"
+ 
+ namespace rosidl_buffer_backend_registry
+@@ -25,6 +27,7 @@ namespace rosidl_buffer_backend_registry
+ 
+ BufferBackendRegistry::BufferBackendRegistry()
+ {
++#ifndef __NuttX__
+   try {
+     loader_ = std::make_unique<pluginlib::ClassLoader<rosidl::BufferBackend>>(
+       "rosidl_buffer_backend",
+@@ -36,12 +39,14 @@ BufferBackendRegistry::BufferBackendRegistry()
+     loader_ = nullptr;
+   }
+   load_plugins();
++#endif
+ }
+ 
+ BufferBackendRegistry::~BufferBackendRegistry() = default;
+ 
+ void BufferBackendRegistry::load_plugins()
+ {
++#ifndef __NuttX__
+   if (!loader_) {
+     return;
+   }
+@@ -71,11 +76,16 @@ void BufferBackendRegistry::load_plugins()
+       "Buffer backend plugin discovery error: %s",
+       e.what());
+   }
++#endif
+ }
+ 
+ std::shared_ptr<rosidl::BufferBackend> BufferBackendRegistry::create_backend_instance(
+   const std::string & name)
+ {
++#ifdef __NuttX__
++  (void)name;
++  return nullptr;
++#else
+   if (!loader_) {
+     return nullptr;
+   }
+@@ -95,6 +105,7 @@ std::shared_ptr<rosidl::BufferBackend> BufferBackendRegistry::create_backend_instance(
+       name.c_str(), e.what());
+     return nullptr;
+   }
++#endif
+ }
+ 
+ std::vector<std::string> BufferBackendRegistry::get_backend_names() const

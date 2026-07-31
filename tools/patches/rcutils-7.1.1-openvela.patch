@@ -1,0 +1,29 @@
+diff --git a/src/process.c b/src/process.c
+index d62c329..745aff8 100644
+--- a/src/process.c
++++ b/src/process.c
+@@ -60,7 +60,9 @@ char * rcutils_get_executable_name(rcutils_allocator_t allocator)
+   RCUTILS_CHECK_ALLOCATOR_WITH_MSG(
+     &allocator, "invalid allocator", return NULL);
+ 
+-#if defined __APPLE__ || defined __FreeBSD__ || (defined __ANDROID__ && __ANDROID_API__ >= 21)
++#if defined __NuttX__
++  const char * appname = getprogname();
++#elif defined __APPLE__ || defined __FreeBSD__ || (defined __ANDROID__ && __ANDROID_API__ >= 21)
+   const char * appname = getprogname();
+ #elif (defined __GNUC__ && !defined(__MINGW64__)) && !defined(__QNXNTO__) && !defined(__OHOS__)
+   const char * appname = program_invocation_name;
+diff --git a/src/strcasecmp.c b/src/strcasecmp.c
+index 941919a..c3f7f89 100644
+--- a/src/strcasecmp.c
++++ b/src/strcasecmp.c
+@@ -19,6 +19,9 @@ extern "C"
+ 
+ #include <errno.h>
+ #include <string.h>
++#if defined(__NuttX__)
++#include <strings.h>
++#endif
+ 
+ #include "rcutils/strcasecmp.h"
+ 

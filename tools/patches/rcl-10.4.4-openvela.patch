@@ -1,0 +1,252 @@
+diff --git a/rcl/include/rcl/node.h b/rcl/include/rcl/node.h
+index 58a2163..e2f06e3 100644
+--- a/rcl/include/rcl/node.h
++++ b/rcl/include/rcl/node.h
+@@ -33,7 +33,9 @@ extern "C"
+ #include "rcl/types.h"
+ #include "rcl/visibility_control.h"
+ 
++#ifndef __NuttX__
+ #include "type_description_interfaces/srv/get_type_description.h"
++#endif
+ 
+ extern const char * const RCL_DISABLE_LOANED_MESSAGES_ENV_VAR;
+ 
+@@ -581,6 +583,7 @@ rcl_get_disable_loaned_message(bool * disable_loaned_message);
+  * \return #RCL_RET_BAD_ALLOC if memory allocation for the service failed, or
+  * \return #RCL_RET_ERROR if an unspecified error occurs.
+  */
++#ifndef __NuttX__
+ RCL_PUBLIC
+ RCL_WARN_UNUSED
+ rcl_ret_t rcl_node_type_description_service_init(
+@@ -612,6 +615,7 @@ void rcl_node_type_description_service_handle_request(
+   const rmw_request_id_t * request_header,
+   const type_description_interfaces__srv__GetTypeDescription_Request * request,
+   type_description_interfaces__srv__GetTypeDescription_Response * response);
++#endif
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/rcl/src/rcl/node.c b/rcl/src/rcl/node.c
+index c1d286a..0e24291 100644
+--- a/rcl/src/rcl/node.c
++++ b/rcl/src/rcl/node.c
+@@ -24,7 +24,9 @@
+ #include "rcl/init_options.h"
+ #include "rcl/logging.h"
+ #include "rcl/logging_rosout.h"
++#ifndef __NuttX__
+ #include "rcl/node_type_cache.h"
++#endif
+ #include "rcl/rcl.h"
+ #include "rcl/remap.h"
+ #include "rcl/security.h"
+@@ -49,7 +51,9 @@
+ #include "rosidl_runtime_c/type_description/type_description__functions.h"
+ #include "rosidl_runtime_c/type_description/type_source__functions.h"
+ #include "tracetools/tracetools.h"
++#ifndef __NuttX__
+ #include "type_description_interfaces/srv/get_type_description.h"
++#endif
+ 
+ #include "./context_impl.h"
+ #include "./node_impl.h"
+@@ -279,12 +283,14 @@ rcl_node_init(
+     goto fail;
+   }
+ 
++#ifndef __NuttX__
+   // To capture all types from builtin topics and services, the type cache needs to be initialized
+   // before any publishers/subscriptions/services/etc can be created
+   ret = rcl_node_type_cache_init(node);
+   if (ret != RCL_RET_OK) {
+     goto fail;
+   }
++#endif
+ 
+   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Node initialized");
+   TRACETOOLS_TRACEPOINT(
+@@ -301,12 +307,14 @@ rcl_node_init(
+ 
+ fail:
+   if (node->impl) {
++#ifndef __NuttX__
+     if (NULL != node->impl->registered_types_by_type_hash.impl) {
+       fail_ret = rcl_node_type_cache_fini(node);
+       RCUTILS_LOG_ERROR_EXPRESSION_NAMED(
+         (fail_ret != RCL_RET_OK),
+         ROS_PACKAGE_NAME, "Failed to fini type cache for node: %s", rcl_get_error_string().str);
+     }
++#endif
+ 
+     if (node->impl->graph_guard_condition) {
+       fail_ret = rcl_guard_condition_fini(node->impl->graph_guard_condition);
+@@ -357,11 +365,13 @@ rcl_node_fini(rcl_node_t * node)
+   rcl_allocator_t allocator = node->impl->options.allocator;
+   rcl_ret_t result = RCL_RET_OK;
+   rcl_ret_t rcl_ret = RCL_RET_OK;
++#ifndef __NuttX__
+   rcl_ret = rcl_node_type_cache_fini(node);
+   if (rcl_ret != RCL_RET_OK) {
+     RCL_SET_ERROR_MSG("Unable to fini type cache for node.");
+     result = RCL_RET_ERROR;
+   }
++#endif
+   rmw_ret_t rmw_ret = rmw_destroy_node(node->impl->rmw_node_handle);
+   if (rmw_ret != RMW_RET_OK) {
+     RCL_SET_ERROR_MSG(rmw_get_error_string().str);
+@@ -518,6 +528,7 @@ rcl_get_disable_loaned_message(bool * disable_loaned_message)
+   return RCL_RET_OK;
+ }
+ 
++#ifndef __NuttX__
+ void rcl_node_type_description_service_handle_request(
+   rcl_node_t * node,
+   const rmw_request_id_t * request_header,
+@@ -623,3 +634,4 @@ rcl_ret_t rcl_node_type_description_service_init(
+ 
+   return ret;
+ }
++#endif
+diff --git a/rcl/src/rcl/publisher.c b/rcl/src/rcl/publisher.c
+index d8bc31d..fbf2a5e 100644
+--- a/rcl/src/rcl/publisher.c
++++ b/rcl/src/rcl/publisher.c
+@@ -25,9 +25,12 @@ extern "C"
+ #include "rcl/allocator.h"
+ #include "rcl/error_handling.h"
+ #include "rcl/node.h"
++#ifndef __NuttX__
+ #include "rcl/node_type_cache.h"
++#endif
+ #include "rcutils/logging_macros.h"
+ #include "rcutils/macros.h"
++#include "rcutils/strdup.h"
+ #include "rcl/time.h"
+ #include "rmw/time.h"
+ #include "rmw/error_handling.h"
+@@ -82,6 +85,14 @@ rcl_publisher_init(
+ 
+   // Expand and remap the given topic name.
+   char * remapped_topic_name = NULL;
++#ifdef __NuttX__
++  remapped_topic_name = rcutils_strdup(topic_name, *allocator);
++  if (remapped_topic_name == NULL) {
++    RCL_SET_ERROR_MSG("failed to copy topic name");
++    return RCL_RET_BAD_ALLOC;
++  }
++  rcl_ret_t ret = RCL_RET_OK;
++#else
+   rcl_ret_t ret = rcl_node_resolve_name(
+     node,
+     topic_name,
+@@ -97,6 +108,7 @@ rcl_publisher_init(
+     }
+     goto cleanup;
+   }
++#endif
+   RCUTILS_LOG_DEBUG_NAMED(
+     ROS_PACKAGE_NAME, "Expanded and remapped topic name '%s'", remapped_topic_name);
+ 
+@@ -130,6 +142,7 @@ rcl_publisher_init(
+   // options
+   publisher->impl->options = *options;
+ 
++#ifndef __NuttX__
+   if (RCL_RET_OK != rcl_node_type_cache_register_type(
+       node, type_support->get_type_hash_func(type_support),
+       type_support->get_type_description_func(type_support),
+@@ -140,6 +153,7 @@ rcl_publisher_init(
+     goto fail;
+   }
+   publisher->impl->type_hash = *type_support->get_type_hash_func(type_support);
++#endif
+ 
+   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Publisher initialized");
+   // context
+@@ -202,6 +216,7 @@ rcl_publisher_fini(rcl_publisher_t * publisher, rcl_node_t * node)
+       RCL_SET_ERROR_MSG(rmw_get_error_string().str);
+       result = RCL_RET_ERROR;
+     }
++#ifndef __NuttX__
+     if (
+       ROSIDL_TYPE_HASH_VERSION_UNSET != publisher->impl->type_hash.version &&
+       RCL_RET_OK != rcl_node_type_cache_unregister_type(node, &publisher->impl->type_hash))
+@@ -209,6 +224,7 @@ rcl_publisher_fini(rcl_publisher_t * publisher, rcl_node_t * node)
+       RCUTILS_SAFE_FWRITE_TO_STDERR(rcl_get_error_string().str);
+       result = RCL_RET_ERROR;
+     }
++#endif
+     allocator.deallocate(publisher->impl, allocator.state);
+     publisher->impl = NULL;
+   }
+diff --git a/rcl/src/rcl/subscription.c b/rcl/src/rcl/subscription.c
+index 2e36cbb..a442aa2 100644
+--- a/rcl/src/rcl/subscription.c
++++ b/rcl/src/rcl/subscription.c
+@@ -23,7 +23,9 @@ extern "C"
+ 
+ #include "rcl/error_handling.h"
+ #include "rcl/node.h"
++#ifndef __NuttX__
+ #include "rcl/node_type_cache.h"
++#endif
+ #include "rcutils/env.h"
+ #include "rcutils/logging_macros.h"
+ #include "rcutils/strdup.h"
+@@ -77,6 +79,14 @@ rcl_subscription_init(
+ 
+   // Expand and remap the given topic name.
+   char * remapped_topic_name = NULL;
++#ifdef __NuttX__
++  remapped_topic_name = rcutils_strdup(topic_name, *allocator);
++  if (remapped_topic_name == NULL) {
++    RCL_SET_ERROR_MSG("failed to copy topic name");
++    return RCL_RET_BAD_ALLOC;
++  }
++  rcl_ret_t ret = RCL_RET_OK;
++#else
+   rcl_ret_t ret = rcl_node_resolve_name(
+     node,
+     topic_name,
+@@ -92,6 +102,7 @@ rcl_subscription_init(
+     }
+     goto cleanup;
+   }
++#endif
+   RCUTILS_LOG_DEBUG_NAMED(
+     ROS_PACKAGE_NAME, "Expanded and remapped topic name '%s'", remapped_topic_name);
+ 
+@@ -128,6 +139,7 @@ rcl_subscription_init(
+   subscription->impl->actual_qos.avoid_ros_namespace_conventions =
+     options->qos.avoid_ros_namespace_conventions;
+ 
++#ifndef __NuttX__
+   if (RCL_RET_OK != rcl_node_type_cache_register_type(
+       node, type_support->get_type_hash_func(type_support),
+       type_support->get_type_description_func(type_support),
+@@ -138,6 +150,7 @@ rcl_subscription_init(
+     goto fail;
+   }
+   subscription->impl->type_hash = *type_support->get_type_hash_func(type_support);
++#endif
+ 
+   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Subscription initialized");
+   ret = RCL_RET_OK;
+@@ -210,6 +223,7 @@ rcl_subscription_fini(rcl_subscription_t * subscription, rcl_node_t * node)
+       result = RCL_RET_ERROR;
+     }
+ 
++#ifndef __NuttX__
+     if (
+       ROSIDL_TYPE_HASH_VERSION_UNSET != subscription->impl->type_hash.version &&
+       RCL_RET_OK != rcl_node_type_cache_unregister_type(node, &subscription->impl->type_hash))
+@@ -218,6 +232,7 @@ rcl_subscription_fini(rcl_subscription_t * subscription, rcl_node_t * node)
+       RCUTILS_SAFE_FWRITE_TO_STDERR("\n");
+       result = RCL_RET_ERROR;
+     }
++#endif
+ 
+     allocator.deallocate(subscription->impl, allocator.state);
+     subscription->impl = NULL;
