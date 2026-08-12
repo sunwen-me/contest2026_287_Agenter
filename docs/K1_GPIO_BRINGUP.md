@@ -86,10 +86,16 @@ chip/k1/hardware/k1_gpio.h
 board/k1/muse_pi_pro/src/k1_gpio.c
 ```
 
-驱动只操作上述 GPIO 对应的 GPIO bank、MFPR pinmux，以及 GPIO/AIB 的时钟复位
-寄存器；不会改写 UART0 的 APBC 寄存器。1.8V CPU pad 经 MUSE Pi Pro
-原理图中的电平转换器连接到 40Pin 的 3.3V 侧；external pad 则按 3.3V
-驱动配置处理。
+驱动只操作上述 GPIO 对应的 GPIO bank、MFPR pinmux、外部 IO 电源域，以及
+GPIO/AIB 的时钟复位寄存器；不会改写 UART0 的 APBC 寄存器。1.8V CPU pad
+经 MUSE Pi Pro 原理图中的电平转换器连接到 40Pin 的 3.3V 侧；external pad
+则由驱动显式选择 3.3V 电源域。
+
+K1 的外部 IO 电源域是受保护寄存器。驱动遵循 Linux mainline
+`drivers/pinctrl/spacemit/pinctrl-k1.c` 的序列，在每次写入前向 APBC
+`ASFar=0x50` / `ASSar=0x54` 写入 `0xbaba` / `0xeb10`，然后将 MFPR
+`+0x800+0x10`（GPIO47..52）和 `+0x800+0x0c`（GPIO75..80）的 `V18EN`
+清零，明确选择 MUSE Pi Pro 的 3.3V 外部 IO 电源。
 
 ## 构建配置
 
@@ -104,7 +110,7 @@ CONFIG_EXAMPLES_GPIO_STACKSIZE=8192
 构建入口：
 
 ```bash
-K1_PACKAGE_DIR=/home/sw/Dev/k1-workspace/out/k1-bringup-gpio-v2 \
+K1_PACKAGE_DIR=/home/sw/Dev/k1-workspace/out/k1-gpio-migrate-v2 \
 /home/sw/Dev/k1-workspace/contest2026_287_Agenter/tools/build_k1.sh \
   --clean --package
 ```
@@ -158,7 +164,7 @@ Verify:        Value=1
 - Linux mainline `arch/riscv/boot/dts/spacemit/k1.dtsi`
 - 项目使用的 `MUSEPi Pro_schematic-V1.1-20250619.pdf`
 
-1. 新增 GPIO 已完成资料核对，但除 GPIO49/Pin 22 外还没有逐个完成实板电压
+1. 新增 GPIO 已完成资料核对和 3.3V IO 电源域初始化，但除 GPIO49/Pin 22 外还没有逐个完成实板电压
    验证；首次测试建议一次只接一个目标脚，并避开 Pin 8/10；
 2. 当前仍是 NuttX RAM 临时启动，按 RST 或重新上电会回到原厂 Linux；
 3. 当前没有实现 GPIO 外部中断、PLIC 路由和硬件去抖；

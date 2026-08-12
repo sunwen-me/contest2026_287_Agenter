@@ -16,6 +16,13 @@
 #define K1_APBC_BASE                    0xd4015000ul
 #define K1_APBC_GPIO_CLK_RST            (K1_APBC_BASE + 0x008ul)
 #define K1_APBC_AIB_CLK_RST             (K1_APBC_BASE + 0x03cul)
+#define K1_APBC_ASFAR                   (K1_APBC_BASE + 0x050ul)
+#define K1_APBC_ASSAR                   (K1_APBC_BASE + 0x054ul)
+
+/* APBC secure-access keys for the MFPR IO power-domain registers. */
+
+#define K1_APBC_ASFAR_KEY               0xbabaul
+#define K1_APBC_ASSAR_KEY               0xeb10ul
 
 #define K1_CLK_BUS_ENABLE               (1ul << 0)
 #define K1_CLK_FUNCTION_ENABLE          (1ul << 1)
@@ -27,6 +34,23 @@
  */
 
 #define K1_MFPR_BASE                    0xd401e000ul
+
+/* MFPR IO power-domain registers.  These registers are protected by the
+ * APBC secure-access sequence above.  A cleared V18EN bit selects the
+ * board's 3.3V external IO supply; setting it selects 1.8V.
+ */
+
+#define K1_MFPR_IO_PWR_DOMAIN_OFFSET    0x800ul
+#define K1_MFPR_IO_PWR_GPIO2_OFFSET     0x00cul /* GPIO75..GPIO80 */
+#define K1_MFPR_IO_PWR_GPIO3_OFFSET     0x010ul /* GPIO47..GPIO52 */
+#define K1_MFPR_IO_PWR_V18EN             (1ul << 2)
+
+#define K1_MFPR_IO_PWR_GPIO2            \
+  (K1_MFPR_BASE + K1_MFPR_IO_PWR_DOMAIN_OFFSET + \
+   K1_MFPR_IO_PWR_GPIO2_OFFSET)
+#define K1_MFPR_IO_PWR_GPIO3            \
+  (K1_MFPR_BASE + K1_MFPR_IO_PWR_DOMAIN_OFFSET + \
+   K1_MFPR_IO_PWR_GPIO3_OFFSET)
 
 #define K1_MFPR_GPIO33                  (K1_MFPR_BASE + 0x088ul)
 #define K1_MFPR_GPIO34                  (K1_MFPR_BASE + 0x08cul)
