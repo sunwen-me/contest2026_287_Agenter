@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include <nuttx/board.h>
+#include <syslog.h>
 
 #include <arch/board/board.h>
 
@@ -39,6 +40,15 @@ void board_early_initialize(void)
 #ifdef CONFIG_BOARD_LATE_INITIALIZE
 void board_late_initialize(void)
 {
+#if defined(CONFIG_DEV_GPIO) && !defined(CONFIG_GPIO_LOWER_HALF)
+  int ret;
+
+  ret = k1_gpio_initialize();
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: k1_gpio_initialize failed: %d\n", ret);
+    }
+#endif
 }
 #endif
 
