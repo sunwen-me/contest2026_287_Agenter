@@ -200,6 +200,25 @@ static inline void k1_gpio_set_output(FAR struct k1_gpio_dev_s *priv,
            k1_gpio_reg(priv, K1_GPIO_GSDR_OFFSET));
 }
 
+static inline void k1_gpio_unlock_io_power(void)
+{
+  /* The K1 MFPR IO power-domain registers accept exactly one access after
+   * this two-register unlock sequence.  Keep the key writes immediately
+   * before each protected register write.
+   */
+
+  putreg32(K1_APBC_ASFAR_KEY, K1_APBC_ASFAR);
+  putreg32(K1_APBC_ASSAR_KEY, K1_APBC_ASSAR);
+}
+
+static inline void k1_gpio_set_io_power(uintptr_t reg, bool v18)
+{
+  uint32_t value = v18 ? K1_MFPR_IO_PWR_V18EN : 0;
+
+  k1_gpio_unlock_io_power();
+  putreg32(value, reg);
+}
+
 static int k1_gpio_read(FAR struct gpio_dev_s *dev, FAR bool *value)
 {
   FAR struct k1_gpio_dev_s *priv;
@@ -374,6 +393,18 @@ int k1_gpio_initialize(void)
               K1_CLK_BUS_ENABLE | K1_CLK_FUNCTION_ENABLE);
   modifyreg32(K1_APBC_AIB_CLK_RST, K1_CLK_RESET,
               K1_CLK_BUS_ENABLE | K1_CLK_FUNCTION_ENABLE);
+
+  /* Set both K1 external GPIO power domains to the MUSE Pi Pro 3.3V rail
+   * before programming the individual MFPR pin settings.
+   */
+
+  /* GPIO47..GPIO52 and GPIO75..GPIO80 are external-voltage domains on K1.
+   * MUSE Pi Pro routes these header signals through its 3.3V interface, so
+   * select 3.3V explicitly instead of relying on U-Boot/Linux inheritance.
+   */
+
+  k1_gpio_set_io_power(K1_MFPR_IO_PWR_GPIO3, false);
+  k1_gpio_set_io_power(K1_MFPR_IO_PWR_GPIO2, false);
 
   for (i = 0; i < K1_GPIO_PIN_COUNT; i++)
     {
