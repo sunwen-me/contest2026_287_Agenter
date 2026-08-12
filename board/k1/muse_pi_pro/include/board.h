@@ -26,6 +26,10 @@ extern "C"
 
 void k1_muse_pi_pro_board_initialize(void);
 
+#if defined(CONFIG_DEV_GPIO) && !defined(CONFIG_GPIO_LOWER_HALF)
+int k1_gpio_initialize(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
