@@ -197,7 +197,44 @@ gpio -t 3 -o 1 /dev/gpio0
 
 `gpio -t 8` 在后台等待 GPIO47 的上升沿，随后同一个 `nsh>` 会话把 GPIO49
 拉高；不需要也不能再开第二个 NSH 串口会话。预期后台命令会结束并打印输入值
-变为 1。当前 IRQ 代码尚未在实板上完成最终验收。
+变为 1。
+
+### 实板验收（2026-08-13）
+
+PASS。在真实 MUSE Pi Pro 上，用一根杜邦线直连 Pin 22 与 Pin 33，按下列顺序
+完成了硬件上升沿中断验证：
+
+```text
+gpio -t 3 -o 0 /dev/gpio0
+gpio -t 8 /dev/gpio20 &
+gpio -t 3 -o 1 /dev/gpio0
+```
+
+串口实际输出先确认 Pin 33 为低，随后 Pin 22 拉高后后台命令返回高电平：
+
+```text
+Driver: /dev/gpio20
+  Interrupt pin: Value=0
+  Verify:        Value=0
+...
+Driver: /dev/gpio0
+  Writing:       Value=1
+  Verify:        Value=1
+  Verify:        Value=1
+```
+
+最后一行是 `/dev/gpio20` 后台等待命令的返回值，证明 GPIO47 经 PLIC source 58
+收到 GPIO49 产生的上升沿。触发后 `uptime` 仍返回 `00:07:20` 和新的 `nsh>`，
+没有异常 trap 或复位。
+
+验收镜像为独立 IRQ 配置：
+
+```text
+CONFIG_K1_PLIC=y
+CONFIG_K1_GPIO_IRQ=y
+out/k1-gpio-irq/contest-nuttx-flat.bin
+SHA256: db3fb006d60e1c0797ec2b5ffee4b4937082f5b40af049cdf8ac13d4f343d359
+```
 
 ## 参考资料与已知限制
 
@@ -214,8 +251,8 @@ gpio -t 3 -o 1 /dev/gpio0
 1. 新增 GPIO 已完成资料核对和 3.3V IO 电源域初始化，但除 GPIO49/Pin 22 外还没有逐个完成实板电压
    验证；首次测试建议一次只接一个目标脚，并避开 Pin 8/10；
 2. 当前仍是 NuttX RAM 临时启动，按 RST 或重新上电会回到原厂 Linux；
-3. GPIO 外部中断和 PLIC 路由已经实现为默认关闭的实验性路径，尚未完成实板边沿验收；
-   硬件去抖、level/wakeup 中断仍未实现；
+3. GPIO 外部中断和 PLIC 路由已在 Pin 22 → Pin 33 的上升沿路径完成实板验收，
+   但它仍默认关闭；硬件去抖、level/wakeup 中断仍未实现；
 4. `CONFIG_GPIO_LOWER_HALF` 与当前板级 lower-half 互斥，避免重复注册；
 5. GPIO70--73 在 K1 pinctrl 中使用 GPIO mux 1，这是 Linux mainline 对
    PRI_JTAG 复用脚的 GPIO 功能定义，不应擅自改成 mux 0。
