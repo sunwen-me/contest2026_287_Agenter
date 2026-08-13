@@ -15,6 +15,7 @@ CONFIG="${K1_CONFIG:-${WORKSPACE_ROOT}/cmake_out/muse_pi_pro_nsh/.config}"
 UART_SOURCE="${K1_UART_SOURCE:-${CONTEST_ROOT}/chip/k1/k1_console.c}"
 EXPECTED_ENTRY="${K1_EXPECTED_ENTRY:-0x11000000}"
 TOOLCHAIN_BIN="${K1_TOOLCHAIN_BIN:-${WORKSPACE_ROOT}/prebuilts/gcc/linux-x86_64/riscv-none-elf/bin}"
+EXPERIMENTAL_IRQ=0
 
 usage()
 {
@@ -27,6 +28,7 @@ Options:
   --uart-source PATH  K1 polling console source
   --entry ADDRESS     Expected ELF entry (default: 0x11000000)
   --toolchain-bin DIR Directory containing riscv-none-elf tools
+  --experimental-irq  Allow and require the K1 PLIC/GPIO IRQ path
   -h, --help          Show this help
 EOF
 }
@@ -63,6 +65,10 @@ while (($# > 0)); do
     --toolchain-bin)
       TOOLCHAIN_BIN="$2"
       shift 2
+      ;;
+    --experimental-irq)
+      EXPERIMENTAL_IRQ=1
+      shift
       ;;
     -h|--help)
       usage
@@ -158,13 +164,21 @@ done
 pass "LOAD segments are non-overlapping and contain no RWX segment"
 
 SYMBOLS="$("${NM}" -g --defined-only "${ELF}")"
-for symbol in __start __global_pointer\$ k1_start nsh_main \
-              riscv_sbi_set_timer; do
+for symbol in __start __global_pointer\$ k1_start nsh_main; do
   awk -v wanted="${symbol}" '$NF == wanted { found = 1 }
     END { exit found ? 0 : 1 }' <<<"${SYMBOLS}" ||
     fail "required symbol missing: ${symbol}"
 done
-pass "required boot, NSH and SBI timer symbols"
+pass "required boot and NSH symbols"
+
+if grep -qx "CONFIG_ARCH_RV_EXT_SSTC=y" "${CONFIG}"; then
+  pass "S-mode timer uses the SSTC stimecmp CSR"
+else
+  awk '$NF == "riscv_sbi_set_timer" { found = 1 }
+    END { exit found ? 0 : 1 }' <<<"${SYMBOLS}" ||
+    fail "SBI TIME timer symbol is missing while SSTC is disabled"
+  pass "S-mode timer uses the SBI TIME extension"
+fi
 
 for option in ARCH_USE_S_MODE ARCH_RV_ISA_ZICSR_ZIFENCEI \
               K1_PRESERVE_BOOT_UART K1_EARLY_BOOT_LOG ALARM_ARCH \
@@ -173,12 +187,22 @@ for option in ARCH_USE_S_MODE ARCH_RV_ISA_ZICSR_ZIFENCEI \
     fail "CONFIG_${option} is not enabled"
 done
 
-for option in SMP ARCH_RV_EXT_SSTC K1_PLIC; do
-  if grep -qx "CONFIG_${option}=y" "${CONFIG}"; then
-    fail "CONFIG_${option} must remain disabled for initial bring-up"
-  fi
-done
-pass "K1 initial bring-up Kconfig invariants"
+if ((EXPERIMENTAL_IRQ == 1)); then
+  grep -qx "CONFIG_K1_PLIC=y" "${CONFIG}" ||
+    fail "experimental IRQ validation requires CONFIG_K1_PLIC=y"
+  grep -qx "CONFIG_K1_GPIO_IRQ=y" "${CONFIG}" ||
+    fail "experimental IRQ validation requires CONFIG_K1_GPIO_IRQ=y"
+  grep -qx "CONFIG_SMP=y" "${CONFIG}" &&
+    fail "K1 GPIO IRQ validation requires SMP to remain disabled"
+  pass "K1 experimental PLIC/GPIO IRQ Kconfig invariants"
+else
+  for option in SMP K1_PLIC; do
+    if grep -qx "CONFIG_${option}=y" "${CONFIG}"; then
+      fail "CONFIG_${option} must remain disabled for initial bring-up"
+    fi
+  done
+  pass "K1 initial bring-up Kconfig invariants"
+fi
 
 if grep -Eq \
   'k1_uart_putreg[[:space:]]*\([[:space:]]*K1_UART_IER_OFFSET' \

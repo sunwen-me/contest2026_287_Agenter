@@ -1,0 +1,7 @@
+# K1 GPIO edge-interrupt verification configuration.
+# This is an explicitly experimental configuration and must not replace nsh.
+
+#include "../nsh/defconfig"
+
+CONFIG_K1_PLIC=y
+CONFIG_K1_GPIO_IRQ=y

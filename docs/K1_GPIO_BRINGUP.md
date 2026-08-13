@@ -122,6 +122,19 @@ CONFIG_K1_GPIO_IRQ=y
 
 这两个选项只应在已经确认 PLIC DTS、并准备做单根 GPIO 边沿测试的临时构建中启用。
 
+仓库提供了独立的实验配置，不会修改默认 `nsh/defconfig`：
+
+```bash
+tools/build_k1.sh \
+  --config vendor/spacemit/boards/k1/muse_pi_pro/configs/gpio_irq \
+  --build-dir cmake_out/muse_pi_pro_gpio_irq \
+  --package-dir out/k1-gpio-irq \
+  --clean --package --experimental-irq
+```
+
+`--experimental-irq` 是刻意要求的安全闸门：没有它，ELF 检查器会拒绝带
+`CONFIG_K1_PLIC=y` 的镜像；默认 `nsh` 构建仍按首板基线检查 PLIC 必须关闭。
+
 构建入口：
 
 ```bash
