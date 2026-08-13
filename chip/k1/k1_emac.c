@@ -13,6 +13,7 @@
 #ifdef CONFIG_K1_EMAC
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -29,6 +30,7 @@
 #include <debug.h>
 
 #include "hardware/k1_emac.h"
+#include "k1_cache.h"
 #include "riscv_internal.h"
 
 /****************************************************************************
@@ -42,6 +44,22 @@
 #define K1_EMAC_RGMII_LAST_GPIO      14u
 #define K1_EMAC_RGMII_REFCLK_GPIO    45u
 
+#define K1_EMAC_CACHE_LINE_SIZE       64u
+#define K1_EMAC_BUFFER_SIZE           1536u
+#define K1_EMAC_MIN_FRAME_SIZE          64u
+#define K1_EMAC_MAX_FRAME_SIZE         1518u
+#define K1_EMAC_FCS_SIZE                  4u
+#define K1_EMAC_MAX_PACKET_SIZE \
+  (K1_EMAC_MAX_FRAME_SIZE - K1_EMAC_FCS_SIZE)
+
+#define K1_EMAC_PHY_PAGE_SELECT_REG   0x1fu
+#define K1_EMAC_PHY_STATUS_PAGE       0xa43u
+#define K1_EMAC_PHY_STATUS_REG        0x1au
+#define K1_EMAC_PHY_STATUS_DUPLEX     (1u << 3)
+#define K1_EMAC_PHY_STATUS_SPEED_MASK 0x30u
+#define K1_EMAC_PHY_STATUS_SPEED_100   0x10u
+#define K1_EMAC_PHY_STATUS_SPEED_1000  0x20u
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -50,6 +68,14 @@ struct k1_emac_dev_s
 {
   struct netdev_lowerhalf_s dev; /* Must be first */
   struct work_s link_work;
+  struct work_s dma_work;
+  FAR uint32_t *tx_desc;
+  FAR uint32_t *rx_desc;
+  FAR uint8_t *tx_buffer;
+  FAR uint8_t *rx_buffer;
+  FAR netpkt_t *tx_pkt;
+  bool dma_ready;
+  bool tx_pending;
   bool ifup;
   bool link_up;
   uint8_t phy_addr;
@@ -64,6 +90,7 @@ static int k1_emac_ifdown(FAR struct netdev_lowerhalf_s *dev);
 static int k1_emac_transmit(FAR struct netdev_lowerhalf_s *dev,
                             FAR netpkt_t *pkt);
 static FAR netpkt_t *k1_emac_receive(FAR struct netdev_lowerhalf_s *dev);
+static void k1_emac_dma_worker(FAR void *arg);
 #ifdef CONFIG_NETDEV_IOCTL
 static int k1_emac_ioctl(FAR struct netdev_lowerhalf_s *dev, int cmd,
                          unsigned long arg);
@@ -195,6 +222,73 @@ static int k1_emac_link_status(FAR struct k1_emac_dev_s *priv,
   return OK;
 }
 
+static int k1_emac_update_mac_mode(FAR struct k1_emac_dev_s *priv)
+{
+  uint16_t status;
+  uint32_t control;
+  int restore_ret;
+  int ret;
+
+  ret = k1_emac_phywrite(priv, priv->phy_addr,
+                          K1_EMAC_PHY_PAGE_SELECT_REG,
+                          K1_EMAC_PHY_STATUS_PAGE);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_emac_phyread(priv, priv->phy_addr, K1_EMAC_PHY_STATUS_REG,
+                         &status);
+
+  /* Always restore the standard register page, even if the status read
+   * fails.  A later generic MDIO ioctl must not inherit page 0xa43.
+   */
+
+  restore_ret = k1_emac_phywrite(priv, priv->phy_addr,
+                                  K1_EMAC_PHY_PAGE_SELECT_REG, 0);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (restore_ret < 0)
+    {
+      return restore_ret;
+    }
+
+  control = getreg32(K1_EMAC_MAC_GLOBAL_CONTROL);
+  control &= ~(K1_EMAC_MAC_SPEED_MASK | K1_EMAC_MAC_FULL_DUPLEX);
+
+  switch (status & K1_EMAC_PHY_STATUS_SPEED_MASK)
+    {
+      case K1_EMAC_PHY_STATUS_SPEED_1000:
+        control |= K1_EMAC_MAC_SPEED_1000;
+        break;
+
+      case K1_EMAC_PHY_STATUS_SPEED_100:
+        control |= K1_EMAC_MAC_SPEED_100;
+        break;
+
+      default:
+        control |= K1_EMAC_MAC_SPEED_10;
+        break;
+    }
+
+  if ((status & K1_EMAC_PHY_STATUS_DUPLEX) != 0)
+    {
+      control |= K1_EMAC_MAC_FULL_DUPLEX;
+    }
+
+  putreg32(control, K1_EMAC_MAC_GLOBAL_CONTROL);
+  ninfo("K1 EMAC: link mode %s %u Mbps\n",
+        (status & K1_EMAC_PHY_STATUS_DUPLEX) != 0 ? "full" : "half",
+        (status & K1_EMAC_PHY_STATUS_SPEED_MASK) ==
+        K1_EMAC_PHY_STATUS_SPEED_1000 ? 1000 :
+        (status & K1_EMAC_PHY_STATUS_SPEED_MASK) ==
+        K1_EMAC_PHY_STATUS_SPEED_100 ? 100 : 10);
+  return OK;
+}
+
 static void k1_emac_update_link(FAR struct k1_emac_dev_s *priv)
 {
   bool link_up;
@@ -215,6 +309,12 @@ static void k1_emac_update_link(FAR struct k1_emac_dev_s *priv)
   priv->link_up = link_up;
   if (link_up)
     {
+      ret = k1_emac_update_mac_mode(priv);
+      if (ret < 0)
+        {
+          nwarn("WARNING: K1 EMAC PHY mode read failed: %d\n", ret);
+        }
+
       ninfo("K1 EMAC: PHY link up\n");
       netdev_lower_carrier_on(&priv->dev);
     }
@@ -342,6 +442,223 @@ static void k1_emac_hardware_setup(FAR struct k1_emac_dev_s *priv)
   k1_emac_reset_phy();
 }
 
+static uint32_t k1_emac_dma_address(FAR const void *address)
+{
+  uintptr_t value = (uintptr_t)address;
+
+  /* K1 runs this port with satp=0, so the DRAM virtual address is already
+   * the DMA bus address.  The EMAC descriptor fields are 32-bit.
+   */
+
+  DEBUGASSERT(value <= UINT32_MAX);
+  return (uint32_t)value;
+}
+
+static void k1_emac_desc_clean(FAR uint32_t *desc)
+{
+  k1_dcache_clean((uintptr_t)desc, K1_EMAC_CACHE_LINE_SIZE);
+}
+
+static void k1_emac_desc_flush(FAR uint32_t *desc)
+{
+  k1_dcache_invalidate((uintptr_t)desc, K1_EMAC_CACHE_LINE_SIZE);
+}
+
+static void k1_emac_prepare_rx(FAR struct k1_emac_dev_s *priv)
+{
+  FAR uint32_t *desc = priv->rx_desc;
+
+  desc[1] = K1_EMAC_BUFFER_SIZE | K1_EMAC_DESC_END_OF_RING;
+  desc[2] = k1_emac_dma_address(priv->rx_buffer);
+  desc[3] = 0;
+
+  /* OWN must be the final descriptor store before the cache clean. */
+
+  asm volatile ("fence rw, rw" : : : "memory");
+  desc[0] = K1_EMAC_DESC_OWN;
+  k1_emac_desc_clean(desc);
+}
+
+static int k1_emac_dma_setup(FAR struct k1_emac_dev_s *priv)
+{
+  uint32_t configuration;
+
+  if (priv->tx_desc == NULL)
+    {
+      priv->tx_desc = kmm_memalign(K1_EMAC_CACHE_LINE_SIZE,
+                                   K1_EMAC_CACHE_LINE_SIZE);
+    }
+
+  if (priv->rx_desc == NULL)
+    {
+      priv->rx_desc = kmm_memalign(K1_EMAC_CACHE_LINE_SIZE,
+                                   K1_EMAC_CACHE_LINE_SIZE);
+    }
+
+  if (priv->tx_buffer == NULL)
+    {
+      priv->tx_buffer = kmm_memalign(K1_EMAC_CACHE_LINE_SIZE,
+                                     K1_EMAC_BUFFER_SIZE);
+    }
+
+  if (priv->rx_buffer == NULL)
+    {
+      priv->rx_buffer = kmm_memalign(K1_EMAC_CACHE_LINE_SIZE,
+                                     K1_EMAC_BUFFER_SIZE);
+    }
+
+  if (priv->tx_desc == NULL || priv->rx_desc == NULL ||
+      priv->tx_buffer == NULL || priv->rx_buffer == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  /* Each 16-byte descriptor has an entire cache line to itself.  This is
+   * required because clean/invalidate operates on 64-byte K1 cache blocks.
+   */
+
+  k1_dcache_invalidate((uintptr_t)priv->rx_buffer, K1_EMAC_BUFFER_SIZE);
+  priv->tx_desc[0] = 0;
+  priv->tx_desc[1] = K1_EMAC_DESC_END_OF_RING;
+  priv->tx_desc[2] = k1_emac_dma_address(priv->tx_buffer);
+  priv->tx_desc[3] = 0;
+  k1_emac_desc_clean(priv->tx_desc);
+  k1_emac_prepare_rx(priv);
+
+  putreg32(0, K1_EMAC_DMA_INTERRUPT_ENABLE);
+  putreg32(0, K1_EMAC_MAC_INTERRUPT_ENABLE);
+  putreg32(0, K1_EMAC_DMA_CONTROL);
+
+  putreg32(K1_EMAC_DMA_SOFTWARE_RESET, K1_EMAC_DMA_CONFIGURATION);
+  up_mdelay(10);
+  putreg32(0, K1_EMAC_DMA_CONFIGURATION);
+  up_mdelay(10);
+
+  configuration = K1_EMAC_DMA_STRICT_BURST |
+                  K1_EMAC_DMA_64BIT_MODE |
+                  K1_EMAC_DMA_BURST_16WORD;
+  putreg32(configuration, K1_EMAC_DMA_CONFIGURATION);
+
+  putreg32(K1_EMAC_TX_FIFO_ALMOST_FULL,
+           K1_EMAC_MAC_TRANSMIT_FIFO_ALMOST_FULL);
+  putreg32(K1_EMAC_TX_STORE_FORWARD_THRESHOLD,
+           K1_EMAC_MAC_TRANSMIT_PACKET_START);
+  putreg32(K1_EMAC_RX_STORE_FORWARD_THRESHOLD,
+           K1_EMAC_MAC_RECEIVE_PACKET_START);
+  putreg32(K1_EMAC_MAX_FRAME_SIZE & K1_EMAC_MAC_MAX_FRAME_SIZE_MASK,
+           K1_EMAC_MAC_MAXIMUM_FRAME_SIZE);
+
+  putreg32(k1_emac_dma_address(priv->tx_desc), K1_EMAC_DMA_TRANSMIT_BASE);
+  putreg32(k1_emac_dma_address(priv->rx_desc), K1_EMAC_DMA_RECEIVE_BASE);
+  putreg32(0, K1_EMAC_DMA_TRANSMIT_AUTO_POLL);
+
+  modifyreg32(K1_EMAC_MAC_TRANSMIT_CONTROL,
+              K1_EMAC_MAC_TRANSMIT_IFG_MASK,
+              K1_EMAC_MAC_TRANSMIT_ENABLE |
+              K1_EMAC_MAC_TRANSMIT_AUTO_RETRY);
+  modifyreg32(K1_EMAC_MAC_RECEIVE_CONTROL, 0,
+              K1_EMAC_MAC_RECEIVE_ENABLE |
+              K1_EMAC_MAC_RECEIVE_STORE_FORWARD);
+  modifyreg32(K1_EMAC_DMA_CONTROL, 0,
+              K1_EMAC_DMA_START_TRANSMIT | K1_EMAC_DMA_START_RECEIVE);
+
+  priv->dma_ready = true;
+  return OK;
+}
+
+static void k1_emac_dma_stop(FAR struct k1_emac_dev_s *priv)
+{
+  putreg32(0, K1_EMAC_DMA_CONTROL);
+  putreg32(0, K1_EMAC_MAC_TRANSMIT_CONTROL);
+  putreg32(0, K1_EMAC_MAC_RECEIVE_CONTROL);
+  putreg32(K1_EMAC_DMA_SOFTWARE_RESET, K1_EMAC_DMA_CONFIGURATION);
+  up_mdelay(10);
+  putreg32(0, K1_EMAC_DMA_CONFIGURATION);
+  priv->dma_ready = false;
+}
+
+static void k1_emac_dma_release(FAR struct k1_emac_dev_s *priv)
+{
+  kmm_free(priv->rx_buffer);
+  kmm_free(priv->tx_buffer);
+  kmm_free(priv->rx_desc);
+  kmm_free(priv->tx_desc);
+  priv->rx_buffer = NULL;
+  priv->tx_buffer = NULL;
+  priv->rx_desc = NULL;
+  priv->tx_desc = NULL;
+}
+
+static bool k1_emac_tx_complete(FAR struct k1_emac_dev_s *priv)
+{
+  k1_emac_desc_flush(priv->tx_desc);
+  return (priv->tx_desc[0] & K1_EMAC_DESC_OWN) == 0;
+}
+
+static void k1_emac_reclaim_tx(FAR struct k1_emac_dev_s *priv)
+{
+  if (priv->tx_pending && k1_emac_tx_complete(priv))
+    {
+      netpkt_free(&priv->dev, priv->tx_pkt, NETPKT_TX);
+      priv->tx_pkt = NULL;
+      priv->tx_pending = false;
+      netdev_lower_txdone(&priv->dev);
+    }
+}
+
+static void k1_emac_dma_worker(FAR void *arg)
+{
+  FAR struct k1_emac_dev_s *priv = arg;
+
+  if (!priv->ifup || !priv->dma_ready)
+    {
+      return;
+    }
+
+  /* TX completion can race with the upper-half transmit callback.  Both
+   * sides use the netdev lock to serialize ownership of the one descriptor.
+   */
+
+  netdev_lock(&priv->dev.netdev);
+  if (priv->ifup && priv->dma_ready)
+    {
+      k1_emac_reclaim_tx(priv);
+
+      k1_emac_desc_flush(priv->rx_desc);
+      if ((priv->rx_desc[0] & K1_EMAC_DESC_OWN) == 0)
+        {
+          /* Keep the notification under d_lock.  The upper-half ifdown
+           * path cancels its receive work while holding this lock, so it
+           * cannot miss a newly queued receive worker before DMA storage is
+           * released.
+           */
+
+          netdev_lower_rxready(&priv->dev);
+        }
+
+      work_queue(LPWORK, &priv->dma_work, k1_emac_dma_worker, priv,
+                 MSEC2TICK(CONFIG_K1_EMAC_DMA_POLL_MSEC));
+    }
+
+  netdev_unlock(&priv->dev.netdev);
+}
+
+static void k1_emac_cancel_workers(FAR struct k1_emac_dev_s *priv)
+{
+  unsigned int lock_count;
+
+  /* ifdown is called with d_lock held.  The link worker may be waiting for
+   * that same lock in netdev_lower_carrier_{on,off}(), so release it while
+   * synchronously stopping both workers.  ifup is already false when this
+   * helper is called, which prevents either worker from re-queueing itself.
+   */
+
+  netdev_breaklock(&priv->dev.netdev, &lock_count);
+  work_cancel_sync(LPWORK, &priv->dma_work);
+  work_cancel_sync(LPWORK, &priv->link_work);
+  netdev_restorelock(&priv->dev.netdev, lock_count);
+}
+
 static int k1_emac_check_phy(FAR struct k1_emac_dev_s *priv)
 {
   uint16_t id1;
@@ -389,6 +706,15 @@ static int k1_emac_ifup(FAR struct netdev_lowerhalf_s *dev)
       return ret;
     }
 
+  ret = k1_emac_dma_setup(priv);
+  if (ret < 0)
+    {
+      nerr("ERROR: K1 EMAC DMA allocation failed: %d\n", ret);
+      k1_emac_dma_stop(priv);
+      k1_emac_dma_release(priv);
+      return ret;
+    }
+
   priv->link_up = false;
   priv->ifup = true;
   k1_emac_update_link(priv);
@@ -397,11 +723,31 @@ static int k1_emac_ifup(FAR struct netdev_lowerhalf_s *dev)
                    MSEC2TICK(CONFIG_K1_EMAC_LINK_POLL_MSEC));
   if (ret < 0)
     {
-      priv->ifup = false;
-      return ret;
+      goto err_stop_dma;
+    }
+
+  ret = work_queue(LPWORK, &priv->dma_work, k1_emac_dma_worker, priv,
+                   MSEC2TICK(CONFIG_K1_EMAC_DMA_POLL_MSEC));
+  if (ret < 0)
+    {
+      goto err_stop_dma;
     }
 
   return OK;
+
+err_stop_dma:
+  priv->ifup = false;
+  k1_emac_cancel_workers(priv);
+  k1_emac_dma_stop(priv);
+  k1_emac_dma_release(priv);
+
+  if (priv->link_up)
+    {
+      priv->link_up = false;
+      netdev_lower_carrier_off(dev);
+    }
+
+  return ret;
 }
 
 static int k1_emac_ifdown(FAR struct netdev_lowerhalf_s *dev)
@@ -414,10 +760,17 @@ static int k1_emac_ifdown(FAR struct netdev_lowerhalf_s *dev)
     }
 
   priv->ifup = false;
-  work_cancel_sync(LPWORK, &priv->link_work);
-  putreg32(0, K1_EMAC_DMA_CONTROL);
-  putreg32(0, K1_EMAC_MAC_TRANSMIT_CONTROL);
-  putreg32(0, K1_EMAC_MAC_RECEIVE_CONTROL);
+  k1_emac_cancel_workers(priv);
+  k1_emac_dma_stop(priv);
+
+  if (priv->tx_pending)
+    {
+      netpkt_free(dev, priv->tx_pkt, NETPKT_TX);
+      priv->tx_pkt = NULL;
+      priv->tx_pending = false;
+    }
+
+  k1_emac_dma_release(priv);
 
   if (priv->link_up)
     {
@@ -431,21 +784,114 @@ static int k1_emac_ifdown(FAR struct netdev_lowerhalf_s *dev)
 static int k1_emac_transmit(FAR struct netdev_lowerhalf_s *dev,
                             FAR netpkt_t *pkt)
 {
-  (void)dev;
-  (void)pkt;
+  FAR struct k1_emac_dev_s *priv = (FAR struct k1_emac_dev_s *)dev;
+  unsigned int length;
+  int ret;
 
-  /* The DMA descriptor/data path is intentionally absent from phase one. */
+  if (!priv->ifup || !priv->dma_ready || !priv->link_up)
+    {
+      return -ENETDOWN;
+    }
 
-  return -ENOSYS;
+  k1_emac_reclaim_tx(priv);
+  if (priv->tx_pending)
+    {
+      return -EBUSY;
+    }
+
+  length = netpkt_getdatalen(dev, pkt);
+  if (length > K1_EMAC_MAX_PACKET_SIZE)
+    {
+      return -EMSGSIZE;
+    }
+
+  ret = netpkt_copyout(dev, priv->tx_buffer, pkt, length, 0);
+  if (ret != (int)length)
+    {
+      return ret < 0 ? ret : -EIO;
+    }
+
+  k1_dcache_clean((uintptr_t)priv->tx_buffer, length);
+  priv->tx_desc[1] = (length & K1_EMAC_DESC_BUFFER1_SIZE_MASK) |
+                     K1_EMAC_DESC_END_OF_RING |
+                     K1_EMAC_DESC_TX_FIRST | K1_EMAC_DESC_TX_LAST |
+                     K1_EMAC_DESC_TX_INTERRUPT_ON_DONE;
+  priv->tx_desc[2] = k1_emac_dma_address(priv->tx_buffer);
+  priv->tx_desc[3] = 0;
+
+  /* OWN must be the final descriptor store before the cache clean. */
+
+  asm volatile ("fence rw, rw" : : : "memory");
+  priv->tx_desc[0] = K1_EMAC_DESC_OWN;
+  k1_emac_desc_clean(priv->tx_desc);
+  priv->tx_pkt = pkt;
+  priv->tx_pending = true;
+  putreg32(0xff, K1_EMAC_DMA_TRANSMIT_POLL_DEMAND);
+
+  return OK;
 }
 
 static FAR netpkt_t *k1_emac_receive(FAR struct netdev_lowerhalf_s *dev)
 {
-  (void)dev;
+  FAR struct k1_emac_dev_s *priv = (FAR struct k1_emac_dev_s *)dev;
+  FAR netpkt_t *pkt;
+  uint32_t status;
+  unsigned int length;
+  int ret;
 
-  /* The DMA descriptor/data path is intentionally absent from phase one. */
+  if (!priv->ifup || !priv->dma_ready)
+    {
+      return NULL;
+    }
 
-  return NULL;
+  k1_emac_desc_flush(priv->rx_desc);
+  status = priv->rx_desc[0];
+  if ((status & K1_EMAC_DESC_OWN) != 0)
+    {
+      return NULL;
+    }
+
+  length = status & K1_EMAC_DESC_RX_FRAME_LENGTH_MASK;
+  if ((status & (K1_EMAC_DESC_RX_FIRST | K1_EMAC_DESC_RX_LAST)) !=
+      (K1_EMAC_DESC_RX_FIRST | K1_EMAC_DESC_RX_LAST) ||
+      (status & K1_EMAC_DESC_RX_ERROR_STATUS) != 0 ||
+      length < K1_EMAC_MIN_FRAME_SIZE ||
+      length > K1_EMAC_MAX_FRAME_SIZE)
+    {
+      nwarn("WARNING: K1 EMAC dropped RX descriptor status=%08" PRIx32
+            "\n", status);
+      k1_emac_prepare_rx(priv);
+      putreg32(0xff, K1_EMAC_DMA_RECEIVE_POLL_DEMAND);
+      return NULL;
+    }
+
+  /* Hardware reports the frame including FCS.  NuttX Ethernet packets do
+   * not include the four FCS octets.
+   */
+
+  length -= K1_EMAC_FCS_SIZE;
+  k1_dcache_invalidate((uintptr_t)priv->rx_buffer, length);
+  pkt = netpkt_alloc(dev, NETPKT_RX);
+  if (pkt == NULL)
+    {
+      k1_emac_prepare_rx(priv);
+      putreg32(0xff, K1_EMAC_DMA_RECEIVE_POLL_DEMAND);
+      return NULL;
+    }
+
+  ret = netpkt_copyin(dev, pkt, priv->rx_buffer, length, 0);
+  if (ret != (int)length)
+    {
+      netpkt_free(dev, pkt, NETPKT_RX);
+      k1_emac_prepare_rx(priv);
+      putreg32(0xff, K1_EMAC_DMA_RECEIVE_POLL_DEMAND);
+      return NULL;
+    }
+
+  k1_emac_prepare_rx(priv);
+  putreg32(0xff, K1_EMAC_DMA_RECEIVE_POLL_DEMAND);
+
+  return pkt;
 }
 
 #ifdef CONFIG_NETDEV_IOCTL
@@ -496,8 +942,7 @@ static int k1_emac_ioctl(FAR struct netdev_lowerhalf_s *dev, int cmd,
  * Name: k1_emac_initialize
  *
  * Description:
- *   Register the MUSE Pi Pro EMAC0 PHY/MDIO validation lower-half as eth0.
- *   This is deliberately not an Ethernet traffic driver yet.
+ *   Register the MUSE Pi Pro EMAC0 polling Ethernet lower-half as eth0.
  *
  ****************************************************************************/
 
@@ -516,7 +961,8 @@ int k1_emac_initialize(void)
   priv->dev.ops = &g_k1_emac_ops;
   priv->dev.quota[NETPKT_TX] = 1;
   priv->dev.quota[NETPKT_RX] = 1;
-  priv->dev.rxtype = NETDEV_RX_DIRECT;
+  priv->dev.rxtype = NETDEV_RX_WORK;
+  priv->dev.priority = LPWORK;
   priv->phy_addr = CONFIG_K1_EMAC_PHY_ADDR;
 
   priv->dev.netdev.d_mac.ether.ether_addr_octet[0] = (uint8_t)(mac >> 40);

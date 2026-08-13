@@ -15,5 +15,5 @@ CHIP_CSRCS += k1_plic.c
 endif
 
 ifeq ($(CONFIG_K1_EMAC),y)
-CHIP_CSRCS += k1_emac.c
+CHIP_CSRCS += k1_cache.c k1_emac.c
 endif
