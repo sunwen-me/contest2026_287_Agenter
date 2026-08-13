@@ -61,17 +61,15 @@ config K1_GPIO_IRQ
 		have been verified on the target board.
 
 config K1_EMAC
-	bool "K1 EMAC0 PHY/MDIO support (experimental)"
+	bool "K1 EMAC0 Ethernet support (experimental)"
 	default n
-	depends on NET && NET_ETHERNET && !NETDEV_LATEINIT
-	select NETDEVICES
+	depends on NET && NET_ETHERNET && NETDEVICES && !NETDEV_LATEINIT
 	select SCHED_LPWORK
 	---help---
-		Enable the first K1 EMAC0 bring-up phase for the MUSE Pi Pro.
-		It configures the RGMII pins, EMAC clock/reset, RTL8211F reset,
-		MDIO access, and polling link state. DMA receive/transmit is not
-		implemented yet, so this option must not be used for DHCP, ping, or
-		any traffic test.
+		Enable the K1 EMAC0 polling driver for the MUSE Pi Pro. It configures
+		the RGMII pins, EMAC clock/reset, RTL8211F reset and MDIO, then uses
+		one cache-line-isolated TX descriptor and one RX descriptor. EMAC
+		interrupts are deliberately disabled; traffic completion is polled.
 
 if K1_EMAC
 
@@ -87,8 +85,17 @@ config K1_EMAC_LINK_POLL_MSEC
 	range 100 10000
 	default 1000
 	---help---
-		Period between PHY link-status checks. The first K1 EMAC bring-up
-		phase uses polling and deliberately does not enable EMAC interrupts.
+		Period between PHY link-status checks. The K1 EMAC driver uses
+		polling and deliberately does not enable EMAC interrupts.
+
+config K1_EMAC_DMA_POLL_MSEC
+	int "EMAC DMA poll interval (milliseconds)"
+	range 1 1000
+	default 10
+	depends on SCHED_LPWORK
+	---help---
+		Period between DMA descriptor checks. A lower value reduces receive
+		and transmit-completion latency at the cost of more LPWORK activity.
 
 config K1_EMAC_MACADDR
 	hex "Locally administered EMAC MAC address"

@@ -1,13 +1,23 @@
-# K1 EMAC0 PHY/MDIO validation configuration.
+# K1 EMAC0 polling configuration.
 #
-# This profile deliberately excludes automatic network setup and traffic
-# testing. K1_EMAC currently implements pinmux, PHY reset, MDIO, and link
-# polling only; TX/RX DMA will be added in a later phase.
+# The driver uses fixed DMA buffers and copies to/from NuttX IOBs. A full
+# 1514-byte Ethernet frame without FCS fits in one IOB, so RX does not need
+# to fragment packets.
 
 #include "../nsh/defconfig"
 
 CONFIG_NET=y
 CONFIG_NET_ETHERNET=y
+CONFIG_NETDEVICES=y
 CONFIG_K1_EMAC=y
+CONFIG_K1_EMAC_DMA_POLL_MSEC=10
 CONFIG_NETDEV_PHY_IOCTL=y
 CONFIG_SYSTEM_MDIO=y
+CONFIG_NET_ETH_PKTSIZE=1514
+CONFIG_IOB_NBUFFERS=16
+CONFIG_IOB_BUFSIZE=1536
+CONFIG_IOB_ALIGNMENT=64
+
+# The inherited K1 debug configuration disables compiler inlining.  Build
+# out-of-line recursive mutex helpers for the netdev d_lock users.
+CONFIG_LIBC_SEM_MUTEX_NOINLINE=y

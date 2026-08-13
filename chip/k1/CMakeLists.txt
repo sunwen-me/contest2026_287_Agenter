@@ -18,7 +18,7 @@ if(CONFIG_K1_PLIC)
 endif()
 
 if(CONFIG_K1_EMAC)
-  list(APPEND SRCS k1_emac.c)
+  list(APPEND SRCS k1_cache.c k1_emac.c)
 endif()
 
 target_sources(arch PRIVATE ${SRCS})
