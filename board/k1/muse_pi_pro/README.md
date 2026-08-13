@@ -20,6 +20,11 @@ vendor/spacemit/boards/k1/muse_pi_pro
 - SBI TIME timer；
 - 保留 U-Boot 配置、只轮询 RBR/LSR/THR 的 `/dev/console`。
 - scheduler/syslog 就绪前可用的启动标记和同步异常寄存器日志。
+- 默认关闭、可选启用的 hart 0 S-mode PLIC context 1；
+- 默认关闭、依赖 PLIC 的 K1 GPIO source 58 边沿中断路径。
+
+官方板卡接口、Type-C 烧录模式、40Pin UART 线序和首板接线见：
+[`docs/K1_MUSE_PI_PRO_OFFICIAL_HARDWARE.md`](../../../docs/K1_MUSE_PI_PRO_OFFICIAL_HARDWARE.md)。
 
 比赛仓根目录还提供：
 
@@ -30,9 +35,9 @@ vendor/spacemit/boards/k1/muse_pi_pro
 
 当前尚未包含：
 
-- PLIC context 与 hart 映射实现；
 - SMP 的 SBI HSM/IPI 接线；
-- 可整盘写入的 SD 镜像生成器。
+- 可整盘写入的 SD 镜像生成器；
+- GPIO 中断和 PLIC 的最终实板验收。
 
 本配置已完成编译链接验证，但尚未完成 K1 实板 NSH 验证。不要为扩大功能而临时
 套用 QEMU 的 PLIC 或通用 16550 初始化路径，它们会掩盖真实的中断和 UART 约束。

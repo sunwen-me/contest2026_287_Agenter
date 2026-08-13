@@ -15,7 +15,11 @@
 #include <stdint.h>
 
 #include <nuttx/arch.h>
+#include <nuttx/irq.h>
 #include <nuttx/ioexpander/gpio.h>
+#include <nuttx/spinlock.h>
+
+#include <arch/irq.h>
 
 #include "riscv_internal.h"
 #include "hardware/k1_gpio.h"
@@ -27,6 +31,10 @@
  ****************************************************************************/
 
 #define K1_GPIO_PIN_COUNT 26
+
+#ifdef CONFIG_K1_GPIO_IRQ
+#  define K1_GPIO_BANK_COUNT 4
+#endif
 
 /****************************************************************************
  * Private Types
@@ -41,6 +49,11 @@ struct k1_gpio_dev_s
   uint32_t pad;
   uint8_t gpio_number;
   uint8_t header_pin;
+#ifdef CONFIG_K1_GPIO_IRQ
+  pin_interrupt_t callback;
+  bool irq_enabled;
+  bool irq_masked;
+#endif
 };
 
 /****************************************************************************
@@ -57,6 +70,12 @@ static int k1_gpio_setpintype(FAR struct gpio_dev_s *dev,
 static int k1_gpio_setdebounce(FAR struct gpio_dev_s *dev,
                                unsigned long duration);
 static int k1_gpio_setmask(FAR struct gpio_dev_s *dev, bool enable);
+
+#ifdef CONFIG_K1_GPIO_IRQ
+static int k1_gpio_interrupt(int irq, FAR void *context, FAR void *arg);
+static void k1_gpio_irq_program(FAR struct k1_gpio_dev_s *priv);
+static void k1_gpio_irq_update_source(void);
+#endif
 
 /****************************************************************************
  * Private Data
@@ -145,6 +164,11 @@ static struct k1_gpio_dev_s g_k1gpio[K1_GPIO_PIN_COUNT] =
 };
 
 static bool g_k1gpio_registered;
+
+#ifdef CONFIG_K1_GPIO_IRQ
+static bool g_k1gpio_irq_attached;
+static bool g_k1gpio_irq_source_enabled;
+#endif
 
 /****************************************************************************
  * Private Functions
@@ -274,19 +298,221 @@ static int k1_gpio_write(FAR struct gpio_dev_s *dev, bool value)
   return OK;
 }
 
+#ifdef CONFIG_K1_GPIO_IRQ
+static bool k1_gpio_is_irq_pintype(enum gpio_pintype_e pintype)
+{
+  switch (pintype)
+    {
+      case GPIO_INTERRUPT_PIN:
+      case GPIO_INTERRUPT_RISING_PIN:
+      case GPIO_INTERRUPT_FALLING_PIN:
+      case GPIO_INTERRUPT_BOTH_PIN:
+        return true;
+
+      default:
+        return false;
+    }
+}
+
+static void k1_gpio_irq_update_source(void)
+{
+  bool active = false;
+  int i;
+
+  for (i = 0; i < K1_GPIO_PIN_COUNT; i++)
+    {
+      if (k1_gpio_is_irq_pintype(g_k1gpio[i].gpio.gp_pintype) &&
+          g_k1gpio[i].irq_enabled && !g_k1gpio[i].irq_masked &&
+          g_k1gpio[i].callback != NULL)
+        {
+          active = true;
+          break;
+        }
+    }
+
+  if (active && !g_k1gpio_irq_source_enabled)
+    {
+      up_enable_irq(K1_IRQ_GPIO);
+      g_k1gpio_irq_source_enabled = true;
+    }
+  else if (!active && g_k1gpio_irq_source_enabled)
+    {
+      up_disable_irq(K1_IRQ_GPIO);
+      g_k1gpio_irq_source_enabled = false;
+    }
+}
+
+static void k1_gpio_irq_program(FAR struct k1_gpio_dev_s *priv)
+{
+  uint32_t rising = 0;
+  uint32_t falling = 0;
+
+  /* GAPMASK bit one allows the GPIO interrupt to reach the shared GPIO
+   * controller output.  Mask the pin while changing edge configuration and
+   * clear any stale status before unmasking it.
+   */
+
+  modifyreg32(k1_gpio_reg(priv, K1_GPIO_GAPMASK_OFFSET), priv->mask, 0);
+  putreg32(priv->mask, k1_gpio_reg(priv, K1_GPIO_GCRER_OFFSET));
+  putreg32(priv->mask, k1_gpio_reg(priv, K1_GPIO_GCFER_OFFSET));
+  putreg32(priv->mask, k1_gpio_reg(priv, K1_GPIO_GEDR_OFFSET));
+
+  if (k1_gpio_is_irq_pintype(priv->gpio.gp_pintype) &&
+      priv->irq_enabled && priv->callback != NULL &&
+      !priv->irq_masked)
+    {
+      switch (priv->gpio.gp_pintype)
+        {
+          case GPIO_INTERRUPT_PIN:
+          case GPIO_INTERRUPT_BOTH_PIN:
+            rising = priv->mask;
+            falling = priv->mask;
+            break;
+
+          case GPIO_INTERRUPT_RISING_PIN:
+            rising = priv->mask;
+            break;
+
+          case GPIO_INTERRUPT_FALLING_PIN:
+            falling = priv->mask;
+            break;
+
+          default:
+            break;
+        }
+
+      if (rising != 0)
+        {
+          putreg32(rising,
+                   k1_gpio_reg(priv, K1_GPIO_GSRER_OFFSET));
+        }
+
+      if (falling != 0)
+        {
+          putreg32(falling,
+                   k1_gpio_reg(priv, K1_GPIO_GSFER_OFFSET));
+        }
+
+      if (rising != 0 || falling != 0)
+        {
+          modifyreg32(k1_gpio_reg(priv, K1_GPIO_GAPMASK_OFFSET), 0,
+                      priv->mask);
+        }
+    }
+}
+
+static int k1_gpio_interrupt(int irq, FAR void *context, FAR void *arg)
+{
+  int i;
+  unsigned int bank;
+
+  (void)irq;
+  (void)context;
+  (void)arg;
+
+  /* GPIO0..GPIO127 share one PLIC source.  Clear every reported status bit
+   * first, then dispatch only pins that are currently enabled and unmasked.
+   */
+
+  for (bank = 0; bank < K1_GPIO_BANK_COUNT; bank++)
+    {
+      uintptr_t base;
+      uint32_t pending;
+
+      switch (bank)
+        {
+          case 0:
+            base = K1_GPIO_BANK0_BASE;
+            break;
+          case 1:
+            base = K1_GPIO_BANK1_BASE;
+            break;
+          case 2:
+            base = K1_GPIO_BANK2_BASE;
+            break;
+          default:
+            base = K1_GPIO_BANK3_BASE;
+            break;
+        }
+
+      pending = getreg32(base + K1_GPIO_GEDR_OFFSET);
+      if (pending != 0)
+        {
+          putreg32(pending, base + K1_GPIO_GEDR_OFFSET);
+
+          for (i = 0; i < K1_GPIO_PIN_COUNT; i++)
+            {
+              FAR struct k1_gpio_dev_s *priv = &g_k1gpio[i];
+
+              if (priv->bank == base && (pending & priv->mask) != 0 &&
+                  k1_gpio_is_irq_pintype(priv->gpio.gp_pintype) &&
+                  priv->irq_enabled && !priv->irq_masked &&
+                  priv->callback != NULL)
+                {
+                  priv->callback(&priv->gpio, priv->gpio_number);
+                }
+            }
+        }
+    }
+
+  return OK;
+}
+#endif
+
 static int k1_gpio_attach(FAR struct gpio_dev_s *dev,
                           pin_interrupt_t callback)
 {
+#ifdef CONFIG_K1_GPIO_IRQ
+  FAR struct k1_gpio_dev_s *priv;
+  irqstate_t flags;
+
+  if (dev == NULL)
+    {
+      return -EINVAL;
+    }
+
+  priv = k1_gpio_priv(dev);
+  flags = enter_critical_section();
+  priv->callback = callback;
+  k1_gpio_irq_program(priv);
+  k1_gpio_irq_update_source();
+  leave_critical_section(flags);
+  return OK;
+#else
   (void)dev;
   (void)callback;
   return -ENOTSUP;
+#endif
 }
 
 static int k1_gpio_enable(FAR struct gpio_dev_s *dev, bool enable)
 {
+#ifdef CONFIG_K1_GPIO_IRQ
+  FAR struct k1_gpio_dev_s *priv;
+  irqstate_t flags;
+
+  if (dev == NULL)
+    {
+      return -EINVAL;
+    }
+
+  priv = k1_gpio_priv(dev);
+  if (enable && priv->callback == NULL)
+    {
+      return -EINVAL;
+    }
+
+  flags = enter_critical_section();
+  priv->irq_enabled = enable;
+  k1_gpio_irq_program(priv);
+  k1_gpio_irq_update_source();
+  leave_critical_section(flags);
+  return OK;
+#else
   (void)dev;
   (void)enable;
   return -ENOTSUP;
+#endif
 }
 
 static int k1_gpio_setpintype(FAR struct gpio_dev_s *dev,
@@ -296,6 +522,11 @@ static int k1_gpio_setpintype(FAR struct gpio_dev_s *dev,
   uint32_t pad;
 
   if (dev == NULL)
+    {
+      return -EINVAL;
+    }
+
+  if ((unsigned int)pintype >= GPIO_NPINTYPES)
     {
       return -EINVAL;
     }
@@ -330,14 +561,32 @@ static int k1_gpio_setpintype(FAR struct gpio_dev_s *dev,
         k1_gpio_set_input(priv);
         break;
 
+#ifdef CONFIG_K1_GPIO_IRQ
+      case GPIO_INTERRUPT_PIN:
+      case GPIO_INTERRUPT_RISING_PIN:
+      case GPIO_INTERRUPT_FALLING_PIN:
+      case GPIO_INTERRUPT_BOTH_PIN:
+        k1_gpio_set_pad(priv, pad);
+        k1_gpio_set_input(priv);
+        break;
+#endif
+
       default:
-
-        /* GPIO interrupts require the K1 GPIO IRQ and PLIC chain, which is
-         * deliberately outside this first multi-pin migration.
-         */
-
         return -ENOTSUP;
     }
+
+#ifdef CONFIG_K1_GPIO_IRQ
+  if (k1_gpio_is_irq_pintype(dev->gp_pintype))
+    {
+      irqstate_t flags = enter_critical_section();
+
+      priv->irq_enabled = false;
+      priv->callback = NULL;
+      k1_gpio_irq_program(priv);
+      k1_gpio_irq_update_source();
+      leave_critical_section(flags);
+    }
+#endif
 
   dev->gp_pintype = pintype;
   return OK;
@@ -353,9 +602,32 @@ static int k1_gpio_setdebounce(FAR struct gpio_dev_s *dev,
 
 static int k1_gpio_setmask(FAR struct gpio_dev_s *dev, bool enable)
 {
+#ifdef CONFIG_K1_GPIO_IRQ
+  FAR struct k1_gpio_dev_s *priv;
+  irqstate_t flags;
+
+  if (dev == NULL)
+    {
+      return -EINVAL;
+    }
+
+  priv = k1_gpio_priv(dev);
+  flags = enter_critical_section();
+  priv->irq_masked = enable;
+
+  if (k1_gpio_is_irq_pintype(dev->gp_pintype))
+    {
+      k1_gpio_irq_program(priv);
+      k1_gpio_irq_update_source();
+    }
+
+  leave_critical_section(flags);
+  return OK;
+#else
   (void)dev;
   (void)enable;
   return -ENOTSUP;
+#endif
 }
 
 /****************************************************************************
@@ -379,6 +651,9 @@ int k1_gpio_initialize(void)
 {
   int ret;
   int i;
+#ifdef CONFIG_K1_GPIO_IRQ
+  unsigned int bank;
+#endif
 
   if (g_k1gpio_registered)
     {
@@ -425,10 +700,64 @@ int k1_gpio_initialize(void)
         }
     }
 
+#ifdef CONFIG_K1_GPIO_IRQ
+  /* Disable all GPIO edge sources and clear stale status before attaching
+   * the shared PLIC handler.  The PLIC source remains disabled until a GPIO
+   * pin has a callback, is enabled, and is not masked.
+   */
+
+  for (bank = 0; bank < K1_GPIO_BANK_COUNT; bank++)
+    {
+      uintptr_t base;
+
+      switch (bank)
+        {
+          case 0:
+            base = K1_GPIO_BANK0_BASE;
+            break;
+          case 1:
+            base = K1_GPIO_BANK1_BASE;
+            break;
+          case 2:
+            base = K1_GPIO_BANK2_BASE;
+            break;
+          default:
+            base = K1_GPIO_BANK3_BASE;
+            break;
+        }
+
+      putreg32(0, base + K1_GPIO_GRER_OFFSET);
+      putreg32(0, base + K1_GPIO_GFER_OFFSET);
+      putreg32(UINT32_MAX, base + K1_GPIO_GCRER_OFFSET);
+      putreg32(UINT32_MAX, base + K1_GPIO_GCFER_OFFSET);
+      putreg32(UINT32_MAX, base + K1_GPIO_GEDR_OFFSET);
+      putreg32(0, base + K1_GPIO_GAPMASK_OFFSET);
+    }
+
+  ret = irq_attach(K1_IRQ_GPIO, k1_gpio_interrupt, NULL);
+  if (ret < 0)
+    {
+      goto err_unregister;
+    }
+
+  g_k1gpio_irq_attached = true;
+  up_disable_irq(K1_IRQ_GPIO);
+#endif
+
   g_k1gpio_registered = true;
   return OK;
 
 err_unregister:
+#ifdef CONFIG_K1_GPIO_IRQ
+  if (g_k1gpio_irq_attached)
+    {
+      up_disable_irq(K1_IRQ_GPIO);
+      irq_detach(K1_IRQ_GPIO);
+      g_k1gpio_irq_attached = false;
+      g_k1gpio_irq_source_enabled = false;
+    }
+#endif
+
   while (i-- > 0)
     {
       gpio_pin_unregister(&g_k1gpio[i].gpio, i);
