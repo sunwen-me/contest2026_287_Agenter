@@ -17,8 +17,8 @@ JOBS="${K1_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '8')}"
 CLEAN=0
 PACKAGE=0
 RUN_CHECK=1
-declare -a CREATED_LINKS
-declare -a CREATED_DIRS
+CREATED_LINKS=()
+CREATED_DIRS=()
 
 usage()
 {
