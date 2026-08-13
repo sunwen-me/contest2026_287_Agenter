@@ -1,0 +1,13 @@
+# K1 EMAC0 PHY/MDIO validation configuration.
+#
+# This profile deliberately excludes automatic network setup and traffic
+# testing. K1_EMAC currently implements pinmux, PHY reset, MDIO, and link
+# polling only; TX/RX DMA will be added in a later phase.
+
+#include "../nsh/defconfig"
+
+CONFIG_NET=y
+CONFIG_NET_ETHERNET=y
+CONFIG_K1_EMAC=y
+CONFIG_NETDEV_PHY_IOCTL=y
+CONFIG_SYSTEM_MDIO=y
