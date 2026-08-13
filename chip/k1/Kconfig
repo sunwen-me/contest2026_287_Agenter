@@ -47,6 +47,19 @@ config K1_PLIC
 		Keep this disabled until polling UART and SBI timer pass first-board
 		bring-up.
 
+config K1_GPIO_IRQ
+	bool "K1 GPIO external interrupt support (experimental)"
+	default n
+	depends on K1_PLIC && DEV_GPIO
+	depends on !GPIO_LOWER_HALF
+	---help---
+		Enable edge-triggered external interrupts for the MUSE Pi Pro GPIO
+		devices.  The K1 GPIO controller is connected to PLIC source 58.
+		Only GPIO_INTERRUPT_PIN, GPIO_INTERRUPT_RISING_PIN,
+		GPIO_INTERRUPT_FALLING_PIN, and GPIO_INTERRUPT_BOTH_PIN are
+		supported.  Keep this disabled until the PLIC and one GPIO edge
+		have been verified on the target board.
+
 config K1_INITIAL_BRINGUP
 	bool
 	default y

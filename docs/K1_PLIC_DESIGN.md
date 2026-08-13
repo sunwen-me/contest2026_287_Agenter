@@ -11,9 +11,9 @@ K1 的 hart 0 S-mode PLIC context 为 **context 1**。对应寄存器：
 | hart 0 S-mode threshold | `0xe0201000` |
 | hart 0 S-mode claim/complete | `0xe0201004` |
 
-实现位于 `chip/k1/k1_plic.c` 和 `chip/k1/hardware/k1_plic.h`，通过
-`CONFIG_K1_PLIC` 控制，**默认关闭**。初始 NSH defconfig 不启用它，因此不会改变
-当前 polling UART + SBI timer 的首板基线。
+实现位于 `chip/k1/k1_plic.c`、`chip/k1/k1_irq_dispatch.c` 和
+`chip/k1/hardware/k1_plic.h`，通过 `CONFIG_K1_PLIC` 控制，**默认关闭**。初始 NSH
+defconfig 不启用它，因此不会改变当前 polling UART + SBI timer 的首板基线。
 
 2026-07-30 已使用临时 `CONFIG_K1_PLIC=y` 配置完成编译链接，ELF 中包含
 `k1_plic_initialize/enable_irq/disable_irq/claim/complete`；验证后恢复默认配置。
@@ -79,6 +79,22 @@ threshold 和 claim/complete 地址。
 - external trap 循环 claim、调用 NuttX IRQ 分发、再 complete；
 - 不触碰 UART IER，不接管 OpenSBI/CLINT；
 - 实板验证前不进入比赛默认 defconfig。
+
+## GPIO source 58 接线
+
+U-Boot DTS 的 GPIO 节点声明 `interrupts = <58>`。Linux mainline
+`drivers/gpio/gpio-spacemit-k1.c` 也以同一个 source 58 注册四个 K1 GPIO bank，
+并确认以下寄存器语义：
+
+- `GEDR`（`+0x48`）为读状态、写 1 清除；
+- `GSRER/GCRER`（`+0x6c/+0x78`）控制上升沿检测的 set/clear；
+- `GSFER/GCFER`（`+0x84/+0x90`）控制下降沿检测的 set/clear；
+- `GAPMASK`（`+0x9c`）是读写 mask，0 屏蔽、1 允许。
+
+项目中的 `CONFIG_K1_GPIO_IRQ` 依赖 `CONFIG_K1_PLIC`，默认关闭。板级 GPIO ISR
+读取四个 bank 的 `GEDR`，写回待处理位清除状态，再按 40Pin GPIO 映射调用 NuttX
+GPIO callback。代码编译路径已覆盖；source 58 和一根外部 GPIO 边沿仍需在实板上
+验证 claim/complete 与 callback 分发。
 
 ## 上板复核命令
 

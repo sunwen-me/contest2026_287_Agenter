@@ -19,5 +19,6 @@
 #define NR_IRQS       (RISCV_IRQ_EXT + K1_PLIC_NDEV + 1)
 
 #define K1_IRQ_UART0  (RISCV_IRQ_EXT + 42)
+#define K1_IRQ_GPIO   (RISCV_IRQ_EXT + 58)
 
 #endif /* __CHIP_K1_INCLUDE_IRQ_H */

@@ -71,8 +71,14 @@ are 5V, and Pin 6/9/14/20/25/30/34/39 are GND; they are not GPIO devices.
 - `GPIO_INPUT_PIN_PULLDOWN`：内部下拉输入；
 - `GPIO_OUTPUT_PIN`：推挽输出；
 - `GPIO_OUTPUT_PIN_OPENDRAIN`：开漏输出，高电平释放、低电平主动拉低；
-- GPIO 中断、去抖和中断屏蔽：当前返回 `-ENOTSUP`，因为本轮没有启用 K1
-  GPIO/PLIC 中断链路。
+- 在同时启用 `CONFIG_K1_PLIC=y` 和 `CONFIG_K1_GPIO_IRQ=y` 时，支持
+  `GPIO_INTERRUPT_PIN`、`GPIO_INTERRUPT_RISING_PIN`、
+  `GPIO_INTERRUPT_FALLING_PIN` 和 `GPIO_INTERRUPT_BOTH_PIN`；
+- GPIO 中断共享 PLIC source 58，K1 GPIO 的四个 32-bit bank 共用一个板级 ISR，
+  ISR 读取并写 1 清除 `GEDR` 后再分发到对应 GPIO callback；
+- GPIO 硬件去抖、有效高/低电平中断和 wakeup 中断仍返回 `-ENOTSUP`；
+- `GPIOC_SETMASK` 的 `true` 表示屏蔽。硬件 `GAPMASK` 与此相反：位为 0 表示屏蔽，
+  位为 1 表示允许中断。
 
 寄存器定义位于：
 
@@ -106,6 +112,15 @@ CONFIG_DEV_GPIO=y
 CONFIG_EXAMPLES_GPIO=y
 CONFIG_EXAMPLES_GPIO_STACKSIZE=8192
 ```
+
+GPIO 外部中断是单独的实验性选项，不进入默认 NSH 配置：
+
+```text
+CONFIG_K1_PLIC=y
+CONFIG_K1_GPIO_IRQ=y
+```
+
+这两个选项只应在已经确认 PLIC DTS、并准备做单根 GPIO 边沿测试的临时构建中启用。
 
 构建入口：
 
@@ -152,6 +167,27 @@ Verify:        Value=1
 | 输出低 | `Verify: Value=0` | 约 0 V |
 | 输出高 | `Verify: Value=1` | 约 3.3 V |
 
+## GPIO 外部中断验证
+
+下面的测试需要一根跳线，把 40Pin Pin 22（GPIO49，`/dev/gpio0`）接到
+Pin 33（GPIO47，`/dev/gpio20`）。两根信号都在 3.3V 侧；接线前先确认输出端为低，
+不要把两个 GPIO 同时配置为输出。还应连接同一排针上的 GND（例如 Pin 6）。
+
+仅在临时 IRQ 构建中执行：
+
+```text
+gpio -t 3 -o 0 /dev/gpio0
+gpio -t 8 /dev/gpio20
+```
+
+第二条命令会等待 GPIO47 的上升沿。保持它运行，在另一个 NSH 串口会话中执行：
+
+```text
+gpio -t 3 -o 1 /dev/gpio0
+```
+
+预期等待会结束并打印输入值变为 1。当前 IRQ 代码尚未在实板上完成最终验收。
+
 ## 参考资料与已知限制
 
 映射依据：
@@ -167,7 +203,8 @@ Verify:        Value=1
 1. 新增 GPIO 已完成资料核对和 3.3V IO 电源域初始化，但除 GPIO49/Pin 22 外还没有逐个完成实板电压
    验证；首次测试建议一次只接一个目标脚，并避开 Pin 8/10；
 2. 当前仍是 NuttX RAM 临时启动，按 RST 或重新上电会回到原厂 Linux；
-3. 当前没有实现 GPIO 外部中断、PLIC 路由和硬件去抖；
+3. GPIO 外部中断和 PLIC 路由已经实现为默认关闭的实验性路径，尚未完成实板边沿验收；
+   硬件去抖、level/wakeup 中断仍未实现；
 4. `CONFIG_GPIO_LOWER_HALF` 与当前板级 lower-half 互斥，避免重复注册；
 5. GPIO70--73 在 K1 pinctrl 中使用 GPIO mux 1，这是 Linux mainline 对
    PRI_JTAG 复用脚的 GPIO 功能定义，不应擅自改成 mux 0。
