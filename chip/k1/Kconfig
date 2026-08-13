@@ -60,6 +60,46 @@ config K1_GPIO_IRQ
 		supported.  Keep this disabled until the PLIC and one GPIO edge
 		have been verified on the target board.
 
+config K1_EMAC
+	bool "K1 EMAC0 PHY/MDIO support (experimental)"
+	default n
+	depends on NET && NET_ETHERNET && !NETDEV_LATEINIT
+	select NETDEVICES
+	select SCHED_LPWORK
+	---help---
+		Enable the first K1 EMAC0 bring-up phase for the MUSE Pi Pro.
+		It configures the RGMII pins, EMAC clock/reset, RTL8211F reset,
+		MDIO access, and polling link state. DMA receive/transmit is not
+		implemented yet, so this option must not be used for DHCP, ping, or
+		any traffic test.
+
+if K1_EMAC
+
+config K1_EMAC_PHY_ADDR
+	int "RTL8211F MDIO address"
+	range 0 31
+	default 1
+	---help---
+		MDIO address of the RTL8211F PHY on MUSE Pi Pro EMAC0.
+
+config K1_EMAC_LINK_POLL_MSEC
+	int "PHY link poll interval (milliseconds)"
+	range 100 10000
+	default 1000
+	---help---
+		Period between PHY link-status checks. The first K1 EMAC bring-up
+		phase uses polling and deliberately does not enable EMAC interrupts.
+
+config K1_EMAC_MACADDR
+	hex "Locally administered EMAC MAC address"
+	default 0x020000000001
+	---help---
+		Temporary locally administered MAC address used until a board-specific
+		factory MAC/NVMEM source is added. Do not put a production globally
+		administered address here unless it belongs to this board.
+
+endif # K1_EMAC
+
 config K1_INITIAL_BRINGUP
 	bool
 	default y

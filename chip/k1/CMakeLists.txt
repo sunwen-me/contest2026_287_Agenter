@@ -17,4 +17,8 @@ if(CONFIG_K1_PLIC)
   list(APPEND SRCS k1_plic.c)
 endif()
 
+if(CONFIG_K1_EMAC)
+  list(APPEND SRCS k1_emac.c)
+endif()
+
 target_sources(arch PRIVATE ${SRCS})
