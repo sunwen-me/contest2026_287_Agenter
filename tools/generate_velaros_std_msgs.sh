@@ -247,7 +247,7 @@ validate_output()
       \( -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) |
       wc -l
   )"
-  ((${generated_count} == ${#GENERATED_FILES[@]})) ||
+  ((generated_count == ${#GENERATED_FILES[@]})) ||
     fail "expected ${#GENERATED_FILES[@]} standard Topic files, found ${generated_count}"
 
   if grep -R -l -E '/opt/ros|\.so([.0-9]*)?$' \
