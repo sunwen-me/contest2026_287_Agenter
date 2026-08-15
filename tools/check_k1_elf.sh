@@ -134,8 +134,8 @@ for index in "${!LOADS[@]}"; do
   [[ ! ("${flags}" == *W* && "${flags}" == *E*) ]] ||
     fail "LOAD ${index} is writable and executable (${flags})"
 
-  STARTS[${index}]="${start}"
-  ENDS[${index}]="${end}"
+  STARTS[index]="${start}"
+  ENDS[index]="${end}"
 
   if ((LOWEST_START < 0 || start < LOWEST_START)); then
     LOWEST_START="${start}"
