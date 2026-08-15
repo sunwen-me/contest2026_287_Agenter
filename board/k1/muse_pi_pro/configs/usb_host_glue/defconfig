@@ -1,0 +1,8 @@
+# K1 DWC3 host clock/reset and USB2 PHY bring-up profile.
+
+# This profile selects host role but intentionally does not start xHCI or
+# enumerate devices. It is the hardware-init gate before the non-PCI xHCI HCD.
+
+#include "../nsh/defconfig"
+
+CONFIG_K1_USB_HOST_GLUE=y

@@ -66,9 +66,34 @@ if grep -qx 'CONFIG_K1_PLIC=y' \
 fi
 pass "PLIC remains opt-in"
 
+awk '
+  $1 == "config" { inside = ($2 == "K1_WATCHDOG") }
+  inside && $1 == "default" && $2 == "n" { found = 1 }
+  END { exit found ? 0 : 1 }
+' "${CONTEST_ROOT}/chip/k1/Kconfig" ||
+  fail "CONFIG_K1_WATCHDOG is not default n"
+
+if grep -qx 'CONFIG_K1_WATCHDOG=y' \
+  "${CONTEST_ROOT}/board/k1/muse_pi_pro/configs/nsh/defconfig"; then
+  fail "initial NSH defconfig unexpectedly enables K1 watchdog"
+fi
+pass "K1 watchdog remains opt-in"
+
+awk '
+  $1 == "config" { inside = ($2 == "K1_WATCHDOG") }
+  inside && $0 ~ /depends on WATCHDOG && !WATCHDOG_AUTOMONITOR/ { found = 1 }
+  END { exit found ? 0 : 1 }
+' "${CONTEST_ROOT}/chip/k1/Kconfig" ||
+  fail "CONFIG_K1_WATCHDOG must exclude WATCHDOG_AUTOMONITOR"
+pass "K1 watchdog uses manual control only"
+
 if git -C "${CONTEST_ROOT}" rev-parse --is-inside-work-tree \
      >/dev/null 2>&1; then
-  git -C "${CONTEST_ROOT}" diff --check
+  # Patch files contain mandatory one-character context prefixes for blank
+  # lines. They are valid patch syntax but look like trailing whitespace to
+  # git diff --check, so validate source files separately.
+  git -C "${CONTEST_ROOT}" diff --check -- . \
+    ':(exclude)tools/patches/*.patch'
   pass "git whitespace check"
 fi
 

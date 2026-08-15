@@ -47,12 +47,90 @@ VelaROS 侧：
   `rcl_node_fini()`、shutdown 和 context 回收全部通过；
 - 当前 `rcl` 最小生命周期验收 ELF SHA256：
   `982e15964bbe443b779568c3cde4daafd917545fb6f784ce5750c9bdf63bf181`；
-- 当前裁剪明确关闭 rosout、全局参数、非空命令行参数、YAML 参数解析和
-  Type Description service；这些属于后续功能增量，不应把当前结果描述成完整
-  `rcl` 或完整 ROS 2 移植；
+- 已接入 `rcl` publisher/subscription 与 `std_msgs/String`，完成 openvela
+  simulator 和本机 ROS 2 Lyrical 的无 Agent 双向 Fast DDS 通信；guest 到 host
+  与 host 到 guest 均 3 发 3 收，节点正常退出；
+- 已接入 `rcl` Client/Service、bounded executor service 槽和裁剪后的
+  `std_srvs/SetBool`；主机 Lyrical 对 `/velaros/runtime/set_bridge` 两次标准
+  请求/响应均 PASS，并实际复用 openVela KVDB 更新 bridge 状态；
+- 已接入 `rcl_action` 与静态 `example_interfaces/Fibonacci`，保留 SendGoal、
+  GetResult、CancelGoal、Feedback、Status 五条标准通道；默认限制 2 个并发 Goal、
+  序列 32 项，不引入每 Goal 线程、无界缓存或动态多线程 executor；
+- simulator 与主机 Lyrical 已完成双向 Action server/client 互操作，两个方向均
+  覆盖 `SUCCEEDED(4)`、`CANCELED(5)`、feedback/status 和正常资源回收；
+- 已接入 steady clock、timer 和 wait set；50 ms timer 通过 `rcl_wait()` 唤醒，
+  callback 恰好执行一次，wait set/timer/clock 均正常回收；
+- 已实现有界、无内部线程的 VelaROS 单线程 executor，复用一个 `rcl_wait_set`；
+  simulator 中 timer 发布 3 条消息，subscription callback 按序接收 3 条，
+  executor 和全部 ROS 实体正常回收；
+- 已实现以 Lyrical `rclcpp 32.0.0` 为语义基线的静态 C++ RAII 子集，提供
+  Context、Node、QoS、Publisher/Subscription、Client/Service、WallTimer 和
+  有界 SingleThreadedExecutor；simulator 上 C++ Topic 3/3、SetBool 请求/响应
+  1/1、Timer 3 次和完整回收均 PASS；
+- 已增加有界 `rclcpp_action` 源码级 RAII 子集，保留标准五通道、Goal 接受/拒绝、
+  Feedback、成功/中止/取消和 Result；与 Topic/Service 共用 caller-owned
+  executor，不包含 future、每 Goal 线程、无界缓存或动态 Action 加载；simulator
+  上一次成功和一次取消均 PASS，且 rcutils 非致命 TypeObject 降级日志已清理；
+- 当前静态 rclcpp + Action 开发验收 ELF SHA256：
+  `ed9b3928f3cf1f37fbfaf547698ecf55ad8a814624e20fe39416f8c08f3ce3a7`；
+- 已加入首个真实移动机器人产品节点：标准 `geometry_msgs/Twist /cmd_vel`
+  进入持久 uORB，固定布局 `velaros_interfaces/MoveRelative` Action 支持成功、
+  Feedback、Result 和取消；开发与 Release 均已和本机 ROS 2 Lyrical 互操作；
+- Release 只编译产品 `MoveRelative`，开发用 Fibonacci 的 functions、Fast RTPS
+  typesupport、traits 和 ELF 符号均不存在；
+- 不包含完整上游 ABI、线程池、parameters、rosout、组件加载或动态类型；
+- 已完成 openVela 能力复用审计：板内高频数据优先使用 uORB，日志、配置、
+  服务管理和 AMP 分别复用 syslog、KVDB、Binder/service manager 与 RPMsg，
+  DDS 只承担跨设备 ROS 2 graph/Topic/QoS 兼容；
+- 已实现 `rcutils` 到 NuttX syslog 的薄适配；固定 384-byte 栈缓冲，不引入
+  spdlog、文件日志、动态插件或日志线程；
+- 已实现首批白名单 uORB ↔ ROS 2 bridge：现有 `sensor_temp` 到
+  `/velaros/sensor/temperature`，以及 `/velaros/control/setpoint` 到持久化
+  uORB `velaros_control_setpoint`；bridge 由调用方/executor 驱动，不创建线程、
+  事件循环或运行时类型注册表；
+- 已把本地运行配置接入 openvela KVDB，不移植 ROS YAML 配置栈；Domain ID、
+  participant ID、bridge 开关和 heartbeat 周期使用 `persist.velaros.*` 键保存，
+  talker/listener 创建 ROS context 时实际读取 Domain/participant 配置；
+- 已实现 Binder 管理的 `velarosd` 控制面和 `velarosctl` 客户端，服务注册名为
+  `openvela.velaros.runtime`；跨 NuttX task 完成状态查询、配置读写和干净停止，
+  服务端只使用一个显式 64 KiB task 与 `poll()`，不引入线程池或 `epoll`；
+- simulator 集成 smoke 中 syslog 2 条、uORB → ROS 3 条、ROS → uORB 3 条均
+  通过，原有 DDS/RMW/rcl/executor 和 Linux Lyrical 双向 3/3 回归仍为 PASS；
+- 已实现面向 openVela 的固定共享缓冲 backend：产品配置锁定 4×16 KiB payload
+  池和每 slot 4 个有界 lease，uORB/ROSIDL 只传 descriptor；simulator 已验证
+  同地址 payload、静态 backend、耗尽/陈旧 descriptor 拒绝和远端 CPU/CDR
+  fallback。K1 DMA/cache、RPMsg/AMP 和真实相机/点云节点仍待接入；
+- 当前包含 executor、syslog/uORB、KVDB/Binder 控制面与 ROS 2 Lyrical 双向
+  互操作的 ELF SHA256：
+  `7a44d3f0b4a08beb6e43dd756103d605d53bf729d88a4e6edfb45a5db5d7f839`
+  （650175048 bytes）；删除无关 Binder 示例后，加入 VelaROS 控制面的 ELF 仍比
+  上一基线减少 3783288 bytes；
+- 当前包含有界 Action 的开发 ELF SHA256：
+  `ed9b3928f3cf1f37fbfaf547698ecf55ad8a814624e20fe39416f8c08f3ce3a7`；
+- 当前裁剪明确关闭 rosout、全局参数、非空命令行参数、YAML 参数解析、远程 ROS
+  参数服务和 Type Description service；本地设备配置已由 KVDB 承担，但不应把
+  当前结果描述成完整 `rcl` 或完整 ROS 2 移植；
+- 已增加 `goldfish-arm64-v8a-ap-velaros` ROS-only 发布配置；完整保留 openVela
+  的 UI、媒体、网络、安全库、数据库、调试和测试栈；发布配置启用 Fast DDS
+  VelaROS 静态 profile，在源码级排除 TypeLookup Service、Fast DDS DDS-RPC、
+  Discovery Server/Client/Backup、静态 EDP 和 Fast DDS 原生 SHM/DataSharing，并
+  锁定 SIMPLE discovery + UDPv4；板内普通消息由 uORB 替代；
+- profile 已通过双向 Topic、Service 和 Action 互操作，以及 DDS/RMW/rcl/executor/
+  uORB/Binder/KVDB 生命周期回归；最终发布 ELF SHA256 为
+  `82f5b314d433c00be9c115831e8d14bad4b8f2dc5490db94d484e7fd81803505`；
+- 相同当前产品闭包下，删除 Fast DDS 原生 SHM/DataSharing 使 Flash 从
+  23,485,960 B 降至 23,125,496 B（-360,464 B），静态 RAM 从 663,640 B 降至
+  661,752 B；后续固定共享缓冲 backend 的独立体积结果见
+  [`docs/VELAROS_BUFFER_BACKEND.md`](docs/VELAROS_BUFFER_BACKEND.md) 与体积文档；
+- 同一发布 defconfig、`-O3` 和 openVela 基线下，静态 profile 使整机 Flash 从
+  25,672,616 B 降至 23,143,224 B（-9.85%），Fast DDS 链接 Flash 从
+  17,248,198 B 降至 14,769,205 B（-14.37%），静态 RAM 减少 43,936 B；完整
+  排除/保留清单见
+  [`docs/VELAROS_FASTDDS_STATIC_PROFILE.md`](docs/VELAROS_FASTDDS_STATIC_PROFILE.md)；
 - host ROSIDL 只负责可重复代码生成，最终 ELF 和构建元数据的宿主 ROS 污染
   检查已纳入一键验收；
-- K1 Ethernet 驱动尚未开始，DDS 逻辑将先在 openvela simulator 验证；
+- K1 EMAC0/RTL8211F polling 驱动已完成实板 ARP、双向 ICMP 和最大 1472-byte
+  UDPv4 payload 验证；K1 实板 Fast DDS 跨设备互操作和网络长稳仍待完成；
 - 完整边界、依赖、Demo 和 Go/No-Go 计划见项目描述。
 
 K1 BSP 侧：
@@ -63,11 +141,13 @@ K1 BSP 侧：
 - 已接入 OpenSBI TIME 的 24 MHz 单次定时器；
 - 已加入启动阶段标记和同步异常寄存器直出日志；
 - 已加入 hart、DTB 和初始 CSR handoff 日志；
-- 已从参考 DTS 确认 PLIC context 1，并提供默认关闭的实现骨架；
+- 已从真实 U-Boot FDT 确认 PLIC context 1，并完成 GPIO source 58 的
+  Pin 22 -> Pin 33 上升沿 claim/complete 实板验证；默认配置仍关闭 PLIC；
 - 已提供可重复构建、ELF 验收和 U-Boot 上板包工具；
 - 已提供静态 CI、串口原始抓取和异常自动符号化；
 - 已完成双轮驱动审查和来源/许可证清单；
-- 已产出 RV64 S-mode NSH ELF，尚待实板启动验证。
+- 已使用 wrapper + U-Boot `go` 在 MUSE Pi Pro 实板启动 RV64 S-mode NSH；
+  `bootelf -p` 不是当前固件上的可用路径。
 
 当前构建通过只证明芯片层、板级层和 NSH 已完成编译链接闭环，不代表 openvela
 已经在 K1 实板上启动。
@@ -96,19 +176,37 @@ BootROM -> FSBL -> OpenSBI -> U-Boot -> openvela/NuttX (S-mode)
 board/k1/muse_pi_pro/       MUSE Pi Pro 板级支持包
 chip/k1/                    K1 RISC-V 自定义芯片层
 docs/K1_BOOT_INVENTORY.md   启动资料、硬件参数、风险和验证清单
+docs/K1_MUSE_PI_PRO_OFFICIAL_HARDWARE.md 官方硬件接口、Type-C、UART 和首板操作
 docs/K1_UBOOT_BRINGUP.md     U-Boot 首启、故障定位和恢复手册
 docs/K1_PLIC_DESIGN.md       PLIC context 证据、寄存器和启用门槛
 docs/K1_DRIVER_REVIEW.md      59 Pattern 双轮审查与修复记录
 docs/K1_DELIVERY_CHECKLIST.md 无板、上板和提交前检查清单
+docs/CONTEST_MILESTONE_20260816.md 本次比赛里程碑的构建、验收与边界证据
+docs/K1_HOST_BUILD_REGRESSION_20260814.md 十一个 K1 profile 的主机构建回归证据
+docs/K1_WATCHDOG_BRINGUP.md   K1 watchdog 寄存器依据、安全 smoke 与实板步骤
 docs/VELAROS_VERSION_MATRIX.md ROS 2 / Fast DDS 版本与 ABI 锁定
 docs/VELAROS_ROS2_MINIMAL_CLOSURE.md ROS 2 分阶段目标依赖闭包
 docs/VELAROS_ROS2_SOURCE_AND_LICENSES.md ROS 2 源码与许可证
+docs/VELAROS_OPENVELA_INTEGRATION.md ROS 2 与 openVela 能力复用边界
+docs/VELAROS_COMMUNICATION_PROFILE.md 精简高级通信保留/裁剪与发布配置
+docs/VELAROS_FASTDDS_STATIC_PROFILE.md Fast DDS 产品静态 profile、体积和验收
+docs/VELAROS_BUFFER_BACKEND.md openVela 固定池、uORB descriptor 与 ROSIDL backend
+docs/VELAROS_HANDOFF.md        VelaROS/K1 当前状态、复现入口、边界和下一阶段交接
+docs/VELAROS_RCLCPP_STATIC_PROFILE.md 静态 rclcpp RAII API、裁剪边界和验收
+docs/VELAROS_RCLCPP_ACTION_STATIC_PROFILE.md 静态 C++ Action 五通道、资源边界和验收
+docs/VELAROS_ROBOT_PRODUCT_PROFILE.md 移动机器人 Topic/Action、uORB 边界和产品验收
+docs/VELAROS_SIZE_BASELINE.md ELF/Map 体积基线与优化优先级
 tools/build_k1.sh            可重复构建入口
 tools/build_velaros_dds_sim.sh DDS simulator 干净环境构建
+tools/build_velaros_release_sim.sh VelaROS 精简通信发布构建
+tools/check_velaros_release_config.sh 发布能力存在性和诊断排除检查
+tools/check_velaros_fastdds_profile.sh Fast DDS 静态 profile 编译图门禁
 tools/restore_velaros_dds_sources.sh DDS 精确源码恢复与补丁应用
 tools/restore_velaros_ros2_sources.sh ROS 2 精确源码恢复与校验
 tools/generate_velaros_ros2_interfaces.sh ROSIDL 生成源码可重复导出
+tools/generate_velaros_action.sh 开发 Fibonacci/产品 MoveRelative Action 生成与校验
 tools/check_velaros_dds_sim.py rcl/RMW、DDS 3 发 3 收和资源回收一键验收
+tools/check_velaros_ros2_host.py simulator 与 ROS 2 Lyrical 双向一键验收
 tools/ci_k1.sh               静态/完整一键回归
 tools/check_k1_elf.sh        ELF、Kconfig 和 UART 安全验收
 tools/package_k1_bringup.sh  U-Boot 上板包生成器

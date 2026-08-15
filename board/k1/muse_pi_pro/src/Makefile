@@ -14,4 +14,8 @@ ifneq ($(CONFIG_GPIO_LOWER_HALF),y)
 endif
 endif
 
+ifneq ($(filter y,$(CONFIG_K1_RTL8852BS2_WIFI) $(CONFIG_K1_RTL8852BS2_BT)),)
+  CSRCS += k1_wireless.c
+endif
+
 include $(TOPDIR)/boards/Board.mk

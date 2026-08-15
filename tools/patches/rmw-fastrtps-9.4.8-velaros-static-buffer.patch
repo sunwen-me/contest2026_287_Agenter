@@ -1,0 +1,33 @@
+diff --git a/rmw_fastrtps_cpp/src/buffer_backend_loader.cpp b/rmw_fastrtps_cpp/src/buffer_backend_loader.cpp
+--- a/rmw_fastrtps_cpp/src/buffer_backend_loader.cpp
++++ b/rmw_fastrtps_cpp/src/buffer_backend_loader.cpp
+@@ -27,6 +27,9 @@
+ #include "rosidl_typesupport_fastrtps_cpp/message_type_support_decl.hpp"
+ #include "rosidl_typesupport_fastrtps_cpp/buffer_serialization.hpp"
+ #include "rosidl_runtime_c/message_type_support_struct.h"
++#ifdef CONFIG_VELAROS_BUFFER_BACKEND
++#  include "velaros/buffer_backend.hpp"
++#endif
+ 
+ namespace rmw_fastrtps_cpp
+ {
+@@ -41,11 +44,19 @@
+   auto & backend_ops = context.serialization_context.descriptor_ops;
+   auto & serializers = context.serialization_context.descriptor_serializers;
+   auto backend_names = registry.get_backend_names();
++#ifdef CONFIG_VELAROS_BUFFER_BACKEND
++  backend_names.emplace_back(velaros::kStaticBufferBackendName);
++#endif
+   RCUTILS_LOG_DEBUG_NAMED(
+     kLoggerName, "Buffer backends: found %zu backend(s)", backend_names.size());
+ 
+   for (const auto & backend_name : backend_names) {
++#ifdef CONFIG_VELAROS_BUFFER_BACKEND
++    auto backend = backend_name == velaros::kStaticBufferBackendName ?
++      velaros::create_buffer_backend() : registry.create_backend_instance(backend_name);
++#else
+     auto backend = registry.create_backend_instance(backend_name);
++#endif
+     if (!backend) {
+       RCUTILS_LOG_ERROR_NAMED(
+         kLoggerName, "Backend '%s' pointer is null", backend_name.c_str());

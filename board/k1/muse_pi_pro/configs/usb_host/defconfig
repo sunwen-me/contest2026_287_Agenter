@@ -1,0 +1,30 @@
+# K1 DWC3/xHCI host validation profile.
+
+# This starts the non-PCI xHCI host stack through the USB2817 high-speed hub.
+
+#include "../usb_host_glue/defconfig"
+
+CONFIG_USBHOST=y
+CONFIG_USBHOST_WAITER=y
+CONFIG_USBHOST_WAITER_STACKSIZE=4096
+CONFIG_USBHOST_XHCI_K1=y
+CONFIG_USBHOST_XHCI_MAX_DEVS=8
+CONFIG_USBHOST_HUB=y
+CONFIG_USBHOST_MSC=y
+CONFIG_USBHOST_UAS=y
+CONFIG_DEBUG_USB=y
+CONFIG_DEBUG_USB_ERROR=y
+CONFIG_SYSLOG_CONSOLE=y
+CONFIG_FS_FAT=y
+# xHCI initialization and event processing have deep 64-bit call chains.
+# The default 2 KiB board/work-queue stacks corrupt the initial task context
+# before the controller start wait completes.
+
+CONFIG_BOARD_INITTHREAD_STACKSIZE=8192
+CONFIG_SCHED_WORKQUEUE=y
+CONFIG_SCHED_HPWORK=y
+CONFIG_SCHED_HPWORKSTACKSIZE=4096
+CONFIG_SCHED_LPWORK=y
+CONFIG_SCHED_LPWORKSTACKSIZE=4096
+CONFIG_K1_PLIC=y
+CONFIG_K1_USB_HOST_POWER=y

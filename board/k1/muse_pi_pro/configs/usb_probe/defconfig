@@ -1,0 +1,8 @@
+# K1 DWC3 and PHY register validation profile.
+
+# This profile deliberately does not enable a USB class or pretend that the
+# DWC3 event-ring/TRB host/device layer is complete.
+
+#include "../nsh/defconfig"
+
+CONFIG_K1_USB_PROBE=y

@@ -1,0 +1,49 @@
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+menu "K1 Board Validation"
+
+config K1_UDP_ECHO
+	bool "K1 UDPv4 echo validation command"
+	default n
+	depends on NET_UDP && NET_IPv4 && NET_SOCKOPTS
+	---help---
+		Build k1_udpecho, a bounded UDPv4 echo command for real-board
+		Ethernet validation. It receives a fixed number of datagrams,
+		echoes each byte-identically to its source, then exits with PASS
+		or FAIL output.
+
+if K1_UDP_ECHO
+
+config K1_UDP_ECHO_PORT
+	int "UDP echo port"
+	default 33333
+	range 1024 65535
+	---help---
+		Local UDP port used by k1_udpecho.
+
+config K1_UDP_ECHO_PACKETS
+	int "UDP datagrams per run"
+	default 4
+	range 1 16
+	---help---
+		Number of datagrams k1_udpecho must receive and echo before it
+		reports success.
+
+config K1_UDP_ECHO_STACKSIZE
+	int "UDP echo stack size"
+	default 8192
+	range 2048 16384
+	---help---
+		Stack reserved for the UDP echo command.
+
+config K1_UDP_ECHO_PRIORITY
+	int "UDP echo task priority"
+	default 100
+	---help---
+		Scheduling priority for the UDP echo command.
+
+endif # K1_UDP_ECHO
+
+endmenu

@@ -24,12 +24,22 @@ void up_irqinitialize(void)
   up_irq_save();
   riscv_exception_attach();
 
+#ifdef CONFIG_K1_EARLY_BOOT_LOG
+  k1_early_puts("K1 IRQ: exception vectors attached\r\n");
+#endif
+
 #ifdef CONFIG_K1_PLIC
   k1_plic_initialize();
+#  ifdef CONFIG_K1_EARLY_BOOT_LOG
+  k1_early_puts("K1 IRQ: PLIC sources masked\r\n");
+#  endif
 #endif
 
 #ifndef CONFIG_SUPPRESS_INTERRUPTS
   riscv_color_intstack();
+#  ifdef CONFIG_K1_EARLY_BOOT_LOG
+  k1_early_puts("K1 IRQ: enabling global interrupts\r\n");
+#  endif
   up_irq_enable();
 #endif
 }

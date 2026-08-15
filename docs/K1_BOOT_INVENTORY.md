@@ -17,7 +17,7 @@
 - SBI timer；
 - 单 hart NSH，随后再启用 SMP。
 
-存储、网络、显示、音频和 NPU 不属于第一阶段。
+存储、网络、显示、音频和 X60 AI 自定义指令运行时不属于第一阶段。
 
 ## 2. 资料来源
 
@@ -30,6 +30,7 @@
 | S5 | 参考仓 `docs/K1_BOOT_CHAIN.md` | 实板探测、启动链、镜像布局 | 实板参考 |
 | S6 | 参考仓 `platform.h`、`uart.c`、`start.S`、U-Boot env | 地址、UART 风险和 handoff 行为 | 实现证据 |
 | S7 | 当前 openvela/NuttX RISC-V common code | SBI、S-mode、timer、IPI 可复用能力 | 当前基线 |
+| S8 | [SpacemiT K1 MUSE Pi Pro 用户使用指南](https://www.spacemit.com/community/document/info?lang=zh&nodepath=hardware/eco/k1_muse_pi_pro/pi_pro_user_guide.md) | 官方 Type-C、按键、指示灯、40Pin UART、UEFI 和 FDL 操作 | 官方 |
 
 参考仓根代码采用 MIT 许可证，vendored U-Boot/OpenSBI 有各自许可证。本项目
 当前仅摘录硬件事实和验证结论，没有复制参考仓源码。
@@ -53,6 +54,18 @@
 
 结论：openvela 应复用 OpenSBI 的 TIME、IPI 和 HSM 服务。第一版不应尝试替换
 FSBL/OpenSBI，也不应从 M-mode 起步。
+
+### 3.1.1 AI 加速硬件事实
+
+K1 **没有独立的 NPU 外设**。官方 K1 Datasheet 将 2.0 TOPS 描述为
+Cluster 0 的四个 X60 CPU 核通过 256-bit RVV 和 SpacemiT 自定义 AI 指令实现的
+CPU/AI 融合算力；Cluster 0 另有 512 KiB TCM。当前 Linux 主线设备树和驱动搜索
+也没有发现独立 NPU 的 MMIO 节点或 NPU 驱动。
+
+因此后续应使用“X60 AI 自定义指令/推理运行时”这个术语，不能把它写成“迁移
+NPU 驱动”。K1 的 VPU 是 H.264/H.265 等视频编解码单元，与 AI 加速不是同一模块。
+
+依据：[K1 Datasheet](https://github.com/spacemit-com/docs-chip/blob/main/en/key_stone/k1/k1_docs/k1_ds.md)。
 
 ### 3.2 DRAM 与装载地址
 
@@ -117,6 +130,19 @@ Linux 日志报告 8 个 handler、16 个 PLIC contexts。参考 U-Boot DTS 的
 `interrupts-extended` 已确认每个 hart 按 M-mode(11)、S-mode(9) 排列，因此
 hart 0 S-mode 是 context 1。推导和默认关闭的实现边界见
 `K1_PLIC_DESIGN.md`；拿到板后仍须用实际 U-Boot DTB 复核。
+
+### 3.5 官方板端接口与调试操作
+
+根据 S8 官方用户指南：
+
+- PWR 接口是 USB Type-C，支持 USB-PD 5V/3A、9V/3A、12V/3A；在 FDL 烧录模式下同时作为 USB Device；
+- 正常启动时 PWR Type-C 不保证在主机上枚举 USB 设备；Type-C 枚举和 Titan/fastboot 烧录需要按 FDL 流程进入烧录模式；
+- 40Pin 调试 UART 使用 pin 6/8/10：6=`GND`，8=`UART0_TXD_3V3`，10=`UART0_RXD_3V3`；板端 TX 接 USB-TTL RX，板端 RX 接 USB-TTL TX；
+- GPIO/UART 电平域为 3.3V，USB-TTL VCC 不接板；
+- PWR 为开机/强制关机键，RST 为短按复位键，FDL 为烧录模式键；
+- 官方默认启动路径为 UEFI，F2 可进入设置，Boot Manager 可选择 eMMC、SSD、USB 硬盘或 SD 卡。
+
+这组官方事实与项目参考仓的 U-Boot `bootelf -p` 路径不是同一层。首次上板必须先记录实际启动固件；只有确认出现 U-Boot 命令提示符后，才能执行本仓库的 U-Boot 命令表。完整接线和安全决策见 [`K1_MUSE_PI_PRO_OFFICIAL_HARDWARE.md`](K1_MUSE_PI_PRO_OFFICIAL_HARDWARE.md)。
 
 ## 4. 启动链设计
 
@@ -209,6 +235,8 @@ openvela 必须在首轮实板日志中记录并验证：
 - [ ] NuttX 入口打印单字符；
 - [ ] polling UART 打印完整 banner；
 - [x] 静态验证 K1 console 的唯一 MMIO 写目标为 UART THR，不存在 IER 写路径；
+- [x] 按官方指南确认 40Pin pin 6/8/10 和 3.3V UART 电平；
+- [x] 按官方指南确认 PWR Type-C 的 USB Device/FDL 进入条件；
 
 ### M2：timer 与 NSH
 
@@ -230,12 +258,13 @@ openvela 必须在首轮实板日志中记录并验证：
 ## 8. 首轮上板需采集的证据
 
 1. 完整 UART 日志，从 BootROM/FSBL 开始；
-2. U-Boot `version`、`bdinfo`、`printenv`；
-3. `fdt addr`、`fdt print /cpus`、`fdt print /soc/serial@d4017000`；
-4. `fdt print /soc/interrupt-controller@e0000000`；
-5. payload 文件大小、加载地址和入口地址；
-6. 第一次 exception 的 `scause`、`sepc`、`stval`；
-7. 成功进入 NSH 后的版本、内存和任务列表。
+2. STAT 指示灯、PWR/RST/FDL 操作结果和板卡供电方式；
+3. 实际启动固件类型；若是 U-Boot，再记录 `version`、`bdinfo`、`printenv`；
+4. `fdt addr`、`fdt print /cpus`、`fdt print /soc/serial@d4017000`；
+5. `fdt print /soc/interrupt-controller@e0000000`；
+6. payload 文件大小、加载地址和入口地址；
+7. 第一次 exception 的 `scause`、`sepc`、`stval`；
+8. 成功进入 NSH 后的版本、内存和任务列表。
 
 以上日志应和对应 AI Coding session 一起归档到比赛仓。
 

@@ -28,6 +28,173 @@ index 58a2163..e2f06e3 100644
  
  #ifdef __cplusplus
  }
+diff --git a/rcl/src/rcl/client.c b/rcl/src/rcl/client.c
+index 7529c78..93b818f 100644
+--- a/rcl/src/rcl/client.c
++++ b/rcl/src/rcl/client.c
+@@ -24,15 +24,20 @@ extern "C"
+ 
+ #include "rcl/error_handling.h"
+ #include "rcl/node.h"
++#ifndef __NuttX__
+ #include "rcl/node_type_cache.h"
++#endif
+ #include "rcl/publisher.h"
+ #include "rcl/time.h"
+ #include "rcutils/logging_macros.h"
+ #include "rcutils/macros.h"
+ #include "rcutils/stdatomic_helper.h"
++#include "rcutils/strdup.h"
+ #include "rmw/error_handling.h"
+ #include "rmw/rmw.h"
++#ifndef __NuttX__
+ #include "service_msgs/msg/service_event_info.h"
++#endif
+ #include "tracetools/tracetools.h"
+ 
+ #include "rosidl_runtime_c/service_type_support_struct.h"
+@@ -56,6 +61,11 @@ unconfigure_service_introspection(
+   struct rcl_client_impl_s * client_impl,
+   rcl_allocator_t * allocator)
+ {
++#ifdef __NuttX__
++  (void)node;
++  (void)allocator;
++  return client_impl == NULL ? RCL_RET_ERROR : RCL_RET_OK;
++#else
+   if (client_impl == NULL) {
+     return RCL_RET_ERROR;
+   }
+@@ -70,6 +80,7 @@ unconfigure_service_introspection(
+   client_impl->service_event_publisher = NULL;
+ 
+   return ret;
++#endif
+ }
+ 
+ rcl_ret_t
+@@ -104,7 +115,18 @@ rcl_client_init(
+     client->impl, "allocating memory failed",
+     return RCL_RET_BAD_ALLOC;);
+ 
+-  // Expand the given service name.
++  // Expand the given service name.  Target-side VelaROS intentionally omits
++  // command-line remapping and copies the already fully-qualified name.
++#ifdef __NuttX__
++  client->impl->remapped_service_name = rcutils_strdup(service_name, *allocator);
++  if (client->impl->remapped_service_name == NULL) {
++    RCL_SET_ERROR_MSG("failed to copy service name");
++    allocator->deallocate(client->impl, allocator->state);
++    client->impl = NULL;
++    return RCL_RET_BAD_ALLOC;
++  }
++  rcl_ret_t ret = RCL_RET_OK;
++#else
+   rcl_ret_t ret = rcl_node_resolve_name(
+     node,
+     service_name,
+@@ -120,6 +142,7 @@ rcl_client_init(
+     }
+     goto free_client_impl;
+   }
++#endif
+   RCUTILS_LOG_DEBUG_NAMED(
+     ROS_PACKAGE_NAME, "Expanded and remapped service name '%s'",
+     client->impl->remapped_service_name);
+@@ -169,6 +192,7 @@ rcl_client_init(
+   atomic_init(&client->impl->sequence_number, 0);
+   client->impl->in_use_by_waitset = false;
+ 
++#ifndef __NuttX__
+   const rosidl_type_hash_t * hash = type_support->get_type_hash_func(type_support);
+   if (hash == NULL) {
+     RCL_SET_ERROR_MSG("Failed to get the type hash");
+@@ -186,6 +210,7 @@ rcl_client_init(
+     goto destroy_client;
+   }
+   client->impl->type_hash = *hash;
++#endif
+ 
+   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Client initialized");
+   TRACETOOLS_TRACEPOINT(
+@@ -208,7 +233,9 @@ free_remapped_service_name:
+   allocator->deallocate(client->impl->remapped_service_name, allocator->state);
+   client->impl->remapped_service_name = NULL;
+ 
++#ifndef __NuttX__
+ free_client_impl:
++#endif
+   allocator->deallocate(client->impl, allocator->state);
+   client->impl = NULL;
+ 
+@@ -248,6 +275,7 @@ rcl_client_fini(rcl_client_t * client, rcl_node_t * node)
+       result = RCL_RET_ERROR;
+     }
+ 
++#ifndef __NuttX__
+     if (
+       ROSIDL_TYPE_HASH_VERSION_UNSET != client->impl->type_hash.version &&
+       RCL_RET_OK != rcl_node_type_cache_unregister_type(node, &client->impl->type_hash))
+@@ -255,6 +283,7 @@ rcl_client_fini(rcl_client_t * client, rcl_node_t * node)
+       RCUTILS_SAFE_FWRITE_TO_STDERR(rcl_get_error_string().str);
+       result = RCL_RET_ERROR;
+     }
++#endif
+ 
+     allocator.deallocate(client->impl->remapped_service_name, allocator.state);
+     client->impl->remapped_service_name = NULL;
+@@ -322,6 +351,7 @@ rcl_send_request(const rcl_client_t * client, const void * ros_request, int64_t
+   }
+   rcutils_atomic_exchange_int64_t(&client->impl->sequence_number, *sequence_number);
+ 
++#ifndef __NuttX__
+   if (client->impl->service_event_publisher != NULL) {
+     rmw_gid_t gid;
+     rmw_ret_t rmw_ret = rmw_get_gid_for_client(client->impl->rmw_handle, &gid);
+@@ -340,6 +370,7 @@ rcl_send_request(const rcl_client_t * client, const void * ros_request, int64_t
+       return ret;
+     }
+   }
++#endif
+   return RCL_RET_OK;
+ }
+ 
+@@ -372,6 +403,7 @@ rcl_take_response_with_info(
+     return RCL_RET_CLIENT_TAKE_FAILED;
+   }
+ 
++#ifndef __NuttX__
+   if (client->impl->service_event_publisher != NULL) {
+     rmw_gid_t gid;
+     rmw_ret_t rmw_ret = rmw_get_gid_for_client(client->impl->rmw_handle, &gid);
+@@ -390,6 +422,7 @@ rcl_take_response_with_info(
+       return ret;
+     }
+   }
++#endif
+   return RCL_RET_OK;
+ }
+ 
+@@ -474,6 +507,11 @@ rcl_client_configure_service_introspection(
+     return unconfigure_service_introspection(node, client->impl, &allocator);
+   }
+ 
++#ifdef __NuttX__
++  (void)publisher_options;
++  RCL_SET_ERROR_MSG("service introspection is excluded from the VelaROS target profile");
++  return RCL_RET_UNSUPPORTED;
++#else
+   if (client->impl->service_event_publisher == NULL) {
+     // We haven't been introspecting, so we need to allocate the service event publisher
+ 
+@@ -495,6 +533,7 @@ rcl_client_configure_service_introspection(
+ 
+   return rcl_service_event_publisher_change_state(
+     client->impl->service_event_publisher, introspection_state);
++#endif
+ }
+ 
+ #ifdef __cplusplus
 diff --git a/rcl/src/rcl/node.c b/rcl/src/rcl/node.c
 index c1d286a..0e24291 100644
 --- a/rcl/src/rcl/node.c
@@ -181,6 +348,173 @@ index d8bc31d..fbf2a5e 100644
      allocator.deallocate(publisher->impl, allocator.state);
      publisher->impl = NULL;
    }
+diff --git a/rcl/src/rcl/service.c b/rcl/src/rcl/service.c
+index 97816a5..7e100f6 100644
+--- a/rcl/src/rcl/service.c
++++ b/rcl/src/rcl/service.c
+@@ -24,15 +24,20 @@ extern "C"
+ 
+ #include "rcl/error_handling.h"
+ #include "rcl/node.h"
++#ifndef __NuttX__
+ #include "rcl/node_type_cache.h"
++#endif
+ #include "rcl/publisher.h"
+ #include "rcl/time.h"
+ #include "rcl/types.h"
+ #include "rcutils/logging_macros.h"
+ #include "rcutils/macros.h"
++#include "rcutils/strdup.h"
+ #include "rmw/error_handling.h"
+ #include "rmw/rmw.h"
++#ifndef __NuttX__
+ #include "service_msgs/msg/service_event_info.h"
++#endif
+ #include "tracetools/tracetools.h"
+ 
+ #include "rosidl_runtime_c/service_type_support_struct.h"
+@@ -56,6 +61,11 @@ unconfigure_service_introspection(
+   struct rcl_service_impl_s * service_impl,
+   rcl_allocator_t * allocator)
+ {
++#ifdef __NuttX__
++  (void)node;
++  (void)allocator;
++  return service_impl == NULL ? RCL_RET_ERROR : RCL_RET_OK;
++#else
+   if (service_impl == NULL) {
+     return RCL_RET_ERROR;
+   }
+@@ -70,6 +80,7 @@ unconfigure_service_introspection(
+   service_impl->service_event_publisher = NULL;
+ 
+   return ret;
++#endif
+ }
+ 
+ rcl_ret_t
+@@ -112,7 +123,18 @@ rcl_service_init(
+     service->impl, "allocating memory failed",
+     return RCL_RET_BAD_ALLOC;);
+ 
+-  // Expand and remap the given service name.
++  // Expand and remap the given service name.  Target-side VelaROS omits the
++  // command-line remapping parser and copies the fully-qualified name.
++#ifdef __NuttX__
++  service->impl->remapped_service_name = rcutils_strdup(service_name, *allocator);
++  if (service->impl->remapped_service_name == NULL) {
++    RCL_SET_ERROR_MSG("failed to copy service name");
++    allocator->deallocate(service->impl, allocator->state);
++    service->impl = NULL;
++    return RCL_RET_BAD_ALLOC;
++  }
++  rcl_ret_t ret = RCL_RET_OK;
++#else
+   rcl_ret_t ret = rcl_node_resolve_name(
+     node,
+     service_name,
+@@ -128,6 +150,7 @@ rcl_service_init(
+     }
+     goto free_service_impl;
+   }
++#endif
+   RCUTILS_LOG_DEBUG_NAMED(
+     ROS_PACKAGE_NAME, "Expanded and remapped service name '%s'",
+     service->impl->remapped_service_name);
+@@ -181,6 +204,7 @@ rcl_service_init(
+   service->impl->options = *options;
+   service->impl->in_use_by_waitset = false;
+ 
++#ifndef __NuttX__
+   if (RCL_RET_OK != rcl_node_type_cache_register_type(
+       node, type_support->get_type_hash_func(type_support),
+       type_support->get_type_description_func(type_support),
+@@ -192,6 +216,7 @@ rcl_service_init(
+     goto destroy_service;
+   }
+   service->impl->type_hash = *type_support->get_type_hash_func(type_support);
++#endif
+ 
+   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Service initialized");
+   TRACETOOLS_TRACEPOINT(
+@@ -214,7 +239,9 @@ free_remapped_service_name:
+   allocator->deallocate(service->impl->remapped_service_name, allocator->state);
+   service->impl->remapped_service_name = NULL;
+ 
++#ifndef __NuttX__
+ free_service_impl:
++#endif
+   allocator->deallocate(service->impl, allocator->state);
+   service->impl = NULL;
+ 
+@@ -255,6 +282,7 @@ rcl_service_fini(rcl_service_t * service, rcl_node_t * node)
+       result = RCL_RET_ERROR;
+     }
+ 
++#ifndef __NuttX__
+     if (
+       ROSIDL_TYPE_HASH_VERSION_UNSET != service->impl->type_hash.version &&
+       RCL_RET_OK != rcl_node_type_cache_unregister_type(node, &service->impl->type_hash))
+@@ -262,6 +290,7 @@ rcl_service_fini(rcl_service_t * service, rcl_node_t * node)
+       RCUTILS_SAFE_FWRITE_TO_STDERR(rcl_get_error_string().str);
+       result = RCL_RET_ERROR;
+     }
++#endif
+ 
+     allocator.deallocate(service->impl->remapped_service_name, allocator.state);
+     service->impl->remapped_service_name = NULL;
+@@ -343,6 +372,7 @@ rcl_take_request_with_info(
+   if (!taken) {
+     return RCL_RET_SERVICE_TAKE_FAILED;
+   }
++#ifndef __NuttX__
+   if (service->impl->service_event_publisher != NULL) {
+     rcl_ret_t rclret = rcl_send_service_event_message(
+       service->impl->service_event_publisher,
+@@ -355,6 +385,7 @@ rcl_take_request_with_info(
+       return rclret;
+     }
+   }
++#endif
+   return RCL_RET_OK;
+ }
+ 
+@@ -397,6 +428,7 @@ rcl_send_response(
+   }
+ 
+   // publish out the introspected content
++#ifndef __NuttX__
+   if (service->impl->service_event_publisher != NULL) {
+     ret = rcl_send_service_event_message(
+       service->impl->service_event_publisher,
+@@ -409,6 +441,7 @@ rcl_send_response(
+       return ret;
+     }
+   }
++#endif
+   return RCL_RET_OK;
+ }
+ 
+@@ -480,6 +513,11 @@ rcl_service_configure_service_introspection(
+     return unconfigure_service_introspection(node, service->impl, &allocator);
+   }
+ 
++#ifdef __NuttX__
++  (void)publisher_options;
++  RCL_SET_ERROR_MSG("service introspection is excluded from the VelaROS target profile");
++  return RCL_RET_UNSUPPORTED;
++#else
+   if (service->impl->service_event_publisher == NULL) {
+     // We haven't been introspecting, so we need to allocate the service event publisher
+ 
+@@ -502,6 +540,7 @@ rcl_service_configure_service_introspection(
+ 
+   return rcl_service_event_publisher_change_state(
+     service->impl->service_event_publisher, introspection_state);
++#endif
+ }
+ 
+ #ifdef __cplusplus
 diff --git a/rcl/src/rcl/subscription.c b/rcl/src/rcl/subscription.c
 index 2e36cbb..a442aa2 100644
 --- a/rcl/src/rcl/subscription.c
@@ -250,3 +584,321 @@ index 2e36cbb..a442aa2 100644
  
      allocator.deallocate(subscription->impl, allocator.state);
      subscription->impl = NULL;
+diff --git a/rcl_action/src/rcl_action/action_client.c b/rcl_action/src/rcl_action/action_client.c
+index df4cbff..e4742ba 100644
+--- a/rcl_action/src/rcl_action/action_client.c
++++ b/rcl_action/src/rcl_action/action_client.c
+@@ -28,7 +28,9 @@ extern "C"
+ #include "rcl/client.h"
+ #include "rcl/error_handling.h"
+ #include "rcl/graph.h"
++#ifndef __NuttX__
+ #include "rcl/node_type_cache.h"
++#endif
+ #include "rcl/subscription.h"
+ #include "rcl/types.h"
+ #include "rcl/wait.h"
+@@ -96,8 +98,13 @@ _rcl_action_client_fini_impl(
+     ret = RCL_RET_ERROR;
+   }
+   if (
++#ifndef __NuttX__
+     ROSIDL_TYPE_HASH_VERSION_UNSET != action_client->impl->type_hash.version &&
+-    RCL_RET_OK != rcl_node_type_cache_unregister_type(node, &action_client->impl->type_hash))
++    RCL_RET_OK != rcl_node_type_cache_unregister_type(node, &action_client->impl->type_hash)
++#else
++    false
++#endif
++  )
+   {
+     ret = RCL_RET_ERROR;
+   }
+@@ -200,6 +207,14 @@ rcl_action_client_init(
+   *action_client->impl = _rcl_action_get_zero_initialized_client_impl();
+ 
+   // Remap/Expand the action name
++#ifdef __NuttX__
++  action_client->impl->remapped_action_name = rcutils_strdup(action_name, allocator);
++  if (NULL == action_client->impl->remapped_action_name) {
++    RCL_SET_ERROR_MSG("copying the fixed Action name failed");
++    ret = RCL_RET_BAD_ALLOC;
++    goto fail;
++  }
++#else
+   ret = rcl_node_resolve_name(
+     node,
+     action_name,
+@@ -216,6 +231,7 @@ rcl_action_client_init(
+     }
+     goto fail;
+   }
++#endif
+   RCUTILS_LOG_DEBUG_NAMED(
+     ROS_PACKAGE_NAME,
+     "Remapped and expanded action name '%s'",
+@@ -234,6 +250,11 @@ rcl_action_client_init(
+   SUBSCRIPTION_INIT(feedback);
+   SUBSCRIPTION_INIT(status);
+ 
++#ifdef __NuttX__
++  if (NULL != type_support->get_type_hash_func) {
++    action_client->impl->type_hash = *type_support->get_type_hash_func(type_support);
++  }
++#else
+   ret = rcl_node_type_cache_register_type(
+       node, type_support->get_type_hash_func(type_support),
+       type_support->get_type_description_func(type_support),
+@@ -244,6 +265,7 @@ rcl_action_client_init(
+     goto fail;
+   }
+   action_client->impl->type_hash = *type_support->get_type_hash_func(type_support);
++#endif
+ 
+   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Action client initialized");
+   return ret;
+@@ -782,10 +804,16 @@ rcl_action_client_configure_action_introspection(
+   RCL_CHECK_ARGUMENT_FOR_NULL(clock, RCL_RET_INVALID_ARGUMENT);
+   RCL_CHECK_ARGUMENT_FOR_NULL(type_support, RCL_RET_INVALID_ARGUMENT);
+ 
++#ifdef __NuttX__
++  (void)publisher_options;
++  return RCL_SERVICE_INTROSPECTION_OFF == introspection_state ?
++         RCL_RET_OK : RCL_RET_UNSUPPORTED;
++#else
+   CLIENT_CONFIGURE_SERVICE_INTROSPECTION(goal, introspection_state);
+   CLIENT_CONFIGURE_SERVICE_INTROSPECTION(cancel, introspection_state);
+   CLIENT_CONFIGURE_SERVICE_INTROSPECTION(result, introspection_state);
+   return RCL_RET_OK;
++#endif
+ }
+ 
+ /// \internal
+diff --git a/rcl_action/src/rcl_action/action_server.c b/rcl_action/src/rcl_action/action_server.c
+index 9123e70..ddb4417 100644
+--- a/rcl_action/src/rcl_action/action_server.c
++++ b/rcl_action/src/rcl_action/action_server.c
+@@ -27,7 +27,9 @@ extern "C"
+ #include "rcl_action/wait.h"
+ 
+ #include "rcl/error_handling.h"
++#ifndef __NuttX__
+ #include "rcl/node_type_cache.h"
++#endif
+ #include "rcl/rcl.h"
+ #include "rcl/time.h"
+ 
+@@ -36,6 +38,12 @@ extern "C"
+ 
+ #include "rmw/rmw.h"
+ 
++#ifdef __NuttX__
++#  ifndef VELAROS_ACTION_MAX_GOALS
++#    define VELAROS_ACTION_MAX_GOALS 4
++#  endif
++#endif
++
+ extern rcl_ret_t
+ rcl_action_goal_handle_set_goal_terminal_timestamp(
+   const rcl_action_goal_handle_t * goal_handle,
+@@ -223,7 +231,27 @@ rcl_action_server_init2(
+ 
+   rcl_ret_t ret = RCL_RET_OK;
+ 
++#ifdef __NuttX__
++  action_server->impl->goal_handles = allocator.zero_allocate(
++    VELAROS_ACTION_MAX_GOALS,
++    sizeof(*action_server->impl->goal_handles),
++    allocator.state);
++  if (NULL == action_server->impl->goal_handles) {
++    RCL_SET_ERROR_MSG("allocating bounded Action goal storage failed");
++    ret = RCL_RET_BAD_ALLOC;
++    goto fail;
++  }
++#endif
++
+   // Resolve action name
++#ifdef __NuttX__
++  action_server->impl->remapped_action_name = rcutils_strdup(action_name, allocator);
++  if (NULL == action_server->impl->remapped_action_name) {
++    RCL_SET_ERROR_MSG("copying the fixed Action name failed");
++    ret = RCL_RET_BAD_ALLOC;
++    goto fail;
++  }
++#else
+   ret = rcl_node_resolve_name(
+     node,
+     action_name,
+@@ -240,6 +268,7 @@ rcl_action_server_init2(
+     }
+     goto fail;
+   }
++#endif
+   RCUTILS_LOG_DEBUG_NAMED(
+     ROS_PACKAGE_NAME,
+     "Remapped and expanded action name '%s'",
+@@ -280,6 +309,11 @@ rcl_action_server_init2(
+   (void) dont_care;
+ 
+   // Store type hash
++#ifdef __NuttX__
++  if (NULL != type_support->get_type_hash_func) {
++    action_server->impl->type_hash = *type_support->get_type_hash_func(type_support);
++  }
++#else
+   ret = rcl_node_type_cache_register_type(
+       node, type_support->get_type_hash_func(type_support),
+       type_support->get_type_description_func(type_support),
+@@ -291,6 +325,7 @@ rcl_action_server_init2(
+     goto fail;
+   }
+   action_server->impl->type_hash = *type_support->get_type_hash_func(type_support);
++#endif
+ 
+   return ret;
+ fail:
+@@ -350,15 +385,23 @@ rcl_action_server_fini(rcl_action_server_t * action_server, rcl_node_t * node)
+       allocator.deallocate(action_server->impl->remapped_action_name, allocator.state);
+       action_server->impl->remapped_action_name = NULL;
+     }
+-    // Deallocate goal handles storage, but don't fini them.
++    // Finalize and deallocate the bounded goal handles.
+     for (size_t i = 0; i < action_server->impl->num_goal_handles; ++i) {
++      if (rcl_action_goal_handle_fini(action_server->impl->goal_handles[i]) != RCL_RET_OK) {
++        ret = RCL_RET_ERROR;
++      }
+       allocator.deallocate(action_server->impl->goal_handles[i], allocator.state);
+     }
+     allocator.deallocate(action_server->impl->goal_handles, allocator.state);
+     action_server->impl->goal_handles = NULL;
+     if (
++#ifndef __NuttX__
+       ROSIDL_TYPE_HASH_VERSION_UNSET != action_server->impl->type_hash.version &&
+-      RCL_RET_OK != rcl_node_type_cache_unregister_type(node, &action_server->impl->type_hash))
++      RCL_RET_OK != rcl_node_type_cache_unregister_type(node, &action_server->impl->type_hash)
++#else
++      false
++#endif
++    )
+     {
+       ret = RCL_RET_ERROR;
+     }
+@@ -476,6 +519,14 @@ rcl_action_accept_new_goal(
+   rcl_allocator_t allocator = action_server->impl->options.allocator;
+   rcl_action_goal_handle_t ** goal_handles = action_server->impl->goal_handles;
+   const size_t num_goal_handles = action_server->impl->num_goal_handles;
++#ifdef __NuttX__
++  if (num_goal_handles >= VELAROS_ACTION_MAX_GOALS) {
++    RCL_SET_ERROR_MSG("bounded VelaROS Action goal capacity exhausted");
++    return NULL;
++  }
++  const size_t new_num_goal_handles = num_goal_handles + 1u;
++  void * tmp_ptr;
++#else
+   // TODO(jacobperron): Don't allocate for every accepted goal handle,
+   //                    instead double the memory allocated if needed.
+   const size_t new_num_goal_handles = num_goal_handles + 1u;
+@@ -486,6 +537,7 @@ rcl_action_accept_new_goal(
+     return NULL;
+   }
+   goal_handles = (rcl_action_goal_handle_t **)tmp_ptr;
++#endif
+ 
+   // Allocate space for a new goal handle
+   tmp_ptr = allocator.allocate(sizeof(rcl_action_goal_handle_t), allocator.state);
+@@ -501,6 +553,8 @@ rcl_action_accept_new_goal(
+   rcl_time_point_value_t now_time_point;
+   rcl_ret_t ret = rcl_clock_get_now(action_server->impl->clock, &now_time_point);
+   if (RCL_RET_OK != ret) {
++    allocator.deallocate(goal_handles[num_goal_handles], allocator.state);
++    goal_handles[num_goal_handles] = NULL;
+     return NULL;  // Error already set
+   }
+   _nanosec_to_goal_info_stamp(&now_time_point, &goal_info_stamp_now);
+@@ -510,6 +564,8 @@ rcl_action_accept_new_goal(
+   ret = rcl_action_goal_handle_init(
+     goal_handles[num_goal_handles], &goal_info_stamp_now, allocator);
+   if (RCL_RET_OK != ret) {
++    allocator.deallocate(goal_handles[num_goal_handles], allocator.state);
++    goal_handles[num_goal_handles] = NULL;
+     RCL_SET_ERROR_MSG("failed to initialize goal handle");
+     return NULL;
+   }
+@@ -754,6 +810,10 @@ rcl_action_expire_goals(
+ 
+     if ((current_time - goal_terminal_timestamp) >= timeout) {
+       // Deallocate space used to store pointer to goal handle
++      if (rcl_action_goal_handle_fini(action_server->impl->goal_handles[i]) != RCL_RET_OK) {
++        ret_final = RCL_RET_ERROR;
++        continue;
++      }
+       allocator.deallocate(action_server->impl->goal_handles[i], allocator.state);
+       action_server->impl->goal_handles[i] = NULL;
+       // Move all pointers after backwards one to fill the gap
+@@ -768,6 +828,13 @@ rcl_action_expire_goals(
+   }
+ 
+   if (num_goals_expired > 0u) {
++#ifdef __NuttX__
++    for (size_t index = num_goal_handles;
++         index < action_server->impl->num_goal_handles; ++index) {
++      action_server->impl->goal_handles[index] = NULL;
++    }
++    action_server->impl->num_goal_handles = num_goal_handles;
++#else
+     // Shrink goal handle array if some goals expired
+     if (0u == num_goal_handles) {
+       allocator.deallocate(action_server->impl->goal_handles, allocator.state);
+@@ -786,6 +853,7 @@ rcl_action_expire_goals(
+         action_server->impl->num_goal_handles = num_goal_handles;
+       }
+     }
++#endif
+   }
+   rcl_ret_t expire_timer_ret = _recalculate_expire_timer(
+     &action_server->impl->expire_timer,
+@@ -873,6 +941,10 @@ rcl_action_process_cancel_request(
+   const size_t total_num_goals = action_server->impl->num_goal_handles;
+ 
+   // Storage for pointers to active goals handles that will be transitioned to canceling
++#ifdef __NuttX__
++  rcl_action_goal_handle_t * bounded_goal_handles[VELAROS_ACTION_MAX_GOALS];
++  rcl_action_goal_handle_t ** goal_handles_to_cancel = bounded_goal_handles;
++#else
+   // Note, we need heap allocation for MSVC support
+   rcl_action_goal_handle_t ** goal_handles_to_cancel =
+     (rcl_action_goal_handle_t **)allocator.allocate(
+@@ -881,6 +953,7 @@ rcl_action_process_cancel_request(
+     RCL_SET_ERROR_MSG("allocation failed for temporary goal handle array");
+     return RCL_RET_BAD_ALLOC;
+   }
++#endif
+   size_t num_goals_to_cancel = 0u;
+ 
+   // Request data
+@@ -975,7 +1048,9 @@ rcl_action_process_cancel_request(
+     }
+   }
+ cleanup:
++#ifndef __NuttX__
+   allocator.deallocate(goal_handles_to_cancel, allocator.state);
++#endif
+   return ret_final;
+ }
+ 
+@@ -1294,10 +1369,16 @@ rcl_action_server_configure_action_introspection(
+   RCL_CHECK_ARGUMENT_FOR_NULL(clock, RCL_RET_INVALID_ARGUMENT);
+   RCL_CHECK_ARGUMENT_FOR_NULL(type_support, RCL_RET_INVALID_ARGUMENT);
+ 
++#ifdef __NuttX__
++  (void)publisher_options;
++  return RCL_SERVICE_INTROSPECTION_OFF == introspection_state ?
++         RCL_RET_OK : RCL_RET_UNSUPPORTED;
++#else
+   SERVER_CONFIGURE_SERVICE_INTROSPECTION(goal, introspection_state);
+   SERVER_CONFIGURE_SERVICE_INTROSPECTION(cancel, introspection_state);
+   SERVER_CONFIGURE_SERVICE_INTROSPECTION(result, introspection_state);
+   return RCL_RET_OK;
++#endif
+ }
+ 
+ rcl_ret_t

@@ -1,0 +1,903 @@
+diff --git a/fastdds/CMakeLists.txt b/fastdds/CMakeLists.txt
+index ef668ea..e06568f 100644
+--- a/fastdds/CMakeLists.txt
++++ b/fastdds/CMakeLists.txt
+@@ -53,8 +53,12 @@ if(CONFIG_FASTDDS)
+       -DASIO_HAS_PTHREADS
+       -Wno-shadow
+       -Wno-undef
+-      -Wno-unused-parameter
+-      -DBOOST_INTERPROCESS_SHARED_DIR_PATH="${CONFIG_FS_SHMFS_VFS_PATH}")
++      -Wno-unused-parameter)
++
++  if(NOT CONFIG_FASTDDS_VELAROS_STATIC_PROFILE)
++    list(APPEND FASTDDS_FLAGS
++        -DBOOST_INTERPROCESS_SHARED_DIR_PATH="${CONFIG_FS_SHMFS_VFS_PATH}")
++  endif()
+ 
+   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+     list(APPEND FASTDDS_FLAGS -Wno-psabi)
+diff --git a/fastdds/Kconfig b/fastdds/Kconfig
+index 0b5ad63..3281378 100644
+--- a/fastdds/Kconfig
++++ b/fastdds/Kconfig
+@@ -43,8 +43,9 @@ config FASTDDS_VELAROS_STATIC_PROFILE
+ 		The profile keeps statically generated ROS 2 Topic, Service and Action
+ 		communication over UDPv4 with SIMPLE discovery and the QoS paths used
+ 		by rmw_fastrtps_cpp.  Host-oriented runtime extension points are
+-		compiled out, together with TCP and UDPv6 transport implementations, so
+-		they cannot be enabled accidentally in a product image.
++		compiled out, together with TCP, UDPv6, native SHM transport and
++		DataSharing implementations, so they cannot be enabled accidentally in
++		a product image. Board-local traffic uses openVela uORB instead.
+ 		Keep this disabled for the generic Fast DDS developer configuration.
+ 
+ config FASTDDS_ENABLE_OLD_LOG_MACROS
+diff --git a/fastdds/Fast-DDS/src/cpp/CMakeLists.txt b/fastdds/Fast-DDS/src/cpp/CMakeLists.txt
+index 62fae3c..2f0d2e9 100644
+--- a/fastdds/Fast-DDS/src/cpp/CMakeLists.txt
++++ b/fastdds/Fast-DDS/src/cpp/CMakeLists.txt
+@@ -141,6 +141,8 @@ target_compile_definitions(${PROJECT_NAME}
+     $<$<AND:$<BOOL:${ANDROID}>,$<NOT:$<BOOL:${HAVE_CXX14}>>,$<NOT:$<BOOL:${HAVE_CXX1Y}>>>:ASIO_DISABLE_STD_STRING_VIEW>
+     $<$<BOOL:${WIN32}>:_ENABLE_ATOMIC_ALIGNMENT_FIX>
+     $<$<NOT:$<BOOL:${IS_THIRDPARTY_BOOST_SUPPORTED}>>:FASTDDS_SHM_TRANSPORT_DISABLED> # Do not compile SHM Transport
++    $<$<BOOL:${FASTDDS_VELAROS_STATIC_PROFILE}>:FASTDDS_SHM_TRANSPORT_DISABLED>
++    $<$<BOOL:${FASTDDS_VELAROS_STATIC_PROFILE}>:FASTDDS_DATASHARING_DISABLED>
+     $<$<BOOL:${SHM_TRANSPORT_DEFAULT}>:SHM_TRANSPORT_BUILTIN> # Enable SHM as built-in transport
+     $<$<BOOL:${STDOUTERR_LOG_CONSUMER}>:STDOUTERR_LOG_CONSUMER> # Enable StdoutErrConsumer as default LogConsumer
+     $<$<BOOL:${FASTDDS_VELAROS_STATIC_PROFILE}>:FASTDDS_VELAROS_STATIC_PROFILE>
+diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp b/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
+index c74fbc7..7b3d077 100644
+--- a/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
++++ b/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
+@@ -34,7 +34,9 @@
+ #include <rtps/history/TopicPayloadPoolRegistry.hpp>
+ #include <rtps/domain/RTPSDomainImpl.hpp>
+ #include <statistics/fastdds/domain/DomainParticipantImpl.hpp>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <utils/shared_memory/SharedMemWatchdog.hpp>
++#endif
+ #include <utils/SystemInfo.hpp>
+ #include <xmlparser/XMLEndpointParser.h>
+ #include <xmlparser/XMLProfileManager.h>
+@@ -587,7 +589,9 @@ void DomainParticipantFactory::set_qos(
+     //As all the Qos can always be updated and none of them need to be sent
+     to = from;
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     rtps::SharedMemWatchdog::set_thread_settings(to.shm_watchdog_thread());
++#endif
+ }
+ 
+ ReturnCode_t DomainParticipantFactory::check_qos(
+diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/publisher/DataWriterImpl.cpp b/fastdds/Fast-DDS/src/cpp/fastdds/publisher/DataWriterImpl.cpp
+index 4812538..3e3c70e 100644
+--- a/fastdds/Fast-DDS/src/cpp/fastdds/publisher/DataWriterImpl.cpp
++++ b/fastdds/Fast-DDS/src/cpp/fastdds/publisher/DataWriterImpl.cpp
+@@ -44,8 +44,10 @@
+ 
+ #include <fastdds/utils/TypePropagation.hpp>
+ #include <rtps/builtin/liveliness/WLP.hpp>
++#ifndef FASTDDS_DATASHARING_DISABLED
+ #include <rtps/DataSharing/DataSharingPayloadPool.hpp>
+ #include <rtps/DataSharing/WriterPool.hpp>
++#endif
+ #include <rtps/history/CacheChangePool.h>
+ #include <rtps/history/TopicPayloadPoolRegistry.hpp>
+ #include <rtps/participant/RTPSParticipantImpl.hpp>
+@@ -401,6 +403,7 @@ ReturnCode_t DataWriterImpl::enable()
+         history_.get(),
+         static_cast<WriterListener*>(&writer_listener_));
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+     if (writer != nullptr &&
+             w_att.endpoint.data_sharing_configuration().kind() != DataSharingKind::OFF)
+     {
+@@ -412,6 +415,7 @@ ReturnCode_t DataWriterImpl::enable()
+             writer = nullptr;
+         }
+     }
++#endif
+ 
+     if (writer == nullptr &&
+             w_att.endpoint.data_sharing_configuration().kind() == DataSharingKind::AUTO)
+@@ -2269,11 +2273,13 @@ std::shared_ptr<IPayloadPool> DataWriterImpl::get_payload_pool()
+                 pool_config_.memory_policy == PREALLOCATED_MEMORY_MODE ? pool_config_.payload_initial_size : 0u;
+ 
+         // Get payload pool reference and allocate space for our history
++#ifndef FASTDDS_DATASHARING_DISABLED
+         if (is_data_sharing_compatible_)
+         {
+             payload_pool_ = DataSharingPayloadPool::get_writer_pool(pool_config_);
+         }
+         else
++#endif
+         {
+             payload_pool_ = TopicPayloadPoolRegistry::get(topic_->get_name(), pool_config_);
+             if (!std::static_pointer_cast<ITopicPayloadPool>(payload_pool_)->reserve_history(pool_config_, false))
+@@ -2350,6 +2356,17 @@ ReturnCode_t DataWriterImpl::check_datasharing_compatible(
+         const WriterAttributes& writer_attributes,
+         bool& is_datasharing_compatible) const
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    static_cast<void>(writer_attributes);
++    is_datasharing_compatible = false;
++    if (qos_.data_sharing().kind() == DataSharingKind::ON)
++    {
++        EPROSIMA_LOG_ERROR(DATA_WRITER,
++                "Fast DDS DataSharing is not part of the VelaROS static profile; use openVela uORB locally.");
++        return RETCODE_UNSUPPORTED;
++    }
++    return RETCODE_OK;
++#else
+ 
+ #if HAVE_SECURITY
+     bool has_security_enabled = publisher_->rtps_participant()->is_security_enabled_for_writer(writer_attributes);
+@@ -2436,6 +2453,7 @@ ReturnCode_t DataWriterImpl::check_datasharing_compatible(
+             EPROSIMA_LOG_ERROR(DATA_WRITER, "Unknown data sharing kind.");
+             return RETCODE_BAD_PARAMETER;
+     }
++#endif
+ }
+ 
+ void DataWriterImpl::remove_reader_filter(
+diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/publisher/DataWriterImpl.hpp b/fastdds/Fast-DDS/src/cpp/fastdds/publisher/DataWriterImpl.hpp
+index e0db076..f57c680 100644
+--- a/fastdds/Fast-DDS/src/cpp/fastdds/publisher/DataWriterImpl.hpp
++++ b/fastdds/Fast-DDS/src/cpp/fastdds/publisher/DataWriterImpl.hpp
+@@ -44,7 +44,6 @@
+ 
+ #include <fastdds/publisher/DataWriterHistory.hpp>
+ #include <fastdds/publisher/filtering/ReaderFilterCollection.hpp>
+-#include <rtps/DataSharing/DataSharingPayloadPool.hpp>
+ #include <rtps/history/ITopicPayloadPool.h>
+ #include <rtps/history/PoolConfig.h>
+ 
+diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/subscriber/DataReaderImpl/ReadTakeCommand.hpp b/fastdds/Fast-DDS/src/cpp/fastdds/subscriber/DataReaderImpl/ReadTakeCommand.hpp
+index 19991b7..2f28f93 100644
+--- a/fastdds/Fast-DDS/src/cpp/fastdds/subscriber/DataReaderImpl/ReadTakeCommand.hpp
++++ b/fastdds/Fast-DDS/src/cpp/fastdds/subscriber/DataReaderImpl/ReadTakeCommand.hpp
+@@ -40,7 +40,9 @@
+ 
+ #include <rtps/reader/BaseReader.hpp>
+ #include <rtps/reader/WriterProxy.h>
++#ifndef FASTDDS_DATASHARING_DISABLED
+ #include <rtps/DataSharing/DataSharingPayloadPool.hpp>
++#endif
+ 
+ 
+ namespace eprosima {
+@@ -55,7 +57,9 @@ struct ReadTakeCommand
+     using RTPSReader = eprosima::fastdds::rtps::RTPSReader;
+     using WriterProxy = eprosima::fastdds::rtps::WriterProxy;
+     using SampleInfoSeq = LoanableTypedCollection<SampleInfo>;
++#ifndef FASTDDS_DATASHARING_DISABLED
+     using DataSharingPayloadPool = eprosima::fastdds::rtps::DataSharingPayloadPool;
++#endif
+ 
+     ReadTakeCommand(
+             DataReaderImpl& reader,
+@@ -460,6 +464,11 @@ private:
+             CacheChange_t* change,
+             bool has_ownership)
+     {
++#ifdef FASTDDS_DATASHARING_DISABLED
++        static_cast<void>(change);
++        static_cast<void>(has_ownership);
++        return true;
++#else
+         bool is_valid = true;
+         if (has_ownership)  //< On loans the user must check the validity anyways
+         {
+@@ -480,6 +489,7 @@ private:
+         }
+ 
+         return true;
++#endif
+     }
+ 
+ };
+diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/subscriber/DataReaderImpl.cpp b/fastdds/Fast-DDS/src/cpp/fastdds/subscriber/DataReaderImpl.cpp
+index c96a86c..8c7b9e1 100644
+--- a/fastdds/Fast-DDS/src/cpp/fastdds/subscriber/DataReaderImpl.cpp
++++ b/fastdds/Fast-DDS/src/cpp/fastdds/subscriber/DataReaderImpl.cpp
+@@ -1923,6 +1923,17 @@ ReturnCode_t DataReaderImpl::check_datasharing_compatible(
+         const ReaderAttributes& reader_attributes,
+         bool& is_datasharing_compatible) const
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    static_cast<void>(reader_attributes);
++    is_datasharing_compatible = false;
++    if (qos_.data_sharing().kind() == DataSharingKind::ON)
++    {
++        EPROSIMA_LOG_ERROR(DATA_READER,
++                "Fast DDS DataSharing is not part of the VelaROS static profile; use openVela uORB locally.");
++        return RETCODE_UNSUPPORTED;
++    }
++    return RETCODE_OK;
++#else
+ #if HAVE_SECURITY
+     bool has_security_enabled = subscriber_->rtps_participant()->is_security_enabled_for_reader(reader_attributes);
+ #else
+@@ -1988,6 +1999,7 @@ ReturnCode_t DataReaderImpl::check_datasharing_compatible(
+             EPROSIMA_LOG_ERROR(DATA_READER, "Unknown data sharing kind.");
+             return RETCODE_BAD_PARAMETER;
+     }
++#endif
+ }
+ 
+ bool DataReaderImpl::is_sample_valid(
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/attributes/RTPSParticipantAttributes.cpp b/fastdds/Fast-DDS/src/cpp/rtps/attributes/RTPSParticipantAttributes.cpp
+index aaea282..28f86b3 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/attributes/RTPSParticipantAttributes.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/attributes/RTPSParticipantAttributes.cpp
+@@ -25,12 +25,12 @@
+ #include <fastdds/rtps/transport/TCPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv6TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/UDPv6TransportDescriptor.hpp>
++#include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
++#include <rtps/transport/shared_mem/SHMLocator.hpp>
+ #endif
+ #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
+-#include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
+ #include <fastdds/utils/IPLocator.hpp>
+ 
+-#include <rtps/transport/shared_mem/SHMLocator.hpp>
+ #include <xmlparser/XMLProfileManager.h>
+ 
+ namespace eprosima {
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomainImpl.hpp b/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomainImpl.hpp
+index 75b841d..fa03116 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomainImpl.hpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomainImpl.hpp
+@@ -33,7 +33,9 @@
+ #include <rtps/reader/BaseReader.hpp>
+ #include <rtps/reader/LocalReaderPointer.hpp>
+ #include <rtps/writer/BaseWriter.hpp>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <utils/shared_memory/BoostAtExitRegistry.hpp>
++#endif
+ #include <utils/SystemInfo.hpp>
+ 
+ #if HAVE_SECURITY
+@@ -199,9 +201,11 @@ private:
+     void removeRTPSParticipant_nts(
+             t_p_RTPSParticipant&);
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     std::shared_ptr<eprosima::detail::BoostAtExitRegistry> boost_singleton_handler_ { eprosima::detail::
+                                                                                               BoostAtExitRegistry::
+                                                                                               get_instance() };
++#endif
+ #if HAVE_SECURITY
+     std::shared_ptr<security::OpenSSLInit> openssl_singleton_handler_{ security::OpenSSLInit::get_instance() };
+ #endif // HAVE_SECURITY
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/participant/RTPSParticipantImpl.cpp b/fastdds/Fast-DDS/src/cpp/rtps/participant/RTPSParticipantImpl.cpp
+index e666220..5018952 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/participant/RTPSParticipantImpl.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/participant/RTPSParticipantImpl.cpp
+@@ -38,8 +38,8 @@
+ #include <fastdds/rtps/participant/RTPSParticipantListener.hpp>
+ #include <fastdds/rtps/reader/ReaderDiscoveryStatus.hpp>
+ #include <fastdds/rtps/RTPSDomain.hpp>
+-#include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
+ #ifndef FASTDDS_VELAROS_STATIC_PROFILE
++#include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv6TransportDescriptor.hpp>
+ #endif
+@@ -58,7 +58,9 @@
+ #include <rtps/builtin/discovery/participant/PDPSimple.h>
+ #include <rtps/builtin/discovery/participant/simple/PDPStatelessWriter.hpp>
+ #include <rtps/builtin/liveliness/WLP.hpp>
++#ifndef FASTDDS_DATASHARING_DISABLED
+ #include <rtps/DataSharing/WriterPool.hpp>
++#endif
+ #include <rtps/history/BasicPayloadPool.hpp>
+ #include <rtps/messages/MessageReceiver.h>
+ #include <rtps/network/utils/external_locators.hpp>
+@@ -538,11 +540,14 @@ bool RTPSParticipantImpl::setup_transports()
+ 
+         if (transport_registered)
+         {
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+             has_shm_transport_ |=
+                     (nullptr != dynamic_cast<SharedMemTransportDescriptor*>(transportDescriptor.get()));
++#endif
+         }
+         else
+         {
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+             // SHM transport could be disabled
+             if ((nullptr != dynamic_cast<SharedMemTransportDescriptor*>(transportDescriptor.get())))
+             {
+@@ -551,6 +556,7 @@ bool RTPSParticipantImpl::setup_transports()
+                         " the current platform.");
+             }
+             else
++#endif
+             {
+                 EPROSIMA_LOG_ERROR(RTPS_PARTICIPANT,
+                         "User transport failed to register.");
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/reader/BaseReader.cpp b/fastdds/Fast-DDS/src/cpp/rtps/reader/BaseReader.cpp
+index f3d8029..f62adfc 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/reader/BaseReader.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/reader/BaseReader.cpp
+@@ -37,9 +37,13 @@
+ #include <fastdds/rtps/reader/RTPSReader.hpp>
+ 
+ #include <rtps/builtin/data/WriterProxyData.hpp>
++#ifdef FASTDDS_DATASHARING_DISABLED
++#include <rtps/DataSharing/IDataSharingListener.hpp>
++#else
+ #include <rtps/DataSharing/DataSharingListener.hpp>
+ #include <rtps/DataSharing/DataSharingNotification.hpp>
+ #include <rtps/DataSharing/DataSharingPayloadPool.hpp>
++#endif
+ #include <rtps/history/BasicPayloadPool.hpp>
+ #include <rtps/history/CacheChangePool.h>
+ #include <rtps/participant/RTPSParticipantImpl.hpp>
+@@ -239,6 +243,12 @@ bool BaseReader::is_sample_valid(
+         const fastdds::rtps::GUID_t& writer,
+         const fastdds::rtps::SequenceNumber_t& sn) const
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    static_cast<void>(data);
++    static_cast<void>(writer);
++    static_cast<void>(sn);
++    return true;
++#else
+     if (is_datasharing_compatible_ && datasharing_listener_->writer_is_matched(writer))
+     {
+         // Check if the payload is dirty
+@@ -251,6 +261,7 @@ bool BaseReader::is_sample_valid(
+         }
+     }
+     return true;
++#endif
+ }
+ 
+ BaseReader* BaseReader::downcast(
+@@ -502,6 +513,10 @@ void BaseReader::persist_last_notified_nts(
+ bool BaseReader::is_datasharing_compatible_with(
+         const fastdds::rtps::WriterProxyData& wdata)
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    static_cast<void>(wdata);
++    return false;
++#else
+     if (!is_datasharing_compatible_ ||
+             wdata.data_sharing.kind() == fastdds::dds::DataSharingKind::OFF)
+     {
+@@ -519,6 +534,7 @@ bool BaseReader::is_datasharing_compatible_with(
+     }
+ 
+     return false;
++#endif
+ }
+ 
+ void BaseReader::init(
+@@ -541,7 +557,9 @@ void BaseReader::init(
+ void BaseReader::setup_datasharing(
+         const fastdds::rtps::ReaderAttributes& att)
+ {
+-
++#ifdef FASTDDS_DATASHARING_DISABLED
++    static_cast<void>(att);
++#else
+     if (att.endpoint.data_sharing_configuration().kind() != fastdds::dds::DataSharingKind::OFF)
+     {
+         std::shared_ptr<DataSharingNotification> notification = DataSharingNotification::create_notification(
+@@ -562,6 +580,7 @@ void BaseReader::setup_datasharing(
+             datasharing_listener_->start();
+         }
+     }
++#endif
+ }
+ 
+ }  // namespace rtps
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/reader/StatefulReader.cpp b/fastdds/Fast-DDS/src/cpp/rtps/reader/StatefulReader.cpp
+index 34265c2..e052128 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/reader/StatefulReader.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/reader/StatefulReader.cpp
+@@ -34,8 +34,12 @@
+ #include "rtps/domain/RTPSDomainImpl.hpp"
+ #include <rtps/builtin/BuiltinProtocols.h>
+ #include <rtps/builtin/liveliness/WLP.hpp>
++#ifdef FASTDDS_DATASHARING_DISABLED
++#include <rtps/DataSharing/IDataSharingListener.hpp>
++#else
+ #include <rtps/DataSharing/DataSharingListener.hpp>
+ #include <rtps/DataSharing/ReaderPool.hpp>
++#endif
+ #include <rtps/history/HistoryAttributesExtension.hpp>
+ #include <rtps/messages/RTPSMessageGroup.hpp>
+ #include <rtps/participant/RTPSParticipantImpl.hpp>
+@@ -295,6 +299,7 @@ bool StatefulReader::matched_writer_add_edp(
+             }
+         }
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+         if (is_datasharing)
+         {
+             if (datasharing_listener_->add_datasharing_writer(wdata.guid,
+@@ -340,6 +345,7 @@ bool StatefulReader::matched_writer_add_edp(
+             }
+         }
+         else
++#endif
+         {
+             matched_writers_.push_back(wp);
+             EPROSIMA_LOG_INFO(RTPS_READER, "Writer Proxy " << wp->guid() << " added to " << m_guid.entityId);
+@@ -634,6 +640,7 @@ bool StatefulReader::process_data_msg(
+             // Copy metadata to reserved change
+             change_to_add->copy_not_memcpy(change);
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+             if (is_datasharing_compatible_ && datasharing_listener_->writer_is_matched(change->writerGUID))
+             {
+                 // We may receive the change from the listener (with owner a ReaderPool) or intraprocess (with owner a WriterPool)
+@@ -651,7 +658,9 @@ bool StatefulReader::process_data_msg(
+                 }
+                 datasharing_pool->get_datasharing_change(change->serializedPayload, *change_to_add);
+             }
+-            else if (change->serializedPayload.length == 0 && change->kind != ChangeKind_t::ALIVE &&
++            else
++#endif
++            if (change->serializedPayload.length == 0 && change->kind != ChangeKind_t::ALIVE &&
+                     change->instanceHandle.isDefined())
+             {
+                 // A UNREGISTER or DISPOSE status change was sent without payload, but calling get_payload with size 0 might fail
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/reader/StatelessReader.cpp b/fastdds/Fast-DDS/src/cpp/rtps/reader/StatelessReader.cpp
+index e9ab68c..f070444 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/reader/StatelessReader.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/reader/StatelessReader.cpp
+@@ -32,8 +32,12 @@
+ #include "rtps/domain/RTPSDomainImpl.hpp"
+ #include <rtps/builtin/BuiltinProtocols.h>
+ #include <rtps/builtin/liveliness/WLP.hpp>
++#ifdef FASTDDS_DATASHARING_DISABLED
++#include <rtps/DataSharing/IDataSharingListener.hpp>
++#else
+ #include <rtps/DataSharing/DataSharingListener.hpp>
+ #include <rtps/DataSharing/ReaderPool.hpp>
++#endif
+ #include <rtps/participant/RTPSParticipantImpl.hpp>
+ #include <rtps/reader/StatelessReader.hpp>
+ #include <rtps/writer/LivelinessManager.hpp>
+@@ -641,6 +645,7 @@ bool StatelessReader::process_data_msg(
+             // Copy metadata to reserved change
+             change_to_add->copy_not_memcpy(change);
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+             bool is_datasharing = std::any_of(matched_writers_.begin(), matched_writers_.end(),
+                             [&change](const RemoteWriterInfo_t& writer)
+                             {
+@@ -664,7 +669,9 @@ bool StatelessReader::process_data_msg(
+                 }
+                 datasharing_pool->get_datasharing_change(change->serializedPayload, *change_to_add);
+             }
+-            else if (change->serializedPayload.length == 0 && change->kind != ChangeKind_t::ALIVE &&
++            else
++#endif
++            if (change->serializedPayload.length == 0 && change->kind != ChangeKind_t::ALIVE &&
+                     change->instanceHandle.isDefined())
+             {
+                 // A UNREGISTER or DISPOSE status change was sent without payload, but calling get_payload with size 0 might fail
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/writer/BaseWriter.cpp b/fastdds/Fast-DDS/src/cpp/rtps/writer/BaseWriter.cpp
+index b1ec8c1..9dc7a45 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/writer/BaseWriter.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/writer/BaseWriter.cpp
+@@ -51,7 +51,9 @@
+ #include <fastdds/utils/TimedMutex.hpp>
+ 
+ #include <rtps/builtin/data/ReaderProxyData.hpp>
++#ifndef FASTDDS_DATASHARING_DISABLED
+ #include <rtps/DataSharing/WriterPool.hpp>
++#endif
+ #include <rtps/flowcontrol/FlowController.hpp>
+ #include <rtps/participant/RTPSParticipantImpl.hpp>
+ #include <rtps/writer/LocatorSelectorSender.hpp>
+@@ -289,12 +291,20 @@ void BaseWriter::liveliness_lost()
+ 
+ bool BaseWriter::is_datasharing_compatible() const
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    return false;
++#else
+     return (m_att.data_sharing_configuration().kind() != dds::OFF);
++#endif
+ }
+ 
+ bool BaseWriter::is_datasharing_compatible_with(
+         const dds::DataSharingQosPolicy& qos) const
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    static_cast<void>(qos);
++    return false;
++#else
+     if (!is_datasharing_compatible() || qos.kind() == fastdds::dds::OFF)
+     {
+         return false;
+@@ -310,6 +320,7 @@ bool BaseWriter::is_datasharing_compatible_with(
+         }
+     }
+     return false;
++#endif
+ }
+ 
+ SequenceNumber_t BaseWriter::get_seq_num_min()
+@@ -399,6 +410,7 @@ void BaseWriter::init(
+         fixed_payload_size_ = history_->m_att.payloadMaxSize;
+     }
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+     if (att.endpoint.data_sharing_configuration().kind() != dds::OFF)
+     {
+         std::shared_ptr<WriterPool> pool = std::dynamic_pointer_cast<WriterPool>(history_->get_payload_pool());
+@@ -407,6 +419,7 @@ void BaseWriter::init(
+             EPROSIMA_LOG_ERROR(RTPS_WRITER, "Could not initialize DataSharing writer pool");
+         }
+     }
++#endif
+ }
+ 
+ void BaseWriter::local_actions_on_writer_removed()
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/writer/PersistentWriter.cpp b/fastdds/Fast-DDS/src/cpp/rtps/writer/PersistentWriter.cpp
+index aaf5c9b..854df1d 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/writer/PersistentWriter.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/writer/PersistentWriter.cpp
+@@ -21,7 +21,9 @@
+ 
+ #include <fastdds/rtps/history/WriterHistory.hpp>
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+ #include <rtps/DataSharing/WriterPool.hpp>
++#endif
+ #include <rtps/persistence/PersistenceService.h>
+ 
+ namespace eprosima {
+@@ -50,6 +52,7 @@ PersistentWriter::PersistentWriter(
+             hist->m_att.maximumReservedCaches > 0 &&
+             static_cast<int32_t>(hist->m_changes.size()) == hist->m_att.maximumReservedCaches;
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+     // Prepare the changes for datasharing if compatible
+     if (att.endpoint.data_sharing_configuration().kind() != dds::DataSharingKind::OFF)
+     {
+@@ -60,6 +63,7 @@ PersistentWriter::PersistentWriter(
+             pool->add_to_shared_history(change);
+         }
+     }
++#endif
+ }
+ 
+ PersistentWriter::~PersistentWriter()
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/writer/ReaderLocator.cpp b/fastdds/Fast-DDS/src/cpp/rtps/writer/ReaderLocator.cpp
+index fa20532..d183d55 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/writer/ReaderLocator.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/writer/ReaderLocator.cpp
+@@ -27,8 +27,10 @@
+ #include <rtps/participant/RTPSParticipantImpl.hpp>
+ #include <rtps/reader/BaseReader.hpp>
+ #include <rtps/writer/BaseWriter.hpp>
++#ifndef FASTDDS_DATASHARING_DISABLED
+ #include <rtps/DataSharing/DataSharingListener.hpp>
+ #include <rtps/DataSharing/DataSharingNotifier.hpp>
++#endif
+ #include "rtps/domain/RTPSDomainImpl.hpp"
+ 
+ namespace eprosima {
+@@ -50,20 +52,24 @@ ReaderLocator::ReaderLocator(
+     , guid_as_vector_(1u)
+     , datasharing_notifier_(nullptr)
+ {
++#ifndef FASTDDS_DATASHARING_DISABLED
+     if (owner->is_datasharing_compatible())
+     {
+         datasharing_notifier_ = new DataSharingNotifier(
+             owner->getAttributes().data_sharing_configuration().shm_directory());
+     }
++#endif
+ }
+ 
+ ReaderLocator::~ReaderLocator()
+ {
++#ifndef FASTDDS_DATASHARING_DISABLED
+     if (datasharing_notifier_)
+     {
+         delete(datasharing_notifier_);
+         datasharing_notifier_ = nullptr;
+     }
++#endif
+ }
+ 
+ bool ReaderLocator::start(
+@@ -73,6 +79,9 @@ bool ReaderLocator::start(
+         bool expects_inline_qos,
+         bool is_datasharing)
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    is_datasharing = false;
++#endif
+     if (general_locator_info_.remote_guid == c_Guid_Unknown)
+     {
+         assert(c_Guid_Unknown == async_locator_info_.remote_guid);
+@@ -101,7 +110,9 @@ bool ReaderLocator::start(
+ 
+         if (is_datasharing)
+         {
++#ifndef FASTDDS_DATASHARING_DISABLED
+             datasharing_notifier_->enable(remote_guid);
++#endif
+         }
+ 
+         return true;
+@@ -158,10 +169,12 @@ bool ReaderLocator::stop(
+ 
+ void ReaderLocator::stop()
+ {
++#ifndef FASTDDS_DATASHARING_DISABLED
+     if (datasharing_notifier_ != nullptr)
+     {
+         datasharing_notifier_->disable();
+     }
++#endif
+ 
+     general_locator_info_.enable(false);
+     general_locator_info_.reset();
+@@ -216,11 +229,16 @@ LocalReaderPointer::Instance ReaderLocator::local_reader()
+ 
+ bool ReaderLocator::is_datasharing_reader() const
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    return false;
++#else
+     return datasharing_notifier_ && datasharing_notifier_->is_enabled();
++#endif
+ }
+ 
+ void ReaderLocator::datasharing_notify()
+ {
++#ifndef FASTDDS_DATASHARING_DISABLED
+     if (is_local_reader())
+     {
+         LocalReaderPointer::Instance reader = local_reader();
+@@ -233,6 +251,7 @@ void ReaderLocator::datasharing_notify()
+     {
+         datasharing_notifier()->notify();
+     }
++#endif
+ }
+ 
+ } /* namespace rtps */
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/writer/StatefulWriter.cpp b/fastdds/Fast-DDS/src/cpp/rtps/writer/StatefulWriter.cpp
+index 84b292e..48cec6a 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/writer/StatefulWriter.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/writer/StatefulWriter.cpp
+@@ -37,9 +37,11 @@
+ 
+ #include <rtps/builtin/BuiltinProtocols.h>
+ #include <rtps/builtin/liveliness/WLP.hpp>
++#ifndef FASTDDS_DATASHARING_DISABLED
+ #include <rtps/DataSharing/DataSharingNotifier.hpp>
+ #include <rtps/DataSharing/DataSharingPayloadPool.hpp>
+ #include <rtps/DataSharing/WriterPool.hpp>
++#endif
+ #include <rtps/history/BasicPayloadPool.hpp>
+ #include <rtps/history/CacheChangePool.h>
+ #include <rtps/messages/RTPSGapBuilder.hpp>
+@@ -323,11 +325,15 @@ void StatefulWriter::local_actions_on_writer_removed()
+ void StatefulWriter::prepare_datasharing_delivery(
+         CacheChange_t* change)
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    static_cast<void>(change);
++#else
+     auto pool = std::dynamic_pointer_cast<WriterPool>(history_->get_payload_pool());
+     assert (pool != nullptr);
+ 
+     pool->add_to_shared_history(change);
+     EPROSIMA_LOG_INFO(RTPS_WRITER, "Notifying readers of cache change with SN " << change->sequenceNumber);
++#endif
+ }
+ 
+ void StatefulWriter::unsent_change_added_to_history(
+@@ -504,6 +510,7 @@ bool StatefulWriter::change_removed_by_history(
+                 }
+                 );
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+         // remove from datasharing pool history
+         if (is_datasharing_compatible())
+         {
+@@ -513,6 +520,7 @@ bool StatefulWriter::change_removed_by_history(
+             pool->remove_from_shared_history(a_change);
+             EPROSIMA_LOG_INFO(RTPS_WRITER, "Removing shared cache change with SN " << a_change->sequenceNumber);
+         }
++#endif
+ 
+         may_remove_change_ = 2;
+         may_remove_change_cond_.notify_one();
+@@ -1769,6 +1777,7 @@ bool StatefulWriter::send_periodic_heartbeat(
+                 unacked_changes = true;
+             }
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+             for (ReaderProxy* reader : matched_datasharing_readers_)
+             {
+                 auto pool = std::dynamic_pointer_cast<WriterPool>(history_->get_payload_pool());
+@@ -1777,6 +1786,7 @@ bool StatefulWriter::send_periodic_heartbeat(
+                 reader->datasharing_notify();
+                 unacked_changes = true;
+             }
++#endif
+ 
+             if (there_are_remote_readers_)
+             {
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/writer/StatelessWriter.cpp b/fastdds/Fast-DDS/src/cpp/rtps/writer/StatelessWriter.cpp
+index c86014c..af199cf 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/writer/StatelessWriter.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/writer/StatelessWriter.cpp
+@@ -34,9 +34,11 @@
+ #include "../flowcontrol/FlowController.hpp"
+ #include <rtps/builtin/BuiltinProtocols.h>
+ #include <rtps/builtin/liveliness/WLP.hpp>
++#ifndef FASTDDS_DATASHARING_DISABLED
+ #include <rtps/DataSharing/DataSharingNotifier.hpp>
+ #include <rtps/DataSharing/DataSharingPayloadPool.hpp>
+ #include <rtps/DataSharing/WriterPool.hpp>
++#endif
+ #include <rtps/history/BasicPayloadPool.hpp>
+ #include <rtps/history/CacheChangePool.h>
+ #include <rtps/history/HistoryAttributesExtension.hpp>
+@@ -258,6 +260,10 @@ void StatelessWriter::update_reader_info(
+ bool StatelessWriter::datasharing_delivery(
+         CacheChange_t* change)
+ {
++#ifdef FASTDDS_DATASHARING_DISABLED
++    static_cast<void>(change);
++    return false;
++#else
+     auto pool = std::dynamic_pointer_cast<WriterPool>(history_->get_payload_pool());
+     assert(pool != nullptr);
+ 
+@@ -271,6 +277,7 @@ bool StatelessWriter::datasharing_delivery(
+         }
+     }
+     return true;
++#endif
+ }
+ 
+ void StatelessWriter::unsent_change_added_to_history(
+@@ -342,6 +349,7 @@ bool StatelessWriter::change_removed_by_history(
+     if (flow_controller_->remove_change(change, max_blocking_time))
+     {
+ 
++#ifndef FASTDDS_DATASHARING_DISABLED
+         // remove from datasharing pool history
+         if (is_datasharing_compatible())
+         {
+@@ -351,6 +359,7 @@ bool StatelessWriter::change_removed_by_history(
+             pool->remove_from_shared_history(change);
+             EPROSIMA_LOG_INFO(RTPS_WRITER, "Removing shared cache change with SN " << change->sequenceNumber);
+         }
++#endif
+ 
+         const uint64_t sequence_number = change->sequenceNumber.to64long();
+         if (sequence_number > last_sequence_number_sent_)
+diff --git a/fastdds/Fast-DDS/src/cpp/source.cmake b/fastdds/Fast-DDS/src/cpp/source.cmake
+index c82618f..06720f0 100644
+--- a/fastdds/Fast-DDS/src/cpp/source.cmake
++++ b/fastdds/Fast-DDS/src/cpp/source.cmake
+@@ -249,6 +249,10 @@ if(FASTDDS_VELAROS_STATIC_PROFILE)
+         "/rtps/builtin/discovery/participant/timedevent/(DSClientEvent|DServerEvent)")
+     list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
+         "/rtps/transport/(tcp/|TCP|UDPv6Transport)")
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/rtps/DataSharing/")
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/rtps/transport/shared_mem/")
+ endif()
+ 
+ # Statistics support
+@@ -275,7 +279,7 @@ if (FASTDDS_STATISTICS)
+ endif()
+ 
+ # SHM Transport
+-if(IS_THIRDPARTY_BOOST_OK)
++if(IS_THIRDPARTY_BOOST_OK AND NOT FASTDDS_VELAROS_STATIC_PROFILE)
+     list(APPEND ${PROJECT_NAME}_source_files
+         ${FASTDDS_SOURCE_DIR}/rtps/transport/shared_mem/test_SharedMemTransport.cpp
+         ${FASTDDS_SOURCE_DIR}/rtps/transport/shared_mem/SharedMemTransport.cpp
+diff --git a/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParser.cpp b/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParser.cpp
+index 5b0c6b6..21ede7f 100644
+--- a/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParser.cpp
++++ b/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParser.cpp
+@@ -34,10 +34,10 @@
+ #include <fastdds/LibrarySettings.hpp>
+ #include <fastdds/rtps/attributes/ThreadSettings.hpp>
+ #include <fastdds/rtps/transport/network/NetmaskFilterKind.hpp>
+-#include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/PortBasedTransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/SocketTransportDescriptor.hpp>
+ #ifndef FASTDDS_VELAROS_STATIC_PROFILE
++#include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPTransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv4TransportDescriptor.hpp>
+ #endif
+@@ -340,8 +340,8 @@ XMLP_ret XMLParser::parseXMLTransportData(
+     auto udp_descriptor = std::dynamic_pointer_cast<fastdds::rtps::UDPTransportDescriptor>(pDescriptor);
+ #ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     auto tcp_descriptor = std::dynamic_pointer_cast<fastdds::rtps::TCPTransportDescriptor>(pDescriptor);
+-#endif
+     auto shm_descriptor = std::dynamic_pointer_cast<fastdds::rtps::SharedMemTransportDescriptor>(pDescriptor);
++#endif
+     if (udp_descriptor)
+     {
+         // Output UDP Socket
+@@ -388,6 +388,7 @@ XMLP_ret XMLParser::parseXMLTransportData(
+         }
+     }
+ #endif
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     else if (shm_descriptor)
+     {
+         ret = parseXMLCommonSharedMemTransportData(p_root, shm_descriptor);
+@@ -396,6 +397,7 @@ XMLP_ret XMLParser::parseXMLTransportData(
+             return ret;
+         }
+     }
++#endif
+ 
+     ret = parseXMLCommonTransportData(p_root, pDescriptor);
+     if (ret != XMLP_ret::XML_OK)
+@@ -1043,6 +1045,12 @@ XMLP_ret XMLParser::parseXMLCommonSharedMemTransportData(
+         tinyxml2::XMLElement* p_root,
+         sp_transport_t p_transport)
+ {
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    static_cast<void>(p_root);
++    static_cast<void>(p_transport);
++    EPROSIMA_LOG_ERROR(XMLPARSER, "SharedMem transport is disabled by the VelaROS static profile");
++    return XMLP_ret::XML_ERROR;
++#else
+     /*
+         <xs:complexType name="rtpsTransportDescriptorType">
+             <xs:all minOccurs="0">
+@@ -1121,6 +1129,7 @@ XMLP_ret XMLParser::parseXMLCommonSharedMemTransportData(
+     }
+ 
+     return ret;
++#endif
+ }
+ 
+ XMLP_ret XMLParser::parse_tls_config(
+diff --git a/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParserExtras.cpp b/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParserExtras.cpp
+index cd7bba4..0a87068 100644
+--- a/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParserExtras.cpp
++++ b/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParserExtras.cpp
+@@ -29,8 +29,8 @@
+ #include <fastdds/rtps/transport/UDPv6TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv6TransportDescriptor.hpp>
+-#endif
+ #include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
++#endif
+ 
+ #include <xmlparser/XMLParser.h>
+ #include <xmlparser/XMLParserCommon.h>
+@@ -108,11 +108,13 @@ XMLP_ret XMLParser::create_transport_descriptor_from_xml_type(
+     }
+ #endif
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     if (transport_type == SHM)
+     {
+         p_transport = std::make_shared<fastdds::rtps::SharedMemTransportDescriptor>();
+         return XMLP_ret::XML_OK;
+     }
++#endif
+ 
+     EPROSIMA_LOG_ERROR(XMLPARSER, "Unknown transport type: '" << transport_type << "'");
+     return XMLP_ret::XML_ERROR;

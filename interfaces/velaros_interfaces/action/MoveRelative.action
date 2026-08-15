@@ -1,0 +1,19 @@
+# Move a differential/mobile base by a relative planar displacement.
+# All fields have fixed wire size so the target needs no variable-length heap.
+float32 distance_m
+float32 yaw_rad
+float32 max_linear_speed_mps
+float32 max_angular_speed_rps
+---
+int8 STATUS_SUCCEEDED=0
+int8 STATUS_INVALID_GOAL=-1
+int8 STATUS_CANCELED=-2
+int8 STATUS_ACTUATION_ERROR=-3
+int8 status
+float32 traveled_m
+float32 turned_rad
+---
+float32 traveled_m
+float32 turned_rad
+float32 remaining_distance_m
+float32 remaining_yaw_rad

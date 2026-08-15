@@ -34,7 +34,7 @@ Options:
   --config PATH Board configuration directory
   --build-dir DIR  CMake output directory
   --package-dir DIR  U-Boot package output directory
-  --experimental-irq  Build the explicit K1 PLIC/GPIO IRQ configuration
+  --experimental-irq  Build an explicit K1 PLIC IRQ configuration
   --jobs N      Parallel build jobs
   -h, --help    Show this help
 
@@ -170,6 +170,12 @@ ensure_mapping \
 ensure_mapping \
   "${CONTEST_ROOT}/board/k1/muse_pi_pro" \
   "${WORKSPACE_ROOT}/vendor/spacemit/boards/k1/muse_pi_pro"
+ensure_mapping \
+  "${CONTEST_ROOT}/middleware/k1_udp_echo" \
+  "${WORKSPACE_ROOT}/external/k1_udp_echo"
+ensure_mapping \
+  "${CONTEST_ROOT}/middleware/k1_watchdog_smoke" \
+  "${WORKSPACE_ROOT}/external/k1_watchdog_smoke"
 
 mkdir -p "${CCACHE_ROOT}/tmp"
 

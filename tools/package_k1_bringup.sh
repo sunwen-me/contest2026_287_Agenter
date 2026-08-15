@@ -27,7 +27,7 @@ Options:
   --output DIR     Package output directory
   --flat PATH      Existing flat NuttX binary (optional)
   --wrapper PATH   Existing U-Boot wrapper binary (optional)
-  --experimental-irq  Package the explicit K1 PLIC/GPIO IRQ build
+  --experimental-irq  Package an explicit K1 PLIC IRQ build
   -h, --help       Show this help
 EOF
 }
@@ -105,6 +105,31 @@ install -m 0644 \
 install -m 0644 \
   "${CONTEST_ROOT}/docs/K1_HOST_TOOLING.md" \
   "${OUTPUT}/K1_HOST_TOOLING.md"
+if [[ -f "${CONTEST_ROOT}/docs/K1_USB_DISPLAY_BRINGUP.md" ]]; then
+  install -m 0644 \
+    "${CONTEST_ROOT}/docs/K1_USB_DISPLAY_BRINGUP.md" \
+    "${OUTPUT}/K1_USB_DISPLAY_BRINGUP.md"
+fi
+if [[ -f "${CONTEST_ROOT}/docs/K1_ETHERNET_DESIGN.md" ]]; then
+  install -m 0644 \
+    "${CONTEST_ROOT}/docs/K1_ETHERNET_DESIGN.md" \
+    "${OUTPUT}/K1_ETHERNET_DESIGN.md"
+fi
+if [[ -f "${CONTEST_ROOT}/docs/K1_WATCHDOG_BRINGUP.md" ]]; then
+  install -m 0644 \
+    "${CONTEST_ROOT}/docs/K1_WATCHDOG_BRINGUP.md" \
+    "${OUTPUT}/K1_WATCHDOG_BRINGUP.md"
+fi
+if [[ -f "${CONTEST_ROOT}/docs/K1_EMMC_BRINGUP.md" ]]; then
+  install -m 0644 \
+    "${CONTEST_ROOT}/docs/K1_EMMC_BRINGUP.md" \
+    "${OUTPUT}/K1_EMMC_BRINGUP.md"
+fi
+if [[ -f "${CONTEST_ROOT}/docs/K1_FLASH_RECOVERY_WORKFLOW.md" ]]; then
+  install -m 0644 \
+    "${CONTEST_ROOT}/docs/K1_FLASH_RECOVERY_WORKFLOW.md" \
+    "${OUTPUT}/K1_FLASH_RECOVERY_WORKFLOW.md"
+fi
 install -m 0644 \
   "${CONTEST_ROOT}/docs/K1_SOURCE_AND_LICENSES.md" \
   "${OUTPUT}/SOURCE_AND_LICENSES.md"
@@ -115,8 +140,19 @@ install -m 0755 \
   "${CONTEST_ROOT}/tools/console_k1_serial.py" \
   "${OUTPUT}/console_k1_serial.py"
 install -m 0755 \
+  "${CONTEST_ROOT}/tools/k1_fastboot_flash.py" \
+  "${OUTPUT}/k1_fastboot_flash.py"
+install -m 0755 \
+  "${CONTEST_ROOT}/tools/k1_flash_manifest_check.py" \
+  "${OUTPUT}/k1_flash_manifest_check.py"
+install -m 0755 \
   "${CONTEST_ROOT}/tools/decode_k1_trap.py" \
   "${OUTPUT}/decode_k1_trap.py"
+if [[ -f "${CONTEST_ROOT}/tools/run_k1_ethernet_smoke.py" ]]; then
+  install -m 0755 \
+    "${CONTEST_ROOT}/tools/run_k1_ethernet_smoke.py" \
+    "${OUTPUT}/run_k1_ethernet_smoke.py"
+fi
 install -m 0644 \
   "${CONTEST_ROOT}/LICENSE" \
   "${OUTPUT}/licenses/CONTEST-LICENSE"
@@ -173,7 +209,7 @@ cat >"${OUTPUT}/PACKAGE_MANIFEST.txt" <<EOF
 Target: MUSE Pi Pro (SpacemiT K1)
 Payload: nuttx
 Validation profile: $([[ "${EXPERIMENTAL_IRQ}" == 1 ]] &&
-  printf 'experimental K1 GPIO IRQ' || printf 'initial bring-up')
+  printf 'experimental K1 PLIC IRQ' || printf 'initial bring-up')
 ELF staging address: 0x12000000
 ELF entry/PT_LOAD base: 0x11000000
 ELF size: ${ELF_SIZE} bytes (${ELF_SIZE_HEX})
@@ -194,10 +230,18 @@ Files:
   K1_UBOOT_BRINGUP.md       Bring-up and recovery guide
   TEST_RECORD.md            First-board evidence template
   K1_HOST_TOOLING.md        Serial capture, trap decode and CI commands
+  K1_USB_DISPLAY_BRINGUP.md USB/display scope and real-board test procedure
+  K1_ETHERNET_DESIGN.md     Ethernet implementation and board evidence
+  K1_WATCHDOG_BRINGUP.md    K1 watchdog safety boundary and smoke procedure
+  K1_EMMC_BRINGUP.md        K1 SDH2 eMMC bring-up and recovery procedure
+  K1_FLASH_RECOVERY_WORKFLOW.md  Guarded Fastboot workflow and FDL boundary
   SOURCE_AND_LICENSES.md    Source provenance and license inventory
   capture_k1_serial.py      Standalone raw serial capture tool
   console_k1_serial.py      Interactive raw serial console
+  k1_fastboot_flash.py      Guarded Fastboot write/reboot verification
+  k1_flash_manifest_check.py Read-only image/recovery manifest preflight
   decode_k1_trap.py         Standalone trap parser/symbolizer
+  run_k1_ethernet_smoke.py  RAM-only ICMP/UDP Ethernet smoke test (when included)
   licenses/                 Contest and NuttX license/notice files
 EOF
 

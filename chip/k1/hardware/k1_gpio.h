@@ -14,6 +14,7 @@
 /* K1 APB clock and reset controller. */
 
 #define K1_APBC_BASE                    0xd4015000ul
+#define K1_APBC_UART2_CLK_RST           (K1_APBC_BASE + 0x004ul)
 #define K1_APBC_GPIO_CLK_RST            (K1_APBC_BASE + 0x008ul)
 #define K1_APBC_AIB_CLK_RST             (K1_APBC_BASE + 0x03cul)
 #define K1_APBC_ASFAR                   (K1_APBC_BASE + 0x050ul)
@@ -27,6 +28,15 @@
 #define K1_CLK_BUS_ENABLE               (1ul << 0)
 #define K1_CLK_FUNCTION_ENABLE          (1ul << 1)
 #define K1_CLK_RESET                    (1ul << 2)
+
+/* UART clock-select field.  The Linux K1 clock driver selects the slow
+ * 14.7456 MHz UART parent with value 1, which gives an exact 115200 baud
+ * divisor of eight.
+ */
+
+#define K1_APBC_UART_CLK_SEL_SHIFT       4
+#define K1_APBC_UART_CLK_SEL_MASK        (7ul << K1_APBC_UART_CLK_SEL_SHIFT)
+#define K1_APBC_UART_CLK_SEL_SLOW_14M    (1ul << K1_APBC_UART_CLK_SEL_SHIFT)
 
 /* K1 multi-function pin registers.  The offsets follow the Linux mainline
  * spacemit_k1_pin_to_offset() mapping.  GPIO91 and GPIO92 are after a
@@ -67,6 +77,19 @@
 #define K1_MFPR_GPIO50                  (K1_MFPR_BASE + 0x0ccul)
 #define K1_MFPR_GPIO51                  (K1_MFPR_BASE + 0x0d0ul)
 #define K1_MFPR_GPIO52                  (K1_MFPR_BASE + 0x0d4ul)
+#define K1_MFPR_GPIO15                  (K1_MFPR_BASE + 0x040ul)
+#define K1_MFPR_GPIO16                  (K1_MFPR_BASE + 0x044ul)
+#define K1_MFPR_GPIO17                  (K1_MFPR_BASE + 0x048ul)
+#define K1_MFPR_GPIO18                  (K1_MFPR_BASE + 0x04cul)
+#define K1_MFPR_GPIO19                  (K1_MFPR_BASE + 0x050ul)
+#define K1_MFPR_GPIO20                  (K1_MFPR_BASE + 0x054ul)
+#define K1_MFPR_GPIO21                  (K1_MFPR_BASE + 0x058ul)
+#define K1_MFPR_GPIO22                  (K1_MFPR_BASE + 0x05cul)
+#define K1_MFPR_GPIO23                  (K1_MFPR_BASE + 0x060ul)
+#define K1_MFPR_GPIO24                  (K1_MFPR_BASE + 0x064ul)
+#define K1_MFPR_GPIO63                  (K1_MFPR_BASE + 0x100ul)
+#define K1_MFPR_GPIO66                  (K1_MFPR_BASE + 0x10cul)
+#define K1_MFPR_GPIO67                  (K1_MFPR_BASE + 0x110ul)
 #define K1_MFPR_GPIO70                  (K1_MFPR_BASE + 0x11cul)
 #define K1_MFPR_GPIO71                  (K1_MFPR_BASE + 0x120ul)
 #define K1_MFPR_GPIO72                  (K1_MFPR_BASE + 0x124ul)
@@ -76,16 +99,31 @@
 #define K1_MFPR_GPIO76                  (K1_MFPR_BASE + 0x134ul)
 #define K1_MFPR_GPIO77                  (K1_MFPR_BASE + 0x138ul)
 #define K1_MFPR_GPIO78                  (K1_MFPR_BASE + 0x13cul)
+#define K1_MFPR_GPIO79                  (K1_MFPR_BASE + 0x140ul)
+#define K1_MFPR_GPIO84                  (K1_MFPR_BASE + 0x154ul)
+#define K1_MFPR_GPIO85                  (K1_MFPR_BASE + 0x158ul)
 #define K1_MFPR_GPIO91                  (K1_MFPR_BASE + 0x200ul)
 #define K1_MFPR_GPIO92                  (K1_MFPR_BASE + 0x204ul)
+#define K1_MFPR_GPIO116                 (K1_MFPR_BASE + 0x220ul)
+#define K1_MFPR_GPIO123                 (K1_MFPR_BASE + 0x23cul)
+#define K1_MFPR_GPIO127                 (K1_MFPR_BASE + 0x24cul)
 
 /* MFPR fields. */
 
 #define K1_MFPR_MUX_MODE0              0ul
 #define K1_MFPR_MUX_MODE1              1ul
+#define K1_MFPR_MUX_MODE2              2ul
+#define K1_MFPR_MUX_MODE3              3ul
+#define K1_MFPR_MUX_MODE4              4ul
+#define K1_MFPR_EDGE_RISE              (1ul << 4)
+#define K1_MFPR_EDGE_FALL              (1ul << 5)
 #define K1_MFPR_EDGE_CLEAR             (1ul << 6)
 #define K1_MFPR_DRIVE_1V8_DS2          (2ul << 10)
-#define K1_MFPR_DRIVE_3V3_DS1          (1ul << 10)
+/* K1 3.3 V drive codes are ordered 0, 2, 4, 6, 1, 3, 5, 7. */
+
+#define K1_MFPR_DRIVE_3V3_DS4          (1ul << 10)
+#define K1_MFPR_DRIVE_3V3_DS1          (2ul << 10)
+#define K1_MFPR_DRIVE_3V3_DS2          (4ul << 10)
 #define K1_MFPR_PULLDOWN               (1ul << 13)
 #define K1_MFPR_PULLUP                 (1ul << 14)
 #define K1_MFPR_PULL_ENABLE            (1ul << 15)

@@ -11,6 +11,7 @@ CONTEST_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="${OPENVELA_ROOT:-$(cd -- "${CONTEST_ROOT}/.." && pwd)}"
 LOCK_FILE="${SCRIPT_DIR}/velaros-dds-sources.lock"
 FASTDDS_PATCH="${SCRIPT_DIR}/patches/fastdds-3.6.1-openvela.patch"
+FASTDDS_VELAROS_PATCH="${SCRIPT_DIR}/patches/fastdds-3.6.1-velaros-no-native-shm.patch"
 LIBCXXABI_PATCH="${SCRIPT_DIR}/patches/libcxxabi-nuttx-task-group-tls.patch"
 LIBCXXABI_ROOT="${WORKSPACE_ROOT}/nuttx/libs/libxx/libcxxabi/libcxxabi"
 BACKUP_ROOT="${VELAROS_BACKUP_ROOT:-/tmp}"
@@ -25,7 +26,7 @@ usage()
 Usage: restore_velaros_dds_sources.sh [options]
 
 Options:
-  --check       Verify locked revisions and both openvela patches
+  --check       Verify locked revisions and all openvela/VelaROS patches
   --replace     Recoverably replace an existing unmarked/mismatched source tree
   -h, --help    Show this help
 
@@ -34,7 +35,8 @@ Environment:
   VELAROS_BACKUP_ROOT   replacement backup parent (default: /tmp)
 
 The script exports exact Git commits without their .git directories, applies
-the reviewed Fast DDS and libc++abi NuttX patches, and writes revision markers.
+the reviewed Fast DDS, VelaROS profile and libc++abi NuttX patches, and writes
+revision markers.
 EOF
 }
 
@@ -73,6 +75,8 @@ done
 
 [[ -f "${LOCK_FILE}" ]] || fail "source lock is missing: ${LOCK_FILE}"
 [[ -f "${FASTDDS_PATCH}" ]] || fail "Fast DDS patch is missing: ${FASTDDS_PATCH}"
+[[ -f "${FASTDDS_VELAROS_PATCH}" ]] ||
+  fail "VelaROS Fast DDS patch is missing: ${FASTDDS_VELAROS_PATCH}"
 [[ -f "${LIBCXXABI_PATCH}" ]] || fail "libc++abi patch is missing: ${LIBCXXABI_PATCH}"
 [[ -d "${WORKSPACE_ROOT}/external" ]] ||
   fail "external repository is missing under ${WORKSPACE_ROOT}"
@@ -159,8 +163,21 @@ export_revision()
 
 port_patch_is_applied()
 {
+  # The product-profile patch intentionally changes context introduced by the
+  # base port patch.  If the former reverses cleanly, it proves the latter was
+  # present when the profile patch was applied.
+  if velaros_patch_is_applied; then
+    return 0
+  fi
+
   patch --batch --silent --dry-run --reverse \
     -d "${WORKSPACE_ROOT}/external" -p1 <"${FASTDDS_PATCH}" >/dev/null 2>&1
+}
+
+velaros_patch_is_applied()
+{
+  patch --batch --silent --dry-run --reverse \
+    -d "${WORKSPACE_ROOT}/external" -p1 <"${FASTDDS_VELAROS_PATCH}" >/dev/null 2>&1
 }
 
 apply_port_patch()
@@ -173,6 +190,19 @@ apply_port_patch()
     printf 'present openvela Fast DDS port patch\n'
   else
     fail "port patch is neither applicable nor already applied"
+  fi
+}
+
+apply_velaros_patch()
+{
+  if patch --batch --silent --dry-run \
+    -d "${WORKSPACE_ROOT}/external" -p1 <"${FASTDDS_VELAROS_PATCH}" >/dev/null 2>&1; then
+    patch --batch -d "${WORKSPACE_ROOT}/external" -p1 <"${FASTDDS_VELAROS_PATCH}"
+    printf 'applied VelaROS no-native-SHM profile patch\n'
+  elif velaros_patch_is_applied; then
+    printf 'present VelaROS no-native-SHM profile patch\n'
+  else
+    fail "VelaROS profile patch is neither applicable nor already applied"
   fi
 }
 
@@ -226,6 +256,9 @@ if ((CHECK_ONLY == 1)); then
   printf 'verified %-18s %s\n' TinyXML2 "${tinyxml_version}"
   port_patch_is_applied || fail "openvela Fast DDS port patch is not applied"
   printf 'verified openvela Fast DDS port patch\n'
+  velaros_patch_is_applied ||
+    fail "VelaROS no-native-SHM profile patch is not applied"
+  printf 'verified VelaROS no-native-SHM profile patch\n'
   verify_libcxxabi_revision
   libcxxabi_patch_is_applied ||
     fail "openvela libc++abi task-group TLS patch is not applied"
@@ -246,6 +279,7 @@ export_revision Asio "${ASIO_URL}" "${ASIO_REV}" \
   "${WORKSPACE_ROOT}/external/asio/asio"
 
 apply_port_patch
+apply_velaros_patch
 apply_libcxxabi_patch
 
 printf '\nVelaROS DDS sources and runtime patches restored.\n'

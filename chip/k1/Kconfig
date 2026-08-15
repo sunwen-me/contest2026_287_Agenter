@@ -107,9 +107,254 @@ config K1_EMAC_MACADDR
 
 endif # K1_EMAC
 
+config K1_I2C
+	bool "K1 I2C controller support (polling)"
+	default n
+	select ARCH_HAVE_I2CRESET
+	select I2C
+	select I2C_POLLED
+	---help---
+		Enable the polling K1 I2C lower-half. The initial implementation
+		supports MUSE Pi Pro I2C2 at standard (100 kHz) and fast (400 kHz)
+		mode, with no I2C interrupt dependency.
+
+if K1_I2C
+
+config K1_I2C2
+	bool "K1 I2C2 (MUSE Pi Pro board EEPROM)"
+	default y
+	---help---
+		Enable I2C2 at 0xd4012000. GPIO84 and GPIO85 are configured as the
+		board's 1.8 V I2C2 SCL and SDA pins. The MUSE Pi Pro DTS describes
+		a 24C02 EEPROM at address 0x50 on this bus.
+
+config K1_I2C_POLL_TIMEOUT_USEC
+	int "K1 I2C polling timeout (microseconds)"
+	default 100000
+	range 1000 1000000
+	---help---
+		Maximum time to wait for an I2C byte phase or bus release before the
+		controller is reset and a bus recovery attempt is made.
+
+endif # K1_I2C
+
+config K1_SPI
+	bool "K1 SPI controller support (polling)"
+	default n
+	select SPI
+	---help---
+		Enable the polling K1 SPI lower-half. The initial implementation
+		supports the MUSE Pi Pro 40-pin SSP3 controller in master mode,
+		with hardware CS0 and no DMA or interrupt dependency.
+
+if K1_SPI
+
+config K1_SPI3
+	bool "K1 SPI3 (MUSE Pi Pro 40-pin header)"
+	default y
+	---help---
+		Enable SSP3 at 0xd401c000. GPIO75/76/77/78 are configured as the
+		3.3 V header SCLK, CS0, MOSI, and MISO pins in mux mode 2.
+		This controller is separate from the QSPI boot flash controller.
+
+config K1_SPI_POLL_TIMEOUT_USEC
+	int "K1 SPI polling timeout (microseconds)"
+	default 100000
+	range 1000 1000000
+	---help---
+		Maximum time to wait for TX FIFO space, RX FIFO data, or an idle
+		SSP3 controller. A timeout disables SSP3 and requires a new select.
+
+endif # K1_SPI
+
+config K1_SDIO
+	bool "K1 SDH controller support (polling PIO)"
+	default n
+	select ARCH_HAVE_SDIO
+	---help---
+		Enable the polling PIO K1 SDH lower-half.  SDH2 supports the MUSE Pi
+		Pro eMMC path and SDH1 is available for the RTL8852BS2 SDIO CMD5
+		probe.  DMA, high-speed timing, and SDHCI interrupts are not yet
+		implemented.
+
+if K1_SDIO
+
+config K1_SDIO_WIFI
+	bool "K1 SDH1 RTL8852BS2 SDIO probe"
+	default n
+	---help---
+		Enable the SDH1 1.8 V, four-bit SDIO controller instance connected to
+		the MUSE Pi Pro RTL8852BS2 Wi-Fi function.  This exposes only the
+		controller needed for the non-destructive CMD5 identification probe;
+		it does not provide an 802.11 MAC driver.
+
+endif # K1_SDIO
+
+config K1_RTL8852BS2_WIFI
+	bool "MUSE Pi Pro RTL8852BS2 Wi-Fi electrical bring-up"
+	default n
+	depends on K1_SDIO_WIFI
+	---help---
+		Configure the RTL8852BS2 power sequence and SDH1 pinmux, then issue
+		an SDIO CMD5 probe.  It deliberately does not load Realtek firmware,
+		register a network device, or claim working Wi-Fi connectivity.
+
+config K1_RTL8852BS2_BT
+	bool "MUSE Pi Pro RTL8852BS2 Bluetooth H4 transport (experimental)"
+	default n
+	depends on K1_PLIC && DRIVERS_BLUETOOTH && BLUETOOTH_UART && \
+		BLUETOOTH_UART_OTHER
+	select UART_BTH4
+	---help---
+		Configure the RTL8852BS2 reset sequence, UART2 pinmux, and H4 UART
+		lower-half.  UART2 uses PLIC source 44 and writes its own IER only;
+		UART0 remains the protected polling console.  The RTL8852BS2 vendor
+		firmware download is not implemented, so this is an experimental
+		transport bring-up and not a claim of usable Bluetooth.
+
+config K1_BT_UART_TX_TIMEOUT_USEC
+	int "UART2 Bluetooth transmit timeout (microseconds)"
+	default 100000
+	range 1000 1000000
+	depends on K1_RTL8852BS2_BT
+	---help---
+		Maximum time an H4 frame write waits for UART2 transmitter space.
+		This bounds failure when the controller keeps CTS asserted during an
+		incomplete vendor-firmware bring-up.
+
+config K1_PWM
+	bool "K1 PWM controller support"
+	default n
+	select PWM
+	---help---
+		Enable the PXA-style K1 PWM lower-half. The initial implementation
+		supports only PWM11 on MUSE Pi Pro 40-pin header Pin 3, with no
+		DMA, PLIC, pulse-count, fixed-point frequency, or multichannel
+		dependency.
+
+if K1_PWM
+
+config K1_PWM11
+	bool "K1 PWM11 (MUSE Pi Pro 40-pin Pin 3)"
+	default y
+	---help---
+		Enable PWM11 at 0xd4020c00. GPIO41 is configured in mux mode 4 for
+		PWM output. The MUSE Pi Pro routes this SoC 1.8 V pad through a
+		level shifter to the 3.3 V 40-pin Pin 3.
+
+endif # K1_PWM
+
+config K1_WATCHDOG
+	bool "K1 watchdog support"
+	depends on WATCHDOG && !WATCHDOG_AUTOMONITOR
+	default n
+	---help---
+		Enable the K1 on-chip watchdog lower-half at 0xd4080000. The
+		driver exposes /dev/watchdog0 and supports start, stop, keepalive,
+		settimeout, and status operations in reset mode only. It deliberately
+		does not provide an automonitor timer source, so keep it disabled
+		unless using the dedicated watchdog validation image.
+
+config K1_FB
+	bool "K1 inherited U-Boot framebuffer"
+	depends on DRIVERS_VIDEO && VIDEO_FB
+	default n
+	---help---
+		Register /dev/fb0 over the framebuffer allocated and configured by
+		U-Boot. This profile does not initialize the K1 DPU, HDMI, MIPI, or
+		panel bridge; it is the first display-memory validation step.
+
+if K1_FB
+
+config K1_FB_BASE
+	hex "K1 framebuffer physical base"
+	default 0x7f700000
+
+config K1_FB_XRES
+	int "K1 framebuffer horizontal resolution"
+	default 800
+	range 1 65535
+
+config K1_FB_YRES
+	int "K1 framebuffer vertical resolution"
+	default 480
+	range 1 65535
+
+config K1_FB_BPP
+	int "K1 framebuffer bits per pixel"
+	default 32
+	range 16 32
+
+endif # K1_FB
+
+config K1_USBDEV
+	bool "K1 MV/ChipIdea USB2 device controller"
+	default n
+	depends on USBDEV
+	depends on !K1_USB_HOST_GLUE
+	select USBDEV_DUALSPEED
+	---help---
+		Enable the K1 USB2 MV/ChipIdea USB device controller at
+		0xc0900100. This controller is independent of the DWC3 host
+		controller and is intended for CDC-ACM and other USB gadget classes.
+
+if K1_USBDEV
+
+config K1_USBDEV_IRQ
+	int "K1 USB device PLIC interrupt"
+	default 105
+	range 1 1023
+	---help---
+		PLIC interrupt assigned to the K1 MV USB device controller.
+
+endif # K1_USBDEV
+
+config K1_USB_PROBE
+	bool "K1 DWC3 and PHY register probe"
+	default n
+	---help---
+		Enable the USB30 clock, reset releases, and USB2 PHY before probing
+		the K1 DWC3 controller and its USB2/USB3 PHY blocks. The K1 bus faults
+		DWC3 reads while USB30 is clock-gated. This does not register a NuttX
+		USB host or device controller;
+		full DWC3 xHCI/DCD integration requires the event-ring and TRB layer.
+
+config K1_USB_HOST_GLUE
+	bool "K1 DWC3 host glue and USB2 PHY bring-up"
+	default n
+	---help---
+		Enable the K1 USB30 clock/reset and USB2 PHY initialization, then select
+		DWC3 host role. The profile deliberately leaves xHCI stopped and does
+		not enumerate devices until a non-PCI xHCI HCD with TRB/event-ring
+		support is integrated. VBUS GPIO79, Hub power GPIO127, and Hub reset
+		GPIO123 remain inherited from U-Boot.
+
+if K1_USB_HOST_GLUE
+
+config K1_USB_IRQ
+	int "K1 DWC3/xHCI PLIC interrupt"
+	default 125
+	range 1 1023
+	---help---
+		PLIC interrupt used by the K1 DWC3 controller. The MUSE Pi Pro device
+		tree assigns interrupt 125 to the USB30 controller.
+
+config K1_USB_HOST_POWER
+	bool "MUSE Pi Pro USB-A VBUS and hub power/reset"
+	default n
+	depends on USBHOST_XHCI_K1
+	---help---
+		Give the K1 USB host profile explicit ownership of the MUSE Pi Pro
+		USB-A path: GPIO79 enables 5 V VBUS, GPIO127 enables USB2817 hub
+		power, and GPIO123 releases the hub's active-low reset. This does
+		not enable USB hub enumeration by itself.
+
+endif # K1_USB_HOST_GLUE
+
 config K1_INITIAL_BRINGUP
 	bool
 	default y
+	select ARCH_HAVE_RESET
 	select ALARM_ARCH
 	select ONESHOT
 	select ONESHOT_COUNT

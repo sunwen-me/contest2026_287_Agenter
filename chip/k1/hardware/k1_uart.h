@@ -22,11 +22,34 @@
 #define K1_UART_REG_SHIFT     2
 #define K1_UART_RBR_OFFSET    (0u << K1_UART_REG_SHIFT)
 #define K1_UART_THR_OFFSET    (0u << K1_UART_REG_SHIFT)
+#define K1_UART_DLL_OFFSET    (0u << K1_UART_REG_SHIFT)
 #define K1_UART_IER_OFFSET    (1u << K1_UART_REG_SHIFT)
+#define K1_UART_DLM_OFFSET    (1u << K1_UART_REG_SHIFT)
+#define K1_UART_IIR_OFFSET    (2u << K1_UART_REG_SHIFT)
+#define K1_UART_FCR_OFFSET    (2u << K1_UART_REG_SHIFT)
+#define K1_UART_LCR_OFFSET    (3u << K1_UART_REG_SHIFT)
+#define K1_UART_MCR_OFFSET    (4u << K1_UART_REG_SHIFT)
 #define K1_UART_LSR_OFFSET    (5u << K1_UART_REG_SHIFT)
+
+#define K1_UART_IER_RDA       (1u << 0)
+
+#define K1_UART_IIR_NO_INT    (1u << 0)
+
+#define K1_UART_FCR_FIFO_EN   (1u << 0)
+#define K1_UART_FCR_RXRST     (1u << 1)
+#define K1_UART_FCR_TXRST     (1u << 2)
+#define K1_UART_FCR_TRIG_14   (3u << 6)
+
+#define K1_UART_LCR_WLS_8     (3u << 0)
+#define K1_UART_LCR_DLAB      (1u << 7)
+
+#define K1_UART_MCR_RTS       (1u << 1)
+#define K1_UART_MCR_AFCE      (1u << 5)
 
 #define K1_UART_LSR_DR        (1u << 0)
 #define K1_UART_LSR_THRE      (1u << 5)
 #define K1_UART_LSR_TEMT      (1u << 6)
+
+#define K1_UART2_CLOCK_HZ     14745600ul
 
 #endif /* __CHIP_K1_HARDWARE_K1_UART_H */

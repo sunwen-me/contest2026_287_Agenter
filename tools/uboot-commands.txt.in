@@ -1,55 +1,29 @@
 # MUSE Pi Pro K1 first-boot command sheet
 #
-# Host ELF size:   @ELF_SIZE@ bytes (@ELF_SIZE_HEX@)
-# Host ELF SHA256: @ELF_SHA256@
+# Host ELF size:       @ELF_SIZE@ bytes (@ELF_SIZE_HEX@)
+# Host ELF SHA256:     @ELF_SHA256@
+# Flat payload size:   @FLAT_SIZE@ bytes (@FLAT_SIZE_HEX@)
+# Flat payload SHA256: @FLAT_SHA256@
+# Wrapper size:        @WRAPPER_SIZE@ bytes
+# Wrapper SHA256:      @WRAPPER_SHA256@
 #
 # Safety:
 # - Keep the original bootable SD card available.
 # - Do not run saveenv or replace bootcmd during first bring-up.
-# - Load the ELF file at 0x12000000. bootelf places its PT_LOAD segments
-#   beginning at 0x11000000.
+# - The real board path loads a flat NuttX payload at 0x11000000 and a
+#   RAM-only wrapper at 0x12000000. It does not modify U-Boot environment.
 
-setenv k1_elf_addr 0x12000000
-setenv k1_elf_size @ELF_SIZE_HEX@
+setenv k1_wrapper_addr 0x12000000
+setenv k1_flat_addr 0x11000000
 
-# Inspect the board before loading anything.
-version
-bdinfo
-mmc list
-mmc dev 0
-part list mmc 0
-help bootelf
-help wdt
-
-# Choose ONE load method after confirming the real device and partition.
-
-# Reference dedicated SD layout: ext4 bootfs on mmc 0:5.
-ext4ls mmc 0:5 /
-ext4ls mmc 0:5 /musepi
-ext4load mmc 0:5 ${k1_elf_addr} /musepi/nuttx
-
-# Generic FAT alternative:
-# fatls mmc 0:1 /
-# fatload mmc 0:1 ${k1_elf_addr} nuttx
-
-# TFTP alternative:
-# setenv serverip <server-ip>
-# setenv ipaddr <board-ip>
-# tftpboot ${k1_elf_addr} nuttx
-
-# Verify that the transferred byte count matches @ELF_SIZE@.
-echo loaded=${filesize} expected=${k1_elf_size}
-
-# If the hash command is available, compare its output with:
-# @ELF_SHA256@
-hash sha256 ${k1_elf_addr} ${k1_elf_size}
-
-# Stop the two watchdogs used by the reference K1 U-Boot when these device
-# names are present. If a command fails, record the output before continuing.
+# The real board uses eMMC bootfs mmc 2:5. Type PMIC_WDT exactly.
 wdt dev PMIC_WDT
 wdt stop
 wdt dev watchdog@D4080000
 wdt stop
 
-# Start the ELF. This command does not persistently modify U-Boot variables.
-bootelf -p ${k1_elf_addr}
+ext4load mmc 2:5 ${k1_wrapper_addr} /musepi/k1-go-wrapper.bin
+ext4load mmc 2:5 ${k1_flat_addr} /musepi/contest-nuttx-flat.bin
+
+# The wrapper supplies a0=hart 0/a1=0 and jumps to 0x11000000.
+go ${k1_wrapper_addr}
