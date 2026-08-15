@@ -95,7 +95,13 @@ def main() -> int:
                 if not readable:
                     continue
 
-                data = os.read(fd, 4096)
+                try:
+                    data = os.read(fd, 4096)
+                except BlockingIOError:
+                    # A serial driver can drain its receive queue after
+                    # select() reports readiness.
+                    continue
+
                 if not data:
                     continue
 

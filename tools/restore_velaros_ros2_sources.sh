@@ -13,6 +13,7 @@ LOCK_FILE="${SCRIPT_DIR}/velaros-ros2-sources.lock"
 RCUTILS_PATCH="${SCRIPT_DIR}/patches/rcutils-7.1.1-openvela.patch"
 ROSIDL_PATCH="${SCRIPT_DIR}/patches/rosidl-5.2.1-openvela.patch"
 RMW_FASTRTPS_PATCH="${SCRIPT_DIR}/patches/rmw-fastrtps-9.4.8-openvela.patch"
+RMW_FASTRTPS_BUFFER_PATCH="${SCRIPT_DIR}/patches/rmw-fastrtps-9.4.8-velaros-static-buffer.patch"
 RCL_PATCH="${SCRIPT_DIR}/patches/rcl-10.4.4-openvela.patch"
 SOURCE_ROOT="${WORKSPACE_ROOT}/external/velaros_ros2_sources"
 BACKUP_ROOT="${VELAROS_BACKUP_ROOT:-/tmp}"
@@ -78,6 +79,8 @@ done
 [[ -f "${ROSIDL_PATCH}" ]] || fail "rosidl patch is missing: ${ROSIDL_PATCH}"
 [[ -f "${RMW_FASTRTPS_PATCH}" ]] ||
   fail "rmw_fastrtps patch is missing: ${RMW_FASTRTPS_PATCH}"
+[[ -f "${RMW_FASTRTPS_BUFFER_PATCH}" ]] ||
+  fail "rmw_fastrtps buffer patch is missing: ${RMW_FASTRTPS_BUFFER_PATCH}"
 [[ -f "${RCL_PATCH}" ]] || fail "rcl patch is missing: ${RCL_PATCH}"
 [[ -d "${WORKSPACE_ROOT}/external" ]] ||
   fail "external repository is missing under ${WORKSPACE_ROOT}"
@@ -101,6 +104,7 @@ declare -a REQUIRED_LOCK_VARS=(
   ROSIDL_DYNAMIC_TYPESUPPORT_FASTRTPS_VERSION
   ROSIDL_DYNAMIC_TYPESUPPORT_FASTRTPS_REV
   RCL_URL RCL_VERSION RCL_REV
+  RCLCPP_URL RCLCPP_VERSION RCLCPP_REV
   RCL_INTERFACES_URL RCL_INTERFACES_VERSION RCL_INTERFACES_REV
   RCL_LOGGING_URL RCL_LOGGING_VERSION RCL_LOGGING_REV
   LIBYAML_VENDOR_URL LIBYAML_VENDOR_VERSION LIBYAML_VENDOR_REV
@@ -108,6 +112,7 @@ declare -a REQUIRED_LOCK_VARS=(
   UNIQUE_IDENTIFIER_MSGS_URL UNIQUE_IDENTIFIER_MSGS_VERSION
   UNIQUE_IDENTIFIER_MSGS_REV
   COMMON_INTERFACES_URL COMMON_INTERFACES_VERSION COMMON_INTERFACES_REV
+  EXAMPLE_INTERFACES_URL EXAMPLE_INTERFACES_VERSION EXAMPLE_INTERFACES_REV
 )
 
 for lock_var in "${REQUIRED_LOCK_VARS[@]}"; do
@@ -255,6 +260,8 @@ verify_all()
     "${ROSIDL_DYNAMIC_TYPESUPPORT_FASTRTPS_VERSION}"
   verify_tree rcl "${SOURCE_ROOT}/rcl" "${RCL_REV}" \
     rcl/package.xml "${RCL_VERSION}"
+  verify_tree rclcpp "${SOURCE_ROOT}/rclcpp" "${RCLCPP_REV}" \
+    rclcpp/package.xml "${RCLCPP_VERSION}"
   verify_tree rcl_interfaces "${SOURCE_ROOT}/rcl_interfaces" \
     "${RCL_INTERFACES_REV}" rcl_interfaces/package.xml \
     "${RCL_INTERFACES_VERSION}"
@@ -273,6 +280,9 @@ verify_all()
   verify_tree common_interfaces "${SOURCE_ROOT}/common_interfaces" \
     "${COMMON_INTERFACES_REV}" std_msgs/package.xml \
     "${COMMON_INTERFACES_VERSION}"
+  verify_tree example_interfaces "${SOURCE_ROOT}/example_interfaces" \
+    "${EXAMPLE_INTERFACES_REV}" package.xml \
+    "${EXAMPLE_INTERFACES_VERSION}"
 }
 
 if ((CHECK_ONLY == 1)); then
@@ -287,6 +297,10 @@ if ((CHECK_ONLY == 1)); then
     "${RMW_FASTRTPS_PATCH}" ||
     fail "openvela rmw_fastrtps patch is not applied"
   printf 'verified openvela rmw_fastrtps patch\n'
+  source_patch_is_applied "${SOURCE_ROOT}/rmw_fastrtps" \
+    "${RMW_FASTRTPS_BUFFER_PATCH}" ||
+    fail "VelaROS static buffer backend patch is not applied"
+  printf 'verified VelaROS static buffer backend patch\n'
   source_patch_is_applied "${SOURCE_ROOT}/rcl" "${RCL_PATCH}" ||
     fail "openvela rcl patch is not applied"
   printf 'verified openvela rcl patch\n'
@@ -320,6 +334,8 @@ export_revision rosidl_dynamic_typesupport_fastrtps \
   "${ROSIDL_DYNAMIC_TYPESUPPORT_FASTRTPS_REV}" \
   "${SOURCE_ROOT}/rosidl_dynamic_typesupport_fastrtps"
 export_revision rcl "${RCL_URL}" "${RCL_REV}" "${SOURCE_ROOT}/rcl"
+export_revision rclcpp "${RCLCPP_URL}" "${RCLCPP_REV}" \
+  "${SOURCE_ROOT}/rclcpp"
 export_revision rcl_interfaces "${RCL_INTERFACES_URL}" \
   "${RCL_INTERFACES_REV}" "${SOURCE_ROOT}/rcl_interfaces"
 export_revision rcl_logging "${RCL_LOGGING_URL}" \
@@ -333,11 +349,15 @@ export_revision unique_identifier_msgs "${UNIQUE_IDENTIFIER_MSGS_URL}" \
   "${SOURCE_ROOT}/unique_identifier_msgs"
 export_revision common_interfaces "${COMMON_INTERFACES_URL}" \
   "${COMMON_INTERFACES_REV}" "${SOURCE_ROOT}/common_interfaces"
+export_revision example_interfaces "${EXAMPLE_INTERFACES_URL}" \
+  "${EXAMPLE_INTERFACES_REV}" "${SOURCE_ROOT}/example_interfaces"
 
 apply_source_patch rcutils "${SOURCE_ROOT}/rcutils" "${RCUTILS_PATCH}"
 apply_source_patch rosidl "${SOURCE_ROOT}/rosidl" "${ROSIDL_PATCH}"
 apply_source_patch rmw_fastrtps "${SOURCE_ROOT}/rmw_fastrtps" \
   "${RMW_FASTRTPS_PATCH}"
+apply_source_patch rmw_fastrtps_static_buffer \
+  "${SOURCE_ROOT}/rmw_fastrtps" "${RMW_FASTRTPS_BUFFER_PATCH}"
 apply_source_patch rcl "${SOURCE_ROOT}/rcl" "${RCL_PATCH}"
 verify_all
 

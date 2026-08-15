@@ -79,6 +79,14 @@ RCL_VERSION=10.4.4
 RCL_REV=da0b5e70247ef1fb0425bf35417d4e9fdf11efb9
 RCL_DEB_VERSION=10.4.4-1resolute.20260606.020512
 
+# C++ client-library API baseline.  VelaROS compiles only the audited static
+# RAII subset implemented by its platform layer; this source is retained for
+# API comparison, license provenance, and future incremental extraction.
+RCLCPP_URL=https://github.com/ros2/rclcpp.git
+RCLCPP_VERSION=32.0.0
+RCLCPP_REV=c80310e420185110bb8876a67223c14a02feee59
+RCLCPP_DEB_VERSION=32.0.0-1resolute.20260606.021228
+
 RCL_INTERFACES_URL=https://github.com/ros2/rcl_interfaces.git
 RCL_INTERFACES_VERSION=2.4.5
 RCL_INTERFACES_REV=b90e36e4adf5ed878efa2f365a84798f782618cd
@@ -109,3 +117,16 @@ COMMON_INTERFACES_URL=https://github.com/ros2/common_interfaces.git
 COMMON_INTERFACES_VERSION=5.9.2
 COMMON_INTERFACES_REV=5efc32faf0a6c72d865188b33c58b4ed277e8e5b
 STD_MSGS_DEB_VERSION=5.9.2-3resolute.20260606.003418
+GEOMETRY_MSGS_DEB_VERSION=5.9.2-3resolute.20260606.005051
+STD_SRVS_DEB_VERSION=5.9.2-3resolute.20260606.003402
+
+# Statically generated reference Action used for the bounded Action profile.
+# Only Fibonacci and its standard five-channel wire closure enter openvela.
+EXAMPLE_INTERFACES_URL=https://github.com/ros2/example_interfaces.git
+EXAMPLE_INTERFACES_VERSION=0.14.1
+EXAMPLE_INTERFACES_REV=e4f46c5762e433a72b2496bb23b0375ecfc06d1e
+EXAMPLE_INTERFACES_DEB_VERSION=0.14.1-3resolute.20260606.002907
+ACTION_MSGS_DEB_VERSION=2.4.5-1resolute.20260605.190918
+BUILTIN_INTERFACES_DEB_VERSION=2.4.5-1resolute.20260605.174229
+UNIQUE_IDENTIFIER_MSGS_DEB_VERSION=2.8.1-3resolute.20260605.174410
+SERVICE_MSGS_DEB_VERSION=2.4.5-1resolute.20260605.184435

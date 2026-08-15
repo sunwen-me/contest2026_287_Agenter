@@ -12,6 +12,7 @@
  ****************************************************************************/
 
 #define K1_UART0_BASE  0xd4017000ul
+#define K1_UART2_BASE  0xd4017100ul
 #define K1_EMAC0_BASE  0xcac80000ul
 #define K1_APMU_BASE   0xd4282800ul
 #define K1_PLIC_BASE   0xe0000000ul

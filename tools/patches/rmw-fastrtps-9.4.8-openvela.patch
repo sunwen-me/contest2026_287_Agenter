@@ -96,18 +96,22 @@ index cde9cae..426fb5a 100644
      } catch (const std::exception & exc) {
        RMW_SET_ERROR_MSG_WITH_FORMAT_STRING("Failed to create std::thread: %s", exc.what());
 diff --git a/rmw_fastrtps_shared_cpp/src/participant.cpp b/rmw_fastrtps_shared_cpp/src/participant.cpp
-index bb5d6c7..3b6a0a5 100644
+index bb5d6c7..04a83a3 100644
 --- a/rmw_fastrtps_shared_cpp/src/participant.cpp
 +++ b/rmw_fastrtps_shared_cpp/src/participant.cpp
-@@ -29,6 +29,7 @@
+@@ -27,8 +27,11 @@
+ #include "fastdds/dds/subscriber/DataReader.hpp"
+ #include "fastdds/dds/subscriber/Subscriber.hpp"
  #include "fastdds/dds/subscriber/qos/SubscriberQos.hpp"
++#include <cstdlib>
++#include "fastdds/rtps/attributes/ThreadSettings.hpp"
  #include "fastdds/rtps/attributes/PropertyPolicy.hpp"
  #include "fastdds/rtps/common/Locator.hpp"
 +#include "fastdds/rtps/common/LocatorWithMask.hpp"
  #include "fastdds/rtps/common/Property.hpp"
  #include "fastdds/rtps/transport/UDPv4TransportDescriptor.hpp"
  #include "fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp"
-@@ -185,6 +186,16 @@ rmw_fastrtps_shared_cpp::create_participant(
+@@ -185,6 +188,16 @@ rmw_fastrtps_shared_cpp::create_participant(
    factory->load_profiles();
    auto domainParticipantQos = factory->get_default_participant_qos();
  
@@ -124,7 +128,7 @@ index bb5d6c7..3b6a0a5 100644
    // Configure discovery
    switch (discovery_options->automatic_discovery_range) {
      case RMW_AUTOMATIC_DISCOVERY_RANGE_NOT_SET:
-@@ -213,10 +224,12 @@ rmw_fastrtps_shared_cpp::create_participant(
+@@ -213,10 +226,12 @@ rmw_fastrtps_shared_cpp::create_participant(
          .builtin.metatrafficUnicastLocatorList.push_back(default_unicast_locator);
          // Disable built-in transports, since we are configuring our own.
          domainParticipantQos.transport().use_builtin_transports = false;
@@ -137,17 +141,22 @@ index bb5d6c7..3b6a0a5 100644
          // Add UDP transport with increased max initial peers.
          // This controls the number of participants that can be discovered on a single host,
          // which is roughly equivalent to the number of ROS 2 processes.
-@@ -225,6 +238,9 @@ rmw_fastrtps_shared_cpp::create_participant(
+@@ -225,6 +240,14 @@ rmw_fastrtps_shared_cpp::create_participant(
          // The default number here is picked arbitrarily.
          auto udp_transport = std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
          udp_transport->maxInitialPeersRange = 32;
++#ifdef __NuttX__
++        eprosima::fastdds::rtps::ThreadSettings thread_settings;
++        thread_settings.stack_size = 64 * 1024;
++        udp_transport->default_reception_threads(thread_settings);
++#endif
 +#ifdef __NuttX__
 +        udp_transport->interfaceWhiteList.push_back("127.0.0.1");
 +#endif
          domainParticipantQos.transport().user_transports.push_back(udp_transport);
          break;
        }
-@@ -240,6 +256,39 @@ rmw_fastrtps_shared_cpp::create_participant(
+@@ -240,6 +263,87 @@ rmw_fastrtps_shared_cpp::create_participant(
        break;
    }
  
@@ -156,34 +165,96 @@ index bb5d6c7..3b6a0a5 100644
 +    // QEMU user networking does not route multicast or guest addresses back
 +    // from the host.  Bind deterministic RTPS ports in the guest and
 +    // advertise the host-side UDP redirection ports as external locators.
-+    domainParticipantQos.wire_protocol().participant_id = 0;
++    uint32_t qemu_participant_id = 0;
++    error_str = rcutils_get_env("VELAROS_DDS_QEMU_PARTICIPANT_ID", &env_value);
++    if (error_str != NULL) {
++      RMW_SET_ERROR_MSG_WITH_FORMAT_STRING("Error getting env var: %s\n", error_str);
++      return nullptr;
++    }
++    if (env_value != nullptr && *env_value != '\0') {
++      char * end = nullptr;
++      long parsed_id = strtol(env_value, &end, 10);
++      if (end == env_value || *end != '\0' || parsed_id < 0 || parsed_id > 119) {
++        RMW_SET_ERROR_MSG("VELAROS_DDS_QEMU_PARTICIPANT_ID must be in [0, 119]");
++        return nullptr;
++      }
++      qemu_participant_id = static_cast<uint32_t>(parsed_id);
++    }
++    const uint32_t guest_metatraffic_port = 7410 + 2 * qemu_participant_id;
++    const uint32_t guest_user_port = guest_metatraffic_port + 1;
++    const uint32_t host_metatraffic_port = 17410 + 2 * qemu_participant_id;
++    const uint32_t host_user_port = host_metatraffic_port + 1;
++    domainParticipantQos.wire_protocol().participant_id =
++      static_cast<int32_t>(qemu_participant_id);
++    domainParticipantQos.wire_protocol().builtin.initialPeersList.clear();
 +    domainParticipantQos.wire_protocol().builtin.metatrafficMulticastLocatorList.clear();
 +    domainParticipantQos.wire_protocol().builtin.metatrafficUnicastLocatorList.clear();
-+    eprosima::fastdds::rtps::Locator_t metatraffic_unicast;
++    eprosima::fastdds::rtps::Locator_t metatraffic_unicast(guest_metatraffic_port);
 +    domainParticipantQos.wire_protocol()
 +    .builtin.metatrafficUnicastLocatorList.push_back(metatraffic_unicast);
++    domainParticipantQos.wire_protocol().default_unicast_locator_list.clear();
++    eprosima::fastdds::rtps::Locator_t default_unicast(guest_user_port);
++    domainParticipantQos.wire_protocol().default_unicast_locator_list.push_back(default_unicast);
 +    domainParticipantQos.transport().use_builtin_transports = false;
 +    domainParticipantQos.transport().user_transports.clear();
 +    auto udp_transport =
 +      std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>();
 +    udp_transport->maxInitialPeersRange = 4;
++    eprosima::fastdds::rtps::ThreadSettings thread_settings;
++    thread_settings.stack_size = 64 * 1024;
++    udp_transport->default_reception_threads(thread_settings);
 +    domainParticipantQos.transport().user_transports.push_back(udp_transport);
 +
 +    eprosima::fastdds::rtps::LocatorWithMask external_metatraffic;
++    domainParticipantQos.wire_protocol()
++    .builtin.metatraffic_external_unicast_locators.clear();
++    domainParticipantQos.wire_protocol().default_external_unicast_locators.clear();
 +    eprosima::fastdds::rtps::IPLocator::setIPv4(external_metatraffic, "127.0.0.1");
-+    external_metatraffic.port = 17410;
-+    external_metatraffic.mask(8);
++    external_metatraffic.port = host_metatraffic_port;
++    external_metatraffic.mask(32);
 +    domainParticipantQos.wire_protocol()
 +    .builtin.metatraffic_external_unicast_locators[1][0]
 +    .push_back(external_metatraffic);
 +
 +    eprosima::fastdds::rtps::LocatorWithMask external_user = external_metatraffic;
-+    external_user.port = 17411;
++    external_user.port = host_user_port;
 +    domainParticipantQos.wire_protocol()
 +    .default_external_unicast_locators[1][0].push_back(external_user);
++
++    // Send discovery through the QEMU user-network gateway.  The host-side
++    // participant listens on the corresponding metatraffic port.
++    eprosima::fastdds::rtps::Locator_t host_peer;
++    eprosima::fastdds::rtps::IPLocator::setIPv4(host_peer, "10.0.2.2");
++    // The host test peer is participant 0 and therefore always listens on
++    // PB + DG * domain + d0 = 7410.  Guest participant IDs only select the
++    // guest bind/external redirect ports; using their port here prevents
++    // participant 1+ from discovering the host.
++    host_peer.port = 7410;
++    domainParticipantQos.wire_protocol().builtin.initialPeersList.push_back(host_peer);
++
++    // Keep UDP datagrams below the guest MTU and use the locally registered
++    // ROS 2 generated types instead of the optional TypeLookup service.
++    domainParticipantQos.properties().properties().emplace_back(
++      "fastdds.max_message_size", "1200");
++    domainParticipantQos.properties().properties().emplace_back(
++      "fastdds.type_propagation", "registration_only");
 +  }
 +#endif
 +
    // Add initial peers if LOCALHOST or SUBNET are used
    if (
      RMW_AUTOMATIC_DISCOVERY_RANGE_LOCALHOST == discovery_options->automatic_discovery_range ||
+diff --git a/rmw_fastrtps_shared_cpp/src/TypeSupport_impl.cpp b/rmw_fastrtps_shared_cpp/src/TypeSupport_impl.cpp
+index c376f1e..edfa980 100644
+--- a/rmw_fastrtps_shared_cpp/src/TypeSupport_impl.cpp
++++ b/rmw_fastrtps_shared_cpp/src/TypeSupport_impl.cpp
+@@ -711,4 +711,9 @@ void TypeSupport::register_type_object_representation()
+     get_type_support_introspection(type_supports_);
+   if (!type_support_intro) {
++    // Introspection is optional for the static Fast RTPS callbacks used by
++    // VelaROS.  The lookup records a diagnostic even though serialization can
++    // continue without a TypeObject; do not leak that non-fatal state into
++    // the next endpoint creation.
++    rcutils_reset_error();
+     return;
+   }

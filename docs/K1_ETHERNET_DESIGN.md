@@ -25,8 +25,9 @@ buffer, copies the FCS-stripped frame into a NuttX packet, then returns the
 descriptor to DMA. The simple one-descriptor design deliberately trades
 throughput for an auditable first-board path.
 
-This is not yet a claim that Ethernet works on the real board: a link,
-ARP, and bidirectional `ping` test are still required.
+The physical-board link, ARP, and host-to-board ICMP path have been verified.
+The board-initiated ICMP test requires `CONFIG_NET_ICMP_SOCKET`; the
+`ethernet_polling` profile enables it for the final bidirectional test.
 
 ## Confirmed board wiring
 
@@ -73,6 +74,137 @@ The target build completed on 2026-08-13 using the command above, with
 `k1_cache.c` object contains the three expected Zicbom instruction encodings
 for cache clean, invalidate, and flush.
 
+`CONFIG_NET_UDP` is required by the `mdio` application because it creates an
+`AF_INET`/`SOCK_DGRAM` control socket for network ioctls. `CONFIG_NET_ICMP_SOCKET`
+is required by the `ping` application because it creates an `IPPROTO_ICMP`
+socket for echo requests.
+
+## Physical-board evidence
+
+On 2026-08-13, the MUSE Pi Pro was loaded through the RAM-only U-Boot path;
+no boot variables, bootloader regions, or eMMC raw blocks were modified. The
+final tested ELF SHA256 was `1ab48cd1df9c81a494b8f5436893c54d5a9b273c990d07fedad06b7fbeaee19a`;
+the loaded flat payload SHA256 was
+`bcdc12eaf810f61719cf0c92f51ae7f1c8ab59f7c0ff90c1902d49827bd5dcff`.
+
+- `ifup eth0` completed successfully.
+- `mdio 1 2` returned `0x001c` and `mdio 1 3` returned `0xc916`, identifying
+  the RTL8211F at PHY address 1.
+- A USB Ethernet adapter was directly cabled to the board. The host interface
+  was `192.168.50.1/24`; the board was `192.168.50.2/24` with MAC address
+  `02:00:00:00:00:01`.
+- The final board-to-host test returned three of three replies with no packet
+  loss and 7 ms round-trip time.
+- The final host-to-board test returned three of three replies with no packet
+  loss and 2.350--2.676 ms round-trip time. Host ARP resolved the board MAC as
+  `02:00:00:00:00:01`.
+- The raw success transcript is
+  `out/k1-serial/k1-ethernet-smoke-20260813T133140Z.log`.
+
+The PHY carrier worker checks link state once per second. After `ifup eth0`,
+allow roughly three seconds before starting a counted ping test. Earlier
+packets can fail with `ENETUNREACH` while carrier has not yet been published.
+
+The first ICMP-socket image exposed a separate application resource issue:
+the inherited default `ping` task stack (2048 bytes, 1936 bytes usable) faulted
+while formatting a received reply. The profile now explicitly sets
+`CONFIG_SYSTEM_PING_STACKSIZE=4096`; the final three-packet board-to-host test
+completed without a trap.
+
+## Reproducible smoke test
+
+The host USB Ethernet interface must have `192.168.50.1/24`, and the final
+flat payload and wrapper must already have been copied to `/boot/musepi/` as
+`contest-nuttx-ethernet-udp-flat.bin` and
+`k1-go-wrapper-ethernet-udp.bin`. Then run:
+
+```bash
+/home/sw/Dev/k1-workspace/contest2026_287_Agenter/tools/run_k1_ethernet_smoke.py \
+  --device /dev/ttyUSB0 \
+  --host-interface enx3cab72bf00b4
+```
+
+The tool first requires the host interface to hold its configured static IPv4
+address, then stops U-Boot, uses `ext4load` and `go` for a RAM-only startup,
+waits for PHY carrier convergence, and requires three successful board-to-host
+and host-to-board ICMP replies. It does not invoke `saveenv` or raw eMMC
+writes.
+When the board is already running the configured NuttX shell, rerun only the
+network checks without rebooting:
+
+```bash
+/home/sw/Dev/k1-workspace/contest2026_287_Agenter/tools/run_k1_ethernet_smoke.py \
+  --device /dev/ttyUSB0 \
+  --host-interface enx3cab72bf00b4 \
+  --resume-nsh
+```
+
+## UDPv4 echo validation
+
+The `ethernet_polling` profile also builds the `k1_udpecho` NSH command. It
+binds UDP port 33333, receives exactly four datagrams with a three-second
+per-packet timeout, returns each datagram byte-identically to its source, and
+prints `PASS` before exiting. The command is a bounded data-plane test rather
+than a persistent service.
+
+After copying an image built from the current profile to `/boot/musepi/`, add
+`--udp-echo` to the smoke runner. It starts `k1_udpecho` after the bidirectional
+ICMP checks, sends four tagged payloads from `192.168.50.1` (including embedded
+NUL bytes, a 128-byte binary payload, and a 1472-byte binary payload), and
+verifies source IP/port and byte identity for every echoed payload. The 1472-byte
+case is the maximum IPv4 UDP payload in a standard 1500-byte MTU Ethernet frame
+(1500 - 20-byte IPv4 header - 8-byte UDP header):
+
+```bash
+/home/sw/Dev/k1-workspace/contest2026_287_Agenter/tools/run_k1_ethernet_smoke.py \
+  --device /dev/ttyUSB0 \
+  --host-interface enx3cab72bf00b4 \
+  --udp-echo
+```
+
+### UDP validation status
+
+The final MTU UDP image was built and packaged on 2026-08-13. Its ELF SHA256
+is `110310ab3baa2536a092dee206d5c6169de1eb1121e5d95fc3448c496a066c35`
+and its flat payload SHA256 is
+`c6542047b9f12caa56bd70c70d17bd228e9520ee7b73f1d7ce5e04a3b02b0878`.
+The generated configuration, built-in command table, and ELF symbol table
+confirm `k1_udpecho` is enabled as an 8192-byte-stack command on UDP port
+33333. Its 1472-byte receive buffer is dynamically allocated so the maximum
+datagram does not consume the command task stack.
+
+The UDP image completed its physical-board run on 2026-08-13 using the
+RAM-only U-Boot path. The host copied the flat payload and wrapper to bootfs
+using ADB, verified their SHA256 values there, then loaded them with
+`ext4load mmc 2:5` and entered NuttX through `go 0x12000000`. No boot
+variables, bootloader data, or raw eMMC blocks were written.
+
+- Board-to-host ICMP: 3/3 replies, no loss, 9.000--20.000 ms.
+- Host-to-board ICMP: 3/3 replies, no loss, 6.009--6.939 ms.
+- Host ARP resolved `192.168.50.2` as `02:00:00:00:00:01`.
+- `k1_udpecho` received and byte-identically echoed four datagrams: 14 bytes,
+  21 bytes with an embedded NUL, 128 bytes, and 1472 bytes.
+- The command returned `k1_udpecho: PASS 4/4 datagrams echoed`.
+- The raw success transcript is
+  `out/k1-serial/k1-ethernet-smoke-20260813T145117Z.log` with SHA256
+  `bcdb7ff609e86d7054b53c39a1df61c21dad7490cf43964323071c501f9600a1`.
+
+During validation, NetworkManager briefly removed the host's static address,
+which caused NuttX to cache an ARP-unreachable result for the host. Restoring
+the address and deleting that transient ARP entry restored the link. The smoke
+tool now fails before rebooting the board when the configured host IPv4 address
+is absent. A pre-fix 1472-byte test also exposed an application stack issue;
+the final image uses an 8192-byte command stack and a heap buffer, and passed
+the same physical-board test.
+
+The K1 board profile exposes the standard NSH `reboot` command through
+`CONFIG_BOARDCTL_RESET`. The board-level reset handler first tries SBI SRST;
+the supplied K1 OpenSBI returns `SBI_ERR_NOT_SUPPORTED`, so the handler then
+programs the on-chip watchdog for its shortest interval. This returns the
+RAM-only payload to the normal U-Boot/Linux boot chain without manual RST.
+Use the physical `RST` button only when the serial console is no longer
+responsive.
+
 ## First-board validation
 
 Flash/load the resulting image only through the already-established K1
@@ -109,6 +241,7 @@ the host a spare static address in the same subnet; for example, host
 ```text
 ifup eth0
 ifconfig eth0 192.168.50.2 netmask 255.255.255.0
+# Wait about three seconds for the PHY polling worker to publish carrier.
 ping 192.168.50.1
 ifconfig eth0
 ifdown eth0

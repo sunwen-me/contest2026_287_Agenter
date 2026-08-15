@@ -92,6 +92,10 @@ if ((GENERATE_INTERFACES == 1)); then
     "${SCRIPT_DIR}/generate_velaros_ros2_interfaces.sh"
   OPENVELA_ROOT="${WORKSPACE_ROOT}" \
     "${SCRIPT_DIR}/generate_velaros_std_msgs.sh"
+  OPENVELA_ROOT="${WORKSPACE_ROOT}" \
+    "${SCRIPT_DIR}/generate_velaros_std_srvs.sh"
+  OPENVELA_ROOT="${WORKSPACE_ROOT}" \
+    "${SCRIPT_DIR}/generate_velaros_action.sh"
 fi
 
 if ((CLEAN == 1)) && [[ -e "${OUTPUT_DIR}" ]]; then

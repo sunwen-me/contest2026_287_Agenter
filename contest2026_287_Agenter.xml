@@ -10,7 +10,13 @@
       src="board/k1/muse_pi_pro"
       dest="vendor/spacemit/boards/k1/muse_pi_pro"/>
     <linkfile
-      src="middleware/velaros_ros2"
-      dest="external/velaros_ros2"/>
+      src="middleware/velaros"
+      dest="external/velaros"/>
+    <linkfile
+      src="middleware/k1_udp_echo"
+      dest="external/k1_udp_echo"/>
+    <linkfile
+      src="middleware/k1_watchdog_smoke"
+      dest="external/k1_watchdog_smoke"/>
   </project>
 </manifest>

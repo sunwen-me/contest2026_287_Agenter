@@ -1,0 +1,25 @@
+# K1 MUSE Pi Pro USB Android Fastboot validation profile.
+#
+# This is NuttX fastbootd over the K1 MV/ChipIdea USB device controller. It is
+# a runtime NuttX gadget and is separate from the vendor BootROM/Titan FDL
+# protocol used by the PWR Type-C recovery path.
+
+# The Fastboot profile has its own USB class and must not inherit CDC-ACM.
+#include "../nsh/defconfig"
+
+CONFIG_K1_USBDEV=y
+CONFIG_K1_USBDEV_IRQ=105
+CONFIG_USBDEV=y
+CONFIG_USBDEV_DUALSPEED=y
+CONFIG_USBDEV_TRACE=y
+CONFIG_USBDEV_TRACE_STRINGS=y
+CONFIG_USBDEV_TRACE_INITIALIDSET=31
+CONFIG_NSH_USBDEV_TRACE=y
+CONFIG_BOARDCTL=y
+CONFIG_BOARDCTL_USBDEVCTRL=y
+CONFIG_USBADB=y
+CONFIG_USBFASTBOOT=y
+CONFIG_SYSTEM_FASTBOOTD=y
+CONFIG_FASTBOOTD_USB_BOARDCTL=y
+CONFIG_SYSTEM_FASTBOOTD_STACKSIZE=8192
+CONFIG_SYSTEM_FASTBOOTD_DOWNLOAD_MAX=8388608

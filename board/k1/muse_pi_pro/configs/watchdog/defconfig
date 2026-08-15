@@ -1,0 +1,7 @@
+# K1 on-chip watchdog safe start/keepalive/stop verification configuration.
+
+#include "../nsh/defconfig"
+
+CONFIG_WATCHDOG=y
+CONFIG_K1_WATCHDOG=y
+CONFIG_K1_WATCHDOG_SMOKE=y

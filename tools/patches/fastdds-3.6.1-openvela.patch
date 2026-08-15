@@ -1,8 +1,19 @@
 diff --git a/fastdds/CMakeLists.txt b/fastdds/CMakeLists.txt
-index 906f977..bc4f821 100644
+index 906f977..ef668ea 100644
 --- a/fastdds/CMakeLists.txt
 +++ b/fastdds/CMakeLists.txt
-@@ -33,6 +33,8 @@ if(CONFIG_FASTDDS)
+@@ -15,7 +15,9 @@ if(CONFIG_FASTDDS)
+   set(COMPILE_TOOLS OFF)
+ 
+   if(CONFIG_FASTDDS_ENABLE_OLD_LOG_MACROS)
+-    set(ENABLE_OLD_LOG_MACROS_ 1)
++    set(ENABLE_OLD_LOG_MACROS ON CACHE BOOL "Compile legacy Fast DDS log macros" FORCE)
++  else()
++    set(ENABLE_OLD_LOG_MACROS OFF CACHE BOOL "Compile legacy Fast DDS log macros" FORCE)
+   endif()
+ 
+   if(CONFIG_FASTDDS_LOG_NO_INFO)
+@@ -33,6 +35,8 @@ if(CONFIG_FASTDDS)
    set(BUILD_SHARED_LIBS OFF)
    set(SECURITY 0)
    set(TINYXML2_SOURCE_DIR "${EXTERNAL_DIR}/tinyxml2/tinyxml2")
@@ -11,7 +22,7 @@ index 906f977..bc4f821 100644
    set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${LIB_FASTDDS_DIR}/cmake/modules)
  
    set(FASTDDS_FLAGS
-@@ -42,6 +44,11 @@ if(CONFIG_FASTDDS)
+@@ -42,6 +46,11 @@ if(CONFIG_FASTDDS)
        -Wno-error=deprecated-declarations
        -fexceptions
        -U__VXWORKS__
@@ -23,7 +34,7 @@ index 906f977..bc4f821 100644
        -Wno-shadow
        -Wno-undef
        -Wno-unused-parameter
-@@ -89,13 +96,14 @@ if(CONFIG_FASTDDS)
+@@ -89,13 +98,14 @@ if(CONFIG_FASTDDS)
        ${DATA_INSTALL_DIR}/${PROJECT_NAME}
        CACHE PATH "Installation directory for licenses")
    set(Asio_INCLUDE_DIR ${EXTERNAL_DIR}/asio/asio/asio/include)
@@ -40,7 +51,29 @@ index 906f977..bc4f821 100644
    )
    add_subdirectory(${BUILD_MEMORY_SRC_DIR})
    nuttx_add_external_library(foonathan_memory)
-@@ -117,14 +125,15 @@ if(CONFIG_FASTDDS)
+@@ -106,7 +116,20 @@ if(CONFIG_FASTDDS)
+   target_compile_options(fastcdr PRIVATE ${FASTDDS_FLAGS})
+ 
+   include(CMakeDependentOption)
+-  set(INTERNAL_DEBUG ON)
++  if(CONFIG_FASTDDS_DEVELOPER_DIAGNOSTICS)
++    set(INTERNAL_DEBUG ON CACHE BOOL "Fast DDS internal debug messages" FORCE)
++    set(FASTDDS_STATISTICS ON CACHE BOOL "Fast DDS Statistics module" FORCE)
++  else()
++    set(INTERNAL_DEBUG OFF CACHE BOOL "Fast DDS internal debug messages" FORCE)
++    set(FASTDDS_STATISTICS OFF CACHE BOOL "Fast DDS Statistics module" FORCE)
++  endif()
++  if(CONFIG_FASTDDS_VELAROS_STATIC_PROFILE)
++    set(FASTDDS_VELAROS_STATIC_PROFILE ON CACHE BOOL
++        "Build the bounded VelaROS Fast DDS feature profile" FORCE)
++  else()
++    set(FASTDDS_VELAROS_STATIC_PROFILE OFF CACHE BOOL
++        "Build the bounded VelaROS Fast DDS feature profile" FORCE)
++  endif()
+   set(SHM_TRANSPORT_DEFAULT OFF)
+ 
+   add_subdirectory(${LIB_FASTDDS_DIR})
+@@ -117,14 +140,15 @@ if(CONFIG_FASTDDS)
  
    function(add_example_src_file arg)
      set(DDS_EXAMPLE_SOURCES
@@ -59,7 +92,7 @@ index 906f977..bc4f821 100644
      add_example_src_file(${DDS_EXAMPLE_DIR})
  
    elseif(CONFIG_FASTDDS_HelloWorldExampleTCP)
-@@ -175,7 +184,6 @@ if(CONFIG_FASTDDS)
+@@ -175,7 +199,6 @@ if(CONFIG_FASTDDS)
        fastcdr
        foonathan_memory
        fastdds
@@ -81,7 +114,7 @@ index 62d7f55..c2c8284 100644
      set(CMAKE_BUILD_TYPE Release CACHE STRING
          "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel."
 diff --git a/fastdds/Fast-DDS/CMakeLists.txt b/fastdds/Fast-DDS/CMakeLists.txt
-index 98511a14a..8f4d2ce2d 100644
+index 98511a1..8f4d2ce 100644
 --- a/fastdds/Fast-DDS/CMakeLists.txt
 +++ b/fastdds/Fast-DDS/CMakeLists.txt
 @@ -18,7 +18,7 @@
@@ -118,7 +151,7 @@ index 98511a14a..8f4d2ce2d 100644
  
  if(ANDROID)
 diff --git a/fastdds/Fast-DDS/cmake/modules/FindAtomic.cmake b/fastdds/Fast-DDS/cmake/modules/FindAtomic.cmake
-index 35ca4af42..4d3cc0517 100644
+index 35ca4af..4d3cc05 100644
 --- a/fastdds/Fast-DDS/cmake/modules/FindAtomic.cmake
 +++ b/fastdds/Fast-DDS/cmake/modules/FindAtomic.cmake
 @@ -7,6 +7,14 @@ if(TARGET eProsima_atomic)
@@ -137,7 +170,7 @@ index 35ca4af42..4d3cc0517 100644
  
  set(ATOMIC_TEST_CODE
 diff --git a/fastdds/Fast-DDS/cmake/modules/FindThirdpartyBoost.cmake b/fastdds/Fast-DDS/cmake/modules/FindThirdpartyBoost.cmake
-index 43354c0e5..b394fafa1 100644
+index 43354c0..b394faf 100644
 --- a/fastdds/Fast-DDS/cmake/modules/FindThirdpartyBoost.cmake
 +++ b/fastdds/Fast-DDS/cmake/modules/FindThirdpartyBoost.cmake
 @@ -11,6 +11,14 @@ set(THIRDPARTY_BOOST_INCLUDE_DIR
@@ -156,7 +189,7 @@ index 43354c0e5..b394fafa1 100644
  
  if(WIN32 OR APPLE OR ANDROID OR QNXNTO)
 diff --git a/fastdds/Fast-DDS/cmake/modules/FindThreads.cmake b/fastdds/Fast-DDS/cmake/modules/FindThreads.cmake
-index 8a1f2197b..4bc0553a1 100644
+index 8a1f219..4bc0553 100644
 --- a/fastdds/Fast-DDS/cmake/modules/FindThreads.cmake
 +++ b/fastdds/Fast-DDS/cmake/modules/FindThreads.cmake
 @@ -45,6 +45,20 @@ This module is not needed for C++11 and later if threading is done using
@@ -186,7 +219,7 @@ index 8a1f2197b..4bc0553a1 100644
  endif()
 -
 diff --git a/fastdds/Fast-DDS/examples/cpp/hello_world/ListenerSubscriberApp.cpp b/fastdds/Fast-DDS/examples/cpp/hello_world/ListenerSubscriberApp.cpp
-index df742c556..17f1a4f91 100644
+index df742c5..17f1a4f 100644
 --- a/fastdds/Fast-DDS/examples/cpp/hello_world/ListenerSubscriberApp.cpp
 +++ b/fastdds/Fast-DDS/examples/cpp/hello_world/ListenerSubscriberApp.cpp
 @@ -24,11 +24,16 @@
@@ -240,7 +273,7 @@ index df742c556..17f1a4f91 100644
      {
          throw std::runtime_error("Participant initialization failed");
 diff --git a/fastdds/Fast-DDS/examples/cpp/hello_world/PublisherApp.cpp b/fastdds/Fast-DDS/examples/cpp/hello_world/PublisherApp.cpp
-index 9efba3089..5cd8a752d 100644
+index 9efba30..5cd8a75 100644
 --- a/fastdds/Fast-DDS/examples/cpp/hello_world/PublisherApp.cpp
 +++ b/fastdds/Fast-DDS/examples/cpp/hello_world/PublisherApp.cpp
 @@ -23,10 +23,15 @@
@@ -293,10 +326,20 @@ index 9efba3089..5cd8a752d 100644
      {
          throw std::runtime_error("Participant initialization failed");
 diff --git a/fastdds/Fast-DDS/examples/cpp/hello_world/main.cpp b/fastdds/Fast-DDS/examples/cpp/hello_world/main.cpp
-index edfb6ff46..27b12c84c 100644
+index edfb6ff..7e5a1c9 100644
 --- a/fastdds/Fast-DDS/examples/cpp/hello_world/main.cpp
 +++ b/fastdds/Fast-DDS/examples/cpp/hello_world/main.cpp
-@@ -38,6 +38,9 @@ void signal_handler(
+@@ -26,6 +26,9 @@
+ 
+ #include "Application.hpp"
+ #include "CLIParser.hpp"
++#if defined(__NuttX__)
++#include <utils/thread.hpp>
++#endif
+ 
+ using eprosima::fastdds::dds::Log;
+ 
+@@ -38,6 +41,9 @@ void signal_handler(
      stop_app_handler(signum);
  }
  
@@ -306,7 +349,22 @@ index edfb6ff46..27b12c84c 100644
  int main(
          int argc,
          char** argv)
-@@ -94,11 +97,13 @@ int main(
+@@ -73,7 +79,14 @@ int main(
+ 
+     if (EXIT_FAILURE != ret)
+     {
++#if defined(__NuttX__)
++        eprosima::thread thread(64 * 1024, [app]()
++                {
++                    app->run();
++                });
++#else
+         std::thread thread(&Application::run, app);
++#endif
+ 
+         if (samples == 0)
+         {
+@@ -94,11 +107,13 @@ int main(
                  };
  
          signal(SIGINT, signal_handler);
@@ -320,8 +378,20 @@ index edfb6ff46..27b12c84c 100644
  
          thread.join();
      }
+diff --git a/fastdds/Fast-DDS/src/cpp/CMakeLists.txt b/fastdds/Fast-DDS/src/cpp/CMakeLists.txt
+index 070597d..62fae3c 100644
+--- a/fastdds/Fast-DDS/src/cpp/CMakeLists.txt
++++ b/fastdds/Fast-DDS/src/cpp/CMakeLists.txt
+@@ -143,6 +143,7 @@ target_compile_definitions(${PROJECT_NAME}
+     $<$<NOT:$<BOOL:${IS_THIRDPARTY_BOOST_SUPPORTED}>>:FASTDDS_SHM_TRANSPORT_DISABLED> # Do not compile SHM Transport
+     $<$<BOOL:${SHM_TRANSPORT_DEFAULT}>:SHM_TRANSPORT_BUILTIN> # Enable SHM as built-in transport
+     $<$<BOOL:${STDOUTERR_LOG_CONSUMER}>:STDOUTERR_LOG_CONSUMER> # Enable StdoutErrConsumer as default LogConsumer
++    $<$<BOOL:${FASTDDS_VELAROS_STATIC_PROFILE}>:FASTDDS_VELAROS_STATIC_PROFILE>
+     INTERFACE
+     $<$<BOOL:${WIN32}>:${PROJECT_NAME_UPPER}_NO_LIB>
+     PUBLIC
 diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp b/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
-index 11b2210c0..c74fbc78f 100644
+index 11b2210..c74fbc7 100644
 --- a/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
 +++ b/fastdds/Fast-DDS/src/cpp/fastdds/domain/DomainParticipantFactory.cpp
 @@ -116,7 +116,6 @@ ReturnCode_t DomainParticipantFactory::delete_participant(
@@ -332,8 +402,36 @@ index 11b2210c0..c74fbc78f 100644
          VectorIt vit = participants_.find(part->get_domain_id());
  
          if (vit != participants_.end())
+diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/dynamic_types/idl_parser/IdlPreprocessor.hpp b/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/dynamic_types/idl_parser/IdlPreprocessor.hpp
+index 6e8da44..3cdaac4 100644
+--- a/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/dynamic_types/idl_parser/IdlPreprocessor.hpp
++++ b/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/dynamic_types/idl_parser/IdlPreprocessor.hpp
+@@ -186,6 +186,15 @@ private:
+     std::string exec(
+             const std::string& cmd) const
+     {
++#ifdef __NuttX__
++        // VelaROS ships statically generated ROS 2 type support. Invoking a
++        // host-style C preprocessor at runtime would pull NSH, pipes, and
++        // popen() into the firmware, so this desktop facility is unsupported.
++        static_cast<void>(cmd);
++        EPROSIMA_LOG_ERROR(IDLPARSER,
++                "Runtime IDL preprocessing is not supported on NuttX");
++        return {};
++#else
+         auto deleter = [](FILE* f)
+                 {
+                     pclose(f);
+@@ -211,6 +220,7 @@ private:
+         }
+         return result;
+     #endif // _MSC_VER
++#endif // __NuttX__
+     }
+ 
+ }; // class PreprocessorContext
 diff --git a/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/type_representation/TypeObjectRegistry.cpp b/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/type_representation/TypeObjectRegistry.cpp
-index 256d0e5e5..867c59007 100644
+index 256d0e5..867c590 100644
 --- a/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/type_representation/TypeObjectRegistry.cpp
 +++ b/fastdds/Fast-DDS/src/cpp/fastdds/xtypes/type_representation/TypeObjectRegistry.cpp
 @@ -304,15 +304,14 @@ ReturnCode_t TypeObjectRegistry::get_type_identifiers(
@@ -357,8 +455,380 @@ index 256d0e5e5..867c59007 100644
      return eprosima::fastdds::dds::RETCODE_OK;
  }
  
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/attributes/RTPSParticipantAttributes.cpp b/fastdds/Fast-DDS/src/cpp/rtps/attributes/RTPSParticipantAttributes.cpp
+index 189fbd8..aaea282 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/attributes/RTPSParticipantAttributes.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/attributes/RTPSParticipantAttributes.cpp
+@@ -21,10 +21,12 @@
+ #include <fastdds/LibrarySettings.hpp>
+ #include <fastdds/rtps/attributes/BuiltinTransports.hpp>
+ #include <fastdds/rtps/common/Locator.hpp>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <fastdds/rtps/transport/TCPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv6TransportDescriptor.hpp>
+-#include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/UDPv6TransportDescriptor.hpp>
++#endif
++#include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
+ #include <fastdds/utils/IPLocator.hpp>
+ 
+@@ -44,6 +46,7 @@ static bool is_intraprocess_only(
+         (ParticipantFilteringFlags::FILTER_DIFFERENT_HOST | ParticipantFilteringFlags::FILTER_DIFFERENT_PROCESS);
+ }
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ static std::shared_ptr<fastdds::rtps::SharedMemTransportDescriptor> create_shm_transport(
+         const RTPSParticipantAttributes& att,
+         const fastdds::rtps::BuiltinTransportsOptions& options)
+@@ -60,6 +63,7 @@ static std::shared_ptr<fastdds::rtps::SharedMemTransportDescriptor> create_shm_t
+     descriptor->default_reception_threads(att.builtin_transports_reception_threads);
+     return descriptor;
+ }
++#endif
+ 
+ static std::shared_ptr<fastdds::rtps::UDPv4TransportDescriptor> create_udpv4_transport(
+         const RTPSParticipantAttributes& att,
+@@ -80,6 +84,7 @@ static std::shared_ptr<fastdds::rtps::UDPv4TransportDescriptor> create_udpv4_tra
+     return descriptor;
+ }
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ static std::shared_ptr<fastdds::rtps::UDPv6TransportDescriptor> create_udpv6_transport(
+         const RTPSParticipantAttributes& att,
+         bool intraprocess_only,
+@@ -199,6 +204,7 @@ static void setup_transports_shm(
+     att.userTransports.push_back(descriptor);
+ #endif  // FASTDDS_SHM_TRANSPORT_DISABLED
+ }
++#endif
+ 
+ static void setup_transports_udpv4(
+         RTPSParticipantAttributes& att,
+@@ -209,6 +215,7 @@ static void setup_transports_udpv4(
+     att.userTransports.push_back(descriptor);
+ }
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ static void setup_transports_udpv6(
+         RTPSParticipantAttributes& att,
+         bool intraprocess_only,
+@@ -350,11 +357,46 @@ static void setup_transports_p2p(
+         att.builtin.metatrafficUnicastLocatorList.push_back(udp_locator);
+     }
+ }
++#endif
+ 
+ void RTPSParticipantAttributes::setup_transports(
+         fastdds::rtps::BuiltinTransports transports,
+         const fastdds::rtps::BuiltinTransportsOptions& options)
+ {
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    if (options.maxMessageSize > fastdds::rtps::s_maximumMessageSize)
++    {
++        EPROSIMA_LOG_ERROR(RTPS_PARTICIPANT,
++                "VelaROS UDPv4 max message size cannot be greater than " << std::to_string(
++                    fastdds::rtps::s_maximumMessageSize) << ".");
++        return;
++    }
++
++    bool intraprocess_only = is_intraprocess_only(*this);
++    if (options.sockets_buffer_size != 0)
++    {
++        sendSocketBufferSize = options.sockets_buffer_size;
++        listenSocketBufferSize = options.sockets_buffer_size;
++    }
++
++    switch (transports)
++    {
++        case fastdds::rtps::BuiltinTransports::NONE:
++            break;
++
++        case fastdds::rtps::BuiltinTransports::DEFAULT:
++        case fastdds::rtps::BuiltinTransports::UDPv4:
++            setup_transports_udpv4(*this, intraprocess_only, options);
++            break;
++
++        default:
++            EPROSIMA_LOG_ERROR(RTPS_PARTICIPANT,
++                    "Transport configuration is not part of the VelaROS UDPv4 static profile: " << transports);
++            return;
++    }
++
++    useBuiltinTransports = false;
++#else
+     if (options.maxMessageSize > fastdds::rtps::s_maximumMessageSize &&
+             (transports != fastdds::rtps::BuiltinTransports::NONE &&
+             transports != fastdds::rtps::BuiltinTransports::SHM &&
+@@ -426,6 +468,7 @@ void RTPSParticipantAttributes::setup_transports(
+     }
+ 
+     useBuiltinTransports = false;
++#endif // FASTDDS_VELAROS_STATIC_PROFILE
+ }
+ 
+ } // namespace rtps
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/builtin/BuiltinProtocols.cpp b/fastdds/Fast-DDS/src/cpp/rtps/builtin/BuiltinProtocols.cpp
+index dace9dd..518506d 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/builtin/BuiltinProtocols.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/builtin/BuiltinProtocols.cpp
+@@ -25,13 +25,17 @@
+ #include <fastdds/rtps/common/Locator.hpp>
+ #include <fastdds/utils/IPFinder.hpp>
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <fastdds/builtin/type_lookup_service/TypeLookupManager.hpp>
++#endif
+ #include <fastdds/utils/TypePropagation.hpp>
+ #include <rtps/builtin/data/ParticipantProxyData.hpp>
+ #include <rtps/builtin/discovery/endpoint/EDP.h>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <rtps/builtin/discovery/endpoint/EDPStatic.h>
+ #include <rtps/builtin/discovery/participant/PDPClient.h>
+ #include <rtps/builtin/discovery/participant/PDPServer.hpp>
++#endif
+ #include <rtps/builtin/discovery/participant/PDPSimple.h>
+ #include <rtps/builtin/liveliness/WLP.hpp>
+ #include <rtps/participant/RTPSParticipantImpl.hpp>
+@@ -60,10 +64,12 @@ BuiltinProtocols::~BuiltinProtocols()
+     }
+ 
+     // The type lookup manager should be deleted first, since it will access the PDP database
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     if (nullptr != typelookup_manager_)
+     {
+         delete typelookup_manager_;
+     }
++#endif
+ 
+     delete mp_WLP;
+     delete mp_PDP;
+@@ -99,6 +105,7 @@ bool BuiltinProtocols::initBuiltinProtocols(
+             mp_PDP = new PDPSimple(this, allocation);
+             break;
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+         case DiscoveryProtocol::EXTERNAL:
+             EPROSIMA_LOG_ERROR(RTPS_PDP, "Flag only present for debugging purposes");
+             return false;
+@@ -118,9 +125,16 @@ bool BuiltinProtocols::initBuiltinProtocols(
+             mp_PDP = new fastdds::rtps::PDPServer(this, allocation, DurabilityKind_t::TRANSIENT);
+             break;
+ #endif // if HAVE_SQLITE3
++#endif // FASTDDS_VELAROS_STATIC_PROFILE
+ 
+         default:
+-            EPROSIMA_LOG_ERROR(RTPS_PDP, "Unknown DiscoveryProtocol specified.");
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++            EPROSIMA_LOG_ERROR(RTPS_PDP,
++                    "Only SIMPLE discovery is available in the VelaROS static profile.");
++#else
++            EPROSIMA_LOG_ERROR(RTPS_PDP,
++                    "Unknown DiscoveryProtocol specified.");
++#endif
+             return false;
+     }
+ 
+@@ -139,7 +153,8 @@ bool BuiltinProtocols::initBuiltinProtocols(
+         mp_WLP->initWL(mp_participantImpl);
+     }
+ 
+-    // TypeLookupManager
++    // Runtime TypeLookup is unnecessary for statically generated ROS 2 types.
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     auto type_propagation = p_part->type_propagation();
+     bool should_create_typelookup =
+             (dds::utils::TypePropagation::TYPEPROPAGATION_ENABLED == type_propagation) ||
+@@ -150,6 +165,7 @@ bool BuiltinProtocols::initBuiltinProtocols(
+         typelookup_manager_ = new fastdds::dds::builtin::TypeLookupManager();
+         typelookup_manager_->init(this);
+     }
++#endif
+ 
+     return true;
+ }
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/endpoint/EDPSimpleListeners.cpp b/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/endpoint/EDPSimpleListeners.cpp
+index 81e036f..8b1f9de 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/endpoint/EDPSimpleListeners.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/endpoint/EDPSimpleListeners.cpp
+@@ -73,7 +73,9 @@ void EDPBasePUBListener::add_writer_from_change(
+     NetworkFactory& network = edp->mp_RTPSParticipant->network_factory();
+     CDRMessage_t tempMsg(change->serializedPayload);
+     auto temp_writer_data = edp->get_temporary_writer_proxies_pool().get();
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     const auto type_server = change->writerGUID;
++#endif
+ 
+     if (temp_writer_data->read_from_cdr_message(&tempMsg, change->vendor_id))
+     {
+@@ -135,6 +137,10 @@ void EDPBasePUBListener::add_writer_from_change(
+         // At this point, we can release the reader lock because the change is not used
+         reader->getMutex().unlock();
+ 
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++        // All VelaROS endpoint types are generated and registered locally.
++        after_typelookup_callback(fastdds::dds::RETCODE_NO_DATA, temp_writer_data.get());
++#else
+         auto typelookup_manager = edp->mp_RTPSParticipant->typelookup_manager();
+ 
+         // Check if TypeInformation exists to start the typelookup service
+@@ -145,13 +151,13 @@ void EDPBasePUBListener::add_writer_from_change(
+                 type_server,
+                 after_typelookup_callback);
+         }
+-        // If TypeInformation does not exist, try fallback mechanism
+         else
+         {
+             EPROSIMA_LOG_INFO(
+                 RTPS_EDP, "EDPSimpleListener: No TypeLookupManager or TypeInformation. Trying fallback mechanism");
+             after_typelookup_callback(fastdds::dds::RETCODE_NO_DATA, temp_writer_data.get());
+         }
++#endif
+         // Release temporary proxy
+         temp_writer_data.reset();
+ 
+@@ -218,7 +224,9 @@ void EDPBaseSUBListener::add_reader_from_change(
+     NetworkFactory& network = edp->mp_RTPSParticipant->network_factory();
+     CDRMessage_t tempMsg(change->serializedPayload);
+     auto temp_reader_data = edp->get_temporary_reader_proxies_pool().get();
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     const auto type_server = change->writerGUID;
++#endif
+ 
+     if (temp_reader_data->read_from_cdr_message(&tempMsg, change->vendor_id))
+     {
+@@ -281,6 +289,10 @@ void EDPBaseSUBListener::add_reader_from_change(
+         // At this point, we can release the reader lock because the change is not used
+         reader->getMutex().unlock();
+ 
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++        // All VelaROS endpoint types are generated and registered locally.
++        after_typelookup_callback(fastdds::dds::RETCODE_NO_DATA, temp_reader_data.get());
++#else
+         auto typelookup_manager = edp->mp_RTPSParticipant->typelookup_manager();
+ 
+         // Check if TypeInformation exists to start the typelookup service
+@@ -291,13 +303,13 @@ void EDPBaseSUBListener::add_reader_from_change(
+                 type_server,
+                 after_typelookup_callback);
+         }
+-        // If TypeInformation does not exist, try fallback mechanism
+         else
+         {
+             EPROSIMA_LOG_INFO(
+                 RTPS_EDP, "EDPSimpleListener: No TypeLookupManager or TypeInformation. Trying fallback mechanism");
+             after_typelookup_callback(fastdds::dds::RETCODE_NO_DATA, temp_reader_data.get());
+         }
++#endif
+         // Release the temporary proxy
+         temp_reader_data.reset();
+ 
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/participant/PDP.cpp b/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/participant/PDP.cpp
+index 6b965f7..da1f492 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/participant/PDP.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/participant/PDP.cpp
+@@ -37,7 +37,9 @@
+ #include <fastdds/rtps/writer/WriterDiscoveryStatus.hpp>
+ #include <fastdds/utils/IPLocator.hpp>
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <fastdds/builtin/type_lookup_service/TypeLookupManager.hpp>
++#endif
+ #include <fastdds/utils/TypePropagation.hpp>
+ #include <rtps/builtin/BuiltinProtocols.h>
+ #include <rtps/builtin/data/ParticipantProxyData.hpp>
+@@ -342,7 +344,8 @@ void PDP::initializeParticipantProxyData(
+ #endif // if HAVE_SECURITY
+     }
+ 
+-    // TypeLookupManager
++    // Runtime TypeLookup endpoints are not advertised by the static profile.
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     auto type_propagation = mp_RTPSParticipant->type_propagation();
+     bool should_announce_typelookup =
+             (dds::utils::TypePropagation::TYPEPROPAGATION_ENABLED == type_propagation) ||
+@@ -360,6 +363,7 @@ void PDP::initializeParticipantProxyData(
+         participant_data->m_available_builtin_endpoints |=
+                 fastdds::rtps::BUILTIN_ENDPOINT_TYPELOOKUP_SERVICE_REPLY_DATA_READER;
+     }
++#endif
+ 
+ #if HAVE_SECURITY
+     if (mp_RTPSParticipant->is_secure())
+@@ -1323,10 +1327,12 @@ void PDP::actions_on_remote_participant_removed(
+         mp_builtin->mp_WLP->removeRemoteEndpoints(pdata);
+     }
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     if (nullptr != mp_builtin->typelookup_manager_)
+     {
+         mp_builtin->typelookup_manager_->remove_remote_endpoints(pdata);
+     }
++#endif
+ 
+     mp_EDP->removeRemoteEndpoints(pdata);
+     removeRemoteEndpoints(pdata);
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/participant/PDPSimple.cpp b/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/participant/PDPSimple.cpp
+index 9f7b961..0a83eca 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/participant/PDPSimple.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/builtin/discovery/participant/PDPSimple.cpp
+@@ -163,6 +163,21 @@ bool PDPSimple::init(
+     }
+ 
+     //INIT EDP
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    if (!m_discovery.discovery_config.use_SIMPLE_EndpointDiscoveryProtocol)
++    {
++        EPROSIMA_LOG_ERROR(RTPS_PDP, "VelaROS requires SIMPLE endpoint discovery");
++        return false;
++    }
++    mp_EDP = new EDPSimple(this, mp_RTPSParticipant);
++    if (!mp_EDP->initEDP(m_discovery))
++    {
++        EPROSIMA_LOG_ERROR(RTPS_PDP, "Endpoint discovery configuration failed");
++        delete mp_EDP;
++        mp_EDP = nullptr;
++        return false;
++    }
++#else
+     if (m_discovery.discovery_config.use_STATIC_EndpointDiscoveryProtocol)
+     {
+         mp_EDP = new EDPStatic(this, mp_RTPSParticipant);
+@@ -190,6 +205,7 @@ bool PDPSimple::init(
+         EPROSIMA_LOG_WARNING(RTPS_PDP, "No EndpointDiscoveryProtocol defined");
+         return false;
+     }
++#endif
+ 
+     return true;
+ }
+@@ -254,7 +270,11 @@ ParticipantProxyData* PDPSimple::createParticipantProxyData(
+ // EDPStatic requires matching on ParticipantProxyData property updates
+ bool PDPSimple::updateInfoMatchesEDP()
+ {
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    return false;
++#else
+     return dynamic_cast<EDPStatic*>(mp_EDP) != nullptr;
++#endif
+ }
+ 
+ void PDPSimple::announceParticipantState(
+@@ -763,10 +783,12 @@ void PDPSimple::assign_low_level_remote_endpoints(
+         mp_builtin->mp_WLP->assignRemoteEndpoints(pdata, notify_secure_endpoints);
+     }
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     if (nullptr != mp_builtin->typelookup_manager_)
+     {
+         mp_builtin->typelookup_manager_->assign_remote_endpoints(pdata);
+     }
++#endif
+ 
+     if (mp_EDP != nullptr)
+     {
 diff --git a/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomain.cpp b/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomain.cpp
-index 3b9c8c38e..07c6d8fd6 100644
+index 3b9c8c3..fb5dd17 100644
 --- a/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomain.cpp
 +++ b/fastdds/Fast-DDS/src/cpp/rtps/domain/RTPSDomain.cpp
 @@ -27,6 +27,10 @@
@@ -372,8 +842,181 @@ index 3b9c8c38e..07c6d8fd6 100644
  #include <fastdds/dds/log/Log.hpp>
  #include <fastdds/LibrarySettings.hpp>
  #include <fastdds/log/LogResources.hpp>
+@@ -47,11 +51,13 @@
+ #include <rtps/participant/RTPSParticipantImpl.hpp>
+ #include <rtps/reader/BaseReader.hpp>
+ #include <rtps/reader/LocalReaderPointer.hpp>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <rtps/transport/TCPv4Transport.h>
+ #include <rtps/transport/TCPv6Transport.h>
++#include <rtps/transport/UDPv6Transport.h>
++#endif
+ #include <rtps/transport/test_UDPv4Transport.h>
+ #include <rtps/transport/UDPv4Transport.h>
+-#include <rtps/transport/UDPv6Transport.h>
+ #include <rtps/writer/BaseWriter.hpp>
+ #include <utils/Host.hpp>
+ #include <utils/SystemCommandBuilder.hpp>
+@@ -136,6 +142,15 @@ RTPSParticipant* RTPSDomain::createParticipant(
+ 
+     RTPSParticipant* part = nullptr;
+ 
++    // The product profile has one deterministic discovery path.  It deliberately
++    // ignores ROS2_EASY_MODE and never launches a discovery-server process.
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    part = RTPSDomainImpl::get_instance()->create_participant(domain_id, enabled, attrs, listen);
++    if (!part)
++    {
++        EPROSIMA_LOG_ERROR(RTPS_DOMAIN, "Unable to create the VelaROS SIMPLE participant");
++    }
++#else
+     // Try to create a participant with the default server-client setup.
+     part = create_client_server_participant(domain_id, enabled, attrs, listen);
+ 
+@@ -153,6 +168,7 @@ RTPSParticipant* RTPSDomain::createParticipant(
+     {
+         EPROSIMA_LOG_INFO(RTPS_DOMAIN, "Auto default server-client setup: Client created.");
+     }
++#endif
+ 
+     return part;
+ }
+@@ -646,6 +662,7 @@ bool RTPSDomainImpl::client_server_environment_attributes_override(
+             return false;
+         }
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+         // Check if some address requires the UDPv6, TCPv4 or TCPv6 transport
+         if (server_list.has_kind<LOCATOR_KIND_UDPv6>() &&
+                 !has_user_transport<fastdds::rtps::UDPv6TransportDescriptor>(client_att))
+@@ -678,6 +695,7 @@ bool RTPSDomainImpl::client_server_environment_attributes_override(
+             descriptor->receiveBufferSize = client_att.listenSocketBufferSize;
+             client_att.userTransports.push_back(std::move(descriptor));
+         }
++#endif
+ 
+         EPROSIMA_LOG_INFO(RTPS_DOMAIN, "Detected auto client-server environment variable."
+                 << "Trying to create client with the default server setup: "
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/network/NetworkFactory.cpp b/fastdds/Fast-DDS/src/cpp/rtps/network/NetworkFactory.cpp
+index 895b18f..74964ea 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/network/NetworkFactory.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/network/NetworkFactory.cpp
+@@ -25,7 +25,9 @@
+ #include <fastdds/utils/IPLocator.hpp>
+ 
+ #include <rtps/network/NetworkConfiguration.hpp>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <rtps/transport/TCPTransportInterface.h>
++#endif
+ 
+ using namespace std;
+ 
+@@ -549,6 +551,11 @@ void NetworkFactory::remove_participant_associated_send_resources(
+         const LocatorList_t& remote_participant_locators,
+         const LocatorList_t& participant_initial_peers_and_ds) const
+ {
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    static_cast<void>(send_resource_list);
++    static_cast<void>(remote_participant_locators);
++    static_cast<void>(participant_initial_peers_and_ds);
++#else
+     // TODO(eduponz): Call the overload of CloseOutputChannel that takes a LocatorSelectorEntry for
+     // all transports and let them decide what to do.
+     for (auto& transport : mRegisteredTransports)
+@@ -562,6 +569,7 @@ void NetworkFactory::remove_participant_associated_send_resources(
+                 participant_initial_peers_and_ds);
+         }
+     }
++#endif
+ }
+ 
+ std::vector<TransportNetmaskFilterInfo> NetworkFactory::netmask_filter_info() const
+diff --git a/fastdds/Fast-DDS/src/cpp/rtps/participant/RTPSParticipantImpl.cpp b/fastdds/Fast-DDS/src/cpp/rtps/participant/RTPSParticipantImpl.cpp
+index f75fce5..e666220 100644
+--- a/fastdds/Fast-DDS/src/cpp/rtps/participant/RTPSParticipantImpl.cpp
++++ b/fastdds/Fast-DDS/src/cpp/rtps/participant/RTPSParticipantImpl.cpp
+@@ -39,8 +39,10 @@
+ #include <fastdds/rtps/reader/ReaderDiscoveryStatus.hpp>
+ #include <fastdds/rtps/RTPSDomain.hpp>
+ #include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <fastdds/rtps/transport/TCPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv6TransportDescriptor.hpp>
++#endif
+ #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/writer/WriterDiscoveryStatus.hpp>
+ #include <fastdds/utils/IPFinder.hpp>
+@@ -404,6 +406,7 @@ bool RTPSParticipantImpl::setup_transports()
+     }
+ 
+     // Client-server discovery protocol requires that every TCP transport has a listening port
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     switch (m_att.builtin.discovery_config.discoveryProtocol)
+     {
+         case DiscoveryProtocol::BACKUP:
+@@ -486,6 +489,7 @@ bool RTPSParticipantImpl::setup_transports()
+         default:
+             break;
+     }
++#endif
+ 
+     // User defined transports
+     for (const auto& transportDescriptor : m_att.userTransports)
+@@ -1564,6 +1568,7 @@ void RTPSParticipantImpl::update_attributes(
+     // Check if discovery servers need to be updated
+     LocatorList_t converted_discovery_servers =
+             patt.builtin.discovery_config.m_DiscoveryServers;
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     if (converted_discovery_servers != temp_atts.builtin.discovery_config.m_DiscoveryServers)
+     {
+         for (auto& transportDescriptor : temp_atts.userTransports)
+@@ -1583,6 +1588,7 @@ void RTPSParticipantImpl::update_attributes(
+             }
+         }
+     }
++#endif
+ 
+     // Check if there are changes
+     if (converted_discovery_servers != temp_atts.builtin.discovery_config.m_DiscoveryServers
+@@ -1633,6 +1639,7 @@ void RTPSParticipantImpl::update_attributes(
+             }
+ 
+             // Update remote servers list
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+             if (temp_atts.builtin.discovery_config.discoveryProtocol == DiscoveryProtocol::CLIENT ||
+                     temp_atts.builtin.discovery_config.discoveryProtocol == DiscoveryProtocol::SUPER_CLIENT ||
+                     temp_atts.builtin.discovery_config.discoveryProtocol == DiscoveryProtocol::SERVER ||
+@@ -1665,6 +1672,7 @@ void RTPSParticipantImpl::update_attributes(
+                     pdp_client->update_remote_servers_list();
+                 }
+             }
++#endif
+         }
+     }
+ 
+@@ -2743,6 +2751,12 @@ bool RTPSParticipantImpl::did_mutation_took_place_on_meta(
+ 
+     // TCP is a special case because physical ports are taken from the TransportDescriptors
+     // besides WAN address may be added by the transport
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    auto transform_functor = [](const Locator_t& loc)
++            {
++                return loc;
++            };
++#else
+     struct ResetLogical
+     {
+         // use of unary_function to introduce the following aliases is deprecated
+@@ -2822,6 +2836,7 @@ bool RTPSParticipantImpl::did_mutation_took_place_on_meta(
+ 
+     }
+     transform_functor(m_att.userTransports);
++#endif
+ 
+     // transform-copy
+     set<Locator_t> update_attributes;
 diff --git a/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPChannelResource.cpp b/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPChannelResource.cpp
-index 303eff91d..bcf155d86 100644
+index 303eff9..bcf155d 100644
 --- a/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPChannelResource.cpp
 +++ b/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPChannelResource.cpp
 @@ -16,6 +16,11 @@
@@ -455,7 +1098,7 @@ index 303eff91d..bcf155d86 100644
  #endif // if defined(__APPLE__)
  }
 diff --git a/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPTransportInterface.cpp b/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPTransportInterface.cpp
-index 710ec3497..73c61b283 100644
+index 710ec34..73c61b2 100644
 --- a/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPTransportInterface.cpp
 +++ b/fastdds/Fast-DDS/src/cpp/rtps/transport/UDPTransportInterface.cpp
 @@ -90,8 +90,13 @@ bool UDPTransportInterface::CloseInputChannel(
@@ -472,8 +1115,41 @@ index 710ec3497..73c61b283 100644
          delete channel;
      }
  
+diff --git a/fastdds/Fast-DDS/src/cpp/source.cmake b/fastdds/Fast-DDS/src/cpp/source.cmake
+index 6a0b9d6..c82618f 100644
+--- a/fastdds/Fast-DDS/src/cpp/source.cmake
++++ b/fastdds/Fast-DDS/src/cpp/source.cmake
+@@ -229,6 +229,28 @@ set(${PROJECT_NAME}_source_files
+     ${FASTDDS_SOURCE_DIR}/xmlparser/XMLProfileManager.cpp
+     )
+ 
++# VelaROS uses generated ROS 2 type support, SIMPLE discovery and UDPv4.  Keep
++# the generic Fast DDS build untouched, but do not even compile implementations
++# that the bounded product profile cannot select.  Core call sites are guarded
++# by FASTDDS_VELAROS_STATIC_PROFILE so this list is also a link-time assertion:
++# an accidental dependency on a removed backend fails the firmware link.
++if(FASTDDS_VELAROS_STATIC_PROFILE)
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/fastdds/builtin/type_lookup_service/")
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/fastdds/rpc/")
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/rtps/builtin/discovery/database/")
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/rtps/builtin/discovery/endpoint/EDP(Client|Server|Static)")
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/rtps/builtin/discovery/participant/(PDPClient|PDPServer)")
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/rtps/builtin/discovery/participant/timedevent/(DSClientEvent|DServerEvent)")
++    list(FILTER ${PROJECT_NAME}_source_files EXCLUDE REGEX
++        "/rtps/transport/(tcp/|TCP|UDPv6Transport)")
++endif()
++
+ # Statistics support
+ if (FASTDDS_STATISTICS)
+ 
 diff --git a/fastdds/Fast-DDS/src/cpp/utils/SystemInfo.cpp b/fastdds/Fast-DDS/src/cpp/utils/SystemInfo.cpp
-index b44d015d6..7ba53d3fe 100644
+index b44d015..7ba53d3 100644
 --- a/fastdds/Fast-DDS/src/cpp/utils/SystemInfo.cpp
 +++ b/fastdds/Fast-DDS/src/cpp/utils/SystemInfo.cpp
 @@ -354,6 +354,9 @@ std::mutex SystemInfo::interfaces_mtx_;
@@ -487,7 +1163,7 @@ index b44d015d6..7ba53d3fe 100644
  #include "threading/threading_empty.ipp"
  #endif // Platform selection
 diff --git a/fastdds/Fast-DDS/src/cpp/utils/thread.hpp b/fastdds/Fast-DDS/src/cpp/utils/thread.hpp
-index 8c0793335..a89a5597a 100644
+index 8c07933..a89a559 100644
 --- a/fastdds/Fast-DDS/src/cpp/utils/thread.hpp
 +++ b/fastdds/Fast-DDS/src/cpp/utils/thread.hpp
 @@ -16,7 +16,7 @@
@@ -499,8 +1175,123 @@ index 8c0793335..a89a5597a 100644
  #include "thread_impl/thread_impl_custom.hpp"
  #else
  #include "thread_impl/thread_impl_basic.hpp"
+diff --git a/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParser.cpp b/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParser.cpp
+index 4ca6689..5b0c6b6 100644
+--- a/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParser.cpp
++++ b/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParser.cpp
+@@ -37,8 +37,10 @@
+ #include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/PortBasedTransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/SocketTransportDescriptor.hpp>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <fastdds/rtps/transport/TCPTransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv4TransportDescriptor.hpp>
++#endif
+ #include <fastdds/rtps/transport/UDPTransportDescriptor.hpp>
+ 
+ #include <rtps/network/utils/netmask_filter.hpp>
+@@ -336,7 +338,9 @@ XMLP_ret XMLParser::parseXMLTransportData(
+     }
+ 
+     auto udp_descriptor = std::dynamic_pointer_cast<fastdds::rtps::UDPTransportDescriptor>(pDescriptor);
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     auto tcp_descriptor = std::dynamic_pointer_cast<fastdds::rtps::TCPTransportDescriptor>(pDescriptor);
++#endif
+     auto shm_descriptor = std::dynamic_pointer_cast<fastdds::rtps::SharedMemTransportDescriptor>(pDescriptor);
+     if (udp_descriptor)
+     {
+@@ -359,6 +363,7 @@ XMLP_ret XMLParser::parseXMLTransportData(
+             }
+         }
+     }
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     else if (tcp_descriptor)
+     {
+         ret = parseXMLCommonTCPTransportData(p_root, tcp_descriptor);
+@@ -382,6 +387,7 @@ XMLP_ret XMLParser::parseXMLTransportData(
+             }
+         }
+     }
++#endif
+     else if (shm_descriptor)
+     {
+         ret = parseXMLCommonSharedMemTransportData(p_root, shm_descriptor);
+@@ -853,6 +859,12 @@ XMLP_ret XMLParser::parseXMLCommonTCPTransportData(
+         tinyxml2::XMLElement* p_root,
+         sp_transport_t p_transport)
+ {
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    static_cast<void>(p_root);
++    static_cast<void>(p_transport);
++    EPROSIMA_LOG_ERROR(XMLPARSER, "TCP transport is disabled by the VelaROS static profile");
++    return XMLP_ret::XML_ERROR;
++#else
+     /*
+         <xs:complexType name="rtpsTransportDescriptorType">
+             <xs:all minOccurs="0">
+@@ -1024,6 +1036,7 @@ XMLP_ret XMLParser::parseXMLCommonTCPTransportData(
+     }
+ 
+     return ret;
++#endif
+ }
+ 
+ XMLP_ret XMLParser::parseXMLCommonSharedMemTransportData(
+@@ -1114,6 +1127,12 @@ XMLP_ret XMLParser::parse_tls_config(
+         tinyxml2::XMLElement* p_root,
+         sp_transport_t tcp_transport)
+ {
++#ifdef FASTDDS_VELAROS_STATIC_PROFILE
++    static_cast<void>(p_root);
++    static_cast<void>(tcp_transport);
++    EPROSIMA_LOG_ERROR(XMLPARSER, "TCP/TLS transport is disabled by the VelaROS static profile");
++    return XMLP_ret::XML_ERROR;
++#else
+     /*
+         XSD:
+         <xs:simpleType name="tlsOptionsType">
+@@ -1474,6 +1493,7 @@ XMLP_ret XMLParser::parse_tls_config(
+     }
+ 
+     return ret;
++#endif
+ }
+ 
+ XMLP_ret XMLParser::parseXMLReceptionThreads(
+diff --git a/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParserExtras.cpp b/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParserExtras.cpp
+index d06e013..cd7bba4 100644
+--- a/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParserExtras.cpp
++++ b/fastdds/Fast-DDS/src/cpp/xmlparser/XMLParserExtras.cpp
+@@ -25,9 +25,11 @@
+ 
+ #include <fastdds/dds/log/Log.hpp>
+ #include <fastdds/rtps/transport/UDPv4TransportDescriptor.hpp>
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+ #include <fastdds/rtps/transport/UDPv6TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv4TransportDescriptor.hpp>
+ #include <fastdds/rtps/transport/TCPv6TransportDescriptor.hpp>
++#endif
+ #include <fastdds/rtps/transport/shared_mem/SharedMemTransportDescriptor.hpp>
+ 
+ #include <xmlparser/XMLParser.h>
+@@ -86,6 +88,7 @@ XMLP_ret XMLParser::create_transport_descriptor_from_xml_type(
+         return XMLP_ret::XML_OK;
+     }
+ 
++#ifndef FASTDDS_VELAROS_STATIC_PROFILE
+     if (transport_type == UDPv6)
+     {
+         p_transport = std::make_shared<fastdds::rtps::UDPv6TransportDescriptor>();
+@@ -103,6 +106,7 @@ XMLP_ret XMLParser::create_transport_descriptor_from_xml_type(
+         p_transport = std::make_shared<fastdds::rtps::TCPv6TransportDescriptor>();
+         return XMLP_ret::XML_OK;
+     }
++#endif
+ 
+     if (transport_type == SHM)
+     {
 diff --git a/fastdds/Fast-DDS/thirdparty/boost/include/boost/interprocess/detail/workaround.hpp b/fastdds/Fast-DDS/thirdparty/boost/include/boost/interprocess/detail/workaround.hpp
-index 397d9f7d8..b6298f251 100644
+index 397d9f7..b6298f2 100644
 --- a/fastdds/Fast-DDS/thirdparty/boost/include/boost/interprocess/detail/workaround.hpp
 +++ b/fastdds/Fast-DDS/thirdparty/boost/include/boost/interprocess/detail/workaround.hpp
 @@ -33,7 +33,7 @@
@@ -512,6 +1303,39 @@ index 397d9f7d8..b6298f251 100644
        #define BOOST_INTERPROCESS_XSI_SHARED_MEMORY_OBJECTS
     #endif
  
+diff --git a/fastdds/Kconfig b/fastdds/Kconfig
+index 883e86c..0b5ad63 100644
+--- a/fastdds/Kconfig
++++ b/fastdds/Kconfig
+@@ -25,6 +25,28 @@ config FASTDDS
+ 		providing both the OMG Fast-DDS 1.4 and the OMG RTPS 2.2 interoperable
+ 		wire-protocol standards.
+ 
++config FASTDDS_DEVELOPER_DIAGNOSTICS
++	bool "Enable Fast DDS developer diagnostics and statistics"
++	default n
++	depends on FASTDDS
++	---help---
++		Enable internal developer debug messages and the Fast DDS Statistics
++		module. Keep this disabled in VelaROS release images; normal DDS
++		communication, discovery, QoS and error reporting remain available.
++
++config FASTDDS_VELAROS_STATIC_PROFILE
++	bool "VelaROS static communication profile"
++	default n
++	depends on FASTDDS
++	---help---
++		Build the bounded Fast DDS feature set used by VelaROS products.
++		The profile keeps statically generated ROS 2 Topic, Service and Action
++		communication over UDPv4 with SIMPLE discovery and the QoS paths used
++		by rmw_fastrtps_cpp.  Host-oriented runtime extension points are
++		compiled out, together with TCP and UDPv6 transport implementations, so
++		they cannot be enabled accidentally in a product image.
++		Keep this disabled for the generic Fast DDS developer configuration.
++
+ config FASTDDS_ENABLE_OLD_LOG_MACROS
+ 	bool "Enable OLD LOG MACROS"
+ 	default n
 diff --git a/fastdds/memory/CMakeLists.txt b/fastdds/memory/CMakeLists.txt
 index 89e3e90..593a5bd 100644
 --- a/fastdds/memory/CMakeLists.txt

@@ -880,7 +880,7 @@ static FAR netpkt_t *k1_emac_receive(FAR struct netdev_lowerhalf_s *dev)
     }
 
   ret = netpkt_copyin(dev, pkt, priv->rx_buffer, length, 0);
-  if (ret != (int)length)
+  if (ret < 0)
     {
       netpkt_free(dev, pkt, NETPKT_RX);
       k1_emac_prepare_rx(priv);

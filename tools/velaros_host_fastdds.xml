@@ -4,6 +4,20 @@
   <participant profile_name="velaros_qemu_host" is_default_profile="true">
     <rtps>
       <name>velaros_qemu_host</name>
+      <propertiesPolicy>
+        <properties>
+          <property>
+            <!-- Keep discovery datagrams below the guest's 1500-byte MTU. -->
+            <name>fastdds.max_message_size</name>
+            <value>1200</value>
+          </property>
+          <property>
+            <!-- ROS 2 generated types are registered locally on both peers. -->
+            <name>fastdds.type_propagation</name>
+            <value>registration_only</value>
+          </property>
+        </properties>
+      </propertiesPolicy>
       <defaultUnicastLocatorList>
         <locator>
           <udpv4>
@@ -13,7 +27,7 @@
         </locator>
       </defaultUnicastLocatorList>
       <default_external_unicast_locators>
-        <udpv4 externality="1" cost="0" mask="24">
+        <udpv4 externality="1" cost="0" mask="32">
           <address>10.0.2.2</address>
           <port>7411</port>
         </udpv4>
@@ -37,7 +51,7 @@
           </locator>
         </initialPeersList>
         <metatraffic_external_unicast_locators>
-          <udpv4 externality="1" cost="0" mask="24">
+          <udpv4 externality="1" cost="0" mask="32">
             <address>10.0.2.2</address>
             <port>7410</port>
           </udpv4>

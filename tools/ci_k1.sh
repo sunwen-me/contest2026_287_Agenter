@@ -7,6 +7,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CONTEST_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+WORKSPACE_ROOT="$(cd -- "${CONTEST_ROOT}/.." && pwd)"
 STATIC_ONLY=0
 JOBS="${K1_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '8')}"
 
@@ -53,6 +55,15 @@ done
 
 if ((STATIC_ONLY == 0)); then
   "${SCRIPT_DIR}/build_k1.sh" --clean --package --jobs "${JOBS}"
+
+  "${SCRIPT_DIR}/build_k1.sh" \
+    --clean \
+    --package \
+    --config vendor/spacemit/boards/k1/muse_pi_pro/configs/hardware_bringup \
+    --build-dir "${WORKSPACE_ROOT}/cmake_out/k1-ci-hardware_bringup" \
+    --package-dir "${WORKSPACE_ROOT}/out/k1-bringup-hardware_bringup" \
+    --experimental-irq \
+    --jobs "${JOBS}"
 fi
 
 printf '\nK1 CI completed (%s)\n' \

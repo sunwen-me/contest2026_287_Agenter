@@ -16,8 +16,9 @@ K1 的 hart 0 S-mode PLIC context 为 **context 1**。对应寄存器：
 defconfig 不启用它，因此不会改变当前 polling UART + SBI timer 的首板基线。
 
 2026-07-30 已使用临时 `CONFIG_K1_PLIC=y` 配置完成编译链接，ELF 中包含
-`k1_plic_initialize/enable_irq/disable_irq/claim/complete`；验证后恢复默认配置。
-这只证明代码路径可编译，不代表 PLIC 已在实板工作。
+`k1_plic_initialize/enable_irq/disable_irq/claim/complete`。2026-08-14 又从真实
+MUSE Pi Pro 的 U-Boot 工作 FDT 只读确认了 PLIC 节点、GPIO source 58 和 GPIO
+中断父节点，结果与本文设计一致。`CONFIG_K1_PLIC` 仍保持默认关闭。
 
 ## 证据链
 
@@ -93,8 +94,15 @@ U-Boot DTS 的 GPIO 节点声明 `interrupts = <58>`。Linux mainline
 
 项目中的 `CONFIG_K1_GPIO_IRQ` 依赖 `CONFIG_K1_PLIC`，默认关闭。板级 GPIO ISR
 读取四个 bank 的 `GEDR`，写回待处理位清除状态，再按 40Pin GPIO 映射调用 NuttX
-GPIO callback。代码编译路径已覆盖；source 58 和一根外部 GPIO 边沿仍需在实板上
-验证 claim/complete 与 callback 分发。
+GPIO callback。U-Boot 实际 FDT 已确认 source 58；Pin 22 -> Pin 33 的 GPIO 上升沿
+claim/complete 与 callback 分发实板记录见 `docs/K1_GPIO_BRINGUP.md`。
+
+## Real-Board FDT Verification
+
+On 2026-08-14, the board's existing DTB was loaded read-only from bootfs and
+inspected in U-Boot. The exact serial evidence is recorded in
+`docs/K1_PLIC_REAL_BOARD_20260814.md`. No `saveenv`, `mmc write`, FDL flashing,
+or persistent boot configuration change was performed.
 
 ## 上板复核命令
 

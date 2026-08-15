@@ -28,7 +28,7 @@ Options:
   --uart-source PATH  K1 polling console source
   --entry ADDRESS     Expected ELF entry (default: 0x11000000)
   --toolchain-bin DIR Directory containing riscv-none-elf tools
-  --experimental-irq  Allow and require the K1 PLIC/GPIO IRQ path
+  --experimental-irq  Allow and require the experimental K1 PLIC IRQ path
   -h, --help          Show this help
 EOF
 }
@@ -190,11 +190,9 @@ done
 if ((EXPERIMENTAL_IRQ == 1)); then
   grep -qx "CONFIG_K1_PLIC=y" "${CONFIG}" ||
     fail "experimental IRQ validation requires CONFIG_K1_PLIC=y"
-  grep -qx "CONFIG_K1_GPIO_IRQ=y" "${CONFIG}" ||
-    fail "experimental IRQ validation requires CONFIG_K1_GPIO_IRQ=y"
   grep -qx "CONFIG_SMP=y" "${CONFIG}" &&
-    fail "K1 GPIO IRQ validation requires SMP to remain disabled"
-  pass "K1 experimental PLIC/GPIO IRQ Kconfig invariants"
+    fail "K1 PLIC IRQ validation requires SMP to remain disabled"
+  pass "K1 experimental PLIC IRQ Kconfig invariants"
 else
   for option in SMP K1_PLIC; do
     if grep -qx "CONFIG_${option}=y" "${CONFIG}"; then

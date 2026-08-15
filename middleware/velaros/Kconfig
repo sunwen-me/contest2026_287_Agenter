@@ -1,0 +1,432 @@
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+menu "VelaROS"
+
+config VELAROS_CORE
+	bool "ROS 2 Lyrical core interfaces"
+	default n
+	depends on LIBCXX
+	---help---
+		Build the locked rcutils, rosidl runtime, dynamic typesupport
+		interface, and rmw interface libraries for openvela.
+
+config VELAROS_CORE_SMOKE
+	bool "ROS 2 core interface smoke command"
+	default n
+	depends on VELAROS_CORE
+	---help---
+		Add the velaros_core_smoke NSH command.  It validates the target
+		allocator and the compiled rmw node-name rules without loading any
+		host ROS libraries.
+
+config VELAROS_FASTRTPS_TYPESUPPORT
+	bool "ROS 2 Fast DDS dynamic typesupport bridge"
+	default n
+	depends on VELAROS_CORE && FASTDDS
+	---help---
+		Build the locked rcpputils and
+		rosidl_dynamic_typesupport_fastrtps sources.  This is the first
+		C++ layer between the ROS 2 type model and target-side Fast DDS.
+
+config VELAROS_RMW_DDS_COMMON
+	bool "ROS 2 generated graph messages and rmw_dds_common"
+	default n
+	depends on VELAROS_FASTRTPS_TYPESUPPORT
+	---help---
+		Build the host-generated rmw_dds_common message sources, their
+		target-side Fast RTPS C++ type support, and the locked
+		rmw_dds_common graph cache implementation.
+
+config VELAROS_RMW_DDS_COMMON_SMOKE
+	bool "rmw_dds_common graph and generated typesupport smoke command"
+	default n
+	depends on VELAROS_RMW_DDS_COMMON
+	---help---
+		Add the velaros_rmw_dds_smoke NSH command.  It validates the
+		generated Fast RTPS type support and a graph-cache node update.
+
+config VELAROS_RMW_FASTRTPS_CPP
+	bool "ROS 2 rmw_fastrtps_cpp implementation"
+	default n
+	depends on VELAROS_RMW_DDS_COMMON
+	---help---
+		Build the locked rmw_fastrtps_shared_cpp and
+		rmw_fastrtps_cpp implementations as target-side static libraries.
+		Dynamic buffer plugins and Linux LTTng tracing stay disabled.
+
+config VELAROS_RMW_FASTRTPS_SMOKE
+	bool "rmw_fastrtps context, node, and graph smoke command"
+	default n
+	depends on VELAROS_RMW_FASTRTPS_CPP
+	---help---
+		Add the velaros_rmw_fastrtps_smoke NSH command.  It creates a
+		real Fast DDS-backed RMW context and node, queries the ROS graph,
+		and then verifies the complete destruction path.
+
+config VELAROS_RCL
+	bool "ROS 2 rcl minimal runtime"
+	default n
+	depends on VELAROS_RMW_FASTRTPS_CPP
+	---help---
+		Build the locked rcl 10.4.4 init, context, node, guard
+		condition, clock, timer, wait set, publisher, and subscription
+		lifecycle on top of rmw_fastrtps_cpp.  The first
+		closure intentionally excludes YAML parameters, command-line
+		remapping, rosout, and the type-description service.
+
+config VELAROS_SERVICES
+	bool "ROS 2 bounded client and service communication"
+	default n
+	depends on VELAROS_RCL
+	---help---
+		Add the standard rcl client/service request-response data plane and
+		std_srvs/SetBool wire type.  Target-side service-event introspection,
+		type-description graphs, and command-line remapping remain excluded.
+
+config VELAROS_RCL_SMOKE
+	bool "rcl node and timer/wait set smoke command"
+	default n
+	depends on VELAROS_RCL
+	---help---
+		Add the velaros_rcl_smoke NSH command.  It initializes rcl,
+		creates and validates a Fast DDS-backed node, waits for and calls
+		a steady-clock timer, and verifies all lifecycle cleanup.
+
+config VELAROS_EXECUTOR
+	bool "VelaROS minimal single-thread executor"
+	default n
+	depends on VELAROS_RCL
+	---help---
+		Build the bounded VelaROS C executor.  One caller-owned thread uses
+		a single rcl wait set to dispatch registered subscriptions, timers,
+		clients, and services in deterministic registration order.
+
+config VELAROS_RCLCPP
+	bool "VelaROS static rclcpp RAII profile"
+	default n
+	depends on VELAROS_EXECUTOR && VELAROS_SERVICES
+	---help---
+		Build the audited ROS 2 Lyrical rclcpp 32.0.0 source-level subset for
+		openVela.  It provides stack-safe Context, Node, QoS, Publisher,
+		Subscription, Client, Service, WallTimer, and bounded
+		SingleThreadedExecutor ownership without parameter services, rosout,
+		intra-process management, callback groups, dynamic executors, or
+		worker threads.  Only statically generated message types may link.
+
+config VELAROS_RCLCPP_SMOKE
+	bool "VelaROS static rclcpp RAII smoke command"
+	default n
+	depends on VELAROS_RCLCPP && VELAROS_INTEROP
+	---help---
+		Add velaros_rclcpp_smoke.  The command creates a C++ Node,
+		Publisher, Subscription, Client, Service, WallTimer, and
+		SingleThreadedExecutor, dispatches std_msgs/String Topic and
+		std_srvs/SetBool Service traffic, and validates RAII cleanup.
+
+config VELAROS_ACTIONS
+	bool "ROS 2 bounded Action communication"
+	default n
+	depends on VELAROS_SERVICES && VELAROS_EXECUTOR
+	---help---
+		Build the standard ROS 2 Action five-channel data plane on the same
+		caller-owned executor wait set.  VelaROS uses a compile-time Action
+		type whitelist, bounded goal/result storage, and no per-goal threads,
+		dynamic type loading, or target-side introspection graph.
+
+config VELAROS_ACTION_MAX_GOALS
+	int "Maximum concurrent VelaROS Action goals"
+	default 2
+	range 1 8
+	depends on VELAROS_ACTIONS
+	---help---
+		Maximum number of accepted goals retained by one bounded Action
+		server.  Goal slots and cancellation scratch space are fixed-size.
+
+config VELAROS_ACTION_FIBONACCI
+	bool "Fibonacci Action development type"
+	default n
+	depends on VELAROS_ACTIONS
+	---help---
+		Link the bounded example_interfaces/Fibonacci generated functions and
+		Fast RTPS type support used by development interoperability and RAII
+		smoke commands.  Product profiles should disable this option and link
+		only their audited Action type whitelist.
+
+config VELAROS_ACTION_SEQUENCE_CAPACITY
+	int "Fibonacci Action sequence capacity"
+	default 32
+	range 4 64
+	depends on VELAROS_ACTION_FIBONACCI
+	---help---
+		Maximum Fibonacci sequence elements accepted or deserialized by the
+		interoperability profile.  Larger untrusted sequences are rejected.
+
+config VELAROS_ACTION_INTEROP
+	bool "ROS 2 Fibonacci Action interoperability commands"
+	default n
+	depends on VELAROS_ACTION_FIBONACCI
+	---help---
+		Add velaros_action_server and velaros_action_client for bidirectional
+		interoperability tests with a standard ROS 2 host.  Product code may
+		link the bounded Action libraries without enabling these commands.
+
+config VELAROS_RCLCPP_ACTION_SMOKE
+	bool "VelaROS static rclcpp Action RAII smoke command"
+	default n
+	depends on VELAROS_RCLCPP && VELAROS_ACTION_FIBONACCI
+	---help---
+		Add velaros_rclcpp_action_smoke.  It validates a statically typed
+		Fibonacci Action client/server, feedback, successful result,
+		cancellation, bounded goal slots, caller-thread execution, and RAII
+		cleanup without futures, shared goal ownership, or worker threads.
+
+config VELAROS_SYSLOG_ADAPTER
+	bool "VelaROS rcutils to NuttX syslog adapter"
+	default n
+	depends on VELAROS_RCL && SYSLOG
+	---help---
+		Route rcutils log records to the existing NuttX syslog backend with
+		fixed-size formatting.  This adapter does not add a logging thread,
+		file sink, or second log configuration system.
+
+config VELAROS_PLATFORM_CONFIG
+	bool "VelaROS persistent openVela platform configuration"
+	default n
+	depends on VELAROS_RCL && KVDB
+	---help---
+		Store the bounded VelaROS runtime configuration in openVela KVDB.
+		Persistent keys cover the ROS domain, deterministic DDS participant
+		ID, bridge enable state, and heartbeat period.  This avoids importing
+		ROS YAML and parameter-file infrastructure for local device settings.
+
+config VELAROS_RUNTIME_SERVICE
+	bool "VelaROS Binder-managed runtime service"
+	default n
+	depends on VELAROS_PLATFORM_CONFIG && ANDROID_BINDER
+	depends on ANDROID_SERVICEMANAGER
+	---help---
+		Build velarosd and velarosctl.  velarosd registers
+		openvela.velaros.runtime with the existing Binder service manager;
+		velarosctl provides bounded status/config/lifecycle operations.  The
+		service dispatches Binder from one caller-owned poll loop without a
+		Binder thread pool or Linux epoll.
+
+config VELAROS_UORB_BRIDGE
+	bool "VelaROS compile-time uORB and ROS Topic bridge"
+	default n
+	depends on VELAROS_EXECUTOR && UORB
+	---help---
+		Build the allocation-free bridge core.  Applications provide explicit
+		compile-time conversion callbacks for each allowed uORB/ROS message
+		pair; no runtime type registry or bridge thread is included.
+
+config VELAROS_AMP
+	bool "VelaROS Linux/openvela AMP protocol and uORB service"
+	default n
+	depends on VELAROS_CORE && VELAROS_UORB_BRIDGE
+	---help---
+		Build the transport-neutral AMP protocol and openvela-side service.
+		The no-board profile validates fixed frames, CRC, sequence checks,
+		heartbeats, command timeout, emergency stop, and the persistent
+		motion/status uORB boundaries. The transport can later be replaced by
+		RPMsg/OpenAMP; this option does not claim K1 cross-hart validation.
+
+config VELAROS_AMP_SMOKE
+	bool "VelaROS no-board AMP state-machine smoke command"
+	default n
+	depends on VELAROS_AMP
+	---help---
+		Add velaros_amp_smoke. It validates a Linux/openvela AMP command,
+		heartbeat, status frame, uORB mapping, and timeout-to-zero-velocity
+		transition without requiring a K1 board or RPMsg hardware.
+
+config VELAROS_NAVIGATION
+	bool "VelaROS bounded ROS-free navigation core"
+	default n
+	depends on VELAROS_CORE
+	depends on VELAROS_UORB_BRIDGE
+	---help---
+		Build the fixed-capacity navigation core migrated from x86_lio_slam.
+		The core consumes a bounded pose/map snapshot and publishes only the
+		standard VelaROS motion-command uORB boundary.  The optional target LIO
+		runtime below feeds this snapshot without ROS point-cloud serialization.
+
+config VELAROS_NAV_MAX_MAP_CELLS
+	int "VelaROS navigation maximum map cells"
+	default 16384
+	range 1024 65536
+	depends on VELAROS_NAVIGATION
+	---help---
+		Compile-time upper bound for the costmap and A* records.  The target
+		default is smaller than the host validation capacity to keep static
+		RAM bounded on openVela.
+
+config VELAROS_NAV_MAX_PATH_NODES
+	int "VelaROS navigation maximum path nodes"
+	default 4096
+	range 256 8192
+	depends on VELAROS_NAVIGATION
+	---help---
+		Compile-time upper bound for a planned path.  Path overflow returns a
+		bounded planning failure and therefore produces a stop command.
+
+config VELAROS_NAVIGATION_SMOKE
+	bool "VelaROS navigation target smoke command"
+	default n
+	depends on VELAROS_NAVIGATION
+	---help---
+		Build velaros_navigation_smoke.  It drives the migrated core with a
+		bounded reference pose publisher, validates a goal and emergency stop,
+		and sends commands through the real persistent motion-command uORB
+		topic.  The separate VELAROS_LIO_SMOKE command validates the migrated
+		LIO snapshot producer; neither smoke is a substitute for a K1 runtime
+		test.
+
+config VELAROS_LIO
+	bool "VelaROS Small Point-LIO runtime"
+	default n
+	depends on VELAROS_NAVIGATION
+	depends on LIB_EIGEN
+	---help---
+		Build the ROS-free Small Point-LIO, bounded local/global map path,
+		keyframe system, dense pose graph fallback, and VelaROS snapshot bridge.
+		Host-only ROS bag replay, Miao, Batch LIO, and x86 SIMD paths remain
+		disabled in the target profile.
+
+config VELAROS_LIO_MAX_LOCAL_VOXELS
+	int "VelaROS LIO local voxel capacity"
+	default 32768
+	range 1024 131072
+	depends on VELAROS_LIO
+	---help---
+		Maximum local SmallIVox entries retained by the target frontend.
+
+config VELAROS_LIO_MAX_GLOBAL_POINTS
+	int "VelaROS LIO global map point capacity"
+	default 16384
+	range 1024 65536
+	depends on VELAROS_LIO
+	---help---
+		Maximum voxel-deduplicated points copied into the target navigation
+		snapshot producer.
+
+config VELAROS_LIO_MAX_CLOUD_POINTS
+	int "VelaROS LIO input cloud capacity"
+	default 4096
+	range 256 16384
+	depends on VELAROS_LIO
+	---help---
+		Maximum points accepted by one target-side fixed input cloud buffer.
+
+config VELAROS_LIO_SMOKE
+	bool "VelaROS LIO target smoke command"
+	default n
+	depends on VELAROS_LIO
+	---help---
+		Feed the target Small Point-LIO runtime with a bounded synthetic IMU and
+		point-cloud sequence, then verify the real pose/map snapshot publication.
+
+config VELAROS_BUFFER_BACKEND
+	bool "VelaROS fixed shared-buffer backend"
+	default n
+	depends on VELAROS_RMW_FASTRTPS_CPP && UORB
+	---help---
+		Build the statically registered rosidl VelaBufferBackend and its
+		openVela-local fixed payload pool.  uORB carries only bounded
+		descriptors; payload storage, slot count and leases are fixed at build
+		time.  Incompatible DDS endpoints deterministically fall back to normal
+		CPU CDR serialization.  No pluginlib loader or background worker is
+		included.
+
+config VELAROS_BUFFER_POOL_SLOTS
+	int "VelaROS shared-buffer slot count"
+	default 4
+	range 2 32
+	depends on VELAROS_BUFFER_BACKEND
+	---help---
+		Number of statically allocated payload slots.  Pool exhaustion returns
+		a bounded error instead of allocating from the heap.
+
+config VELAROS_BUFFER_POOL_SLOT_SIZE
+	int "Bytes per VelaROS shared-buffer slot"
+	default 16384
+	range 1024 1048576
+	depends on VELAROS_BUFFER_BACKEND
+	---help---
+		Payload bytes reserved per slot.  Total payload BSS is this value times
+		VELAROS_BUFFER_POOL_SLOTS.
+
+config VELAROS_BUFFER_POOL_MAX_LEASES
+	int "Maximum leases per VelaROS buffer slot"
+	default 4
+	range 2 32
+	depends on VELAROS_BUFFER_BACKEND
+	---help---
+		Maximum simultaneous bounded owners for one payload.  Each lease is
+		tracked by slot generation, lease index and owner token so stale and
+		double release operations are rejected.
+
+config VELAROS_ROBOT_NODE
+	bool "VelaROS bounded mobile-base product node"
+	default n
+	depends on VELAROS_RCLCPP && VELAROS_ACTIONS
+	depends on VELAROS_UORB_BRIDGE
+	---help---
+		Build velaros_robot_node.  The standard geometry_msgs/Twist /cmd_vel
+		Topic and fixed-layout velaros_interfaces/MoveRelative Action share
+		one persistent uORB motion-command boundary.  Action execution is
+		caller-thread driven, goal storage is fixed, and command ownership is
+		deterministically arbitrated without a dynamic executor or worker task.
+
+config VELAROS_INTEROP
+	bool "ROS 2 std_msgs/String talker and listener"
+	default n
+	depends on VELAROS_RCL
+	---help---
+		Add target-side velaros_talker and velaros_listener
+		commands using rcl, rmw_fastrtps_cpp, DDS, and the locked
+		std_msgs/String generated type support.  These commands are the
+		end-to-end interoperability boundary with a host ROS 2 node.
+
+config VELAROS_SERVICE_GATEWAY
+	bool "VelaROS ROS 2 bridge configuration service"
+	default n
+	depends on VELAROS_SERVICES && VELAROS_EXECUTOR
+	depends on VELAROS_PLATFORM_CONFIG
+	---help---
+		Add velaros_bridge_service, a standard std_srvs/SetBool server at
+		/velaros/runtime/set_bridge.  Requests update the existing openVela
+		KVDB bridge state through the bounded single-thread executor.
+
+config VELAROS_EXECUTOR_SMOKE
+	bool "VelaROS executor timer/subscription smoke command"
+	default n
+	depends on VELAROS_EXECUTOR && VELAROS_INTEROP
+	---help---
+		Add the velaros_executor_smoke NSH command.  A timer and a local
+		std_msgs/String subscription are dispatched by one executor wait
+		set; the command verifies three callbacks of each kind and cleanup.
+
+config VELAROS_OPENVELA_INTEGRATION_SMOKE
+	bool "VelaROS syslog and bidirectional uORB bridge smoke command"
+	default n
+	depends on VELAROS_SYSLOG_ADAPTER && VELAROS_UORB_BRIDGE
+	depends on VELAROS_INTEROP
+	---help---
+		Add velaros_openvela_integration_smoke.  It validates rcutils to
+		NuttX syslog mapping, sensor_temp uORB to std_msgs/Float64, and a
+		std_msgs/Float64 control setpoint back to a compile-time uORB topic.
+
+config VELAROS_BUFFER_BACKEND_SMOKE
+	bool "VelaROS fixed-buffer/uORB/backend smoke command"
+	default n
+	depends on VELAROS_BUFFER_BACKEND
+	---help---
+		Add velaros_buffer_backend_smoke.  It validates fixed-pool exhaustion,
+		generation and double-release rejection, zero-payload-copy uORB
+		descriptor transfer, static rosidl backend registration, same-pool
+		descriptor serialization and incompatible-endpoint CPU fallback.
+
+endmenu

@@ -14,7 +14,7 @@
 | 所属方向 | 2026 openvela AI 硬件开发者大赛——新硬件平台适配 |
 | 目标硬件 | 进迭时空 MUSE Pi Pro，SpacemiT K1（8 核 RISC-V X60） |
 | 目标系统 | openvela / NuttX，RV64 S-mode |
-| 当前阶段 | 已完成无板编译链接闭环和首板工具，尚未完成实板验证 |
+| 当前阶段 | 已完成 K1 首板启动、基础外设、显示 framebuffer handoff、USB probe、USB Host/UAS 和 eMMC 只读实板验证；PWM 波形及可写存储仍暂缓 |
 | 核心交付 | K1 芯片层、MUSE Pi Pro 板级包、NSH defconfig、基础驱动、复现文档和演示 |
 
 ## 二、项目简介
@@ -26,10 +26,11 @@ S-mode payload 装载运行，完成系统入口、内存布局、UART 控制台
 时钟节拍、外部中断控制器和板级初始化的适配，最终实现稳定进入 NSH，并通过
 40Pin GPIO 等基础外设完成可观察的功能演示。
 
-项目首先保证单 hart 的最小系统链路稳定，不把 SMP、AMP、NPU、显示、音频等
+项目首先保证单 hart 的最小系统链路稳定，不把 SMP、AMP、X60 AI 指令运行时、显示、音频等
 高风险功能作为初赛成功的前置条件。在最小链路通过实板验证后，再根据时间和
-硬件资料完整度选择扩展 PLIC 外部中断、GPIO/I2C/SPI，以及 Linux + openvela
-AMP 原型。所有“已完成”结论均要求有源码、构建产物或实板日志支撑。
+硬件资料完整度选择扩展 PLIC 外部中断、GPIO/I2C/SPI、Ethernet、watchdog 和
+eMMC 只读路径，以及 Linux + openvela AMP 原型。所有“已完成”结论均要求有源码、
+构建产物或实板日志支撑。
 
 ## 三、项目背景与价值
 
@@ -68,7 +69,7 @@ K1 是国产 64 位多核 RISC-V SoC，MUSE Pi Pro 同时具备大容量内存�
 ### 4.3 本阶段不承诺
 
 - 8 核 SMP 的完整稳定性和性能优化；
-- openvela 直接驱动 K1 NPU、Wi-Fi、蓝牙、显示或音频全栈；
+- openvela 直接接入 K1 X60 AI 自定义指令运行时、Wi-Fi、蓝牙、显示或音频全栈；
 - Linux 与 openvela AMP 的产品级稳定性；
 - 未经实板日志验证的启动、时钟、中断和外设结论。
 
@@ -184,11 +185,11 @@ K1 上唯一的 S-mode payload 独立启动，并完成 BSP 和基础外设闭�
 
 | 系统 | 定位 | 主要职责 |
 |---|---|---|
-| Linux | 富功能主系统 / AI 服务域 | 启动管理、存储、网络、显示、多媒体、NPU 驱动和 AI 推理 |
+| Linux | 富功能主系统 / AI 服务域 | 启动管理、存储、网络、显示、多媒体、X60 AI 指令运行时和 AI 推理 |
 | openvela | 独立实时执行域 | 确定性传感采集、GPIO/I2C/SPI 实时控制、执行器控制、看门狗与安全状态机 |
 
 openvela 在 AMP 中不是“为了展示而运行的第二个系统”，也不替代 Linux 的成熟
-NPU 和多媒体生态；它负责 Linux 难以保证确定性的实时 I/O 与控制闭环。Linux
+AI 推理运行时和多媒体生态；它负责 Linux 难以保证确定性的实时 I/O 与控制闭环。Linux
 侧完成 AI 推理后，通过核间通信向 openvela 下发有边界的控制目标，openvela
 执行实时任务并回传状态和时间戳。
 
@@ -209,19 +210,23 @@ AMP 原型拟使用专用 hart、独立内存区和独占外设/IRQ，Linux 与 
 
 ## 七、当前进度
 
-截至 2026-07-30：
+截至 2026-08-15：
 
 | 状态 | 内容 | 证据边界 |
 |---|---|---|
 | 已完成 | K1 芯片层、MUSE Pi Pro 板级骨架、NSH defconfig | 已进入实际构建 |
 | 已完成 | RV64 S-mode hart 0 入口、`gp` 初始化、handoff/CSR 日志 | 源码和 ELF 可检查 |
 | 已完成 | 不写 IER 的 polling `/dev/console` | 源码和 ELF 静态验收 |
-| 已完成 | OpenSBI TIME 24 MHz timer 接线 | 编译链接通过，未上板 |
-| 已完成 | PLIC context 1 证据和默认关闭的单 hart 实现 | 可选配置编译通过，未上板 |
+| 已完成 | OpenSBI TIME 24 MHz timer 和单核 10 分钟稳定运行 | MUSE Pi Pro 实板日志 |
+| 已完成 | PLIC context 1、GPIO source 58 和 GPIO 边沿 IRQ | FDT 只读核对及 Pin 22 -> Pin 33 实板日志 |
+| 已完成 | EMAC0/RTL8211F polling 网络、I2C2、SPI3、watchdog、SDH2 eMMC 只读路径 | 对应实板日志；eMMC 已验证 CMD18 多块读取，PWM 波形除外 |
 | 已完成 | 可重复构建、ELF 验收、U-Boot 包、串口采集和 trap 解析 | 主机侧工具已验证 |
 | 已完成 | 干净构建 1097 个目标通过 | 只证明编译链接闭环 |
-| 待完成 | 实板 handoff、UART、timer、NSH、GPIO Demo | 当前没有开发板 |
-| 可选 | SMP、AMP、NPU 和复杂外设 | 尚未实现，不作为承诺 |
+| 已完成 | U-Boot framebuffer handoff、DWC3 Host/xHCI、USB2817 双根端口、Netac XS510 UAS 和 `/dev/sda` 注册 | RAM-only 实板日志；不等同于原生 DPU/面板全栈、USB Device/FDL 或磁盘写入 |
+| 已完成 | DWC3/PHY register probe 原始输出 | 只读 RAM-only 实板日志；不等同于 USB Device/FDL |
+| 待实板验证 | 已识别面板的视觉色块 | `display_fb` 仍依赖 U-Boot handoff，需连接并识别面板 |
+| 待完成 | PWM11 波形、持久烧录/恢复闭环、K1 Fast DDS 实板互操作 | 需要测量仪器或进一步软件集成 |
+| 可选 | SMP、AMP、X60 AI 指令运行时和复杂外设 | 尚未实现，不作为承诺 |
 
 当前基线 ELF 为 RV64 little-endian RISC-V，入口为 `0x11000000`，RX/RW
 LOAD 段分离且无 RWX 段。当前产物 SHA256 为
@@ -246,7 +251,7 @@ LOAD 段分离且无 RWX 段。当前产物 SHA256 为
 
 - 若 2026-08-10 前到板，主线有合理缓冲，可在 NSH 稳定后考虑一项扩展；
 - 若 2026-08-11 至 08-15 到板，主线仍可行，但扩展项必须等最小系统通过；
-- 若 2026-08-20 仍未到板，冻结 AMP/SMP/NPU，只做最小系统和一个基础 Demo；
+- 若 2026-08-20 仍未到板，冻结 AMP/SMP/X60 AI 指令运行时，只做最小系统和一个基础 Demo；
 - 若 2026-08-31 仍未到板，实板移植进入高风险状态，应立即与组委会确认板卡；
 - 只有在 2026-08-25 前完成单核 NSH、timer 和 GPIO/PLIC 基线，且 AMP 所需
   资源分区证据完整，才允许投入不超过 5 个工作日做 AMP 可行性原型。
@@ -287,8 +292,9 @@ AI 用于资料检索、代码骨架、测试脚本和审查提示，但不作�
 4. 每次功能启用必须保留原始串口日志、配置、ELF SHA256 和复现命令；
 5. 无法在截止前完成双重证据闭环的功能，从必选目标降为可选设计，不写成成果。
 
-当前代码已完成静态检查和驱动模式审查，但尚未经历实板行为验证。因此项目描述
-只承诺已经形成“可上板验证的实现基线”，不宣称已经完成 K1 移植。
+当前代码已完成静态检查、驱动模式审查和首板行为验证。仍未完成的项目明确限于
+PWM11 波形、持久烧录/恢复闭环、Fast DDS 实板互操作，以及未具备可靠寄存器依据
+的复杂外设；这些不写成已完成成果。
 
 ## 十、预期成果与验收标准
 

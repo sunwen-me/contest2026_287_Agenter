@@ -1,6 +1,6 @@
 # VelaROS ROS 2 源码与许可证清单
 
-版本：2026-07-31
+版本：2026-08-02
 
 ## 锁定仓库
 
@@ -16,6 +16,7 @@
 | `ros2/rosidl_dynamic_typesupport_fastrtps` | 0.5.1 | `de01f56ccbf80851b5460a3ca169b4ca71c58b48` | Apache-2.0 | 第二批目标端动态类型后端 |
 | `ros2/rmw_fastrtps` | 9.4.8 | `198a8b57386144896e5270a2a51bc4306be33967` | Apache-2.0 | 第三批目标 RMW，完整生命周期 PASS |
 | `ros2/rcl` | 10.4.4 | `da0b5e70247ef1fb0425bf35417d4e9fdf11efb9` | Apache-2.0 | 第四批最小 context/node 客户端层 |
+| `ros2/rclcpp` | 32.0.0 | `c80310e420185110bb8876a67223c14a02feee59` | Apache-2.0 | 静态 RAII 子集的 API/语义审计基线 |
 | `ros2/rcl_interfaces` | 2.4.5 | `b90e36e4adf5ed878efa2f365a84798f782618cd` | Apache-2.0 | 已锁定，下一阶段生成消息 |
 | `ros2/rcl_logging` | 3.4.1 | `904c0971bd0b3581094af853b76b56304915248e` | Apache-2.0 | 已锁定，下一阶段日志边界 |
 | `ros2/libyaml_vendor` | 1.8.1 | `78a2eb793c0aefb399f0fc7e9882524868b117c1` | Apache-2.0、MIT | 已锁定，下一阶段 YAML 边界 |
@@ -35,7 +36,7 @@
   target binary 依赖，但源码分发时仍保留其许可证；
 - `rmw_dds_common` 的生成源码由锁定的消息定义和 Lyrical ROSIDL 生成器得到，
   只导出 71 个 C/C++ 源码/头文件，不导出 host 二进制；
-- 后续实际扩展 `rcl`、接入 `rclcpp` 或新消息包时必须同步更新“当前用途”
+- 后续实际扩展 `rcl`、静态 `rclcpp` 子集或新消息包时必须同步更新“当前用途”
   和最终 binary notice。
 
 ## 来源验证
