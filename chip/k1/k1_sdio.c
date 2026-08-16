@@ -48,6 +48,22 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_SDHC_COMMAND_TIMEOUT               1000u
 #define K1_SDHC_DEFAULT_XFR_TIMEOUT           100u
 
+#ifdef CONFIG_K1_SDIO_WIFI
+#  define K1_SDIO_WIFI_READY_TIMEOUT_MSEC     100u
+#  define K1_SDIO_R4_VOLTAGE_WINDOW_MASK      0x00fffffful
+#  define K1_SDIO_R4_IO_READY                 (1ul << 27)
+#  define K1_SDIO_R4_FUNCTIONS_SHIFT          28
+#  define K1_SDIO_R4_FUNCTIONS_MASK           (7ul << 28)
+#  define K1_SDIO_CMD52_WRITE                 (1ul << 31)
+#  define K1_SDIO_CMD52_ADDRESS_SHIFT         9
+#  define K1_SDIO_R5_CRC_ERROR                (1ul << 15)
+#  define K1_SDIO_R5_ILLEGAL_COMMAND          (1ul << 14)
+#  define K1_SDIO_R5_ERROR                    (1ul << 11)
+#  define K1_SDIO_R5_FUNCTION_NUMBER          (1ul << 9)
+#  define K1_SDIO_R5_OUT_OF_RANGE             (1ul << 8)
+#  define K1_SDIO_FBR_INTERFACE_CODE          0x00u
+#endif
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -927,11 +943,88 @@ FAR struct sdio_dev_s *sdio_initialize(int slotno)
 }
 
 #ifdef CONFIG_K1_SDIO_WIFI
-int k1_sdio_wifi_probe(FAR uint32_t *ocr)
+static int k1_sdio_wifi_command(FAR struct sdio_dev_s *dev, uint32_t cmd,
+                                uint32_t arg)
+{
+  int ret;
+
+  ret = SDIO_SENDCMD(dev, cmd, arg);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  return SDIO_WAITRESPONSE(dev, cmd);
+}
+
+static int k1_sdio_wifi_cmd52(FAR struct sdio_dev_s *dev, bool write,
+                               uint32_t address, uint8_t inb,
+                               FAR uint8_t *outb)
+{
+  uint32_t arg;
+  uint32_t response;
+  int ret;
+
+  arg = (address & 0x1fffful) << K1_SDIO_CMD52_ADDRESS_SHIFT;
+  if (write)
+    {
+      arg |= K1_SDIO_CMD52_WRITE | inb;
+    }
+
+  ret = k1_sdio_wifi_command(dev, SDIO_CMD52, arg);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = SDIO_RECVR5(dev, SDIO_CMD52, &response);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if ((response & (K1_SDIO_R5_CRC_ERROR |
+                   K1_SDIO_R5_ILLEGAL_COMMAND)) != 0)
+    {
+      return -EILSEQ;
+    }
+
+  if ((response & K1_SDIO_R5_ERROR) != 0)
+    {
+      return -EIO;
+    }
+
+  if ((response & (K1_SDIO_R5_FUNCTION_NUMBER |
+                   K1_SDIO_R5_OUT_OF_RANGE)) != 0)
+    {
+      return -EINVAL;
+    }
+
+  if (outb != NULL)
+    {
+      *outb = response & UINT8_MAX;
+    }
+
+  return OK;
+}
+
+int k1_sdio_wifi_probe(FAR struct k1_sdio_wifi_info_s *info)
 {
   FAR struct sdio_dev_s *dev;
-  uint32_t response = 0;
+  uint32_t response;
+  uint32_t voltage_window;
+  uint32_t rca;
+  uint8_t value;
+  uint8_t function;
+  unsigned int attempt;
   int ret;
+
+  if (info == NULL)
+    {
+      return -EINVAL;
+    }
+
+  memset(info, 0, sizeof(*info));
 
   dev = sdio_initialize(1);
   if (dev == NULL)
@@ -942,32 +1035,184 @@ int k1_sdio_wifi_probe(FAR uint32_t *ocr)
   SDIO_ATTACH(dev);
   SDIO_CLOCK(dev, CLOCK_IDMODE);
 
-  /* CMD5 is the non-destructive SDIO identification transaction.  It does
-   * not enable a function or touch vendor registers, so it is the first
-   * board-level proof point before an RTL8852BS2 MAC driver exists.
+  /* Select the card with the SDIO-prescribed CMD0/CMD5/CMD3/CMD7 sequence.
+   * No I/O function is enabled here; function enable remains exclusively a
+   * responsibility of a future RTL8852BS2 MAC driver.
    */
 
-  ret = SDIO_SENDCMD(dev, SDIO_CMD5, 0);
+  ret = k1_sdio_wifi_command(dev, MMCSD_CMD0, 0);
   if (ret < 0)
     {
       return ret;
     }
 
-  ret = SDIO_WAITRESPONSE(dev, SDIO_CMD5);
+  up_mdelay(50);
+
+  ret = k1_sdio_wifi_command(dev, SDIO_CMD5, 0);
   if (ret < 0)
     {
       return ret;
     }
 
-  ret = SDIO_RECVR4(dev, SDIO_CMD5, &response);
+  ret = SDIO_RECVR4(dev, SDIO_CMD5, &info->ocr);
   if (ret < 0)
     {
       return ret;
     }
 
-  if (ocr != NULL)
+  info->function_count =
+    (info->ocr & K1_SDIO_R4_FUNCTIONS_MASK) >>
+    K1_SDIO_R4_FUNCTIONS_SHIFT;
+  if (info->function_count == 0)
     {
-      *ocr = response;
+      return -ENODEV;
+    }
+
+  voltage_window = info->ocr & K1_SDIO_R4_VOLTAGE_WINDOW_MASK;
+  if (voltage_window == 0)
+    {
+      return -EINVAL;
+    }
+
+  /* Request the first advertised pair of supported voltage bits, matching
+   * the standard NuttX SDIO probe policy.
+   */
+
+  for (attempt = 0; attempt < 24; attempt++)
+    {
+      if ((voltage_window & (1ul << attempt)) != 0)
+        {
+          voltage_window &= 3ul << attempt;
+          break;
+        }
+    }
+
+  for (attempt = 0; attempt < K1_SDIO_WIFI_READY_TIMEOUT_MSEC; attempt++)
+    {
+      ret = k1_sdio_wifi_command(dev, SDIO_CMD5, voltage_window);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      ret = SDIO_RECVR4(dev, SDIO_CMD5, &response);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      if ((response & K1_SDIO_R4_IO_READY) != 0)
+        {
+          break;
+        }
+
+      up_mdelay(1);
+    }
+
+  if (attempt == K1_SDIO_WIFI_READY_TIMEOUT_MSEC)
+    {
+      return -ETIMEDOUT;
+    }
+
+  ret = k1_sdio_wifi_command(dev, SD_CMD3, 0);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = SDIO_RECVR6(dev, SD_CMD3, &rca);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_sdio_wifi_command(dev, MMCSD_CMD7S, rca & 0xffff0000ul);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = SDIO_RECVR1(dev, MMCSD_CMD7S, &response);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_sdio_wifi_cmd52(dev, false, SDIO_CCCR_BUS_IF, 0, &value);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  value &= ~SDIO_CCCR_BUS_IF_WIDTH_MASK;
+  value |= SDIO_CCCR_BUS_IF_4_BITS;
+  ret = k1_sdio_wifi_cmd52(dev, true, SDIO_CCCR_BUS_IF, value, NULL);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  SDIO_WIDEBUS(dev, true);
+  SDIO_CLOCK(dev, CLOCK_SD_TRANSFER_4BIT);
+
+  ret = k1_sdio_wifi_cmd52(dev, false, SDIO_CCCR_REV, 0,
+                            &info->cccr_revision);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_sdio_wifi_cmd52(dev, false, SDIO_CCCR_SD_SPEC_REV, 0,
+                            &info->sd_spec_revision);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_sdio_wifi_cmd52(dev, false, SDIO_CCCR_IOEN, 0,
+                            &info->io_enable);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_sdio_wifi_cmd52(dev, false, SDIO_CCCR_IORDY, 0,
+                            &info->io_ready);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_sdio_wifi_cmd52(dev, false, SDIO_CCCR_BUS_IF, 0,
+                            &info->bus_interface);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if ((info->bus_interface & SDIO_CCCR_BUS_IF_WIDTH_MASK) !=
+      SDIO_CCCR_BUS_IF_4_BITS)
+    {
+      return -EIO;
+    }
+
+  ret = k1_sdio_wifi_cmd52(dev, false, SDIO_CCCR_CARD_CAP, 0,
+                            &info->card_capability);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  for (function = 1; function <= info->function_count; function++)
+    {
+      ret = k1_sdio_wifi_cmd52(dev, false,
+                                (function << SDIO_FBR_SHIFT) +
+                                K1_SDIO_FBR_INTERFACE_CODE, 0,
+                                &info->function_interface[function - 1]);
+      if (ret < 0)
+        {
+          return ret;
+        }
     }
 
   return OK;

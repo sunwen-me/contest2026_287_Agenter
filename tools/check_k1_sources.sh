@@ -87,6 +87,15 @@ awk '
   fail "CONFIG_K1_WATCHDOG must exclude WATCHDOG_AUTOMONITOR"
 pass "K1 watchdog uses manual control only"
 
+wifi_sdio_source="${CONTEST_ROOT}/chip/k1/k1_sdio.c"
+if [[ "$(grep -c 'SDIO_CCCR_IOEN' "${wifi_sdio_source}")" != "1" ]] ||
+   ! grep -Eq \
+     'k1_sdio_wifi_cmd52\(dev, false, SDIO_CCCR_IOEN, 0,' \
+     "${wifi_sdio_source}"; then
+  fail "Wi-Fi enumeration must only read SDIO_CCCR_IOEN"
+fi
+pass "Wi-Fi enumeration leaves SDIO IOEN untouched"
+
 if git -C "${CONTEST_ROOT}" rev-parse --is-inside-work-tree \
      >/dev/null 2>&1; then
   # Patch files contain mandatory one-character context prefixes for blank

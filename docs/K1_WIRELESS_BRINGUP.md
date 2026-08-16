@@ -3,7 +3,7 @@
 更新时间：2026-08-16（Asia/Shanghai）
 
 本文件记录 MUSE Pi Pro 板载 RTL8852BS2 的 openvela 首轮迁移边界。它是
-硬件供电、pinmux、SDIO 识别和 Bluetooth H4 传输的实现说明，不是“Wi-Fi 或蓝牙
+硬件供电、pinmux、SDIO 卡枚举和 Bluetooth H4 传输的实现说明，不是“Wi-Fi 或蓝牙
 已经可用”的宣称。
 
 ## 1. 硬件事实
@@ -21,8 +21,8 @@ GPIO64、GPIO65 不在该板 DTS 的无线电源序列中，不能作为无线�
 
 ## 2. 已实现
 
-- `chip/k1/k1_sdio.c`：SDH1 实例、4-bit SDIO capability，以及无副作用的
-  CMD5 OCR 探测；
+- `chip/k1/k1_sdio.c`：SDH1 实例、4-bit SDIO capability，以及标准
+  CMD0/CMD5/CMD3/CMD7 卡选择、CCCR/FBR 的 CMD52 识别读取；
 - `board/k1/muse_pi_pro/src/k1_wireless.c`：GPIO15--24 pinmux、无线控制线
   时序、SDH1 探测、UART2 H4 注册；
 - `chip/k1/k1_bt_uart.c`：UART2 的单实例 H4 lower-half，使用 NuttX
@@ -36,16 +36,22 @@ GPIO64、GPIO65 不在该板 DTS 的无线电源序列中，不能作为无线�
 Wi-Fi CMD5 和 Bluetooth H4 会独立尝试；前者失败不会阻断后者，以便从单次串口
 日志区分 SDIO 与 UART2 问题。板级初始化仍会返回第一项失败码。
 
+Wi-Fi 卡枚举会把 CCCR 的 Bus Interface Control 设为 4-bit，并将主机切换为
+4-bit 模式；随后只读 CCCR revision、SD revision、IOEN、IORDY、Bus Interface、
+Card Capability 和已声明 function 的 FBR interface code。它不写 IOEN，因此
+不会启用任何 WLAN function，也不会触碰 Realtek vendor register 或固件。
+
 ## 3. 明确未实现
 
-- RTL8852BS2 Wi-Fi MAC、SDIO function 初始化、Realtek Wi-Fi firmware 下载和
+- RTL8852BS2 Wi-Fi SDIO function 初始化、Realtek Wi-Fi firmware 下载、MAC 和
   `netdev` 注册；
 - RTL8852BS2 Bluetooth vendor firmware 下载、HCI Reset/版本查询及扫描验证；
 - Wi-Fi/蓝牙低功耗唤醒、SDIO 中断、吞吐与长期稳定性验证；
 - 蓝牙 UART2 IER 的实板风险确认。
 
-因此，CMD5 成功只证明 SDIO 从设备响应；`/dev/ttyHCI0` 出现只证明 H4 传输已
-注册。两者均不代表联网、关联 AP、扫描设备或数据传输通过。
+因此，CCCR/FBR 可读仅证明 SDIO 卡选择、4-bit 总线设置和标准 function 描述符可
+用；`/dev/ttyHCI0` 出现只证明 H4 传输已注册。两者均不代表联网、关联 AP、扫描
+设备或数据传输通过。
 
 ## 4. UART 风险隔离
 
@@ -76,7 +82,8 @@ tools/build_k1.sh \
 
 1. 正常进入 NSH，UART0 日志未退化；
 2. `K1 RTL8852BS2 bring-up failed` 没有出现，或记录其确切错误码；
-3. CMD5 返回成功且 OCR 值被记录；
+3. 串口记录 CMD5 OCR、CCCR revision、function 数量及 F1 interface code，且
+   未出现 `K1 RTL8852BS2 bring-up failed`；
 4. `/dev/ttyHCI0` 存在，打开/关闭不导致异常；
 5. 只有在 UART2 H4 收发和厂商初始化已有独立日志后，才继续实现 Realtek 固件
    和网络功能。

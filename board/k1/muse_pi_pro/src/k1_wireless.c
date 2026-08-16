@@ -105,7 +105,7 @@ static void k1_wireless_configure_uart_pins(void)
 int k1_wireless_initialize(void)
 {
 #ifdef CONFIG_K1_RTL8852BS2_WIFI
-  uint32_t ocr;
+  struct k1_sdio_wifi_info_s wifi_info;
   int probe_ret;
 #endif
 #ifdef CONFIG_K1_RTL8852BS2_BT
@@ -159,7 +159,7 @@ int k1_wireless_initialize(void)
                          K1_MFPR_DRIVE_1V8_DS2 | K1_MFPR_PULL_UP, true);
   up_mdelay(30);
 
-  probe_ret = k1_sdio_wifi_probe(&ocr);
+  probe_ret = k1_sdio_wifi_probe(&wifi_info);
   if (probe_ret < 0)
     {
       ret = probe_ret;
@@ -167,7 +167,15 @@ int k1_wireless_initialize(void)
   else
     {
       k1_early_puts("K1 Wi-Fi: CMD5 OCR=");
-      k1_early_puthex(ocr);
+      k1_early_puthex(wifi_info.ocr);
+      k1_early_puts(" CCCR=");
+      k1_early_puthex(wifi_info.cccr_revision);
+      k1_early_puts(" SD revision=");
+      k1_early_puthex(wifi_info.sd_spec_revision);
+      k1_early_puts(" functions=");
+      k1_early_puthex(wifi_info.function_count);
+      k1_early_puts(" F1 interface=");
+      k1_early_puthex(wifi_info.function_interface[0]);
       k1_early_puts("\r\n");
     }
 #endif
@@ -192,13 +200,13 @@ int k1_wireless_initialize(void)
     }
 #endif
 
-  /* Keep the first Wi-Fi handoff intentionally limited to CMD5.  OCR is
-   * read so the compiler cannot discard the probe; the vendor MAC/firmware
-   * driver is a later migration phase.
+  /* SDIO card enumeration only selects the card, switches to the board's
+   * four-bit bus, and reads common/function registers.  It never enables an
+   * I/O function or accesses RTL8852BS2 vendor registers.
    */
 
 #ifdef CONFIG_K1_RTL8852BS2_WIFI
-  (void)ocr;
+  (void)wifi_info;
 #endif
   return ret;
 }

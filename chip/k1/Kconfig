@@ -180,13 +180,14 @@ config K1_SDIO
 if K1_SDIO
 
 config K1_SDIO_WIFI
-	bool "K1 SDH1 RTL8852BS2 SDIO probe"
+	bool "K1 SDH1 RTL8852BS2 SDIO card enumeration"
 	default n
 	---help---
 		Enable the SDH1 1.8 V, four-bit SDIO controller instance connected to
-		the MUSE Pi Pro RTL8852BS2 Wi-Fi function.  This exposes only the
-		controller needed for the non-destructive CMD5 identification probe;
-		it does not provide an 802.11 MAC driver.
+		the MUSE Pi Pro RTL8852BS2 Wi-Fi function.  It selects the SDIO card,
+		switches its common control interface to four-bit mode, and reads the
+		CCCR/FBR identification registers.  It does not enable an I/O function
+		or provide an 802.11 MAC driver.
 
 endif # K1_SDIO
 
@@ -195,9 +196,10 @@ config K1_RTL8852BS2_WIFI
 	default n
 	depends on K1_SDIO_WIFI
 	---help---
-		Configure the RTL8852BS2 power sequence and SDH1 pinmux, then issue
-		an SDIO CMD5 probe.  It deliberately does not load Realtek firmware,
-		register a network device, or claim working Wi-Fi connectivity.
+		Configure the RTL8852BS2 power sequence and SDH1 pinmux, then perform
+		SDIO card enumeration and CCCR/FBR identification.  It deliberately
+		does not enable the WLAN function, load Realtek firmware, register a
+		network device, or claim working Wi-Fi connectivity.
 
 config K1_RTL8852BS2_BT
 	bool "MUSE Pi Pro RTL8852BS2 Bluetooth H4 transport (experimental)"
