@@ -41,6 +41,8 @@
 #define K1_UART_FCR_TRIG_14   (3u << 6)
 
 #define K1_UART_LCR_WLS_8     (3u << 0)
+#define K1_UART_LCR_PEN       (1u << 3)
+#define K1_UART_LCR_EPS       (1u << 4)
 #define K1_UART_LCR_DLAB      (1u << 7)
 
 #define K1_UART_MCR_RTS       (1u << 1)

@@ -14,16 +14,10 @@
 
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <sys/types.h>
 
 #include <nuttx/arch.h>
-#include <nuttx/irq.h>
-#include <nuttx/mutex.h>
-#include <nuttx/spinlock.h>
-#include <nuttx/wireless/bluetooth/bt_uart.h>
-
-#include <arch/irq.h>
 
 #include "hardware/k1_gpio.h"
 #include "hardware/k1_uart.h"
@@ -34,69 +28,40 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define K1_BT_UART_RXBUFSIZE  2048
+#define K1_BT_H5_RETRIES           10u
+#define K1_BT_H5_WAIT_MSEC         500u
+#define K1_BT_H5_RX_DRAIN_MAX      2048u
+#define K1_BT_H5_RX_PER_TICK       128u
+#define K1_BT_H5_FRAME_MAX         32u
+
+#define K1_BT_H5_DELIMITER         0xc0u
+#define K1_BT_H5_ESCAPE            0xdbu
+#define K1_BT_H5_ESCAPE_DELIMITER  0xdcu
+#define K1_BT_H5_ESCAPE_ESCAPE     0xddu
+#define K1_BT_H5_ESCAPE_XON        0xdeu
+#define K1_BT_H5_ESCAPE_XOFF       0xdfu
+
+#define K1_BT_H5_LINK_CONTROL      0x0fu
 
 /****************************************************************************
  * Private Types
  ****************************************************************************/
 
-struct k1_bt_uart_s
+enum k1_bt_h5_message_e
 {
-  struct btuart_lowerhalf_s lower;
-  spinlock_t lock;
-  mutex_t txlock;
-  btuart_rxcallback_t callback;
-  FAR void *callback_arg;
-  uint16_t rxhead;
-  uint16_t rxtail;
-  uint8_t rxbuffer[K1_BT_UART_RXBUFSIZE];
-  bool initialized;
-  bool rxenabled;
+  K1_BT_H5_NONE,
+  K1_BT_H5_SYNC_REQUEST,
+  K1_BT_H5_SYNC_RESPONSE,
+  K1_BT_H5_CONFIG_REQUEST,
+  K1_BT_H5_CONFIG_RESPONSE,
 };
 
-/****************************************************************************
- * Private Function Prototypes
- ****************************************************************************/
-
-static void k1_bt_uart_rxattach(FAR const struct btuart_lowerhalf_s *lower,
-                                btuart_rxcallback_t callback,
-                                FAR void *arg);
-static void k1_bt_uart_rxenable(FAR const struct btuart_lowerhalf_s *lower,
-                                bool enable);
-static int k1_bt_uart_setbaud(FAR const struct btuart_lowerhalf_s *lower,
-                              uint32_t baud);
-static ssize_t k1_bt_uart_read(FAR const struct btuart_lowerhalf_s *lower,
-                               FAR void *buffer, size_t buflen);
-static ssize_t k1_bt_uart_write(FAR const struct btuart_lowerhalf_s *lower,
-                                FAR const void *buffer, size_t buflen);
-static ssize_t k1_bt_uart_rxdrain(
-  FAR const struct btuart_lowerhalf_s *lower);
-static int k1_bt_uart_ioctl(FAR const struct btuart_lowerhalf_s *lower,
-                            int cmd, unsigned long arg);
-static int k1_bt_uart_interrupt(int irq, FAR void *context, FAR void *arg);
-
-/****************************************************************************
- * Private Data
- ****************************************************************************/
-
-/* MUSE Pi Pro exposes one Bluetooth controller on UART2.  A static single
- * instance keeps its IRQ, FIFO, and H4 endpoint ownership unambiguous.
- */
-
-static struct k1_bt_uart_s g_k1_bt_uart =
+struct k1_bt_h5_rx_s
 {
-  .lower =
-  {
-    .rxattach = k1_bt_uart_rxattach,
-    .rxenable = k1_bt_uart_rxenable,
-    .setbaud  = k1_bt_uart_setbaud,
-    .read     = k1_bt_uart_read,
-    .write    = k1_bt_uart_write,
-    .rxdrain  = k1_bt_uart_rxdrain,
-    .ioctl    = k1_bt_uart_ioctl,
-  },
-  .lock = SP_UNLOCKED,
-  .txlock = NXMUTEX_INITIALIZER,
+  uint8_t data[K1_BT_H5_FRAME_MAX];
+  uint8_t length;
+  bool started;
+  bool escaped;
 };
 
 /****************************************************************************
@@ -113,230 +78,410 @@ static inline void k1_bt_uart_putreg(unsigned int offset, uint32_t value)
   putreg32(value, K1_UART2_BASE + offset);
 }
 
-static inline uint16_t k1_bt_uart_next(uint16_t index)
-{
-  return (uint16_t)((index + 1u) % K1_BT_UART_RXBUFSIZE);
-}
-
-static int k1_bt_uart_configure(uint32_t baud)
+static int k1_bt_uart_configure(void)
 {
   uint32_t divisor;
-  uint32_t lcr;
 
-  if (baud == 0)
-    {
-      return -EINVAL;
-    }
-
-  divisor = (K1_UART2_CLOCK_HZ + baud * 8u) / (baud * 16u);
+  divisor = (K1_UART2_CLOCK_HZ + 115200u * 8u) / (115200u * 16u);
   if (divisor == 0 || divisor > UINT16_MAX)
     {
       return -ERANGE;
     }
 
-  lcr = k1_bt_uart_getreg(K1_UART_LCR_OFFSET);
-  k1_bt_uart_putreg(K1_UART_LCR_OFFSET, lcr | K1_UART_LCR_DLAB);
+  k1_bt_uart_putreg(K1_UART_LCR_OFFSET,
+                    K1_UART_LCR_WLS_8 | K1_UART_LCR_DLAB);
   k1_bt_uart_putreg(K1_UART_DLL_OFFSET, divisor & UINT8_MAX);
   k1_bt_uart_putreg(K1_UART_DLM_OFFSET, divisor >> 8);
-  k1_bt_uart_putreg(K1_UART_LCR_OFFSET, K1_UART_LCR_WLS_8);
+
+  /* The vendor's rtk_hciattach configures the RTL8852BS H5 link as
+   * 115200 8E1 with hardware flow control disabled.
+   */
+
+  k1_bt_uart_putreg(K1_UART_LCR_OFFSET,
+                    K1_UART_LCR_WLS_8 | K1_UART_LCR_PEN |
+                    K1_UART_LCR_EPS);
   k1_bt_uart_putreg(K1_UART_FCR_OFFSET,
                     K1_UART_FCR_FIFO_EN | K1_UART_FCR_RXRST |
                     K1_UART_FCR_TXRST | K1_UART_FCR_TRIG_14);
-  k1_bt_uart_putreg(K1_UART_MCR_OFFSET,
-                    K1_UART_MCR_RTS | K1_UART_MCR_AFCE);
+  k1_bt_uart_putreg(K1_UART_MCR_OFFSET, 0);
+  k1_bt_uart_putreg(K1_UART_IER_OFFSET, 0);
   return OK;
 }
 
-static void k1_bt_uart_rxattach(FAR const struct btuart_lowerhalf_s *lower,
-                                btuart_rxcallback_t callback,
-                                FAR void *arg)
+static void k1_bt_uart_drain(void)
 {
-  FAR struct k1_bt_uart_s *priv =
-    (FAR struct k1_bt_uart_s *)lower;
-  irqstate_t flags;
+  unsigned int count;
 
-  flags = spin_lock_irqsave(&priv->lock);
-  priv->callback = callback;
-  priv->callback_arg = arg;
-  spin_unlock_irqrestore(&priv->lock, flags);
-}
-
-static void k1_bt_uart_rxenable(FAR const struct btuart_lowerhalf_s *lower,
-                                bool enable)
-{
-  FAR struct k1_bt_uart_s *priv =
-    (FAR struct k1_bt_uart_s *)lower;
-  irqstate_t flags;
-
-  flags = spin_lock_irqsave(&priv->lock);
-  priv->rxenabled = enable;
-  k1_bt_uart_putreg(K1_UART_IER_OFFSET,
-                    enable ? K1_UART_IER_RDA : 0);
-  spin_unlock_irqrestore(&priv->lock, flags);
-
-  if (enable)
+  for (count = 0; count < K1_BT_H5_RX_DRAIN_MAX; count++)
     {
-      up_enable_irq(K1_IRQ_UART2);
-    }
-  else
-    {
-      up_disable_irq(K1_IRQ_UART2);
+      if ((k1_bt_uart_getreg(K1_UART_LSR_OFFSET) & K1_UART_LSR_DR) == 0)
+        {
+          break;
+        }
+
+      (void)k1_bt_uart_getreg(K1_UART_RBR_OFFSET);
     }
 }
 
-static int k1_bt_uart_setbaud(FAR const struct btuart_lowerhalf_s *lower,
-                              uint32_t baud)
+static int k1_bt_uart_write_byte(uint8_t byte)
 {
-  irqstate_t flags;
-  int ret;
-
-  (void)lower;
-
-  flags = enter_critical_section();
-  ret = k1_bt_uart_configure(baud);
-  leave_critical_section(flags);
-  return ret;
-}
-
-static ssize_t k1_bt_uart_read(FAR const struct btuart_lowerhalf_s *lower,
-                               FAR void *buffer, size_t buflen)
-{
-  FAR struct k1_bt_uart_s *priv =
-    (FAR struct k1_bt_uart_s *)lower;
-  FAR uint8_t *dest = buffer;
-  irqstate_t flags;
-  size_t count = 0;
-
-  if (buffer == NULL)
-    {
-      return -EINVAL;
-    }
-
-  flags = spin_lock_irqsave(&priv->lock);
-  while (count < buflen && priv->rxtail != priv->rxhead)
-    {
-      dest[count++] = priv->rxbuffer[priv->rxtail];
-      priv->rxtail = k1_bt_uart_next(priv->rxtail);
-    }
-
-  spin_unlock_irqrestore(&priv->lock, flags);
-  return count == 0 ? -EAGAIN : (ssize_t)count;
-}
-
-static ssize_t k1_bt_uart_write(FAR const struct btuart_lowerhalf_s *lower,
-                                FAR const void *buffer, size_t buflen)
-{
-  FAR const uint8_t *source = buffer;
   uint32_t timeout;
-  size_t count;
+
+  for (timeout = CONFIG_K1_BT_UART_TX_TIMEOUT_USEC / 10u;
+       (k1_bt_uart_getreg(K1_UART_LSR_OFFSET) & K1_UART_LSR_THRE) == 0;
+       timeout--)
+    {
+      if (timeout == 0)
+        {
+          return -ETIMEDOUT;
+        }
+
+      up_udelay(10);
+    }
+
+  k1_bt_uart_putreg(K1_UART_THR_OFFSET, byte);
+  return OK;
+}
+
+static int k1_bt_h5_write_escaped(uint8_t byte)
+{
   int ret;
 
-  (void)lower;
+  if (byte == K1_BT_H5_DELIMITER)
+    {
+      ret = k1_bt_uart_write_byte(K1_BT_H5_ESCAPE);
+      if (ret < 0)
+        {
+          return ret;
+        }
 
-  if (buffer == NULL)
+      return k1_bt_uart_write_byte(K1_BT_H5_ESCAPE_DELIMITER);
+    }
+
+  if (byte == K1_BT_H5_ESCAPE)
+    {
+      ret = k1_bt_uart_write_byte(K1_BT_H5_ESCAPE);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      return k1_bt_uart_write_byte(K1_BT_H5_ESCAPE_ESCAPE);
+    }
+
+  if (byte == 0x11u)
+    {
+      ret = k1_bt_uart_write_byte(K1_BT_H5_ESCAPE);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      return k1_bt_uart_write_byte(K1_BT_H5_ESCAPE_XON);
+    }
+
+  if (byte == 0x13u)
+    {
+      ret = k1_bt_uart_write_byte(K1_BT_H5_ESCAPE);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      return k1_bt_uart_write_byte(K1_BT_H5_ESCAPE_XOFF);
+    }
+
+  return k1_bt_uart_write_byte(byte);
+}
+
+static int k1_bt_h5_send_link(FAR const uint8_t *payload, uint8_t length)
+{
+  uint8_t header[4];
+  uint8_t index;
+  int ret;
+
+  if (payload == NULL || length == 0)
     {
       return -EINVAL;
     }
 
-  ret = nxmutex_lock(&g_k1_bt_uart.txlock);
+  header[0] = 0;
+  header[1] = (length << 4) | K1_BT_H5_LINK_CONTROL;
+  header[2] = length >> 4;
+  header[3] = (uint8_t)~(header[0] + header[1] + header[2]);
+
+  ret = k1_bt_uart_write_byte(K1_BT_H5_DELIMITER);
   if (ret < 0)
     {
       return ret;
     }
 
-  for (count = 0; count < buflen; count++)
+  for (index = 0; index < sizeof(header); index++)
     {
-      for (timeout = CONFIG_K1_BT_UART_TX_TIMEOUT_USEC / 10u;
-           (k1_bt_uart_getreg(K1_UART_LSR_OFFSET) & K1_UART_LSR_THRE) == 0;
-           timeout--)
+      ret = k1_bt_h5_write_escaped(header[index]);
+      if (ret < 0)
         {
-          if (timeout == 0)
-            {
-              nxmutex_unlock(&g_k1_bt_uart.txlock);
-              return count == 0 ? -ETIMEDOUT : (ssize_t)count;
-            }
-
-          up_udelay(10);
+          return ret;
         }
-
-      k1_bt_uart_putreg(K1_UART_THR_OFFSET, source[count]);
     }
 
-  nxmutex_unlock(&g_k1_bt_uart.txlock);
-  return (ssize_t)count;
-}
-
-static ssize_t k1_bt_uart_rxdrain(FAR const struct btuart_lowerhalf_s *lower)
-{
-  FAR struct k1_bt_uart_s *priv =
-    (FAR struct k1_bt_uart_s *)lower;
-  irqstate_t flags;
-  ssize_t count;
-
-  flags = spin_lock_irqsave(&priv->lock);
-  count = (priv->rxhead + K1_BT_UART_RXBUFSIZE - priv->rxtail) %
-          K1_BT_UART_RXBUFSIZE;
-  priv->rxtail = priv->rxhead;
-  spin_unlock_irqrestore(&priv->lock, flags);
-  return count;
-}
-
-static int k1_bt_uart_ioctl(FAR const struct btuart_lowerhalf_s *lower,
-                            int cmd, unsigned long arg)
-{
-  (void)lower;
-  (void)cmd;
-  (void)arg;
-  return -ENOTTY;
-}
-
-static int k1_bt_uart_interrupt(int irq, FAR void *context, FAR void *arg)
-{
-  FAR struct k1_bt_uart_s *priv = &g_k1_bt_uart;
-  btuart_rxcallback_t callback = NULL;
-  FAR void *callback_arg = NULL;
-  irqstate_t flags;
-  bool received = false;
-
-  (void)irq;
-  (void)context;
-  (void)arg;
-
-  while ((k1_bt_uart_getreg(K1_UART_LSR_OFFSET) & K1_UART_LSR_DR) != 0)
+  for (index = 0; index < length; index++)
     {
-      uint16_t next;
-      uint8_t ch = k1_bt_uart_getreg(K1_UART_RBR_OFFSET) & UINT8_MAX;
-
-      flags = spin_lock_irqsave(&priv->lock);
-      next = k1_bt_uart_next(priv->rxhead);
-      if (next != priv->rxtail)
+      ret = k1_bt_h5_write_escaped(payload[index]);
+      if (ret < 0)
         {
-          priv->rxbuffer[priv->rxhead] = ch;
-          priv->rxhead = next;
-          received = true;
+          return ret;
         }
-
-      spin_unlock_irqrestore(&priv->lock, flags);
     }
 
-  if (received)
+  return k1_bt_uart_write_byte(K1_BT_H5_DELIMITER);
+}
+
+static void k1_bt_h5_reset(FAR struct k1_bt_h5_rx_s *rx)
+{
+  rx->length = 0;
+  rx->started = false;
+  rx->escaped = false;
+}
+
+static enum k1_bt_h5_message_e
+k1_bt_h5_validate(FAR const struct k1_bt_h5_rx_s *rx)
+{
+  FAR const uint8_t *payload;
+  uint16_t payload_length;
+
+  if (rx->length < 6 ||
+      (uint8_t)~(rx->data[0] + rx->data[1] + rx->data[2]) != rx->data[3])
     {
-      flags = spin_lock_irqsave(&priv->lock);
-      if (priv->rxenabled && priv->callback != NULL)
+      return K1_BT_H5_NONE;
+    }
+
+  if ((rx->data[0] & (1u << 6)) != 0 ||
+      (rx->data[1] & 0x0fu) != K1_BT_H5_LINK_CONTROL)
+    {
+      return K1_BT_H5_NONE;
+    }
+
+  payload_length = (rx->data[1] >> 4) | ((uint16_t)rx->data[2] << 4);
+  if (payload_length != rx->length - 4)
+    {
+      return K1_BT_H5_NONE;
+    }
+
+  payload = &rx->data[4];
+  if (payload[0] == 0x01u && payload[1] == 0x7eu)
+    {
+      return K1_BT_H5_SYNC_REQUEST;
+    }
+
+  if (payload[0] == 0x02u && payload[1] == 0x7du)
+    {
+      return K1_BT_H5_SYNC_RESPONSE;
+    }
+
+  if (payload[0] == 0x03u && payload[1] == 0xfcu)
+    {
+      return K1_BT_H5_CONFIG_REQUEST;
+    }
+
+  if (payload[0] == 0x04u && payload[1] == 0x7bu)
+    {
+      return K1_BT_H5_CONFIG_RESPONSE;
+    }
+
+  return K1_BT_H5_NONE;
+}
+
+static enum k1_bt_h5_message_e
+k1_bt_h5_consume(FAR struct k1_bt_h5_rx_s *rx, uint8_t byte)
+{
+  enum k1_bt_h5_message_e message;
+
+  if (byte == K1_BT_H5_DELIMITER)
+    {
+      if (!rx->started)
         {
-          callback = priv->callback;
-          callback_arg = priv->callback_arg;
+          rx->started = true;
+          rx->length = 0;
+          rx->escaped = false;
+          return K1_BT_H5_NONE;
         }
 
-      spin_unlock_irqrestore(&priv->lock, flags);
+      message = k1_bt_h5_validate(rx);
+      rx->length = 0;
+      rx->escaped = false;
+      return message;
+    }
 
-      if (callback != NULL)
+  if (!rx->started || rx->length == K1_BT_H5_FRAME_MAX)
+    {
+      return K1_BT_H5_NONE;
+    }
+
+  if (rx->escaped)
+    {
+      switch (byte)
         {
-          callback(&priv->lower, callback_arg);
+          case K1_BT_H5_ESCAPE_DELIMITER:
+            byte = K1_BT_H5_DELIMITER;
+            break;
+
+          case K1_BT_H5_ESCAPE_ESCAPE:
+            byte = K1_BT_H5_ESCAPE;
+            break;
+
+          case K1_BT_H5_ESCAPE_XON:
+            byte = 0x11u;
+            break;
+
+          case K1_BT_H5_ESCAPE_XOFF:
+            byte = 0x13u;
+            break;
+
+          default:
+            k1_bt_h5_reset(rx);
+            return K1_BT_H5_NONE;
         }
+
+      rx->escaped = false;
+    }
+  else if (byte == K1_BT_H5_ESCAPE)
+    {
+      rx->escaped = true;
+      return K1_BT_H5_NONE;
+    }
+
+  rx->data[rx->length++] = byte;
+  return K1_BT_H5_NONE;
+}
+
+static int k1_bt_h5_handle_message(enum k1_bt_h5_message_e message)
+{
+  static const uint8_t g_sync_response[] =
+  {
+    0x02u, 0x7du
+  };
+
+  static const uint8_t g_config_response[] =
+  {
+    0x04u, 0x7bu
+  };
+
+  if (message == K1_BT_H5_SYNC_REQUEST)
+    {
+      return k1_bt_h5_send_link(g_sync_response,
+                                 sizeof(g_sync_response));
+    }
+
+  if (message == K1_BT_H5_CONFIG_REQUEST)
+    {
+      return k1_bt_h5_send_link(g_config_response,
+                                 sizeof(g_config_response));
     }
 
   return OK;
+}
+
+static int k1_bt_h5_wait(FAR struct k1_bt_h5_rx_s *rx,
+                         enum k1_bt_h5_message_e expected)
+{
+  unsigned int elapsed;
+  unsigned int count;
+
+  for (elapsed = 0; elapsed < K1_BT_H5_WAIT_MSEC; elapsed++)
+    {
+      for (count = 0; count < K1_BT_H5_RX_PER_TICK; count++)
+        {
+          enum k1_bt_h5_message_e message;
+          uint8_t byte;
+          int ret;
+
+          if ((k1_bt_uart_getreg(K1_UART_LSR_OFFSET) & K1_UART_LSR_DR) == 0)
+            {
+              break;
+            }
+
+          byte = k1_bt_uart_getreg(K1_UART_RBR_OFFSET) & UINT8_MAX;
+          message = k1_bt_h5_consume(rx, byte);
+          if (message == expected)
+            {
+              return OK;
+            }
+
+          ret = k1_bt_h5_handle_message(message);
+          if (ret < 0)
+            {
+              return ret;
+            }
+        }
+
+      up_mdelay(1);
+    }
+
+  return -ETIMEDOUT;
+}
+
+static int k1_bt_h5_sync(void)
+{
+  static const uint8_t g_sync_request[] =
+  {
+    0x01u, 0x7eu
+  };
+
+  static const uint8_t g_config_request[] =
+  {
+    0x03u, 0xfcu, 0x14u
+  };
+
+  struct k1_bt_h5_rx_s rx;
+  unsigned int retry;
+  int ret;
+
+  k1_bt_h5_reset(&rx);
+  for (retry = 0; retry < K1_BT_H5_RETRIES; retry++)
+    {
+      ret = k1_bt_h5_send_link(g_sync_request, sizeof(g_sync_request));
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      ret = k1_bt_h5_wait(&rx, K1_BT_H5_SYNC_RESPONSE);
+      if (ret == OK)
+        {
+          break;
+        }
+      else if (ret != -ETIMEDOUT)
+        {
+          return ret;
+        }
+    }
+
+  if (retry == K1_BT_H5_RETRIES)
+    {
+      return -ETIMEDOUT;
+    }
+
+  for (retry = 0; retry < K1_BT_H5_RETRIES; retry++)
+    {
+      ret = k1_bt_h5_send_link(g_config_request, sizeof(g_config_request));
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      ret = k1_bt_h5_wait(&rx, K1_BT_H5_CONFIG_RESPONSE);
+      if (ret == OK)
+        {
+          return OK;
+        }
+      else if (ret != -ETIMEDOUT)
+        {
+          return ret;
+        }
+    }
+
+  return -ETIMEDOUT;
 }
 
 /****************************************************************************
@@ -345,45 +490,33 @@ static int k1_bt_uart_interrupt(int irq, FAR void *context, FAR void *arg)
 
 int k1_bt_uart_initialize(void)
 {
+  static bool initialized;
   int ret;
 
-  if (g_k1_bt_uart.initialized)
+  if (initialized)
     {
       return OK;
     }
-
-  /* UART2 is independent from the inherited UART0 console.  Select the
-   * documented slow UART parent, release its reset, then leave RX interrupts
-   * disabled until the Bluetooth upper half opens the H4 endpoint.
-   */
 
   modifyreg32(K1_APBC_UART2_CLK_RST,
               K1_CLK_RESET | K1_APBC_UART_CLK_SEL_MASK,
               K1_CLK_BUS_ENABLE | K1_CLK_FUNCTION_ENABLE |
               K1_APBC_UART_CLK_SEL_SLOW_14M);
 
-  ret = k1_bt_uart_configure(115200);
+  ret = k1_bt_uart_configure();
   if (ret < 0)
     {
       return ret;
     }
 
-  k1_bt_uart_putreg(K1_UART_IER_OFFSET, 0);
-  ret = irq_attach(K1_IRQ_UART2, k1_bt_uart_interrupt, NULL);
+  k1_bt_uart_drain();
+  ret = k1_bt_h5_sync();
   if (ret < 0)
     {
       return ret;
     }
 
-  up_disable_irq(K1_IRQ_UART2);
-  ret = btuart_register(&g_k1_bt_uart.lower);
-  if (ret < 0)
-    {
-      irq_detach(K1_IRQ_UART2);
-      return ret;
-    }
-
-  g_k1_bt_uart.initialized = true;
+  initialized = true;
   return OK;
 }
 

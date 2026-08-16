@@ -96,6 +96,19 @@ if [[ "$(grep -c 'SDIO_CCCR_IOEN' "${wifi_sdio_source}")" != "1" ]] ||
 fi
 pass "Wi-Fi enumeration leaves SDIO IOEN untouched"
 
+bt_h5_source="${CONTEST_ROOT}/chip/k1/k1_bt_uart.c"
+wireless_defconfig="${CONTEST_ROOT}/board/k1/muse_pi_pro/configs/wireless/defconfig"
+if grep -Eq 'btuart_register|K1_UART_IER_RDA|irq_attach|up_enable_irq' \
+  "${bt_h5_source}"; then
+  fail "Bluetooth H5 diagnostic must not register H4 or enable UART2 IRQ"
+fi
+
+if grep -Eq 'CONFIG_K1_PLIC=y|CONFIG_UART_BTH4=y' \
+  "${wireless_defconfig}"; then
+  fail "wireless H5 diagnostic must not enable the H4 or PLIC path"
+fi
+pass "Bluetooth remains a polled H5 diagnostic"
+
 if git -C "${CONTEST_ROOT}" rev-parse --is-inside-work-tree \
      >/dev/null 2>&1; then
   # Patch files contain mandatory one-character context prefixes for blank

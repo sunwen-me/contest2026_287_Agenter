@@ -2,16 +2,17 @@
 
 更新时间：2026-08-16（Asia/Shanghai）
 
-本文件记录 MUSE Pi Pro 板载 RTL8852BS2 的 openvela 首轮迁移边界。它是
-硬件供电、pinmux、SDIO 卡枚举和 Bluetooth H4 传输的实现说明，不是“Wi-Fi 或蓝牙
-已经可用”的宣称。
+本文件记录 MUSE Pi Pro 板载 RTL8852BS2 的 openvela 首轮迁移边界。它只覆盖
+无线供电、pinmux、Wi-Fi SDIO 卡枚举和 Bluetooth H5 链路诊断；不宣称 Wi-Fi 或
+蓝牙已经可用。
 
-## 1. 硬件事实
+## 1. 硬件与协议事实
 
-| 功能 | K1 资源 | Linux DTS 依据 |
+| 功能 | K1 资源 | 依据 |
 | --- | --- | --- |
-| Wi-Fi | SDH1 `0xd4280800`，GPIO15--20，4-bit 1.8 V SDIO | `k1-x_MUSE-Pi-Pro.dts`、`k1-x_pinctrl.dtsi` |
-| Bluetooth | UART2 `0xd4017100`，GPIO21--24，4-wire flow control，IRQ 44 | `k1-x_MUSE-Pi-Pro.dts`、`k1-x_pinctrl.dtsi` |
+| Wi-Fi | SDH1 `0xd4280800`，GPIO15--20，4-bit 1.8 V SDIO | `spacemit-com/linux-6.6` 的 `k1-x_MUSE-Pi-Pro.dts` 与 `k1-x_pinctrl.dtsi` |
+| Bluetooth | UART2 `0xd4017100`，GPIO21--24 | 同一 DTS 的 `&uart2` / `pinctrl_uart2` |
+| Bluetooth 协议 | H5（3-wire），115200 8E1，关闭 RTS/CTS | `spacemit-com/buildroot-ext` 的 `board/spacemit/k1/plt_overlay/etc/init.d/S40hci`：`rtk_hciattach -n -s 115200 ttyS2 rtk_h5`；`spacemit-com/rtk_hciattach` |
 | RF 电源 | GPIO67，高有效 | `rf-pwrseq/pwr-gpios` |
 | Wi-Fi REG_ON | GPIO116，高有效 | `wlan-pwrseq/regon-gpios` |
 | Wi-Fi wake | GPIO66，输入 | `wlan-pwrseq` pinctrl |
@@ -19,39 +20,52 @@
 
 GPIO64、GPIO65 不在该板 DTS 的无线电源序列中，不能作为无线控制线使用。
 
+官方 `rtk_hciattach` 的 H5 补丁表将 RTL8852BS 映射到
+`rtl8852bs_fw` 与 `rtl8852bs_config`。这两个厂商文件不在本仓、也不能由相近型号
+固件替代。
+
 ## 2. 已实现
 
 - `chip/k1/k1_sdio.c`：SDH1 实例、4-bit SDIO capability，以及标准
   CMD0/CMD5/CMD3/CMD7 卡选择、CCCR/FBR 的 CMD52 识别读取；
 - `board/k1/muse_pi_pro/src/k1_wireless.c`：GPIO15--24 pinmux、无线控制线
-  时序、SDH1 探测、UART2 H4 注册；
-- `chip/k1/k1_bt_uart.c`：UART2 的单实例 H4 lower-half，使用 NuttX
-  `btuart_register()`，可在上层打开时注册 `/dev/ttyHCI0`；
+  时序、SDH1 探测和 Bluetooth RESET_N 释放；
+- `chip/k1/k1_bt_uart.c`：UART2 的 H5 诊断器。它按官方 attach 参数配置
+  115200 8E1、关闭 RTS/CTS，轮询完成 H5 `SYNC -> CONFIG`，校验 SLIP、H5 类型、
+  长度和头校验和；
 - `board/k1/muse_pi_pro/configs/wireless/defconfig`：独立试验配置，默认
   `nsh` 配置不变。
 
 上电时序固定为：`BT_RESET_N=0`、`WLAN_REG_ON=0`、`RF_PWR=0`，等待 10 ms，
 再依次置 `RF_PWR=1`（10 ms）、`WLAN_REG_ON=1`（30 ms）、
 `BT_RESET_N=1`（50 ms）。GPIO66 仅配置为输入，不驱动。
-Wi-Fi CMD5 和 Bluetooth H4 会独立尝试；前者失败不会阻断后者，以便从单次串口
-日志区分 SDIO 与 UART2 问题。板级初始化仍会返回第一项失败码。
 
 Wi-Fi 卡枚举会把 CCCR 的 Bus Interface Control 设为 4-bit，并将主机切换为
 4-bit 模式；随后只读 CCCR revision、SD revision、IOEN、IORDY、Bus Interface、
 Card Capability 和已声明 function 的 FBR interface code。它不写 IOEN，因此
 不会启用任何 WLAN function，也不会触碰 Realtek vendor register 或固件。
 
+Bluetooth H5 诊断使用官方 attach 的 10 次、每次 500 ms 的同步窗口。只有收到并
+验证 `SYNC` 响应后才发送 `CONFIG`；收到配置响应才打印成功。收到控制器主动
+`SYNC` 或 `CONFIG` 请求时会回对应的 H5 控制帧。它不发送 HCI Reset、版本查询或
+Realtek 厂商命令。
+
 ## 3. 明确未实现
 
 - RTL8852BS2 Wi-Fi SDIO function 初始化、Realtek Wi-Fi firmware 下载、MAC 和
   `netdev` 注册；
-- RTL8852BS2 Bluetooth vendor firmware 下载、HCI Reset/版本查询及扫描验证；
+- RTL8852BS2 Bluetooth 厂商 firmware/config 下载、H5 可靠帧传输、HCI Reset、
+  版本查询、Bluetooth stack 注册及扫描验证；
 - Wi-Fi/蓝牙低功耗唤醒、SDIO 中断、吞吐与长期稳定性验证；
-- 蓝牙 UART2 IER 的实板风险确认。
+- H5 链路诊断的实板验收。
 
-因此，CCCR/FBR 可读仅证明 SDIO 卡选择、4-bit 总线设置和标准 function 描述符可
-用；`/dev/ttyHCI0` 出现只证明 H4 传输已注册。两者均不代表联网、关联 AP、扫描
-设备或数据传输通过。
+因此，CCCR/FBR 可读只证明 SDIO 卡选择、4-bit 总线设置和标准 function 描述符
+可用；`K1 Bluetooth: H5 SYNC/CONFIG complete` 只证明 UART2、电源时序与 H5
+基础协商在该次启动中成功。两者都不代表联网、关联 AP、可扫描设备或数据传输。
+
+`/dev/ttyHCI0` 不会由本配置创建。NuttX 现有 `btuart_register()` 上半层只解析
+H4，不能直接接收 H5 字节流；在 H5 可靠传输和厂商启动序列完成前注册它会产生错误
+的设备可用性表象。
 
 ## 4. UART 风险隔离
 
@@ -59,10 +73,9 @@ Card Capability 和已声明 function 的 FBR interface code。它不写 IOEN，
 隔离措施：
 
 - 从不修改 `k1_console.c`，UART0 继续使用 U-Boot 继承的 polling console；
-- UART2 在独立 `wireless` 配置中才启用，依赖已验证的 K1 PLIC；
-- H4 endpoint 未被上层打开前 UART2 IER 保持关闭；
-- UART2 TX 等待有 100 ms 上限，控制器未就绪或 CTS 持续阻塞时返回错误，不无限
-  卡死。
+- UART2 仅在独立 `wireless` 配置中配置，且 IER 始终为零，不接入 PLIC；
+- H5 诊断的 TX 等待有 100 ms 上限，控制器未就绪时返回错误，不无限卡死；
+- 同步失败仅使本次 `wireless` bring-up 返回错误，不写入 U-Boot 环境或持久存储。
 
 ## 5. 构建与实板验收
 
@@ -77,13 +90,13 @@ tools/build_k1.sh \
 ```
 
 上板前仍采用 `docs/K1_REAL_BOARD_HANDOFF.md` 的 RAM-only U-Boot 载入流程，
-不得执行 `saveenv`、`mmc write`、`mmc erase` 或 FDL/fastboot 写入。首轮串口
-验收应依次确认：
+不得执行 `saveenv`、`mmc write`、`mmc erase` 或 FDL/fastboot 写入。首轮串口验收
+应依次确认：
 
 1. 正常进入 NSH，UART0 日志未退化；
-2. `K1 RTL8852BS2 bring-up failed` 没有出现，或记录其确切错误码；
-3. 串口记录 CMD5 OCR、CCCR revision、function 数量及 F1 interface code，且
-   未出现 `K1 RTL8852BS2 bring-up failed`；
-4. `/dev/ttyHCI0` 存在，打开/关闭不导致异常；
-5. 只有在 UART2 H4 收发和厂商初始化已有独立日志后，才继续实现 Realtek 固件
-   和网络功能。
+2. 记录 Wi-Fi CMD5 OCR、CCCR revision、function 数量及 F1 interface code；
+3. 出现 `K1 Bluetooth: H5 SYNC/CONFIG complete`，且未出现
+   `K1 RTL8852BS2 bring-up failed`；
+4. 如果 H5 失败，保留完整串口日志和错误码，不继续发送 HCI 或厂商命令；
+5. 只有取得与板卡匹配的 `rtl8852bs_fw`、`rtl8852bs_config` 且 H5 可靠传输已完成
+   独立测试后，才实现固件下载与 Bluetooth stack 注册。

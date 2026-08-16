@@ -1,26 +1,17 @@
 # MUSE Pi Pro RTL8852BS2 electrical and transport bring-up profile.
 #
 # This is deliberately separate from nsh: it changes the wireless power
-# sequence and enables the experimental UART2 PLIC source.  It does not
+# sequence and runs a polled UART2 H5 link diagnostic.  It does not
 # provide an RTL8852BS2 Wi-Fi MAC, Wi-Fi firmware, or Bluetooth firmware.
 
 #include "../nsh/defconfig"
-
-CONFIG_K1_PLIC=y
 
 # SDH1 Wi-Fi electrical/pinmux initialization and non-destructive CMD5.
 CONFIG_K1_SDIO=y
 CONFIG_K1_SDIO_WIFI=y
 CONFIG_K1_RTL8852BS2_WIFI=y
 
-# UART2 H4 transport.  The generic NuttX upper half creates /dev/ttyHCI0;
-# the controller cannot be considered operational until its Realtek vendor
-# firmware download has been implemented and demonstrated on the board.
-CONFIG_ALLOW_BSD_COMPONENTS=y
-CONFIG_DRIVERS_WIRELESS=y
-CONFIG_DRIVERS_BLUETOOTH=y
-CONFIG_BLUETOOTH_UART=y
-CONFIG_BLUETOOTH_UART_OTHER=y
-CONFIG_UART_BTH4=y
+# UART2 H5 SYNC/CONFIG only. It is deliberately not registered as a generic
+# H4 device, and no vendor firmware/configuration is included in this tree.
 CONFIG_K1_RTL8852BS2_BT=y
 CONFIG_K1_BT_UART_TX_TIMEOUT_USEC=100000

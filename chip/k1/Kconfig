@@ -202,17 +202,14 @@ config K1_RTL8852BS2_WIFI
 		network device, or claim working Wi-Fi connectivity.
 
 config K1_RTL8852BS2_BT
-	bool "MUSE Pi Pro RTL8852BS2 Bluetooth H4 transport (experimental)"
+	bool "MUSE Pi Pro RTL8852BS2 Bluetooth H5 link diagnostic"
 	default n
-	depends on K1_PLIC && DRIVERS_BLUETOOTH && BLUETOOTH_UART && \
-		BLUETOOTH_UART_OTHER
-	select UART_BTH4
 	---help---
-		Configure the RTL8852BS2 reset sequence, UART2 pinmux, and H4 UART
-		lower-half.  UART2 uses PLIC source 44 and writes its own IER only;
-		UART0 remains the protected polling console.  The RTL8852BS2 vendor
-		firmware download is not implemented, so this is an experimental
-		transport bring-up and not a claim of usable Bluetooth.
+		Configure the RTL8852BS2 reset sequence, UART2 pinmux, and the H5
+		SYNC/CONFIG link handshake documented by the vendor MUSE Pi Pro
+		startup script. UART2 runs at 115200 8E1 without RTS/CTS and remains
+		fully polled with IER disabled. This diagnostic neither registers an
+		H4 device nor downloads vendor firmware, so it is not usable Bluetooth.
 
 config K1_BT_UART_TX_TIMEOUT_USEC
 	int "UART2 Bluetooth transmit timeout (microseconds)"
@@ -220,9 +217,8 @@ config K1_BT_UART_TX_TIMEOUT_USEC
 	range 1000 1000000
 	depends on K1_RTL8852BS2_BT
 	---help---
-		Maximum time an H4 frame write waits for UART2 transmitter space.
-		This bounds failure when the controller keeps CTS asserted during an
-		incomplete vendor-firmware bring-up.
+		Maximum time one H5 byte waits for UART2 transmitter space. This bounds
+		failure while the controller is unavailable during a link diagnostic.
 
 config K1_PWM
 	bool "K1 PWM controller support"

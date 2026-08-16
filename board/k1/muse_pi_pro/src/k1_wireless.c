@@ -196,7 +196,7 @@ int k1_wireless_initialize(void)
     }
   else
     {
-      k1_early_puts("K1 Bluetooth: H4 transport registered\r\n");
+      k1_early_puts("K1 Bluetooth: H5 SYNC/CONFIG complete\r\n");
     }
 #endif
 
