@@ -109,6 +109,7 @@ int k1_wireless_initialize(void)
   int probe_ret;
 #endif
 #ifdef CONFIG_K1_RTL8852BS2_BT
+  struct k1_bt_h5_info_s bt_info;
   int bt_ret;
 #endif
   int ret = OK;
@@ -186,7 +187,7 @@ int k1_wireless_initialize(void)
                          K1_MFPR_DRIVE_1V8_DS2 | K1_MFPR_PULL_UP, true);
   up_mdelay(50);
 
-  bt_ret = k1_bt_uart_initialize();
+  bt_ret = k1_bt_uart_initialize(&bt_info);
   if (bt_ret < 0)
     {
       if (ret >= 0)
@@ -196,7 +197,19 @@ int k1_wireless_initialize(void)
     }
   else
     {
-      k1_early_puts("K1 Bluetooth: H5 SYNC/CONFIG complete\r\n");
+      k1_early_puts("K1 Bluetooth: H5 local version HCI=");
+      k1_early_puthex(bt_info.hci_version);
+      k1_early_puts(" revision=");
+      k1_early_puthex(bt_info.hci_revision);
+      k1_early_puts(" LMP=");
+      k1_early_puthex(bt_info.lmp_version);
+      k1_early_puts(" manufacturer=");
+      k1_early_puthex(bt_info.manufacturer);
+      k1_early_puts(" subversion=");
+      k1_early_puthex(bt_info.lmp_subversion);
+      k1_early_puts(" CRC=");
+      k1_early_puthex(bt_info.crc_enabled ? 1 : 0);
+      k1_early_puts("\r\n");
     }
 #endif
 

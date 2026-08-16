@@ -36,8 +36,8 @@ vendor/spacemit/boards/k1/muse_pi_pro
   已在实板完成初始化和单块/CMD18 多块只读读取验证，驱动当前不执行写入，详情见
   `docs/K1_EMMC_BRINGUP.md`。
 - 默认关闭的 RTL8852BS2 无线首轮迁移；`configs/wireless` 完成 Wi-Fi SDIO 卡
-  枚举及 Bluetooth UART2 H5 `SYNC -> CONFIG` 诊断，不注册网络或 Bluetooth
-  设备，详情见 `docs/K1_WIRELESS_BRINGUP.md`。
+  枚举及 Bluetooth UART2 H5 `SYNC -> CONFIG` / 标准版本查询诊断，不注册网络
+  或 Bluetooth 设备，详情见 `docs/K1_WIRELESS_BRINGUP.md`。
 - `configs/hardware_bringup` 将 GPIO/PLIC、EMAC0、I2C2、SPI3 和 watchdog
   合并到同一张验证镜像；PWM11 仍保留在独立配置中，不属于该镜像。
 - `configs/display_fb` 注册继承自 U-Boot 的 `/dev/fb0` 并包含 `fb` 色块测试；它

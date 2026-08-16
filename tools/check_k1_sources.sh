@@ -103,6 +103,9 @@ if grep -Eq 'btuart_register|K1_UART_IER_RDA|irq_attach|up_enable_irq' \
   fail "Bluetooth H5 diagnostic must not register H4 or enable UART2 IRQ"
 fi
 
+grep -Fq 'K1_BT_HCI_READ_LOCAL_VER' "${bt_h5_source}" ||
+  fail "Bluetooth H5 diagnostic must use the standard local-version opcode"
+
 if grep -Eq 'CONFIG_K1_PLIC=y|CONFIG_UART_BTH4=y' \
   "${wireless_defconfig}"; then
   fail "wireless H5 diagnostic must not enable the H4 or PLIC path"

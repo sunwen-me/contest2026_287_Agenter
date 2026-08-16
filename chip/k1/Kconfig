@@ -207,9 +207,10 @@ config K1_RTL8852BS2_BT
 	---help---
 		Configure the RTL8852BS2 reset sequence, UART2 pinmux, and the H5
 		SYNC/CONFIG link handshake documented by the vendor MUSE Pi Pro
-		startup script. UART2 runs at 115200 8E1 without RTS/CTS and remains
-		fully polled with IER disabled. This diagnostic neither registers an
-		H4 device nor downloads vendor firmware, so it is not usable Bluetooth.
+		startup script, then issue the standard HCI Read Local Version command.
+		UART2 runs at 115200 8E1 without RTS/CTS and remains fully polled with
+		IER disabled. This diagnostic neither registers an H4 device nor
+		downloads vendor firmware, so it is not usable Bluetooth.
 
 config K1_BT_UART_TX_TIMEOUT_USEC
 	int "UART2 Bluetooth transmit timeout (microseconds)"
