@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="send U-Boot interrupt characters after its banner is detected",
     )
+    parser.add_argument(
+        "--exit-on-uboot",
+        action="store_true",
+        help="exit after stopping at a U-Boot prompt; do not read local input",
+    )
     return parser.parse_args()
 
 
@@ -81,7 +86,7 @@ def main() -> int:
         os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK,
     )
     stdin_fd = sys.stdin.fileno()
-    old_stdin = termios.tcgetattr(stdin_fd)
+    old_stdin = None
     mode = "cr"
     output_tail = bytearray()
     stopping_autoboot = False
@@ -91,7 +96,10 @@ def main() -> int:
 
     try:
         configure_serial(serial_fd, args.baud)
-        tty.setraw(stdin_fd, termios.TCSANOW)
+        if not args.exit_on_uboot:
+            old_stdin = termios.tcgetattr(stdin_fd)
+            tty.setraw(stdin_fd, termios.TCSANOW)
+
         termios.tcflush(serial_fd, termios.TCIFLUSH)
 
         print(
@@ -101,7 +109,11 @@ def main() -> int:
 
         while True:
             timeout = 0.1 if stopping_autoboot and not autoboot_stopped else None
-            readable, _, _ = select.select([serial_fd, stdin_fd], [], [], timeout)
+            read_fds = [serial_fd]
+            if not args.exit_on_uboot:
+                read_fds.append(stdin_fd)
+
+            readable, _, _ = select.select(read_fds, [], [], timeout)
 
             if serial_fd in readable:
                 try:
@@ -138,6 +150,9 @@ def main() -> int:
                             mode = "cr"
                             print("\n[Enter -> CR for U-Boot]", file=sys.stderr)
 
+                        if args.exit_on_uboot:
+                            return 0
+
                     # SPL prints "U-Boot SPL" before the main U-Boot console
                     # is ready.  Interrupt only after the main U-Boot banner
                     # and delay until the known K1 autoboot window.
@@ -165,7 +180,7 @@ def main() -> int:
                     write_serial(serial_fd, b"ssss")
                     autoboot_send_at = now + 0.1
 
-            if stdin_fd in readable:
+            if not args.exit_on_uboot and stdin_fd in readable:
                 data = os.read(stdin_fd, 4096)
                 if not data:
                     return 0
@@ -183,7 +198,9 @@ def main() -> int:
                 if translated:
                     write_serial(serial_fd, bytes(translated))
     finally:
-        termios.tcsetattr(stdin_fd, termios.TCSANOW, old_stdin)
+        if old_stdin is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSANOW, old_stdin)
+
         os.close(serial_fd)
 
 
