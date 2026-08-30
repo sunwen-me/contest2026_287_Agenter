@@ -5391,3 +5391,142 @@ CCMP 保护的帧了。`mac_port_init()` 仍未移植，仍然是在 parked 的�
    `dis_conn=false` 并把 port 设成 INFRA），以及 `mac_port_init()` 的 band0/port0 子集
    （寄存器顺序见 3d 的「下一步」）。
 3. `rtw8852b_set_channel_{mac,bb,rf}`：驻留在信道 1，不再从 parked dwell 里发帧。
+
+### 增量 3f：把 TK 与 GTK 装进硬件（固件四条命令全部 ack）
+
+提交 `84d64e2`，板上 run 34，日志 `out/k1-serial/k1-wpa-20260830T174332Z.log`，
+镜像 `wireless_wpa_diag`，ELF SHA-256
+`09087a0c06ad84d9e1aa262a24222c24fc604ab91c2b90bf11c8fc61ab559da8`。
+**本 runner 的 33 项 `--require-*` 一条没失败**，最后一行是
+`PASS: K1 wireless RAM image reached NSH`，其中 `--require-runtime-wpa-keys` 是本轮新增。
+
+#### 原厂的顺序：先地址 CAM，后安全 CAM
+
+`mac_sta_add_key()`（`security_cam.c:667`）装一把密钥要发**两条** H2C，顺序是固定的：
+
+1. `insert_key_to_addr_cam()` 先发地址 CAM 更新（cat 1 / class 6 / func 0，
+   与 join、assoc 已经发过两次的**同一条命令**，`agg_en=1`、`done_ack=1`），
+   把密钥槽写进 ADDR_CAM 的 dword9/dword10；
+2. 再发安全 CAM（cat 1 / class 0xa / func 1，content 40 字节，`offset=0`、
+   `len=0x20`、`done_ack=1`），把 16 字节密钥送下去。
+
+反过来发的话，安全 CAM 里有密钥而地址 CAM 还没有指向它的槽，硬件是按一个它不认的槽去查表。
+这条顺序不是猜的，是原厂唯一的调用者就这么写的；也正因为地址 CAM 那条命令和 join/assoc
+发的是同一条，重发它在本端已经被证明安全过两次。
+
+槽位策略同样照抄：`sec_ent_mode` 决定哪个槽能放哪类密钥，CCMP/CCMP 是 mode 2
+（`rtw_phl_trans_sec_mode()`），`check_key_index()` 的合法区间是单播 0–1、组播 2–4、
+BIP 5–6。所以本端把 TK 放 slot 0（安全 CAM entry 0，key id 0）、GTK 放 slot 2
+（entry 1，key id 由 Msg3 给），`sec_ent_valid = (1<<0)|(1<<2) = 0x5`。
+
+#### 加了什么（五块，自下而上）
+
+1. **安全引擎 bring-up**，`sec_eng_init()` 里本端这条路要用的子集：
+   `R_AX_SEC_ENG_CTRL (0x9d00)` 或上 `0x073f` 并清掉 `B_AX_TX_PARTIAL_MODE (bit11)`，
+   `R_AX_SEC_MPDU_PROC (0x9d04)` 或上 `0x3`。板上实测 ctrl `0x80002800` → `0x8000273f`
+   （复位值里 bit11 本来是 1，必须清掉），mpdu-proc `0x0` → `0x3`。
+2. **RFC 3394 AES key unwrap ＋ GTK KDE 解析**：KEK 是 `PTK[16:32]`，完整性值是 8 个
+   `0xa6`；KDE 是 type `0xdd`、OUI `00-0F-AC`、data type 1。Msg3 的 56 字节包装 key data
+   解出 48 字节明文（`keydata-plain=0x30`），里面拿到 16 字节 GTK 和 key id 1。
+   **握手本身仍然验的是到达时的密文字节**，所以解包不在「握手成不成」这条判据的路径上——
+   3e 那轮没有 AES 也能验 MIC，正是这个原因。
+3. **安全 CAM 载荷序列化**：dword0 = `index | offset<<8 | length<<16`，dword1 = 密钥类型
+   ＋ ext-key bit(4) ＋ spp-mode bit(5)，dword2..5 是 16 个密钥字节、不做字节序翻转。
+   一条 entry 宽 `0x20` 字节，一条命令从 offset 0 整条写完，这也是原厂唯一调用者的做法。
+   CCMP-128 是 type 6、`ext_key=0`、`spp_mode=0`，序列化出来 dword1 = `0x6`。
+4. **模块级密钥槽状态 ＋ `key_install()`**：槽状态放在模块级而不是提交函数里面，因为固件是
+   **累加**的——原厂每装一把密钥都把整条 ADDR_CAM entry 重发一遍，所以第二把密钥那次重发
+   必须带着第一把的槽。地址 CAM 那条命令失败就把 mode/valid/entry/keyid 四个字段一起回滚，
+   免得后面任何一次重发带上固件从没接受过的槽。这里不存任何密钥字节，槽号、CAM index、
+   key id 都是寻址而不是秘密。
+5. **在关联完成路径上调用**，位置在「四次握手完成」那一行**之后**：装密钥失败也不会改写
+   3e 那条证据，日志照旧说清握手本身走到哪一步；失败通过既有的 `goto error` 变成这一步的
+   errno（`station WPA2 error=`）。汇总行只打槽位、CAM index、key id 和四个命令的结果。
+
+#### 上板之前先在主机上把序列化跑了一遍
+
+给 wpa profile 打开 `CONFIG_K1_RTL8852BS2_RUNTIME_ADDRESS_CAM_DIAGNOSTIC` 是个硬门
+（`board/k1/muse_pi_pro/src/k1_wireless.c:805`：`probe_ret` 为负会把后面所有诊断——包括 WPA
+那条——全部跳过），任何一个期望值写错就要赔一次上板。所以改成把地址 CAM／安全 CAM 诊断连同
+它依赖的 1059 个 `#define` 抽出来在主机上编译运行，断言全过之后才上板：
+
+```
+runtime address CAM dword2=0x11133f5d dword13=0x1b0a2afd H2C=1/6/0
+runtime address CAM sec dword9=0x8205aa dword10=0x1000005 security CAM dword0=0x200011 dword1=0x6 H2C=1/a/1
+```
+
+`dword9=0x8205aa` 里 `sec_ent_mode=2`（SH16 MSK 0x3）、slot 2 的 key id = 2（SH22）；
+`dword10=0x1000005` 里 `sec_ent_valid=0x5`、`sec_ent0=0x0`、`sec_ent2=0x1`。
+安全 CAM `dword0=0x200011` = index 0x11 | offset 0 | len `0x20`。
+上板验的因此是更强的那件事：固件**接受**了这四条命令。
+
+（顺手修了一个只在日志里看得见的坑：诊断里四条拒绝路径是层叠在 ext-key 那个用例上的，
+不会重写 `sec_content`，所以打出来的是 `dword1=0x36` 而不是真正会发出去的 `0x6`。
+现在打印前重新构造一次被接受的用例，并断言 `dword1 == 6`。）
+
+#### 板上证据（run 34）
+
+```
+K1 Wi-Fi GPL: sec-eng ctrl before=0x80002800 after=0x8000273f mpdu-proc before=0x0 after=0x3
+K1 Wi-Fi GPL: sec-eng init status=0x0
+K1 Wi-Fi GPL: assoc advertised eapol=0x4 eapol-self=0x4 malformed=0x0 ver-refused=0x0
+  rsn-ie=0x16 msg1=0x1 msg1-info=0x8a anonce=f1c68362 ptk=0x1 msg2=0x1 msg2-bytes=0x99
+  msg2-status=0x0 msg3=0x1 msg3-info=0x13ca msg3-keydata=0x38 mic=0x1 mic-fail=0x0
+  keydata-plain=0x30 unwrap=0x0 kde=0x0 gtk=0x1 gtk-len=0x10 gtk-id=0x1 msg4=0x1
+  msg4-status=0x0 complete=0x1
+K1 Wi-Fi GPL: RTL8852BS2 station WPA2 four-way handshake complete
+K1 Wi-Fi GPL: TK CAM H2C queued sequence=0xe pages=0x20 FIFO=0x1c00c
+K1 Wi-Fi GPL: TK CAM done-ack return=0x0
+K1 Wi-Fi GPL: TK SEC H2C queued sequence=0xf pages=0x20 FIFO=0x1c009
+K1 Wi-Fi GPL: TK SEC done-ack return=0x0
+K1 Wi-Fi GPL: GTK CAM H2C queued sequence=0x10 pages=0x20 FIFO=0x1c00c
+K1 Wi-Fi GPL: GTK CAM done-ack return=0x0
+K1 Wi-Fi GPL: GTK SEC H2C queued sequence=0x11 pages=0x20 FIFO=0x1c009
+K1 Wi-Fi GPL: GTK SEC done-ack return=0x0
+K1 Wi-Fi GPL: station keys sec-mode=0x2 sec-valid=0x5 tk-ent=0x0 tk-keyid=0x0 tk-cam=0x0
+  tk-sec=0x0 tk=0x1 gtk-ent=0x1 gtk-keyid=0x1 gtk-cam=0x0 gtk-sec=0x0 gtk=0x1
+K1 Wi-Fi GPL: RTL8852BS2 station WPA2 keys installed
+```
+
+四条 `done-ack return=0x0` 是这一增量的全部硬证据：固件收下了地址 CAM 的槽更新和两条
+安全 CAM 写入，并且回了 0。`gtk-keyid=0x1` 是 AP 在 Msg3 里给的 key id，不是本端编的。
+
+#### 这轮 AP 把 Msg1 发了三遍
+
+`eapol=0x4` 而 3e 那轮是 `0x2`：日志里 `wpa msg2 tx` 出现了三次（`sn=0x7/0x8/0x9`），
+也就是 AP 重传了两次 Msg1，直到第三次之后才收到本端的 Msg2 并接着发 Msg3。原因是本端仍然
+在 parked 的扫描 dwell 里发帧，两个 dwell 之间发不出去，AP 的重传定时器先响了。握手仍然
+一次过（`mic=0x1 mic-fail=0x0 complete=0x1`），但这正是「没有驻留信道」要付的利息，
+也是 `mac_port_init()` ＋ `set_channel` 该排在下一位的又一条理由。
+
+#### 这一步证明了什么、没证明什么
+
+证明的是：安全引擎按原厂的值起来了，GTK 从 Msg3 里解出来了，四条命令按原厂顺序发出去并被
+固件确认，槽位／CAM index／key id 是 mode 2 下合法的组合。
+
+**没有证明任何一帧被 CCMP 保护过。** 发送描述符的安全字段还没填（没有 `sec_type`／
+`sec_cam_idx` 那几位），也没有数据路径去填；接收侧同理，`icv-err`／`crc-err` 仍然是扫描
+统计里的两个 0，不代表有过解密。所以这一增量能说的只有「密钥装进去了、固件认了」。
+
+#### 密钥怎么处理的
+
+和 3e 同一套三层（profile 里留空、构建脚本从 `~/.config/k1-wifi-psk.env` 读、
+`out/k1-wpa` 不发布），本轮另加两条：H2C 的栈载荷缓冲和装密钥的 `sec` 结构在交给传输层之后
+**立刻 memset 清零**，无论命令成功还是失败；汇总行只有槽位、索引、key id 和 errno，
+没有任何由 TK 或 GTK 派生出来的值。上板后按 env 文件里的变量 grep 过：
+仓库 0 命中、run 34 的串口日志 0 命中。
+
+#### 还没做的
+
+除了上面那条「没有加密流量」：`mac_port_init()` 仍未移植（port 0 仍是 `c400=0x1e01b`，
+`PORT_FUNC_EN=0`、`NET_TYPE=NO_LINK`），3b/3c/3d 欠的 `JOININFO` 顺序（认证前
+`dis_conn=true`、关联时才翻 `dis_conn=false` 并把 port 设成 INFRA）仍然欠着，
+`wlan0` 仍然只会扫描，没有 DHCP、没有联网。
+
+#### 下一步
+
+1. `mac_port_init()` 的 band0/port0 子集 ＋ `rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1，
+   然后才是发送描述符的安全字段——这三件凑齐才能谈「被 CCMP 保护的数据帧」。
+2. 还掉 3b/3c/3d 欠的原厂 `JOININFO` 顺序。
+3. `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
+   以及把认证／关联响应的前 32 字节原样打到串口这条一直没补的证据。
