@@ -913,9 +913,20 @@ static int k1_sdio_sendcmd(FAR struct sdio_dev_s *dev, uint32_t cmd,
   uint32_t state;
   bool trace;
 
+#ifdef CONFIG_K1_SDIO_WIFI_COMMAND_TRACE
   trace = !priv->command_trace_suppressed &&
           (!priv->tuning_sweep ||
            ((cmd & MMCSD_CMDIDX_MASK) >> MMCSD_CMDIDX_SHIFT) != 19);
+#else
+  /* Successful-command dumps are by far the largest console consumer on this
+   * board, so they are compiled out unless the trace configuration selects
+   * them.  Every failure path below - command busy, command error, command
+   * timeout and data error - reports independently of this flag, so nothing
+   * that indicates a fault is lost.
+   */
+
+  trace = false;
+#endif
 
   state = K1_SDHC_PRESENT_CMD_INHIBIT;
   if ((cmd & MMCSD_DATAXFR_MASK) != MMCSD_NODATAXFR)

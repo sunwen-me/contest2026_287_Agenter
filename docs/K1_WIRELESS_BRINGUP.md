@@ -4654,3 +4654,142 @@ PASS: K1 wireless RAM image reached NSH
 
 主动扫描不再是失败项。下一步的收尾工作与优先级见
 `docs/CLAUDE_HANDOFF_K1_WIRELESS.md`。
+
+### 2026-08-30（续十四）：关掉 SDIO 逐命令打印，并补齐 `spatial_reuse_init()`
+
+#### 1. 板上一轮从 ~15 分钟降到 70 秒
+
+run 16 的完整验收日志是 8,487,502 bytes，其中 163,124 行 `K1 Wi-Fi SDIO:` 占
+8,306,377 bytes，**97.9%**。按 115200 baud 算，这些字节本身就要十几分钟传完，而
+run 14 与 run 15 两次"失败"最后都查明是这条带宽造成的主机侧超时假象，不是驱动回退。
+
+统计确认这 163,124 行**全部**来自 `k1_sdio_sendcmd()` 里 `if (trace)` 那一个块：
+
+| 标签 | 行数 |
+| --- | --- |
+| `command launch cmd/register/present` | 14,389 × 3 |
+| `data cmd/arg/mode/command/block size/block count/present/host` | 10,889 × 8 |
+| `data ADMA address/descriptor/data` | 10,889 × 3 |
+| 其余（`CMD53 block count`、`APMU AXI`、`CMD5` 探测等） | 179 |
+
+失败路径不在这个块里：`command busy`、`command error`、`command status`、
+`command timeout`、`data error status` 都在 `if (trace)` 之外无条件打印，所以关掉它
+不会丢任何指示故障的输出。26 条验收判据也没有一条读 `K1 Wi-Fi SDIO:` 前缀。
+
+因此新增 `CONFIG_K1_SDIO_WIFI_COMMAND_TRACE`（`default n`，依赖
+`K1_SDIO_WIFI && K1_EARLY_BOOT_LOG`），`k1_sdio_sendcmd()` 在未开启时直接
+`trace = false`。原来的运行期 `k1_sdio_wifi_suppress_command_trace()` 与 GPL 文件里
+9 对 `true…false` 调用都保留，开启该配置后行为与以前完全一致，
+`tools/decode_rtl8852_sdio_trace.py` 仍然可用。选编译期开关而不是"永久运行期抑制"是
+因为 `scanofld_passive_wait` 和 `medium_access_log` 这两对调用跑在扫描期间，它们尾部的
+`suppress(false)` 会把抑制重新打开；编译期关掉就不存在这个覆盖问题。
+
+顺带修掉一个潜在编译问题：`command_trace_suppressed` 字段在
+`#ifdef CONFIG_K1_SDIO_WIFI` 里，而原来 `k1_sdio_sendcmd()`（eMMC 也走这条路）
+无条件引用它。
+
+#### 2. run 17（同一 26 项，`--nsh-reboot`，RAM-only）
+
+| 指标 | run 16 | run 17 |
+| --- | --- | --- |
+| 日志字节 | 8,487,502 | 189,453 |
+| `K1 Wi-Fi SDIO:` 行 | 163,124 | 179 |
+| `K1 Wi-Fi GPL:` 行 | 1,178 | 1,172 |
+| 整轮墙钟（含重启、XMODEM 上传 369 KB、启动、全部诊断、`wapi pscan`） | ~15 分钟 | **70 秒** |
+| 判据 | 26/26 PASS | 26/26 PASS |
+
+`FAIL:` 零次。`block enable before dmac-clk=0x1f9f0000` 说明续十三的时钟修复仍在生效。
+`wlan0 sweep ret=0 end=1 bss=2 data-only=2 dropped=0`：这一轮只听到 2 个 AP（run 16 是
+3 个），是环境差异；`bss=` 只统计有 Beacon 或 Probe Response 支撑的条目，
+`data-only=` 是**另外**被排除掉的、只在 data frame 里出现过的 BSSID
+（`k1_rtl8852bs_runtime_scanofld_export_result()`），所以判据没有被放宽。
+
+#### 3. `dmac_init()` / `cmac_init()` 剩余步骤的逐项审计
+
+只读原厂源码，不占用上板机会。结论：
+
+| 原厂步骤 | 端口状态 |
+| --- | --- |
+| `dle_init` / `hfc_init` / `sta_sch_init` | 已实现 |
+| `preload_init` | 8852B 上 `preload_init_set_8852b()` 立即返回成功，空操作 |
+| `mpdu_proc_init` | 已实现，四个写入逐值相同（`0x02a95a95`、`0x0000aa55`、`0x010e05f0`、`MPDU_PROC` 的 `APPEND_FCS｜A_ICV_ERR`） |
+| `sec_eng_init` / `sec_info_tbl_init` | **未改编**。函数体不在本地原厂缓存里；只影响加密，open-system 认证不需要，留给 WPA2 四次握手阶段 |
+| `scheduler_init` / `addr_cam_init` / `rx_fltr_init` / `cca_ctrl_init` / `nav_ctrl_init` | 已实现 |
+| `rst_port_info` | 纯主机侧 `PLTFM_MEMSET`（`adapter->port_info`、`bcn_rpt_stats`），没有寄存器写，端口没有对应结构，**无需实现** |
+| `spatial_reuse_init` | **本次补上**，见下 |
+| `tmac_init` / `trxptcl_init` / `rmac_init` / `cmac_com_init` / `ptcl_init` / `cmac_dma_init` | 已实现；下面四个寄存器的缺失都已确认不适用 |
+
+四个原厂写到、端口没写的寄存器，逐个排除：
+
+- `R_AX_SIFS_SETTING 0xC624`、`R_AX_PTCL_FSM_MON 0xC6E8`：只在 PCIe/SW 模式有效（续十二已记录）
+- `R_AX_RX_TIME_MON 0xCEEC`：在 `#if MAC_AX_8852C_SUPPORT || 8192XB || 8852D` 里，
+  并且外层 `is_chip_id()` 只匹配 8852C/8192XB/8852D，**8852B 走不到**
+- `R_AX_AGG_LEN_VHT_0 0xC618`：在 `_patch_vht_ampdu_max_len()` 里，受
+  `chk_patch_vht_ampdu_max_len()` 条件保护，只改 VHT AMPDU 最大长度，与扫描/认证/关联无关
+- `R_AX_DLK_PROTECT_CTL 0xCE02`：其实**已覆盖**——它是 `R_AX_RCR 0xCE00` 的高半字，
+  端口用 `{RCR, 0xfff20000, 0x20f20000}` 一条 masked update 写掉了
+
+#### 4. `spatial_reuse_init()` 的两个字段
+
+原厂 `spatial_reuse.c:133` 只有两个字节写：`R_AX_RX_SR_CTRL 0xCE4A` 清
+`B_AX_SR_EN BIT(0)` 与 `B_AX_SR_CTRL_PLCP_EN BIT(1)`；`R_AX_BSSID_SRC_CTRL 0xCE4B`
+置 `B_AX_PLCP_SRC_EN BIT(0)`。两者与 `R_AX_MACID_MATCH 0xCE48` 同在一个 32-bit 字里，
+端口没有 8-bit MAC 访问器，所以合成一条 masked update 加进
+`g_k1_rtl8852bs_runtime_mac_core_fields[]`（放在 `tmac_init` 组之前，与原厂
+`cmac_init()` 的顺序一致）：
+
+```c
+#define K1_RTL8852BS_MACID_MATCH             0xce48u
+#define K1_RTL8852BS_SPATIAL_REUSE_MASK      0x01030000u
+#define K1_RTL8852BS_SPATIAL_REUSE_VALUE     0x01000000u
+```
+
+`mask` 只盖 bit16（`SR_EN`）、bit17（`SR_CTRL_PLCP_EN`）、bit24（`PLCP_SRC_EN`），
+所以 `B_AX_SRG_CHK_EN`、`B_AX_SR_OP_MODE`、`BSSID/BSS-colour/partial-AID match` 以及
+低两个字节的 MACID match 都按原厂的样子留着不动。它和扫描能不能工作无关（扫描在没有它
+的时候已经通过），补上只是为了减少与原厂的偏差，并让后续关联阶段不必再回来查这一条。
+
+#### run 18 的主动扫描失败是环境抖动，不是 `spatial_reuse_init` 引起的回归
+
+带上面这条改动的第一轮（run 18）在三项上失败：
+
+```
+FAIL: NuttX started without: RTL8852BS2 active scan completion,
+      RTL8852BS2 Probe Response RX, successful K1 RTL8852BS2 bring-up
+K1 Wi-Fi GPL: active scan probe response error=0x000000000000003d
+ERROR: K1 RTL8852BS2 bring-up failed: -61
+```
+
+`0x3d` = 61 = `ENODATA`，是 `scanofld_passive_diagnostic_common(false, true, …)`
+在「Probe Request 发出去了、但没有一帧 A1 指向本机的 Probe Response」时的返回值。
+按「每批失败立即停、先分清确定性缺陷与环境抖动」的规矩，**先用同一个二进制原样重跑**
+（不重新编译，整轮 70 秒），得到 run 19：
+
+```
+K1 Wi-Fi GPL: RTL8852BS2 active scan probe response complete
+PASS: K1 wireless RAM image reached NSH
+PASS: K1 wlan0 passive scan reported 3 BSS (data-only=1 dropped=0):
+      64:13:ab:db:f6:28 ch11, 56:4f:3b:e2:e6:d2 ch1, 50:4f:3b:e2:e6:d2 ch1
+```
+
+同一镜像通过，所以 run 18 不是 `spatial_reuse_init` 造成的回归。另有四条独立证据
+指向同一结论，记录下来以免下次重复排查：
+
+| 证据 | run 17（通过） | run 18（失败） | 结论 |
+| --- | --- | --- | --- |
+| `MAC core field=` 回读报错 | 无 | 无 | 0xce48 的 masked update 写进去并回读一致，index 4 通过 |
+| 固件发送通知 | `pre-tx=0xd post-tx=0xd post-tx-fail=0 fw-txfail=0` | 同上，逐字段相同 | Probe Request 在 13 个信道上都真的发了，固件没报一次发送失败 |
+| 被动扫描接收量 | `beacon=0x13 mgmt=0x15 bss=0x1` | `beacon=0x12 mgmt=0x13 bss=0x1`（同一个 BSSID `50:4f:3b:e2:e6:d2`） | 接收机健康，收得并不比通过的那轮少 |
+| `rsp-self` / `rsp-other` | `0x2 / 0x0` | `0x0 / 0x1` | 空中确实有 Probe Response，只是发给别的 STA |
+
+最后一行不能反过来读成「自己的回复被误判成别人的」：`rsp-self`/`rsp-other` 是
+**host 侧软件**按收到帧的 A1 与本机 MAC 逐字节比较分出来的
+（`k1_rtl8852bs_gpl.c:11980` 附近的注释与计数器），没有任何寄存器能把发给自己的单播
+算到 `rsp-other` 上去。加上 `SR_EN` 本来就是被清掉（原厂 `cmac_init()` 也清），
+`PLCP_SRC_EN` 只是在 spatial reuse 关闭时给它选 BSS color 来源，对 A1 过滤与
+Probe Response 接收都不产生作用。
+
+因此这条改动保留。主动扫描依赖「dwell 期间 AP 真的回一帧」，本来就有环境抖动的余量：
+run 16 听到 3 个 AP、run 17 是 2 个、run 18 一个都没回、run 19 又是 3 个。
+`--require-runtime-scanofld-active` 回归时的第一步永远是**原样重跑一次**，
+确认是确定性缺陷之后再动代码。

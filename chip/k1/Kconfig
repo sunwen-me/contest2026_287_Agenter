@@ -190,6 +190,23 @@ config K1_SDIO_WIFI
 		CMD53 ADMA2 transfers.  It does not
 		provide an 802.11 MAC driver.
 
+config K1_SDIO_WIFI_COMMAND_TRACE
+	bool "Dump every successful Wi-Fi SDIO command on the early console"
+	default n
+	depends on K1_SDIO_WIFI && K1_EARLY_BOOT_LOG
+	---help---
+		Print the command register, argument, transfer mode and ADMA descriptor
+		of every successful CMD52 and CMD53 issued to the Wi-Fi SDIO function.
+		This was the primary instrument while the controller and the card were
+		being brought up, and tools/decode_rtl8852_sdio_trace.py still parses
+		its output, but it is far too verbose to leave on: a full Wi-Fi scan
+		acceptance run emits about 160000 of these lines, roughly 8 MB, which is
+		over 97 percent of the console output and around fifteen minutes of
+		115200-baud transmit time.  Failing commands - command busy, command
+		error, command timeout and data error - are reported whether or not this
+		is enabled, and no acceptance criterion reads these lines, so leave it
+		off unless a new fault has to be traced at the SDIO command layer.
+
 config K1_SDIO_WIFI_LINUX_SIGNAL_DIAGNOSTIC
 	bool "Mirror Linux SDH1 interrupt gates during CMD53 diagnostic"
 	default n

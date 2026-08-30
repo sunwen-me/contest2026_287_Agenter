@@ -120,7 +120,10 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   就要 57.3 s（日志末尾已经是 `C2H channel=0x0d reason=0x5` 扫描结束 + `report bytes=0x1c`，
   只差 `wlan0 sweep ret=0 …` 那一行）。`verify_wlan0_scan()` 在所有启动期判据之后才跑
   （`run_k1_wireless_smoke.py:1507`），所以不影响前 25 项。用 `--wlan0-scan-timeout 300` 重跑。
-  诊断 profile 的 `K1 Wi-Fi SDIO:` 逐命令打印（9 MB 日志的绝大部分）已成为板上运行的时间瓶颈。
+  诊断 profile 的 `K1 Wi-Fi SDIO:` 逐命令打印（9 MB 日志的绝大部分）曾是板上运行的时间瓶颈，
+  **已在 2026-08-30 用编译期 Kconfig 关掉**（见下面「下一步优先级」与
+  `docs/K1_WIRELESS_BRINGUP.md` 续十四）：整轮从 ~15 分钟降到 **70 秒**，
+  `--wlan0-scan-timeout` 再也不会因为串口带宽而超时。
 - **`sta_sch_init()` 确实是缺失的一步，但不是本症状的原因。** run 13 的自检行给出结论：
   `sta-sch ctrl before=0x00e40000`（BIT(0)/BIT(31) 都是 0）、`polls=0`、`init-done=1`、
   `after=0xa0e40001`、`status=0`——真的从未执行过；但 run 13 的 `post-sweep` 与 run 10
@@ -160,15 +163,37 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 - 不要仅注册一个 `wlan0` 或返回假扫描结果来宣称 Wi-Fi 完成。26 项验收现在全过，但**扫描
   以上的东西一个都没有**：没有关联、没有认证、没有 4-way、没有数据收发，蓝牙也只到 HCI
   打开。「Wi-Fi 能扫到 AP」不等于「Wi-Fi 完成」
-- **下一步优先级**：(1) 把 `K1 Wi-Fi SDIO:` 逐命令打印做成可关的——它占 8.5 MB 日志的
-  九成以上，是每次板上运行 ~15 分钟的唯一原因；`k1_sdio.c` 已有
-  `k1_sdio_wifi_suppress_command_trace()`，扫描 sweep 与 `wapi pscan` 两段还没包起来。
-  (2) 关联/认证：`k1_rtl8852bs_runtime_mgmt_tx_probe()` 那条描述符现在已被证明能穿到
-  TMAC，可以直接拿来发 Auth/Assoc。(3) 剩下的原厂 `dmac_init`/`cmac_init` 步骤对齐审计
-  （`mpdu_proc_init`、`sec_eng_init`、`sec_info_tbl_init`、`spatial_reuse_init`、
-  `tmac_init`、`trxptcl_init`、`rmac_init`、`cmac_com_init`、`ptcl_init`、`cmac_dma_init`）。
-  (4) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），发送正确性与
-  RSSI 精度要靠它
+- **已完成（2026-08-30，原优先级 1 与 3）**：
+  - `K1 Wi-Fi SDIO:` 逐命令打印改成编译期开关 `CONFIG_K1_SDIO_WIFI_COMMAND_TRACE`
+    （`chip/k1/Kconfig`，默认 `n`；`k1_sdio.c` 里 `trace` 在没定义时直接 `false`）。
+    没有做成运行期 save/restore，理由是按字节偏移做的直方图证明这些行在整条日志里
+    **均匀分布**、bring-up 阶段就占约 91%，「bring-up 成功后再永久 suppress」最多省 9%；
+    而且 `k1_rtl8852bs_gpl.c` 里已有九对 `suppress(true/false)`，其中
+    `scanofld_passive_wait` 与 `medium_access_log` 跨在扫描期间，收尾的 `suppress(false)`
+    会把运行期开关重新打开。`#ifdef` 不会被这样清掉，运行期零成本，
+    并且开着的时候 `tools/decode_rtl8852_sdio_trace.py` 照旧可用。
+    失败路径（`command busy` / `command error` / `command timeout` / `data error`）
+    **不受这个开关影响**，26 项判据里也没有一项去读这些行。
+    实板效果（run 17）：日志 8 487 502 → 189 453 字节、SDIO 行 163 124 → 179、
+    整轮 ~15 分钟 → **70 秒**，判据仍是 26/26。
+  - 原厂 `dmac_init()`/`cmac_init()` 逐步对齐审计做完，唯一真缺的一步是
+    `spatial_reuse_init()`，已补成 0xce48 上的一条 masked update（run 19 实板 26/26）。
+    新发现的 `rst_port_info()` 是纯 host 侧 `PLTFM_MEMSET`，没有寄存器写。
+    `mpdu_proc_init` 与原厂逐值相同。四个原厂写、本端口没写的寄存器
+    （`R_AX_SIFS_SETTING 0xC624`、`R_AX_PTCL_FSM_MON 0xC6E8`、`R_AX_RX_TIME_MON 0xCEEC`、
+    `R_AX_AGG_LEN_VHT_0 0xC618`）都已证明不适用，`R_AX_DLK_PROTECT_CTL 0xCE02`
+    是 `R_AX_RCR 0xCE00` 那个 32 位字的高半字、早就写了。**剩下唯一没审的是
+    `sec_eng_init` / `sec_info_tbl_init`**（本地原厂缓存里没有正文），只影响加密，
+    要到 WPA2 4-way 才需要。细节见 `docs/K1_WIRELESS_BRINGUP.md` 续十四。
+- **下一步优先级**：(1) 关联/认证：`k1_rtl8852bs_runtime_mgmt_tx_probe()`
+  （`k1_rtl8852bs_gpl.c:15682`）那条描述符已被证明能穿到 TMAC 并真辐射出去，
+  可以直接拿来发 Auth/Assoc——扫描结果 → 选 BSS → ADDR_CAM 写 BSSID →
+  Auth Request（open system）→ Auth Response → Assoc Request → Assoc Response；
+  已确认**不需要** JOININFO、CCTL/DCTL、`B_AX_PORT_FUNC_EN`。
+  (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
+  发送正确性与 RSSI 精度要靠它；同一批还有 `set_enable_bb_rf(hal, 0)` 的 disable 半边、
+  `halbb_dm_init()`/`halrf_dm_init()` 正文、五张 `init_rf_reg` store 表、halbb `phy_reg_gain`。
+  (3) `sec_eng_init` / `sec_info_tbl_init`，WPA2 4-way 之前补。
 
 ## 当前最重要的技术结论
 
@@ -257,6 +282,17 @@ Probe Response——这也是把「固件 scan report 为空」和「RMAC 计数
    原样重跑即可；`assert/PANIC/mcause/EPC` 一个都搜不到可以佐证不是软件陷入。
    重跑时按一次 RST 后到结果出来前（约 3 分钟）不要再碰板子或线缆——XMODEM 只占前 40 秒，
    之后 NuttX 还要跑完两轮 `wapi pscan`。
+4. `--require-runtime-scanofld-active` 单独回归、并且串口里是
+   `active scan probe response error=0x000000000000003d`（`ENODATA`）＋
+   `bring-up failed: -61`，**第一步是用同一个二进制原样重跑**（不重新编译，70 秒一轮）。
+   主动扫描要求 dwell 期间 AP 真的回一帧 Probe Response，这一项本来就有环境抖动：
+   run 16 听到 3 个 AP、run 17 是 2 个、run 18 一个都没回、run 19 又是 3 个。
+   判断依据是 `passive scan TX notify pre-tx=0xd post-tx=0xd fw-txfail=0`
+   （Probe Request 在 13 个信道上都发了）加 `rsp-self=0x0 rsp-other!=0x0`
+   （空中有 Probe Response，只是发给别的 STA）。`rsp-self`/`rsp-other` 是 host 侧
+   按 A1 逐字节比较分出来的，没有寄存器能把发给自己的单播算成别人的，所以这个组合
+   只可能是「发出去了没人回」，不要因此回头怀疑 MAC/RX 配置。完整证据见
+   `docs/K1_WIRELESS_BRINGUP.md` 续十四最后一节。
 
 该 profile 的父 profile 必须是 `wireless_fw_runtime_scan_rf_readback_diag`——
 `wireless_fw_runtime_scanofld_rx_diag` 虽然名字里有 rx，却不打开 BB/RF release、

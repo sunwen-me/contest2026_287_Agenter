@@ -113,7 +113,8 @@ power-on 状态的 32-bit 寄存器访问、SDIO pre-init、DLE/SCC page-pool/qu
   network device。
   `CONFIG_K1_RTL8852BS2_RUNTIME_MAC_CORE_DIAGNOSTIC` 额外改编
   `trxcfg.c` 的 `mpdu_proc_init()`、`tmac_init()`、`trxptcl_init()`、
-  `rmac_init()`、`cmac_com_init()`、`ptcl_init()` 和 `cmac_dma_init()` 中不依赖
+  `rmac_init()`、`cmac_com_init()`、`ptcl_init()`、`cmac_dma_init()` 与
+  `spatial_reuse.c` 的 `spatial_reuse_init()` 中不依赖
   scheduler、address-CAM、role、station 或 security state 的 RTL8852B band-0
   `MAC_AX_TRX_SW_MODE` 字段，并使用 `mac_reg_ax.h` 的寄存器/bit 定义。每一个
   update 都在 CMD53 indirect access 后读回验证；它不设置 MACID/peer/key，不创建

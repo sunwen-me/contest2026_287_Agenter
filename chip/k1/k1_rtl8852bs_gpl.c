@@ -462,6 +462,7 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_ADDR_CAM_CTRL            0xce34u
 #define K1_RTL8852BS_RESPBA_CAM_CTRL         0xce3cu
 #define K1_RTL8852BS_PPDU_STAT               0xce40u
+#define K1_RTL8852BS_MACID_MATCH             0xce48u
 
 /* Coexistence arbitration.  This part combines a Wi-Fi and a Bluetooth core
  * behind one 2.4 GHz front end, and an arbiter decides which of them may use
@@ -1076,6 +1077,18 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RCR_CHANNEL_VALUE       0x0000000fu
 #define K1_RTL8852BS_DLK_PROTECT_MASK        0xfff20000u
 #define K1_RTL8852BS_DLK_PROTECT_VALUE       0x20f20000u
+
+/* Spatial reuse shares the 32-bit word at 0xce48 with the MACID match
+ * control, so the two fields the vendor writes as byte accesses are applied
+ * as one masked update: clear B_AX_SR_EN and B_AX_SR_CTRL_PLCP_EN in
+ * R_AX_RX_SR_CTRL (0xce4a) and set B_AX_PLCP_SRC_EN in
+ * R_AX_BSSID_SRC_CTRL (0xce4b).  B_AX_SRG_CHK_EN, B_AX_SR_OP_MODE and the
+ * BSSID/BSS-colour/partial-AID match bits are left as the vendor leaves
+ * them, and the MACID match bytes below are untouched.
+ */
+
+#define K1_RTL8852BS_SPATIAL_REUSE_MASK      0x01030000u
+#define K1_RTL8852BS_SPATIAL_REUSE_VALUE     0x01000000u
 #define K1_RTL8852BS_RX_MPDU_MAX_MASK        0x003f0000u
 #define K1_RTL8852BS_RX_MPDU_MAX_VALUE       0x00170000u
 #define K1_RTL8852BS_VHT_SIGB_CRC_CHECK      0x00000010u
@@ -1880,6 +1893,8 @@ static const struct k1_rtl8852bs_register_field_s
   {K1_RTL8852BS_TF_FWD, UINT32_MAX, K1_RTL8852BS_TF_FWD_VALUE},
   {K1_RTL8852BS_CUT_AMSDU_CTRL, UINT32_MAX,
     K1_RTL8852BS_CUT_AMSDU_CTRL_VALUE},
+  {K1_RTL8852BS_MACID_MATCH, K1_RTL8852BS_SPATIAL_REUSE_MASK,
+    K1_RTL8852BS_SPATIAL_REUSE_VALUE},
   {K1_RTL8852BS_MAC_LOOPBACK, K1_RTL8852BS_MAC_LOOPBACK_EN, 0u},
   {K1_RTL8852BS_TCR0, K1_RTL8852BS_TCR_UDF_THRESHOLD_MASK,
     K1_RTL8852BS_TCR_UDF_THRESHOLD_VALUE},
