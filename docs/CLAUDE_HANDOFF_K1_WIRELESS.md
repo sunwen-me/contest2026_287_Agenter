@@ -44,7 +44,13 @@
 - **open-system 认证**：向选定 AP 发单播 Authentication Request，收到它的
   Authentication Response `alg=0 seq=2 status=0`（run 20，`wireless_auth_diag`，
   27 项 `--require-*` 全过）。发送时机借固件把射频停在扫描信道上的行为，
-  挂在 scan-offload dwell 里。**仅此而已：不关联、硬件不 ACK、无密钥、无数据通路**
+  挂在 scan-offload dwell 里。**仅此而已：不关联、无密钥、无数据通路**
+- **station join（增量 3b）**：把原厂 connect 路径的两条命令按原厂顺序发出去
+  （`MEDIA_RPT/JOININFO`，然后同一 MACID 的 `MAC/ADDR_CAM_UPDATE` 带 AP 的
+  target MAC/BSSID），两条 done ack 都返回 0，并要求同一次认证交换在命令之前、
+  两条之间、两条之后都仍然被 AP 回答、sweep 也仍然在收 Beacon（run 25，
+  `wireless_join_diag`，28 项 `--require-*` 全过，提交 `20c3191`）。
+  **仍然不是关联**：无 Association Request、无 AID、无密钥、TSF 未同步
 - H5 版本结果：HCI `0x0b/0x000b`，manufacturer `0x005d`，LMP subversion `0x8852`
 
 最新已通过的扫描/PHY/FW 日志（运行 12，13 信道被动扫描）：
@@ -63,11 +69,15 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 
 ## 尚未完成，禁止误报
 
-- **认证通了不等于关联通了。** run 20 收到的是 AP 的 Authentication Response，
-  `status=0` 是 AP 给的成功码；但本机 ADDR_CAM 里仍是 no-link role、单播地址匹配
-  关着、接收过滤放开，所以硬件**不会 ACK** 这一帧，AP 会重传几次然后把这次交换
-  超时掉。说「能和 AP 完成 open-system 认证交换的一个来回」是对的，
+- **认证通了、join 命令被固件接受了，都不等于关联通了。** run 20/run 25 收到的是 AP 的
+  Authentication Response，`status=0` 是 AP 给的成功码；增量 3b 之后固件和 ADDR_CAM
+  也确实知道本机属于这个 BSS。但没有 Association Request、没有 AID、没有密钥、
+  port 0 仍是 `PORT_FUNC_EN=0`/`NET_TYPE=0`/TSF 冻结（`mac_port_init()` 未移植）。
+  说「能和 AP 完成 open-system 认证交换的一个来回，并让固件接受 join 状态」是对的，
   说「关联上了」「Wi-Fi 通了」是误报。
+  （原来这里写的「硬件不会 ACK 这一帧，AP 会重传几次然后超时」是没有证据的推测，
+  已删除：run 25 里每一次被回答的交换 `TX PPDU.lcck` 恰好 +2、run 24 里每一次没被回答
+  的只 +1，多出来的那一个 PPDU 只能是本机发的。详见 `K1_WIRELESS_BRINGUP.md` 增量 3b。）
 - 没有关联、WPA、DHCP 或联网。`wireless_wlan0_scan_diag` 里那个**只报告扫描结果**的
   `wlan0` 已经在实板通过 25 项 `--require-*` 全链（run 7，见下），但它的范围就只有扫描：
   `SIOCSIWSCAN` 同步跑一次 13 信道被动 sweep、`SIOCGIWSCAN` 读回结果——**没有 TX、
@@ -148,9 +158,12 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   （`run_k1_wireless_smoke.py:526 halt_at_uboot_from_nsh()`）走 NSH `reboot` → U-Boot
   `reset` 两段恢复，全程 RAM-only、无 `saveenv`。注意 `--manual-reset` 与 `--nsh-reboot`
   是 argparse 互斥组，不能往现成 wrapper 后面追加参数，要另写一条带绝对路径的调用。
-- 从原厂排除、不要照 mainline 再追的三条：STA 角色**不发 JOININFO**（`role.c:595` 只在
-  `self_role == MAC_AX_SELF_ROLE_AP` 时发）、`init_cctl_info`/`mac_upd_dctl_info` 在原厂
-  `#if 0`、`mac_port_init()` 从不置 `B_AX_PORT_FUNC_EN`；另外 `GENERAL_PKT` 的 `probereq`
+- 从原厂排除、不要照 mainline 再追的两条：`init_cctl_info`/`mac_upd_dctl_info` 在原厂
+  `#if 0`、`mac_port_init()` 从不置 `B_AX_PORT_FUNC_EN`；
+  **原来这里的第三条「STA 角色不发 JOININFO」写得过头了，已修正**：`role.c:595` 那个
+  `self_role == MAC_AX_SELF_ROLE_AP` 判断管的是 `FWROLE_MAINTAIN` 的重发，而
+  `MEDIA_RPT/JOININFO` 是 connect 路径另外一条命令，STA 一样要发。增量 3b 在板上发了它，
+  done ack 返回 0（run 25）。另外 `GENERAL_PKT` 的 `probereq`
   id 在原厂 HAL 填充函数里根本不填。本端口 chinfo 编码与
   `rtw_hal_mac_scan_ofld_add_ch()` 逐字段一致，不是缺陷；mainline 的
   `num_addition_pkt`+`additional_pkt_id[]` 形式只是等价后备
@@ -202,9 +215,13 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `alg=0x0 seq=0x2 status=0x0 a2=504f3be2e6d2`——**它自己给出的成功码**。
   关键机制：**固件会把射频停在扫描信道上**。
   `k1_rtl8852bs_runtime_scanofld_next_channel_submit()`（`k1_rtl8852bs_gpl.c:9563`）
-  的自带注释写明 SCANOFLD 一直保持当前信道直到收到 NEXT_CH，而本移植的 NEXT_CH 由 RX
-  循环里的 250 ms dwell 截止时间发出，所以「进入信道通知 → 截止时间」之间射频确定停在
-  目标信道，可以在里面发帧并在同一信道收回复。这是原厂状态机自己的行为，
+  的自带注释写明 SCANOFLD 保持当前信道直到收到 NEXT_CH——**但只在 chinfo 的 `period`
+  到点之前**：原厂把 `period` 定义为 "how long to stay on this ch. unit: ms"
+  （`mac_def.h:7374`，`u8`，上限 255 ms），到点固件自己就走，host 的 NEXT_CH 只能把这段
+  时间缩短。所以 host 的 dwell 截止必须严格小于 `period`，否则每个信道都是一场 host 可能
+  输掉的竞争（host 的计时从**读到**通知才开始）。现在是 `period` = 250 ms 配 host 侧
+  dwell 截止 180 ms。「进入信道通知 → host 截止」之间射频确定停在目标信道，
+  可以在里面发帧并在同一信道收回复。这是原厂状态机自己的行为，
   也是本移植目前唯一能在指定信道发送的办法（还没有
   `rtw8852b_set_channel_{mac,bb,rf}`）。实现要点：
   `mgmt_tx_build()` 加 `bool broadcast` 参数——单播管理帧必须清掉
@@ -213,13 +230,27 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `mgmt_tx_probe()` 完全相同，只去掉仪表输出，因为控制台是轮询式的，
   在 250 ms 窗口里打印十行会吃掉等回复的时间）；判据是 **A1 == 自身 MAC** 的
   host 侧 memcmp，任何寄存器都无法伪造。
-  **但这不是关联**：ADDR_CAM 仍是 no-link role，硬件不 ACK，AP 会重传并超时。
-- **下一步优先级**：(1) 增量 3b：用 AP 的 BSSID/aid 更新 ADDR_CAM 与 role
-  （`struct k1_rtl8852bs_addr_cam_info_s` 里 `network_type`/`self_role`/`bssid`/`aid`
-  已经就位，目前只填了 `self_mac`），让硬件 ACK AP 的帧，然后
-  Assoc Request → Assoc Response。发送路径直接用
+  **但这不是关联**：ADDR_CAM 仍是 no-link role。
+- **已完成（2026-08-30，增量 3b）：station join 的两条命令已在板上被固件接受。**
+  run 25，镜像 `wireless_join_diag`，28 条 `--require-*` 全过，基线（27 条）无回归，
+  提交 `20c3191`。`MEDIA_RPT/JOININFO` → 同一 MACID 的 `MAC/ADDR_CAM_UPDATE`（target
+  MAC/BSSID = AP），两条 done ack 都是 0；同一次认证交换在命令之前、两条之间、两条之后
+  各做一次，三次都被 AP 回答且 sweep 仍在收 Beacon。`FWROLE_MAINTAIN` 故意不重发
+  （原厂也不重发）。**顺手修掉的根因**：host 自建的管理帧原来一直用序列控制字段 0，
+  一次运行里所有请求呈现同一个 `<A2, 序列号, 分片号>` 三元组，正是 IEEE 802.11
+  clause 10.3.2.14 重复检测的输入——AP 在 MAC 层 ACK 之后就丢掉重复帧，看起来就像
+  「只回第一次然后沉默」。现在有一个 12 位本机计数器，同时写进帧和 WD BODY dword3。
+  **仍然不是关联**：没有 Association Request/AID/密钥，port 0 仍
+  `PORT_FUNC_EN=0`/`NET_TYPE=0`/TSF 冻结。
+- **下一步优先级**：(1) 增量 3c：关联。Assoc Request（capability、listen interval、
+  SSID、supported rates，加从 Beacon 里回抄的 RSN IE——需要先把 RSN IE 存进
+  `struct k1_rtl8852bs_scan_bss_s`），解 subtype=1 的 `status`/`aid`，拿到 AID 后重发
+  一次 ADDR_CAM，`status` 非零要照实报告。发送路径直接用
   `k1_rtl8852bs_runtime_mgmt_tx_frame()`（`broadcast=false`），时机同样挂在
-  scan-offload 的 dwell 上；已确认**不需要** JOININFO、CCTL/DCTL、`B_AX_PORT_FUNC_EN`。
+  scan-offload 的 dwell 上。同一批要把 3b 欠的原厂顺序补回来：`JOININFO`
+  `dis_conn=true` 在认证之前，`dis_conn=false` + INFRA port + `mac_port_init()`
+  只在关联时；`mac_port_init()` 的 band0/port0 子集（NO_LINK/INFRA，不做
+  MBSSID/AP/DBCC）输入已经收集齐（`mport.c:2010-2305` 与 `mport.h` 的 DEF 常量）。
   (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
   发送正确性与 RSSI 精度要靠它；同一批还有 `set_enable_bb_rf(hal, 0)` 的 disable 半边、
   `halbb_dm_init()`/`halrf_dm_init()` 正文、五张 `init_rf_reg` store 表、halbb `phy_reg_gain`。
@@ -240,6 +271,20 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 
 项目已完成前 5 项的有界版本，普通 packet type 0 RX 已经出现（见上）。第 6 项的
 dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
+新增的几条硬结论（读日志/写发送路径之前先看）：
+
+- **host 自建的管理帧必须带真序列号。** 帧里的序列控制字段就是上空气的那个；描述符里
+  能让硬件代填的 `AX_TXD_HW_SSN_SEL`/`AX_TXD_EN_HWSEQ_MODE` 在本移植里都是 0。所有请求
+  共用一个号码 = 触发 802.11 clause 10.3.2.14 重复检测，AP 会 ACK 然后丢掉，症状是
+  「第一次有回复、后面全沉默」。这曾经让增量 3b 连续两轮报 `error=0x3d`（ENODATA）。
+- **串口日志里 C2H 行的位置是 host 读到它的时间，不是固件产生它的时间。** 不要用一行
+  C2H 出现在哪两行之间来推断固件事件的先后。
+- **`pause_tx_data` 不会挡住管理帧**：原厂定义是 "whether disable tx (except manage
+  pkt) after sending probe req"（`mac_def.h:7398`）。
+- **`done_ack_wait()` 会抽 RX FIFO**，所以任何 H2C 提交都不能放在扫描 RX 循环里，只能放
+  在两轮 sweep 之间；`k1_rtl8852bs_runtime_mgmt_tx_frame()` 可以从 RX 循环里调。
+- **TX 仪表日志前缀是 `TX state` 与 `TX PPDU`**（旧日志里的旧前缀已改名，不要当成缺失）。
+
 不要继续花时间调整已经排除的因素：
 
 - SDIO CMD53 byte mode 的计数字段只有 9 位（0 表示 512），所以**一次 byte-mode CMD53 最多
@@ -294,11 +339,18 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 验收命令是 `docs/K1_WIRELESS_BRINGUP.md`（续七）里那条完整 `--require-*` 链加
 `--require-wlan0-scan`，需要用户按 RST；run 7 已通过（续十）。
 
-**因此当前实际下一步是关联/认证**，第一块砖是 TX：现在整条路径**只有 RX**，
-`--require-runtime-data-tx-descriptor` 只验证了描述符构造，没有发过一帧。
-在写 `SIOCSIWESSID`／Authentication／Association 之前先要能真发出 Probe Request 并收到
-Probe Response——这也是把「固件 scan report 为空」和「RMAC 计数器不可信」两个已知缺口
-逼出来的最短路径。TX 正确性依赖的初始化缺口见本节前面的清单
+上面这段「第一块砖是 TX」已经完成：Probe Request 真发出去并收到 Probe Response
+（run 14）、open-system 认证收到 AP 的成功回复（run 20 / 增量 3a）、station join 的两条
+命令被固件接受（run 25 / 增量 3b）。**当前实际下一步是增量 3c：关联**，做法与欠账见
+「已在实体板验证」末尾那条优先级 (1)。复现 3b 镜像：
+
+```bash
+tools/build_k1_join.sh            # profile board/k1/muse_pi_pro/configs/wireless_join_diag
+```
+
+板上验收在既有 27 条 `--require-*` 之后追加 `--require-runtime-join`（共 28 条），
+运行日志 `out/k1-serial/k1-join-20260830T101829Z.log`。TX 正确性依赖的初始化缺口
+（`rtw_hal_bb_dm_init`/`rtw_hal_rf_dm_init` 那一批）见本节前面的清单
 （`set_enable_bb_rf(hal, 0)` disable 半边、`halbb_dm_init()`、`halrf_dm_init()` 正文、
 五张 `init_rf_reg` store 表、halbb `phy_reg_gain`），不要在补齐之前把发不出去归因于 MAC 层。
 
@@ -393,6 +445,9 @@ C2H result 等待机制，但使用原厂定义的 `source=RF`、RF path A/B、m
 - `wlan0` 扫描 netdev（Apache-2.0，只调 GPL 组件公开 API）：
   `chip/k1/k1_rtl8852bs_netdev.c`、`chip/k1/k1_rtl8852bs_netdev.h`
 - `wlan0` profile：`board/k1/muse_pi_pro/configs/wireless_wlan0_scan_diag/defconfig`
+- 认证/join profile 与构建脚本：
+  `board/k1/muse_pi_pro/configs/wireless_auth_diag/`＋`tools/build_k1_auth.sh`、
+  `board/k1/muse_pi_pro/configs/wireless_join_diag/`＋`tools/build_k1_join.sh`
 - PHY CR：`chip/k1/k1_rtl8852bs_phy_reg_8852b.inc`
 - Wi-Fi 固件：`chip/k1/k1_rtl8852bs_u2_nic_fw.inc`、`chip/k1/k1_rtl8852bs_u2_nicce_fw.inc`
 - 蓝牙 H5：`chip/k1/k1_bt_uart.c`

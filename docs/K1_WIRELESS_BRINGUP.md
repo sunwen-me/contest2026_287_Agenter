@@ -4802,7 +4802,10 @@ run 16 听到 3 个 AP、run 17 是 2 个、run 18 一个都没回、run 19 又�
 
 1. `k1_rtl8852bs_runtime_auth_request_build()`：24 字节 802.11 头 + 6 字节 body
    （alg=0 open system、seq=1、status=0）。A1/A3 = AP 的 BSSID，A2 = eFuse 自身 MAC；
-   frame control `0x00b0`（type=management, subtype=11）。序列控制字段留 0，由描述符负责。
+   frame control `0x00b0`（type=management, subtype=11）。**序列控制字段当时留了 0，
+   说「由描述符负责」——这是错的，见下面增量 3b 里的根因**：帧里的这个字段就是上空气的
+   那个，描述符里的 `AX_TXD_HW_SSN_SEL`/`AX_TXD_EN_HWSEQ_MODE`（能让硬件代填的两位）
+   在本移植里都是 0。
 2. `k1_rtl8852bs_runtime_mgmt_tx_build()` 增加 `bool broadcast` 参数。原来它硬写
    `info1 = K1_RTL8852BS_MGMT_TXI_BMC`，因为唯一调用者发的是广播 Probe Request。
    **单播管理帧必须清掉这个位**，否则硬件既不会等 AP 的 ACK，也不会在 ACK 缺失时重传。
@@ -4818,9 +4821,21 @@ run 16 听到 3 个 AP、run 17 是 2 个、run 18 一个都没回、run 19 又�
    > SCANOFLD holds the current channel until this FW_OFLD/SCANOFLD_DRV_CTRL/NEXT_CH
    > command is received.  （`k1_rtl8852bs_gpl.c:9563` 自带注释）
 
-   固件进入一个信道后会**一直停在那里**，直到 host 发 NEXT_CH；本移植的 NEXT_CH 是
-   由 RX 循环里的 dwell 截止时间发出的（`K1_RTL8852BS_SCAN_OFLD_PASSIVE_PERIOD_MSEC`
-   = 250 ms）。所以从进入信道到截止时间之间，射频**确定**停在目标 AP 的信道上，
+   **这句注释只在 `period` 没到之前成立，当时的文字漏了这一半。** 原厂
+   `mac_ax_scanofld_chinfo` 对两个时间字段的定义（`mac_def.h:7374`，vendor 缓存）是：
+   `period` = "how long to stay on this ch. unit: ms"，`dwell_time` = "dwell time if
+   recv bcn. unit: ms. set 0 to disable dwell"。也就是说固件停在一个信道上**最多**
+   `period` 毫秒，到点它自己就走，host 的 NEXT_CH 只能把这段时间**缩短**。`period` 是
+   `u8`，上限 255 ms。
+
+   所以 host 侧的 dwell 截止必须**严格小于** `period`，否则每个信道都是一场 host 可能
+   输掉的竞争：host 的计时从它**读到**进入信道通知才开始，而固件的计时从它进入信道就
+   开始。本移植现在是 `K1_RTL8852BS_SCAN_OFLD_PASSIVE_PERIOD_MSEC` = 250 ms（写进
+   chinfo 交给固件）配 `K1_RTL8852BS_SCAN_OFLD_PASSIVE_DWELL_MSEC` = 180 ms（host 自己
+   的截止），留出的 70 ms 要覆盖通知的读取延迟加上一个 dwell 能打印的控制台输出，剩下的
+   仍然跨过一个以上的 100 ms beacon interval。
+
+   在这个前提下，从进入信道通知到 host 的截止之间，射频**确定**停在目标 AP 的信道上，
    既能发也能在同一信道收到回复。这是原厂状态机自己的行为，不是绕过它的 hack——
    本移植还没有 `rtw8852b_set_channel_{mac,bb,rf}`，这是目前唯一能在指定信道发送的办法。
 5. `k1_rtl8852bs_fwdl_runtime_auth_diagnostic()`：跑两轮 sweep。第一轮普通被动扫描，
@@ -4834,9 +4849,8 @@ run 16 听到 3 个 AP、run 17 是 2 个、run 18 一个都没回、run 19 又�
 Probe Response 的那个一样是 **host 侧软件逐字节 memcmp**，没有任何寄存器能让别的 STA
 的帧算成给我们的回复。sweep 期间接收过滤是放开的（嗅探模式），所以必须靠 A1 判定。
 
-**这一步不是关联，也不声称链路建立。** ADDR_CAM 里仍然是 no-link role，硬件不会 ACK
-AP 的回复，AP 会重传然后把这次交换超时掉。能**看到**它的 Authentication Response 就是
-这一步的成果；ACK 与 Association 属于增量 3b（用 AP 的 BSSID 更新 ADDR_CAM/role：
+**这一步不是关联，也不声称链路建立。** ADDR_CAM 里仍然是 no-link role。能**看到**
+AP 的 Authentication Response 就是这一步的成果；Association 属于增量 3b（用 AP 的 BSSID 更新 ADDR_CAM/role：
 `struct k1_rtl8852bs_addr_cam_info_s` 里的 `network_type`/`self_role`/`bssid`/`aid`
 已经就位，现在只填了 `self_mac`）。仍然是 RAM-only：不装密钥、无数据通路、无 IP、
 不动 wlan0 行为，也不写 eMMC/SPI flash/eFuse/U-Boot 环境变量。
@@ -4881,8 +4895,145 @@ PASS: K1 wireless RAM image reached NSH
 接受了这次 open-system 认证，并把结果发回给本机 MAC。这条链路上第一次出现
 「只能由接受了本机请求的那台设备产生」的证据，之前的 Probe Response 只证明请求被辐射了。
 
-**仍然要按实际情况报告**：这不是关联，也不是链路。硬件没有 ACK 这一帧（ADDR_CAM 里还是
-no-link role、单播地址匹配关掉、接收过滤放开），AP 会重传若干次然后把交换超时掉。
-下一步（增量 3b）才是用 BSSID/aid 更新 ADDR_CAM 与 role，让硬件 ACK，然后
-Association Request/Response。Wi-Fi 整体依然未完成：没有四次握手、没有数据通路，
-蓝牙也只到 HCI open。
+**仍然要按实际情况报告**：这不是关联，也不是链路。下一步（增量 3b）是用 BSSID 更新
+ADDR_CAM 与 role 并告诉固件本机已加入这个 BSS，之后才是 Association
+Request/Response。Wi-Fi 整体依然未完成：没有四次握手、没有数据通路，蓝牙也只到
+HCI open。
+
+> **原来这里写的「硬件没有 ACK 这一帧，AP 会重传若干次然后把交换超时掉」是没有证据的
+> 推测，已删除。** 增量 3b 的 run 25 给出了相反的证据：每一次**收到回复**的交换，
+> `TX PPDU` 的 `lcck` 恰好 +2（请求一个，多出来的一个只能是本机发的），而 run 24 里
+> 三次**没收到回复**的交换每次只 +1。run 25 的 prejoin 那一次是在两条 join 命令之前、
+> ADDR_CAM 还是 no-link 时发生的，同样是 +2。计数器只数 PPDU、不给帧类型，所以这是很强
+> 的相关而不是解码；但「硬件不 ACK」这个说法与它冲突，不能再当结论用。
+
+### 增量 3b：把「本机已加入这个 BSS」告诉固件和硬件（JOININFO + ADDR_CAM）
+
+提交 `20c3191`。开关 `CONFIG_K1_RTL8852BS2_RUNTIME_JOIN_DIAGNOSTIC`（依赖
+`..._RUNTIME_AUTH_DIAGNOSTIC`）、profile
+`board/k1/muse_pi_pro/configs/wireless_join_diag/`、构建脚本 `tools/build_k1_join.sh`、
+harness 判据 `--require-runtime-join`。板上 run 25
+（`out/k1-serial/k1-join-20260830T101829Z.log`）**28 项 `--require-*` 全通过**，
+比增量 3a 的 27 项只多了这一条，基线没有回归。
+
+这一步做的事情，和它**没有**做的事情要分清：它把原厂 connect 路径发的两条命令按原厂的
+顺序和内容发出去，然后要求同一次交换在固件和硬件都相信「本机是这个 BSS 的 station」
+之后**仍然成立**。它不是关联：没有 Association Request，没有 AID（报告里的 `aid=0x0`
+是真值不是占位），没有装密钥，没有创建网络设备，没有数据通路，port 的 TSF 也没有和
+AP 的 Beacon 同步——port 0 依旧读到 `PORT_FUNC_EN=0`、`NET_TYPE=0`、TSF 冻结，因为
+`mac_port_init()` 还没移植。
+
+三段实现都在 `chip/k1/k1_rtl8852bs_gpl.c`：
+
+1. **选目标**：先跑一轮普通被动 sweep，用和增量 3a 相同的办法挑收到 Beacon 最多的 AP。
+   BSSID 只有在**真正被听到过**之后才允许写进硬件，而且只有 Beacon 或 Probe Response
+   算听到过。报告行里的 `proven=0x1` 记录的是这个目标就是 AP 亲自回过请求的那一个。
+2. **两条命令**：`MEDIA_RPT/JOININFO`（MACID、infrastructure 网络类型、client
+   self role、band 0、port 0）在前，同一个 MACID 的 `MAC/ADDR_CAM_UPDATE`（target
+   MAC 与 BSSID 都是这台 AP，self role 为 client）在后。两条都要 done ack，且返回值都
+   必须为 0。**`FWROLE_MAINTAIN` 故意不重发**：原厂 connect 路径也不重发，它保留
+   bring-up 时建立的固件 role，只改内容。
+3. **重入约束**：两次提交都放在**两轮 sweep 之间**，绝不在扫描 RX 循环里做——
+   `k1_rtl8852bs_runtime_done_ack_wait()` 会抽同一个 RX FIFO，在 RX 循环里调它会把
+   扫描自己要收的帧吃掉。`k1_rtl8852bs_runtime_mgmt_tx_frame()` 则可以从 RX 循环里调。
+
+判据为什么要连 Beacon 计数一起要求：把一个 BSSID 和 infrastructure 网络类型写进
+ADDR_CAM，正是那种可能悄悄开始过滤接收的改动。一次「报告 join 成功、同时其实已经收不到
+东西了」的运行比直接失败更糟，所以 `join bss=`/`*-beacons=` 是必须项而不是诊断。
+
+#### run 24 的失败与根因：host 自建的管理帧一直用序列号 0
+
+run 24（`out/k1-serial/k1-join-20260830T095957Z.log`）以 `station join error=0x3d`
+（ENODATA）失败：三次交换的 `frames=0x0`——AP 一次都没回。而同一轮里增量 3a 的那次交换
+（同一个 AP、同一个信道、几十毫秒之前）拿到了 `rsp-self=0x1 status=0x0`。
+
+先用板上仪表把发送侧和接收侧都排除掉：
+
+- 三次交换每次 `delta-mactx-mpdu=0x1 delta-mactx-dma=0x1 delta-lcck=0x1`，
+  `macid-pause=0`、`macid-sleep=0`、`cmac-drop=0`、`dmac-drop=0`——请求**确实上了空气**。
+- 每次发送之后紧接着记录到的就是目标 AP 的 Beacon（`prejoin-beacons=0x9`，
+  bss 5/4/5）——射频在信道 1 上、也听得见这台 AP。
+- sweep 期间接收过滤是放开的，日志里连**别的** station 的单播 QoS data 和一帧别的
+  station 的 Deauthentication 都收到了——如果 AP 回了给本机的帧，一定会被收到。
+- 没有任何一帧 Deauthentication 是发给本机的。
+
+剩下的解释只能是 AP **不回重复的请求**，而移植自己的代码写明了为什么：
+`k1_rtl8852bs_runtime_auth_request_build()` 当时的注释和实现都是「序列控制字段留 0，
+由描述符负责」，`..._auth_transmit()` 也把 `0u` 当描述符序列号传下去。于是一次运行里
+每一个 Authentication Request 都呈现同一个 `<address 2, 序列号, 分片号>` 三元组，
+而这正是 IEEE 802.11 clause 10.3.2.14 重复检测的输入：接收方可以缓存最近收到的这些
+三元组，并在 **MAC 层**（在那个本来会回答的状态机**下面**）丢掉重复帧——帧被 ACK 了，
+然后被丢掉。所以一台永远发序列号 0 的 station，每个 AP 只会回它一次，之后就是沉默。
+
+「描述符负责」这句本身也是错的：帧里的序列控制字段就是上空气的那个，而描述符里能让
+硬件代填序列号的 `AX_TXD_HW_SSN_SEL` / `AX_TXD_EN_HWSEQ_MODE` 两位在本移植里都是 0
+（原厂 `trx_desc_8852b.c:214-255` 里 dword0 的这两位，以及 dword3 的
+`SET_WORD(info->sw_seq, AX_TXD_WIFI_SEQ)`）。
+
+修法：`g_k1_rtl8852bs_mgmt_sequence` 一个 12 位的**本机**计数器，
+`k1_rtl8852bs_runtime_mgmt_sequence_next()` 每次发送取一个，同时写进帧的序列控制字段
+（`frame + 22`，`sequence << 4`，分片号 0）和 WD BODY dword3，让硬件的记账和真正辐射
+出去的内容一致。号码**不管发送路径是否接受都要消耗掉**：被拒的请求也可能已经进了 FIFO，
+而上过空气的号码绝不能重用。广播 Probe Request 不从这个计数器取号——它一轮只发一次，
+靠地址而不是序列号被回答。顺带一个佐证：原厂 chinfo 里有
+`rand_seq_num` = "enable random seq num for probe req"，固件自己也在管这件事。
+
+#### run 25：三次交换用了三个不同的序列号，三次都被回答
+
+同一个镜像（`tools/build_k1_join.sh` 全部门禁通过，ELF SHA256
+`c680a4b4a774acc3ebce2b74b9acf041486699be9feafcfda2ea024719e176ad`，
+`text 739542 data 9768 bss 24656`），`--nsh-reboot`，RAM-only：
+
+```
+K1 Wi-Fi GPL: auth target bssid=564f3be2e6d2 channel=0x1 beacons=0x9 ssid-len=0x0
+K1 Wi-Fi GPL: auth request tx channel=0x1 bytes=0x1e sn=0x0 status=0x0
+K1 Wi-Fi GPL: auth req=0x1 req-sn=0x0 tx-status=0x0 frames=0x1 rsp-self=0x1
+              rsp-target=0x1 alg=0x0 seq=0x2 status=0x0 a2=564f3be2e6d2
+K1 Wi-Fi GPL: RTL8852BS2 authentication response complete
+K1 Wi-Fi GPL: join target bssid=564f3be2e6d2 channel=0x1 beacons=0x9 cap=0x421 proven=0x1
+K1 Wi-Fi GPL: auth request tx ... sn=0x1 status=0x0
+K1 Wi-Fi GPL: prejoin auth req=0x1 req-sn=0x1 ... rsp-self=0x1 ... status=0x0
+K1 Wi-Fi GPL: join info done-ack return=0x0
+K1 Wi-Fi GPL: auth request tx ... sn=0x2 status=0x0
+K1 Wi-Fi GPL: joininfo auth req=0x1 req-sn=0x2 ... rsp-self=0x1 ... status=0x0
+K1 Wi-Fi GPL: join CAM done-ack return=0x0
+K1 Wi-Fi GPL: auth request tx ... sn=0x3 status=0x0
+K1 Wi-Fi GPL: join auth req=0x1 req-sn=0x3 ... rsp-self=0x1 ... status=0x0
+K1 Wi-Fi GPL: join step prejoin-bss=0x6 prejoin-beacons=0x8 prejoin-rsp=0x1
+              joininfo-bss=0x7 joininfo-beacons=0x8 joininfo-rsp=0x1
+              cam-bss=0x6 cam-beacons=0x2 cam-rsp=0x1
+K1 Wi-Fi GPL: join bss=0x6 network-type=0x2 aid=0x0 bssid=564f3be2e6d2
+K1 Wi-Fi GPL: RTL8852BS2 station join complete
+```
+
+四次交换（3a 那次加 join 的三次）的序列号是 0/1/2/3，四次都拿到
+`rsp-self=0x1 status=0x0`。这同时说明两件互相独立的事：序列号确实是 run 24 的根因；
+以及两条 join 命令都没有破坏这次交换——**命令之前**（prejoin）、**两条之间**
+（joininfo）、**两条都发完之后**（join）各一次，三次都被回答，三次的 sweep 也都还在数
+Beacon 和 BSS。
+
+`TX PPDU` 的 `lcck` 在这一轮是 `0x0 → 0x2`（主动扫描）`→ 0x4`（3a）`→ 0x6`（prejoin）
+`→ 0x8`（joininfo）`→ 0xa`（join）：**每一次被回答的交换恰好 +2**，而 run 24 里每一次
+没被回答的交换只 +1。多出来的那一个 PPDU 只能是本机发的，最经济的解释就是硬件对收到的
+Authentication Response 回了 ACK；而且 prejoin 那次是在两条命令之前、ADDR_CAM 还是
+no-link 时发生的，同样 +2。计数器只数 PPDU 不给帧类型，所以这是很强的相关而不是解码。
+
+#### 顺便定下来的几件事
+
+- **和原厂顺序的差异（还没改，3c 要处理）**：原厂/mainline 是在**认证之前**发
+  `JOININFO` 且 `dis_conn=true`，只在**关联时**才翻成 `dis_conn=false` 并把 port 设成
+  INFRA、调 `mac_port_init()`。本增量为了让「命令前/命令后」形成对照，把
+  `disconnected=false` 提前到了认证之后关联之前，这在原厂语义上是不对的，属于已知欠账。
+  `_hal_stainfo_to_macrinfo()`（vendor `hal_api_mac.c:3094-3180`）可以逐字段核对：
+  `opmode = is_connect ? MAC_AX_ROLE_CONNECT : MAC_AX_ROLE_DISCONN`、
+  `tsf_sync = rlink->hw_port`、INFRA/NO_LINK 都是 `MAC_AX_SELF_ROLE_CLIENT`，
+  NO_LINK 只拷 `self_mac`，INFRA 才拷 `target_mac`/`bssid` 并填 `aid`。
+- **`pause_tx_data` 不会挡住管理帧**：原厂定义是 "whether disable tx (except manage
+  pkt) after sending probe req"（`mac_def.h:7398`）。曾经怀疑它挡掉了 Authentication
+  Request，可以排除。
+- **串口日志里 C2H 行的位置是 host 读到它的时间，不是固件产生它的时间**：一行 C2H 出现
+  在某两行之间，不能用来推断固件事件的先后。凡是用日志顺序做的因果推断都要先过这一关。
+- **TX 仪表的日志前缀已改名**为 `TX state`（11 个 TX PPDU 计数、`R_AX_MACTX_DBG_SEL_CNT`
+  的 MPDU/DMA 计数、`ctn-txen`、`ptcl-common`、`macid-sleep`、`macid-pause`、
+  `cmac-drop`、`dmac-drop`、`loopback`、`cca-abort`）与 `TX PPDU`，旧日志里的旧前缀不要
+  再当成缺失。
