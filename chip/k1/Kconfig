@@ -717,12 +717,19 @@ config K1_RTL8852BS2_RUNTIME_AUTH_DIAGNOSTIC
 		response is only counted when its A1 is the eFuse self MAC, compared in
 		host software, because the sweep runs with the receive filter opened up.
 
-		This does NOT associate. The address CAM still holds the no-link role, so
-		this host does not acknowledge the access point's response and the access
-		point will retry it and time the exchange out. Receiving the response is
-		the result; a link is not claimed. No key is installed, no network device
+		This does NOT associate. No association request is sent and no
+		association identifier is asked for. Receiving the response is the
+		result; a link is not claimed. No key is installed, no network device
 		is created, no data is carried, and nothing is written to eMMC, SPI
 		flash, eFuse or the U-Boot environment.
+
+		This help text used to add that the host does not acknowledge the access
+		point's response, so the access point retries it and times the exchange
+		out. The board evidence points the other way: an answered exchange
+		raised the transmit PPDU CCK counter by two and an unanswered one by
+		one, so the extra frame can only have come from this host. The counter
+		reports no frame types, so that is a correlation and not a decode, but
+		the old claim contradicts it and is not repeated.
 
 config K1_RTL8852BS2_RUNTIME_JOIN_DIAGNOSTIC
 	bool "Require the RTL8852BS2 station join to one access point"
@@ -758,6 +765,55 @@ config K1_RTL8852BS2_RUNTIME_JOIN_DIAGNOSTIC
 		no data is carried, and the port's TSF is not synchronised to the access
 		point's Beacons. Nothing is written to eMMC, SPI flash, eFuse or the U-Boot
 		environment.
+
+config K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
+	bool "Require the RTL8852BS2 association to one access point"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_JOIN_DIAGNOSTIC
+	---help---
+		Ask one real access point to associate this host, and require its
+		Association Response back. This is the frame that follows authentication
+		in IEEE 802.11 clause 11.3, and the first answer that carries something
+		the access point allocates rather than echoes: an association identifier.
+
+		The two frames are chained inside a single sweep. Authentication leaves
+		this host in state 2 only until the access point ages that state out, so
+		the Association Request cannot wait for the next sweep seconds later; it
+		is transmitted from the receive loop the moment the Authentication
+		Response is decoded, while the radio is still parked on the target's
+		channel.
+
+		Only an access point that advertises no Privacy is asked. This component
+		has no security engine initialized and holds no key, so it can offer no
+		cipher suite, and a Privacy access point would refuse the request for
+		that reason alone. Such an access point is skipped rather than attempted,
+		and a run with nothing else in range fails with EOPNOTSUPP, which
+		describes this port and not the radio environment.
+
+		Up to two attempts are made and the difference between them is the SSID.
+		The first uses what the target advertised, zero length included, because
+		that is the only SSID there is evidence for. When the target suppressed
+		its SSID and that attempt did not associate, a second attempt uses the
+		SSID of a sibling BSS - one on the same channel whose BSSID differs only
+		in the first octet, which is how one radio's multiple BSSIDs look. That
+		is a guess, and every line it produces says ssid-source=sibling.
+
+		When an access point grants an identifier, the two connect commands are
+		re-sent with it in the vendor's order - JOININFO, then one
+		MAC/ADDR_CAM_UPDATE carrying the AID, which is what upstream
+		rtw_hal_mac_addr_cam_set_aid() does through _change_role() - under their
+		own H2C sequence numbers, and both done acknowledgements have to return
+		zero. A confirming sweep follows and the step fails if it no longer
+		receives the target's Beacons.
+
+		An answered exchange is the result, whatever status code it carried; the
+		completion line is printed only for status 0 with a non-zero identifier,
+		and a refusal is reported as a refusal. An identifier is not a working
+		link: no key is installed, no four-way handshake is run, no data frame is
+		sent or received, no network device changes behaviour, no IP address is
+		configured, and the port's TSF is still frozen because mac_port_init() is
+		not ported yet. Nothing is written to eMMC, SPI flash, eFuse or the
+		U-Boot environment.
 
 config K1_RTL8852BS2_WLAN_NETDEV
 	bool "Register the RTL8852BS2 wlan0 scan network device"

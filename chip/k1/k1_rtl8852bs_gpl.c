@@ -1180,6 +1180,7 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_IEEE80211_HEADER_SIZE      24u
 #define K1_RTL8852BS_IEEE80211_BEACON_FIXED_SIZE 12u
 #define K1_RTL8852BS_IEEE80211_SSID_IE          0u
+#define K1_RTL8852BS_IEEE80211_SSID_MAX         32u
 #define K1_RTL8852BS_IEEE80211_CHANNEL_IE       3u
 #define K1_RTL8852BS_SCAN_OFLD_C2H_HEADER_SIZE  16u
 #define K1_RTL8852BS_SCAN_OFLD_REPORT_SIZE      4u
@@ -1239,7 +1240,18 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RUNTIME_DONE_ACK_SIZE     4u
 #define K1_RTL8852BS_RUNTIME_DONE_ACK_POLL_COUNT 1000u
 #define K1_RTL8852BS_RUNTIME_DONE_ACK_POLL_MSEC 1u
-#define K1_RTL8852BS_RUNTIME_DONE_ACK_RX_MAX   512u
+
+/* The RX aggregate a done-ack wait has to have room for.  512 bytes was
+ * enough while every command was issued with the receiver idle, and is not
+ * once a sweep has left the radio parked on a channel an access point is
+ * beaconing on: the pending aggregate then regularly carries several frames,
+ * the SDIO RX FIFO keeps the announced length until it is read whole, and a
+ * request longer than the buffer is refused with -ENOSPC without consuming
+ * it, so the wait fails on its first read and every later one.  Match the
+ * sweep's own reader, which has never reported an oversize aggregate.
+ */
+
+#define K1_RTL8852BS_RUNTIME_DONE_ACK_RX_MAX   8192u
 #define K1_RTL8852BS_CMD_OFLD_CATEGORY          1u
 #define K1_RTL8852BS_CMD_OFLD_H2C_CLASS         9u
 #define K1_RTL8852BS_CMD_OFLD_C2H_CLASS         1u
@@ -1466,6 +1478,15 @@ extern void k1_early_puthex(uintreg_t value);
 
 #define K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE         10u
 #define K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE          11u
+
+/* The association step re-sends the same two commands once more, with the
+ * association identifier the access point granted.  They get sequence
+ * numbers of their own so a done acknowledgement can never be charged to
+ * the wrong submission of the same command.
+ */
+
+#define K1_RTL8852BS_ASSOC_INFO_H2C_SEQUENCE        12u
+#define K1_RTL8852BS_ASSOC_CAM_H2C_SEQUENCE         13u
 #define K1_RTL8852BS_JOIN_NETWORK_TYPE_INFRA        2u
 #define K1_RTL8852BS_JOIN_WIFI_ROLE_STATION         1u
 #define K1_RTL8852BS_PKT_OFLD_HEADER_SIZE           4u
@@ -1483,8 +1504,8 @@ extern void k1_early_puthex(uintreg_t value);
  */
 
 #define K1_RTL8852BS_PROBE_REQUEST_FRAME_CONTROL    0x0040u
-#define K1_RTL8852BS_PROBE_REQUEST_SUPPORTED_RATES_IE 1u
-#define K1_RTL8852BS_PROBE_REQUEST_EXTENDED_RATES_IE  50u
+#define K1_RTL8852BS_IEEE80211_SUPPORTED_RATES_IE 1u
+#define K1_RTL8852BS_IEEE80211_EXTENDED_RATES_IE  50u
 #define K1_RTL8852BS_PROBE_REQUEST_MAX_SIZE         64u
 
 /* One open-system Authentication Request, IEEE 802.11 clause 9.3.3.11.  The
@@ -1508,8 +1529,99 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_AUTH_SEQUENCE_RESPONSE         2u
 #define K1_RTL8852BS_AUTH_STATUS_SUCCESS            0u
 #define K1_RTL8852BS_AUTH_BODY_SIZE                 6u
+
+/* How many times one armed exchange asks.  IEEE 802.11 clause 11.3.2 has a
+ * station retry an unanswered Authentication Request rather than treat the
+ * silence as a refusal, and clause 11.3.5 does the same for an Association
+ * Request; the standard's own retry counters are dot11AuthenticationResponse-
+ * TimeOut and dot11AssociationResponseTimeOut driven.  Three is the count the
+ * usual supplicant timeouts work out to, and it is bounded by the parked
+ * table's thirteen enter-channel notifications either way.
+ */
+
+#define K1_RTL8852BS_AUTH_REQUEST_ATTEMPTS          3u
+#define K1_RTL8852BS_ASSOC_REQUEST_ATTEMPTS         3u
 #define K1_RTL8852BS_AUTH_FRAME_SIZE                \
   (K1_RTL8852BS_IEEE80211_HEADER_SIZE + K1_RTL8852BS_AUTH_BODY_SIZE)
+
+/* The capability-information bits this port has anything to say about, IEEE
+ * 802.11 clause 9.4.1.4.  Privacy is the one that decides whether a BSS can
+ * be associated with at all by a station that builds no RSN element yet; the
+ * other two describe the transmitter's own PHY.
+ */
+
+#define K1_RTL8852BS_IEEE80211_CAPABILITY_ESS            0x0001u
+#define K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY        0x0010u
+#define K1_RTL8852BS_IEEE80211_CAPABILITY_SHORT_PREAMBLE 0x0020u
+#define K1_RTL8852BS_IEEE80211_CAPABILITY_SHORT_SLOT     0x0400u
+
+/* The RSN element of IEEE 802.11 clause 9.4.2.24, decoded far enough to say
+ * what a station would have to offer a Privacy-enabled access point to be
+ * associated by it: the group cipher, whether CCMP is among the pairwise
+ * ciphers, and whether the pre-shared key authentication suite is among the
+ * key management suites.  Nothing here installs or derives a key; this is the
+ * evidence that decides which access points are reachable at all.
+ */
+
+#define K1_RTL8852BS_IEEE80211_RSN_IE                    48u
+#define K1_RTL8852BS_IEEE80211_RSN_VERSION               1u
+#define K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE            4u
+#define K1_RTL8852BS_IEEE80211_RSN_CIPHER_CCMP           4u
+#define K1_RTL8852BS_IEEE80211_RSN_AKM_PSK               2u
+#define K1_RTL8852BS_IEEE80211_RSN_GROUP_UNKNOWN         0xffu
+
+/* One Association Request, IEEE 802.11 clause 9.3.3.6, and the Association
+ * Response that answers it, clause 9.3.3.7.  The frame control is a
+ * management frame of subtype 0 with every flag clear.  Like the
+ * Authentication Request it is unicast to the access point, so the transmit
+ * descriptor must not carry the broadcast/multicast bit the Probe Request
+ * needs.
+ *
+ * The request body is the capability information and the listen interval,
+ * followed by the SSID and the two rate elements.  The capability this host
+ * claims is ESS plus short preamble plus short slot time, which is what the
+ * access points around it advertise themselves: both extras are properties of
+ * the part's PHY rather than of this port's software, a 2.4 GHz 802.11ax radio
+ * has them, and a station that claimed less would make the access point turn
+ * protection on for every other station in the BSS -- a change to somebody
+ * else's BSS that a diagnostic has no business making.  Privacy stays clear:
+ * this host offers no cipher, which is also why only an access point that
+ * advertises no Privacy can be asked to associate it.
+ *
+ * The listen interval is one beacon: this station never sleeps, so it is the
+ * only honest value.
+ *
+ * The response body is capability information, a status code and the
+ * association identifier, whose top two bits are reserved.
+ */
+
+#define K1_RTL8852BS_IEEE80211_SUBTYPE_ASSOC_REQUEST     0u
+#define K1_RTL8852BS_IEEE80211_SUBTYPE_ASSOC_RESPONSE    1u
+#define K1_RTL8852BS_ASSOC_FRAME_CONTROL                 0x0000u
+#define K1_RTL8852BS_ASSOC_CAPABILITY                      \
+  (K1_RTL8852BS_IEEE80211_CAPABILITY_ESS |                 \
+   K1_RTL8852BS_IEEE80211_CAPABILITY_SHORT_PREAMBLE |      \
+   K1_RTL8852BS_IEEE80211_CAPABILITY_SHORT_SLOT)
+#define K1_RTL8852BS_ASSOC_LISTEN_INTERVAL               1u
+#define K1_RTL8852BS_ASSOC_BODY_SIZE                     4u
+#define K1_RTL8852BS_ASSOC_RESPONSE_BODY_SIZE            6u
+#define K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE              96u
+
+/* The largest management frame the host transmit path has to carry.  It is
+ * the Association Request rather than the Probe Request, because the
+ * Association Request adds the capability information and the listen
+ * interval in front of the same elements.  The transmit buffer is sized from
+ * this so that a long SSID is rejected by the hardware or by the frame
+ * builder, never silently by the buffer.
+ */
+
+#define K1_RTL8852BS_MGMT_TX_FRAME_MAX                   \
+  K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE
+#define K1_RTL8852BS_ASSOC_STATUS_SUCCESS                0u
+#define K1_RTL8852BS_ASSOC_AID_MASK                      0x3fffu
+#define K1_RTL8852BS_ASSOC_RESPONSE_MIN_SIZE               \
+  (K1_RTL8852BS_IEEE80211_HEADER_SIZE +                    \
+   K1_RTL8852BS_ASSOC_RESPONSE_BODY_SIZE)
 #define K1_RTL8852BS_SCAN_OFLD_START_OPERATION      1u
 #define K1_RTL8852BS_SCAN_OFLD_START_OPERATION_SHIFT 20u
 #define K1_RTL8852BS_SCAN_OFLD_START_NOTIFY_END      (1u << 0)
@@ -5457,6 +5569,45 @@ static int k1_rtl8852bs_runtime_mgmt_tx_frame(FAR const uint8_t *frame,
                                               uint16_t sequence,
                                               bool broadcast);
 
+/* The channel every entry of the scan-offload channel list carries while a
+ * management exchange is armed, or zero for the ordinary 1 to 13 sweep.
+ *
+ * Run 26 is why this exists.  The access point answered the Authentication
+ * Request, the answer was decoded, and the Association Request that had to
+ * follow it was never transmitted: by the time the answer reached the frame
+ * observer the sweep had already entered the next channel, and a request
+ * radiated from there would not have been on the access point's channel at
+ * all.  An exchange chained inside a sweep cannot be chained to a radio that
+ * walks away between the two frames.  Filling the list with one channel keeps
+ * the radio on it for the whole attempt: thirteen identical 250 ms entries, so
+ * the firmware still marches through the list and still reports scan end, and
+ * every enter-channel notification names the same channel.
+ *
+ * Every armed exchange is parked, not only the association attempt.  Run 27
+ * lost the join step's third sweep to the same one-dwell-in-thirteen window:
+ * the access point answered the two sweeps before it and the third asked once,
+ * inside 180 ms, and got nothing.
+ */
+
+static uint8_t g_k1_rtl8852bs_scanofld_park_channel;
+
+static void k1_rtl8852bs_scanofld_park_arm(uint8_t channel)
+{
+  /* The list this component builds is 2.4 GHz primary channels 1 to 13, so a
+   * channel outside that range has no entry to occupy: parking is left off
+   * rather than approximated with a channel the access point is not on.
+   */
+
+  g_k1_rtl8852bs_scanofld_park_channel =
+    (channel >= 1u &&
+     channel <= K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) ? channel : 0u;
+}
+
+static void k1_rtl8852bs_scanofld_park_disarm(void)
+{
+  g_k1_rtl8852bs_scanofld_park_channel = 0;
+}
+
 static void k1_rtl8852bs_runtime_auth_arm(FAR const uint8_t *bssid,
                                           uint8_t channel)
 {
@@ -5471,11 +5622,266 @@ static void k1_rtl8852bs_runtime_auth_arm(FAR const uint8_t *bssid,
   g_k1_rtl8852bs_auth_action.channel = channel;
   g_k1_rtl8852bs_auth_action.transmit_status = -ENODATA;
   g_k1_rtl8852bs_auth_action.armed = true;
+
+  /* Park the sweep on the access point's channel for as long as the exchange
+   * is armed.  A sweep that walks 1 to 13 is on the target's channel for one
+   * dwell out of thirteen, and the request, its answer, and whatever follows
+   * all have to happen inside that dwell.
+   */
+
+  k1_rtl8852bs_scanofld_park_arm(channel);
 }
 
 static void k1_rtl8852bs_runtime_auth_disarm(void)
 {
+  /* Both exchanges are armed and disarmed around one sweep with nothing
+   * between them, so the park channel is simply released here as well; the
+   * association exchange re-arms it for its own attempt.
+   */
+
   g_k1_rtl8852bs_auth_action.armed = false;
+  k1_rtl8852bs_scanofld_park_disarm();
+}
+
+/* The one Association Request this component transmits, and the account of
+ * what came back.  It is module state for the same reason the authentication
+ * exchange is: the frame has to be handed to the hardware from inside the
+ * scan-offload receive loop, which is the only place that knows the radio is
+ * parked on the access point's channel.
+ *
+ * It is armed together with the authentication exchange rather than in a sweep
+ * of its own, because IEEE 802.11 clause 11.3 puts an association request
+ * after a successful authentication in the same association: the access point
+ * holds this host in state 2 from the moment it answers the Authentication
+ * Request, and the request that follows has to arrive while it still does.
+ * Both frames therefore go out inside one dwell -- the authentication request
+ * when the firmware reports it entered the channel, and this one the moment
+ * the answer to it is observed.
+ */
+
+struct k1_rtl8852bs_assoc_action_s
+{
+  uint8_t bssid[6];
+  uint8_t ssid[32];
+  uint8_t ssid_length;
+  uint8_t channel;
+  uint16_t capability;
+  bool armed;
+  bool transmitted;
+  int transmit_status;
+  uint16_t requests;
+  uint16_t request_sequence;
+  uint16_t request_bytes;
+  uint16_t frames_seen;
+  uint16_t responses_to_self;
+  uint16_t responses_from_target;
+  bool response_valid;
+  uint16_t response_capability;
+  uint16_t response_status;
+  uint16_t response_aid;
+  uint8_t response_a2[6];
+};
+
+static struct k1_rtl8852bs_assoc_action_s g_k1_rtl8852bs_assoc_action;
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_arm
+ *
+ * Description:
+ *   Arm the Association Request one sweep is to transmit.  The SSID is a
+ *   parameter rather than read from the target at transmit time because the
+ *   sweep result the target came from is overwritten by the sweep that
+ *   carries the request, and because the element this host sends is exactly
+ *   what the access point compares against its own configured SSID: an
+ *   access point that suppresses its SSID in beacons advertises a zero-length
+ *   element, a station that copies that gets a non-zero status code back, and
+ *   both of those are results worth having rather than something to paper
+ *   over.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_assoc_arm(FAR const uint8_t *bssid,
+                                           uint8_t channel,
+                                           FAR const uint8_t *ssid,
+                                           uint8_t ssid_length)
+{
+  memset(&g_k1_rtl8852bs_assoc_action, 0,
+         sizeof(g_k1_rtl8852bs_assoc_action));
+  if (bssid == NULL || channel == 0 ||
+      ssid_length > sizeof(g_k1_rtl8852bs_assoc_action.ssid))
+    {
+      return;
+    }
+
+  memcpy(g_k1_rtl8852bs_assoc_action.bssid, bssid,
+         sizeof(g_k1_rtl8852bs_assoc_action.bssid));
+  if (ssid != NULL && ssid_length > 0)
+    {
+      memcpy(g_k1_rtl8852bs_assoc_action.ssid, ssid, ssid_length);
+      g_k1_rtl8852bs_assoc_action.ssid_length = ssid_length;
+    }
+
+  g_k1_rtl8852bs_assoc_action.channel = channel;
+  g_k1_rtl8852bs_assoc_action.transmit_status = -ENODATA;
+  g_k1_rtl8852bs_assoc_action.armed = true;
+  k1_rtl8852bs_scanofld_park_arm(channel);
+}
+
+static void k1_rtl8852bs_runtime_assoc_disarm(void)
+{
+  g_k1_rtl8852bs_assoc_action.armed = false;
+  k1_rtl8852bs_scanofld_park_disarm();
+}
+
+/* True while either management exchange is armed.  The early console is
+ * polled at 115200 baud, so a sixty-line register snapshot costs more than a
+ * second, which is over four channel dwells.  Run 26 spent that second inside
+ * the very dwell that had just transmitted an Authentication Request, which is
+ * the other half of why the answer to it was not decoded until the sweep had
+ * left the channel.  Diagnostics whose cost is measured in milliseconds are
+ * therefore suppressed for the duration of a sweep that carries an exchange,
+ * and only then: a sweep that transmits nothing keeps printing all of them.
+ */
+
+static bool k1_rtl8852bs_scanofld_exchange_armed(void)
+{
+  return g_k1_rtl8852bs_auth_action.armed ||
+         g_k1_rtl8852bs_assoc_action.armed;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_rsn_suite_type
+ *
+ * Description:
+ *   The selector type of one four-byte RSN cipher or key-management suite,
+ *   when the suite belongs to the IEEE 802.11 OUI 00-0F-AC.  A suite from a
+ *   vendor OUI is not one this port could ever offer, so it reads as unknown
+ *   rather than as its numeric type, which would collide with the standard
+ *   selectors.
+ *
+ ****************************************************************************/
+
+static uint8_t k1_rtl8852bs_runtime_rsn_suite_type(FAR const uint8_t *suite)
+{
+  if (suite[0] != 0x00u || suite[1] != 0x0fu || suite[2] != 0xacu)
+    {
+      return K1_RTL8852BS_IEEE80211_RSN_GROUP_UNKNOWN;
+    }
+
+  return suite[3];
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_rsn_parse
+ *
+ * Description:
+ *   Decode one RSN element far enough to say what a station would have to
+ *   offer this BSS to be associated by it: the group cipher suite, whether
+ *   CCMP is among the pairwise ciphers, and whether the pre-shared key suite
+ *   is among the key management suites.  Nothing else in the element is read;
+ *   no key material exists in a beacon and none is derived here.
+ *
+ *   An element that ends inside one of the two suite lists keeps whatever was
+ *   decoded before the truncation, on the same reasoning the element walk
+ *   itself uses: a Beacon captured at the edge of a dwell can end anywhere,
+ *   and that does not void the fields already read.
+ *
+ * Input Parameters:
+ *   body        - the element's contents, after the identifier and length
+ *   body_length - the advertised element length, already bounds-checked by the
+ *                 caller against the frame
+ *   frame       - receives the decoded summary
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_rsn_parse(
+  FAR const uint8_t *body, uint8_t body_length,
+  FAR struct k1_rtl8852bs_mgmt_frame_s *frame)
+{
+  size_t offset = 0;
+  size_t remaining = body_length;
+  uint16_t count;
+  uint16_t index;
+
+  frame->rsn_present = true;
+  frame->rsn_length = body_length;
+  frame->rsn_group_cipher = K1_RTL8852BS_IEEE80211_RSN_GROUP_UNKNOWN;
+
+  /* The version comes first, and a version this port does not know is not
+   * walked any further: the layout after it is only defined for version one.
+   */
+
+  if (remaining < 2 ||
+      k1_rtl8852bs_read_le16(body) != K1_RTL8852BS_IEEE80211_RSN_VERSION)
+    {
+      return;
+    }
+
+  offset += 2;
+  remaining -= 2;
+  if (remaining < K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE)
+    {
+      return;
+    }
+
+  frame->rsn_group_cipher =
+    k1_rtl8852bs_runtime_rsn_suite_type(body + offset);
+  offset += K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+  remaining -= K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+
+  /* The pairwise cipher suite list and then the key management suite list.
+   * Both are a sixteen-bit count followed by that many four-byte selectors.
+   */
+
+  if (remaining < 2)
+    {
+      return;
+    }
+
+  count = k1_rtl8852bs_read_le16(body + offset);
+  offset += 2;
+  remaining -= 2;
+  for (index = 0; index < count; index++)
+    {
+      if (remaining < K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE)
+        {
+          return;
+        }
+
+      if (k1_rtl8852bs_runtime_rsn_suite_type(body + offset) ==
+          K1_RTL8852BS_IEEE80211_RSN_CIPHER_CCMP)
+        {
+          frame->rsn_pairwise_ccmp = true;
+        }
+
+      offset += K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+      remaining -= K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+    }
+
+  if (remaining < 2)
+    {
+      return;
+    }
+
+  count = k1_rtl8852bs_read_le16(body + offset);
+  offset += 2;
+  remaining -= 2;
+  for (index = 0; index < count; index++)
+    {
+      if (remaining < K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE)
+        {
+          return;
+        }
+
+      if (k1_rtl8852bs_runtime_rsn_suite_type(body + offset) ==
+          K1_RTL8852BS_IEEE80211_RSN_AKM_PSK)
+        {
+          frame->rsn_akm_psk = true;
+        }
+
+      offset += K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+      remaining -= K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+    }
 }
 
 /****************************************************************************
@@ -5625,6 +6031,12 @@ int k1_rtl8852bs_runtime_mgmt_parse(
                ie_length >= 1 && frame->channel == 0)
         {
           frame->channel = payload[ie_offset];
+        }
+      else if (ie_id == K1_RTL8852BS_IEEE80211_RSN_IE &&
+               !frame->rsn_present)
+        {
+          k1_rtl8852bs_runtime_rsn_parse(payload + ie_offset, ie_length,
+                                         frame);
         }
 
       ie_offset += ie_length;
@@ -7791,7 +8203,7 @@ static int k1_rtl8852bs_runtime_done_ack_wait(
 
   struct k1_rtl8852bs_rx_frame_s frame;
   FAR uint8_t *buffer;
-  size_t length;
+  size_t length = 0;
   size_t offset;
   unsigned int attempt;
   int ret;
@@ -7881,6 +8293,13 @@ out:
       k1_early_puthex(match.generic_done_ack_frames);
       k1_early_puts(" last=");
       k1_early_puthex(match.last_done_ack_word);
+
+      /* On -ENOSPC this is the aggregate the device announced and still owns,
+       * which is the number a buffer size has to be judged against.
+       */
+
+      k1_early_puts(" length=");
+      k1_early_puthex(length);
       k1_early_puts("\r\n");
     }
 
@@ -9412,12 +9831,12 @@ static int k1_rtl8852bs_runtime_probe_request_build(
   frame[offset++] = K1_RTL8852BS_IEEE80211_SSID_IE;
   frame[offset++] = 0u;
 
-  frame[offset++] = K1_RTL8852BS_PROBE_REQUEST_SUPPORTED_RATES_IE;
+  frame[offset++] = K1_RTL8852BS_IEEE80211_SUPPORTED_RATES_IE;
   frame[offset++] = (uint8_t)sizeof(supported_rates);
   memcpy(frame + offset, supported_rates, sizeof(supported_rates));
   offset += sizeof(supported_rates);
 
-  frame[offset++] = K1_RTL8852BS_PROBE_REQUEST_EXTENDED_RATES_IE;
+  frame[offset++] = K1_RTL8852BS_IEEE80211_EXTENDED_RATES_IE;
   frame[offset++] = (uint8_t)sizeof(extended_rates);
   memcpy(frame + offset, extended_rates, sizeof(extended_rates));
   offset += sizeof(extended_rates);
@@ -9576,6 +9995,196 @@ static void k1_rtl8852bs_runtime_auth_transmit(void)
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_request_build
+ *
+ * Description:
+ *   Serialize one Association Request for the host transmit path.  Like the
+ *   Authentication Request it is unicast to one access point on one channel
+ *   and is written into the band-0 management FIFO with a host descriptor in
+ *   front of it, and like it the caller supplies the sequence number that goes
+ *   into the frame's own sequence-control field.
+ *
+ *   The body is the capability information and the listen interval; the
+ *   elements after it are the SSID and the two rate sets.  The SSID element is
+ *   what the access point compares against its own configured SSID, and it is
+ *   copied from the caller verbatim, zero length included: this port sends what
+ *   it actually heard rather than inventing a name for a BSS that suppresses
+ *   its own.
+ *
+ *   No RSN element is built.  This host offers no cipher, so it may only ask
+ *   an access point that advertises no Privacy to associate it, and the
+ *   diagnostic refuses a Privacy-enabled target before reaching this point.
+ *
+ * Input Parameters:
+ *   frame        - Receives the frame.
+ *   frame_length - Size of frame in bytes.
+ *   self_mac     - The eFuse self MAC, used as transmitter address.
+ *   bssid        - The access point.  It is both the destination and the BSSID.
+ *   ssid         - The SSID element contents, as the BSS advertised them.
+ *   ssid_length  - Its length, which may legitimately be zero.
+ *   sequence     - The twelve-bit sequence number for this frame.
+ *   length       - Receives the number of bytes written.
+ *
+ * Returned Value:
+ *   OK on success, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_assoc_request_build(
+  FAR uint8_t *frame, size_t frame_length, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid, FAR const uint8_t *ssid, uint8_t ssid_length,
+  uint16_t sequence, FAR size_t *length)
+{
+  /* The same two rate sets the Probe Request advertises: 1, 2, 5.5, 11, 6, 9,
+   * 12 and 18 Mbit/s in the Supported Rates element and 24, 36, 48 and
+   * 54 Mbit/s in the Extended Supported Rates element, in units of
+   * 500 kbit/s.  No rate carries the basic-rate bit, which an access point
+   * sets in its own beacon and a station does not echo.
+   */
+
+  static const uint8_t supported_rates[] =
+    {
+      0x02u, 0x04u, 0x0bu, 0x16u, 0x0cu, 0x12u, 0x18u, 0x24u
+    };
+
+  static const uint8_t extended_rates[] =
+    {
+      0x30u, 0x48u, 0x60u, 0x6cu
+    };
+
+  size_t required;
+  size_t offset;
+
+  if (frame == NULL || length == NULL || self_mac == NULL || bssid == NULL ||
+      !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(bssid) ||
+      (ssid == NULL && ssid_length > 0) ||
+      ssid_length > K1_RTL8852BS_IEEE80211_SSID_MAX ||
+      sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK)
+    {
+      return -EINVAL;
+    }
+
+  required = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+             K1_RTL8852BS_ASSOC_BODY_SIZE + 2u + ssid_length +
+             2u + sizeof(supported_rates) + 2u + sizeof(extended_rates);
+  if (frame_length < required)
+    {
+      return -EINVAL;
+    }
+
+  memset(frame, 0, frame_length);
+  frame[0] = (uint8_t)(K1_RTL8852BS_ASSOC_FRAME_CONTROL & 0xffu);
+  frame[1] = (uint8_t)(K1_RTL8852BS_ASSOC_FRAME_CONTROL >> 8);
+
+  /* Duration stays zero for the hardware to fill.  Address 1 is the access
+   * point, address 2 this host and address 3 the BSSID, which for an
+   * infrastructure management frame is the access point again.
+   */
+
+  memcpy(frame + 4, bssid, 6);
+  memcpy(frame + 10, self_mac, 6);
+  memcpy(frame + 16, bssid, 6);
+  k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
+  offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+  k1_rtl8852bs_write_le16(frame + offset, K1_RTL8852BS_ASSOC_CAPABILITY);
+  k1_rtl8852bs_write_le16(frame + offset + 2,
+                          K1_RTL8852BS_ASSOC_LISTEN_INTERVAL);
+  offset += K1_RTL8852BS_ASSOC_BODY_SIZE;
+
+  frame[offset++] = K1_RTL8852BS_IEEE80211_SSID_IE;
+  frame[offset++] = ssid_length;
+  if (ssid_length > 0)
+    {
+      memcpy(frame + offset, ssid, ssid_length);
+      offset += ssid_length;
+    }
+
+  frame[offset++] = K1_RTL8852BS_IEEE80211_SUPPORTED_RATES_IE;
+  frame[offset++] = (uint8_t)sizeof(supported_rates);
+  memcpy(frame + offset, supported_rates, sizeof(supported_rates));
+  offset += sizeof(supported_rates);
+
+  frame[offset++] = K1_RTL8852BS_IEEE80211_EXTENDED_RATES_IE;
+  frame[offset++] = (uint8_t)sizeof(extended_rates);
+  memcpy(frame + offset, extended_rates, sizeof(extended_rates));
+  offset += sizeof(extended_rates);
+
+  *length = offset;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_transmit
+ *
+ * Description:
+ *   Transmit the armed Association Request.  This runs from the frame
+ *   observer of the scan-offload receive loop, at the moment the access
+ *   point's Authentication Response is decoded, which is the only point in the
+ *   sweep where all three things this frame needs are true at once: the radio
+ *   is parked on the access point's channel, the access point has just put
+ *   this host into IEEE 802.11 state 2, and no other sweep work is in flight.
+ *
+ *   It is as quiet as the authentication transmit for the same reason -- the
+ *   console is polled and the dwell it runs inside is the dwell the answer has
+ *   to arrive in.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_assoc_transmit(void)
+{
+  uint8_t frame[K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE];
+  size_t frame_length = 0;
+  uint16_t sequence;
+  int ret;
+
+  g_k1_rtl8852bs_assoc_action.transmitted = true;
+  if (!g_k1_rtl8852bs_scan_self_mac_valid)
+    {
+      g_k1_rtl8852bs_assoc_action.transmit_status = -EINVAL;
+      return;
+    }
+
+  /* One number per transmit, consumed whether or not the frame is accepted,
+   * exactly as the authentication request consumes one.
+   */
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+  g_k1_rtl8852bs_assoc_action.request_sequence = sequence;
+  g_k1_rtl8852bs_assoc_action.capability = K1_RTL8852BS_ASSOC_CAPABILITY;
+
+  ret = k1_rtl8852bs_runtime_assoc_request_build(
+    frame, sizeof(frame), g_k1_rtl8852bs_scan_self_mac,
+    g_k1_rtl8852bs_assoc_action.bssid, g_k1_rtl8852bs_assoc_action.ssid,
+    g_k1_rtl8852bs_assoc_action.ssid_length, sequence, &frame_length);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_runtime_mgmt_tx_frame(frame, frame_length, sequence,
+                                                false);
+      if (ret >= 0)
+        {
+          g_k1_rtl8852bs_assoc_action.requests++;
+        }
+    }
+
+  g_k1_rtl8852bs_assoc_action.transmit_status = ret;
+  g_k1_rtl8852bs_assoc_action.request_bytes = (uint16_t)frame_length;
+
+  k1_early_puts("K1 Wi-Fi GPL: assoc request tx channel=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.channel);
+  k1_early_puts(" bytes=");
+  k1_early_puthex((uintreg_t)frame_length);
+  k1_early_puts(" ssid-len=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.ssid_length);
+  k1_early_puts(" sn=");
+  k1_early_puthex(sequence);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_pkt_ofld_add
  *
  * Description:
@@ -9710,9 +10319,20 @@ static int k1_rtl8852bs_runtime_scanofld_chlist_build(
       FAR uint8_t *entry = content + K1_RTL8852BS_SCAN_OFLD_CONTENT_HEADER_SIZE +
                            index * K1_RTL8852BS_SCAN_OFLD_CHANNEL_INFO_SIZE;
 
+      /* A parked list repeats one channel in all thirteen entries instead of
+       * walking 1 to 13.  The entry layout, the period, and the notification
+       * and pause bits are the ones the sweep was validated with; only the
+       * primary and central channel numbers differ, so the firmware still
+       * consumes thirteen entries and still ends the scan on its own.
+       */
+
+      uint8_t channel = g_k1_rtl8852bs_scanofld_park_channel != 0 ?
+                        g_k1_rtl8852bs_scanofld_park_channel :
+                        channels[index];
+
       entry[0] = K1_RTL8852BS_SCAN_OFLD_PASSIVE_PERIOD_MSEC;
-      entry[2] = channels[index];
-      entry[3] = channels[index];
+      entry[2] = channel;
+      entry[3] = channel;
       entry[4] = K1_RTL8852BS_SCAN_OFLD_NOTIFY_ENTER_CHANNEL;
       entry[5] = K1_RTL8852BS_SCAN_OFLD_PAUSE_TX_DATA;
 
@@ -9794,12 +10414,31 @@ static int k1_rtl8852bs_runtime_scanofld_chlist_submit(uint8_t probe_id)
   k1_early_puthex(available_pages);
   k1_early_puts(" FIFO=");
   k1_early_puthex(fifo_address);
+  k1_early_puts(" park=");
+  k1_early_puthex(g_k1_rtl8852bs_scanofld_park_channel);
   k1_early_puts("\r\n");
 
+  /* A parked table walks no channel span at all, so say so on its own line
+   * rather than leave the reader to reconcile the fixed channels=1-13 text
+   * above with a park channel: every one of the thirteen entries carries the
+   * one channel named here.
+   */
+
+  if (g_k1_rtl8852bs_scanofld_park_channel != 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: passive scan channel-list parked "
+                    "channel=");
+      k1_early_puthex(g_k1_rtl8852bs_scanofld_park_channel);
+      k1_early_puts(" entries=");
+      k1_early_puthex(K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT);
+      k1_early_puts("\r\n");
+    }
+
   /* Dump the first serialized channel entry as it was handed to firmware.
-   * Every entry differs from it only in the two channel bytes, and the whole
-   * transmit question turns on three of its bit fields, so the bytes
-   * themselves belong in the log rather than a decoded summary of them.
+   * Every entry differs from it only in the two channel bytes -- and not even
+   * in those while the table is parked -- and the whole transmit question
+   * turns on three of its bit fields, so the bytes themselves belong in the
+   * log rather than a decoded summary of them.
    */
 
   k1_early_puts("K1 Wi-Fi GPL: passive scan channel-list entry0=");
@@ -11720,7 +12359,12 @@ struct k1_rtl8852bs_scanofld_bss_s
   uint16_t probe_response_frames;
   uint16_t management_frames;
   uint16_t data_frames;
+  uint8_t rsn_length;
+  uint8_t rsn_group_cipher;
   bool ssid_present;
+  bool rsn_present;
+  bool rsn_pairwise_ccmp;
+  bool rsn_akm_psk;
 };
 
 struct k1_rtl8852bs_scanofld_passive_match_s
@@ -11807,6 +12451,15 @@ struct k1_rtl8852bs_scanofld_passive_match_s
   uint8_t bss_count;
   uint8_t bss_dropped;
   uint8_t dwell_channel;
+
+  /* Dwells armed while a park channel was set.  A parked channel list names
+   * one channel in every entry, so the per-channel-bit test that arms a dwell
+   * exactly once per channel would arm one dwell for the whole sweep.  Count
+   * the parked dwells instead so the sweep still arms one dwell per list
+   * entry.
+   */
+
+  uint16_t parked_dwells;
   bool dwell_pending;
   bool first_bss_valid;
   bool first_ssid_present;
@@ -11951,6 +12604,20 @@ static void k1_rtl8852bs_scanofld_bss_record(
       memcpy(entry->ssid, mgmt->ssid, sizeof(entry->ssid));
       entry->ssid_length = mgmt->ssid_length;
       entry->ssid_present = true;
+    }
+
+  /* The RSN summary is kept from the first frame that carried the element, on
+   * the same reasoning the SSID uses: a later Beacon truncated at the edge of
+   * a dwell must not erase a complete decode.
+   */
+
+  if (mgmt->rsn_present && !entry->rsn_present)
+    {
+      entry->rsn_present = true;
+      entry->rsn_length = mgmt->rsn_length;
+      entry->rsn_group_cipher = mgmt->rsn_group_cipher;
+      entry->rsn_pairwise_ccmp = mgmt->rsn_pairwise_ccmp;
+      entry->rsn_akm_psk = mgmt->rsn_akm_psk;
     }
 }
 
@@ -12174,6 +12841,91 @@ static void k1_rtl8852bs_scanofld_observe_wifi(
                 {
                   memcpy(g_k1_rtl8852bs_auth_action.response_a2, mgmt.addr2,
                          sizeof(g_k1_rtl8852bs_auth_action.response_a2));
+                }
+            }
+        }
+    }
+
+  /* The Association Request goes out from here, inside the receive loop, at
+   * the moment the access point's Authentication Response is decoded.  IEEE
+   * 802.11 clause 11.3 leaves this host in state 2 only from that answer until
+   * the access point ages the state out, so an Association Request sent from a
+   * later sweep -- seconds away -- would arrive in state 1 and be refused for
+   * a reason that says nothing about this port.  Transmitting from here puts
+   * both frames in one dwell on one channel, which is the shape the exchange
+   * actually requires.
+   *
+   * Only a successful open-system answer arms it: algorithm 0, transaction 2,
+   * status 0, from the access point this action was armed against, while the
+   * radio is parked on that access point's channel.  The transmitted flag is
+   * set by the transmit itself, so a second Authentication Response -- a
+   * retransmission, or the access point answering another station -- cannot
+   * produce a second request.
+   */
+
+  if (g_k1_rtl8852bs_assoc_action.armed &&
+      !g_k1_rtl8852bs_assoc_action.transmitted &&
+      g_k1_rtl8852bs_auth_action.response_valid &&
+      g_k1_rtl8852bs_auth_action.response_algorithm ==
+        K1_RTL8852BS_AUTH_ALGORITHM_OPEN &&
+      g_k1_rtl8852bs_auth_action.response_sequence ==
+        K1_RTL8852BS_AUTH_SEQUENCE_RESPONSE &&
+      g_k1_rtl8852bs_auth_action.response_status ==
+        K1_RTL8852BS_AUTH_STATUS_SUCCESS &&
+      match->dwell_channel == g_k1_rtl8852bs_assoc_action.channel &&
+      memcmp(g_k1_rtl8852bs_auth_action.bssid,
+             g_k1_rtl8852bs_assoc_action.bssid,
+             sizeof(g_k1_rtl8852bs_assoc_action.bssid)) == 0)
+    {
+      k1_rtl8852bs_runtime_assoc_transmit();
+    }
+
+  /* An Association Response is accounted exactly like an Authentication
+   * Response: the sweep runs with unicast address matching off, so one the
+   * access point sent to a different station arrives here too, and only an A1
+   * equal to this host's own address makes it an answer to this host.  The
+   * body -- capability information, status code and association identifier --
+   * is read from the payload, and only the first answer is kept, because a
+   * status code is a decision and the access point does not change its mind
+   * inside one exchange.
+   *
+   * The association identifier is masked to its fourteen low bits: IEEE 802.11
+   * clause 9.4.1.8 puts the AID in bits 0 to 13 and the two high bits are
+   * reserved and set to one by some access points.
+   */
+
+  if (frame_subtype == K1_RTL8852BS_IEEE80211_SUBTYPE_ASSOC_RESPONSE &&
+      g_k1_rtl8852bs_assoc_action.armed)
+    {
+      g_k1_rtl8852bs_assoc_action.frames_seen++;
+      if (mgmt.addr2_valid &&
+          memcmp(mgmt.addr2, g_k1_rtl8852bs_assoc_action.bssid,
+                 sizeof(g_k1_rtl8852bs_assoc_action.bssid)) == 0)
+        {
+          g_k1_rtl8852bs_assoc_action.responses_from_target++;
+        }
+
+      if (mgmt.addr1_valid && k1_rtl8852bs_scanofld_is_self_mac(mgmt.addr1))
+        {
+          g_k1_rtl8852bs_assoc_action.responses_to_self++;
+          if (!g_k1_rtl8852bs_assoc_action.response_valid &&
+              payload_length >= K1_RTL8852BS_ASSOC_RESPONSE_MIN_SIZE)
+            {
+              FAR const uint8_t *body =
+                payload + K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+              g_k1_rtl8852bs_assoc_action.response_valid = true;
+              g_k1_rtl8852bs_assoc_action.response_capability =
+                k1_rtl8852bs_read_le16(body);
+              g_k1_rtl8852bs_assoc_action.response_status =
+                k1_rtl8852bs_read_le16(body + 2);
+              g_k1_rtl8852bs_assoc_action.response_aid =
+                (uint16_t)(k1_rtl8852bs_read_le16(body + 4) &
+                           K1_RTL8852BS_ASSOC_AID_MASK);
+              if (mgmt.addr2_valid)
+                {
+                  memcpy(g_k1_rtl8852bs_assoc_action.response_a2, mgmt.addr2,
+                         sizeof(g_k1_rtl8852bs_assoc_action.response_a2));
                 }
             }
         }
@@ -12528,6 +13280,14 @@ static void k1_rtl8852bs_scanofld_log_bss_table(
       k1_early_puthex(bss->beacon_interval);
       k1_early_puts(" ssid-len=");
       k1_early_puthex(bss->ssid_present ? bss->ssid_length : 0);
+      k1_early_puts(" rsn=");
+      k1_early_puthex(bss->rsn_present ? bss->rsn_length : 0);
+      k1_early_puts(" rsn-group=");
+      k1_early_puthex(bss->rsn_group_cipher);
+      k1_early_puts(" rsn-ccmp=");
+      k1_early_puthex(bss->rsn_pairwise_ccmp ? 1u : 0u);
+      k1_early_puts(" rsn-psk=");
+      k1_early_puthex(bss->rsn_akm_psk ? 1u : 0u);
       k1_early_puts(" ssid=");
       if (bss->ssid_present && bss->ssid_length > 0)
         {
@@ -12759,9 +13519,13 @@ static int k1_rtl8852bs_runtime_scanofld_passive_match(
       channel_mask = 1u << channel_index;
       match->entered_channels |= channel_mask;
 
-      /* The firmware leaves a channel when the channel-list period expires,
-       * whether or not the host asked it to, so this notification can arrive
-       * while a dwell is still pending for the channel it just left.  Retire
+      /* A channel-list entry carries its own period, so the firmware may in
+       * principle leave a channel without being asked and this notification
+       * can arrive while a dwell is still pending for the channel it just
+       * left.  It has never been observed to: every enter notification of
+       * every sweep so far follows a next-channel command from this host and
+       * firmware_advanced_channels has stayed empty, so the host is the sole
+       * pacemaker of a sweep.  The case is still retired here.  Retire
        * that dwell here.  Leaving it pending would skip this channel's dwell
        * altogether and then push the firmware one channel further with a
        * next-channel command naming a channel it no longer sits on, and the
@@ -12782,9 +13546,24 @@ static int k1_rtl8852bs_runtime_scanofld_passive_match(
           match->dwell_pending = false;
         }
 
-      if (((match->advanced_channels |
-            match->firmware_advanced_channels) & channel_mask) == 0 &&
-          !match->dwell_pending)
+      /* A parked table repeats one channel, so the per-channel-bit test below
+       * would arm a dwell for its first entry only and then stop.  The
+       * firmware advances a channel list solely on this host's next-channel
+       * command -- every enter notification in every sweep of this port
+       * follows one -- so with no further dwell left to expire no further
+       * command is sent, the firmware waits for one that never comes, and the
+       * sweep runs out its poll budget instead of reaching the end of the
+       * list.  Arm one dwell per parked list entry instead, which keeps the
+       * firmware walking the table to its SCAN_END and gives the bounded
+       * retransmissions below their remaining attempts.
+       */
+
+      if (!match->dwell_pending &&
+          (g_k1_rtl8852bs_scanofld_park_channel != 0 ?
+             match->parked_dwells <
+               K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT :
+             ((match->advanced_channels |
+               match->firmware_advanced_channels) & channel_mask) == 0))
         {
           /* The original PHL scan state machine waits for the configured
            * channel dwell, then tells firmware to advance.  Arm a deadline
@@ -12798,28 +13577,67 @@ static int k1_rtl8852bs_runtime_scanofld_passive_match(
           match->dwell_channel = channel;
           match->dwell_deadline = clock_systime_ticks() +
             MSEC2TICK(K1_RTL8852BS_SCAN_OFLD_PASSIVE_DWELL_MSEC);
+          if (g_k1_rtl8852bs_scanofld_park_channel != 0)
+            {
+              match->parked_dwells++;
+            }
+
 
           /* Give every dwell its own small frame-dump budget so the decode
            * evidence covers every channel instead of only the first.
            */
 
           match->rx_frames_logged = 0;
+        }
 
-          /* The radio is now parked on this channel and stays there until the
-           * dwell deadline above submits the next-channel command, so this is
-           * the one point in the sweep at which a host-built management frame
-           * can be handed to the hardware knowing what it will be radiated
-           * on.  The transmit is armed by a diagnostic and is a no-op in
-           * every other sweep, so the passive path is unchanged when nothing
-           * armed it.
+      /* An enter-channel notification for the armed channel is a point at
+       * which the radio is known to be on it, and that is what a host-built
+       * management frame needs: this is the only place in the sweep that knows
+       * what the frame would be radiated on.  It sits outside the dwell-arming
+       * block above because a parked table enters the same channel thirteen
+       * times and arms a dwell only for the first of them, and the
+       * retransmissions below need the other twelve.  Everything here is
+       * armed by a diagnostic and is a no-op in every other sweep, so the
+       * passive path is unchanged when nothing armed it.
+       */
+
+      if (g_k1_rtl8852bs_auth_action.armed &&
+          channel == g_k1_rtl8852bs_auth_action.channel &&
+          (!g_k1_rtl8852bs_auth_action.transmitted ||
+           (g_k1_rtl8852bs_scanofld_park_channel != 0 &&
+            !g_k1_rtl8852bs_auth_action.response_valid &&
+            g_k1_rtl8852bs_auth_action.requests <
+              K1_RTL8852BS_AUTH_REQUEST_ATTEMPTS)))
+        {
+          /* Ask again while the answer is missing.  Run 27 is the case this is
+           * for: the access point answered two of the three sweeps that asked
+           * it and the third got nothing at all, and one request per sweep
+           * makes that silence the entire result of the step.  Only a parked
+           * table retries, because only there does the next notification name
+           * the same channel, and each retry takes a fresh sequence number so
+           * none of them is a duplicate the receiver would drop unanswered.
            */
 
-          if (g_k1_rtl8852bs_auth_action.armed &&
-              !g_k1_rtl8852bs_auth_action.transmitted &&
-              channel == g_k1_rtl8852bs_auth_action.channel)
-            {
-              k1_rtl8852bs_runtime_auth_transmit();
-            }
+          k1_rtl8852bs_runtime_auth_transmit();
+        }
+
+      /* The Association Request is normally transmitted by the frame observer
+       * the moment the Authentication Response is decoded, which is inside the
+       * dwell that asked.  When it went out and drew no answer, the same
+       * argument applies to it, and a parked table's next notification is
+       * where the retry belongs.
+       */
+
+      if (g_k1_rtl8852bs_assoc_action.armed &&
+          g_k1_rtl8852bs_assoc_action.transmitted &&
+          !g_k1_rtl8852bs_assoc_action.response_valid &&
+          g_k1_rtl8852bs_scanofld_park_channel != 0 &&
+          channel == g_k1_rtl8852bs_assoc_action.channel &&
+          g_k1_rtl8852bs_auth_action.response_valid &&
+          g_k1_rtl8852bs_assoc_action.requests <
+            K1_RTL8852BS_ASSOC_REQUEST_ATTEMPTS)
+        {
+          k1_rtl8852bs_runtime_assoc_transmit();
         }
     }
   else if (reason == K1_RTL8852BS_SCAN_OFLD_C2H_SCAN_END)
@@ -12926,6 +13744,11 @@ static void k1_rtl8852bs_runtime_scanofld_export_result(
       entry->beacon_frames = source->beacon_frames;
       entry->probe_response_frames = source->probe_response_frames;
       entry->ssid_present = source->ssid_present;
+      entry->rsn_present = source->rsn_present;
+      entry->rsn_length = source->rsn_length;
+      entry->rsn_group_cipher = source->rsn_group_cipher;
+      entry->rsn_pairwise_ccmp = source->rsn_pairwise_ccmp;
+      entry->rsn_akm_psk = source->rsn_akm_psk;
     }
 }
 
@@ -13384,6 +14207,25 @@ static void k1_rtl8852bs_runtime_tx_witness_sample(unsigned int attempt)
   if (!w->mid_snapshot_done && w->samples >= K1_RTL8852BS_WITNESS_MID_SAMPLE)
     {
       w->mid_snapshot_done = true;
+
+      /* Not while a management exchange is armed.  This snapshot measured
+       * sixty-five polled console lines, 6378 bytes, which at 115200 8N1 is
+       * about 550ms spent inside one 180ms channel dwell, and in run 26 it was
+       * spent inside the dwell that had just transmitted an Authentication
+       * Request, so the answer to that request was not decoded
+       * until the sweep had already entered the next channel and the
+       * Association Request could no longer be sent.  The one line that says
+       * the snapshot was skipped costs a few milliseconds and keeps the log
+       * self-explanatory.
+       */
+
+      if (k1_rtl8852bs_scanofld_exchange_armed())
+        {
+          k1_early_puts("K1 Wi-Fi GPL: tx witness mid-sweep snapshot "
+                        "suppressed exchange=0x1\r\n");
+          return;
+        }
+
       k1_rtl8852bs_runtime_fault_snapshot("mid-sweep", false);
 
       /* The port and the receive filter are read from inside the sweep as
@@ -14307,9 +15149,16 @@ static int k1_rtl8852bs_runtime_scanofld_passive_wait(
            * dwell for decode evidence and keep only counters afterwards; the
            * C2H and PPDU-status descriptors are already covered by the scan
            * C2H trace and the per-type counters.
+           *
+           * Not even one while a management exchange is armed.  The dump is
+           * tens of milliseconds of polled console in the middle of the dwell
+           * that has to carry a request and its answer, and the answer itself
+           * is reported by the exchange's own log lines afterwards, so the
+           * frame is counted as suppressed and the dwell keeps its time.
            */
 
           if (frame.packet_type == 0 &&
+              !k1_rtl8852bs_scanofld_exchange_armed() &&
               match->rx_frames_logged < K1_RTL8852BS_SCAN_OFLD_FRAME_LOG_MAX)
             {
               match->rx_frames_logged++;
@@ -14332,13 +15181,25 @@ static int k1_rtl8852bs_runtime_scanofld_passive_wait(
                   goto out;
                 }
 
+              /* A parked table names one channel in all thirteen entries, so
+               * the per-channel masks can never hold more than that one bit
+               * and demanding all thirteen would hang the sweep until its
+               * timeout.  What remains is still firmware's own account of
+               * finishing the list: the generic done acknowledgement plus the
+               * scan-end notification.  The unparked sweep keeps the stricter
+               * test unchanged.
+               */
+
               if (!complete && match->done_ack.matched &&
-                  match->entered_channels ==
-                    (1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) - 1u &&
-                  (match->advanced_channels |
-                   match->firmware_advanced_channels) ==
-                    (1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) - 1u &&
-                  match->saw_scan_end)
+                  match->saw_scan_end &&
+                  (g_k1_rtl8852bs_scanofld_park_channel != 0 ||
+                   (match->entered_channels ==
+                      (1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) -
+                      1u &&
+                    (match->advanced_channels |
+                     match->firmware_advanced_channels) ==
+                      (1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) -
+                      1u)))
                 {
                   /* Firmware is done with the channel list.  Frames received
                    * during the last dwell can still be queued, so record the
@@ -14604,6 +15465,8 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
   k1_early_puthex(available_pages);
   k1_early_puts(" FIFO=");
   k1_early_puthex(fifo_address);
+  k1_early_puts(" park=");
+  k1_early_puthex(g_k1_rtl8852bs_scanofld_park_channel);
   k1_early_puts("\r\n");
 
   ret = k1_rtl8852bs_runtime_scanofld_passive_wait(&firmware_return,
@@ -16323,7 +17186,7 @@ static int k1_rtl8852bs_runtime_mgmt_tx_frame(FAR const uint8_t *frame,
                                               bool broadcast)
 {
   uint8_t packet[K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
-                 K1_RTL8852BS_PROBE_REQUEST_MAX_SIZE];
+                 K1_RTL8852BS_MGMT_TX_FRAME_MAX];
   struct k1_rtl8852bs_data_tx_layout_s layout;
   struct k1_rtl8852bs_data_tx_resources_s before_res;
   struct k1_rtl8852bs_data_tx_resources_s after_res;
@@ -16945,14 +17808,22 @@ static void k1_rtl8852bs_runtime_auth_report(FAR const char *label)
  *   so this is the only way it can currently transmit on a chosen channel.
  *
  *   What this does NOT do, stated plainly because the distinction decides how
- *   the result may be reported: it does not associate, it installs no key, it
- *   creates no network device, it carries no data, and the hardware does not
- *   acknowledge the access point's response.  The sweep runs with the receive
- *   filter opened up and the address CAM still holding a no-link role, so the
- *   answer is received but not acknowledged, and the access point will retry
- *   it and then time the exchange out.  Seeing the response is the milestone;
- *   a link is not claimed.  Nothing is written to eMMC, SPI flash, eFuse or
- *   the U-Boot environment.
+ *   the result may be reported: it does not associate, it asks for no
+ *   association identifier, it installs no key, it creates no network device
+ *   and it carries no data.  Seeing the response is the milestone; a link is
+ *   not claimed.  Nothing is written to eMMC, SPI flash, eFuse or the U-Boot
+ *   environment.
+ *
+ *   Whether the hardware acknowledges the access point's response is not
+ *   settled here, and this comment used to assert that it does not and that
+ *   the access point therefore retries the frame and times the exchange out.
+ *   The board evidence points the other way: every exchange that was answered
+ *   raised the transmit PPDU CCK counter by exactly two -- the request, plus
+ *   one more frame this host must have sent -- while every exchange that went
+ *   unanswered raised it by one, including the one run before any join command
+ *   while the address CAM still held a no-link role.  That counter reports
+ *   PPDUs without frame types, so this is a strong correlation and not a
+ *   decode; but it contradicts the old claim, which is not repeated.
  *
  * Input Parameters:
  *   self_mac - The eFuse self MAC.  It has to be the address the no-link role
@@ -17145,6 +18016,15 @@ static void k1_rtl8852bs_runtime_port_log(FAR const char *phase)
  *   acknowledgement wait drains the receive FIFO, so it would swallow the
  *   frames the sweep is accounting for; the sweeps have to be finished.
  *
+ * Input Parameters:
+ *   label    - console label for this submission's two lines.  The command is
+ *              sent once by the join step and once more by the association
+ *              step, and a log a person or the acceptance harness reads has to
+ *              say which of the two a done acknowledgement belongs to.
+ *   sequence - the H2C sequence number to submit under and to wait for.  Each
+ *              submission uses its own, so a late acknowledgement cannot be
+ *              charged to the other one.
+ *
  * Returned Value:
  *   OK when the command was accepted and its done acknowledgement returned
  *   zero, a negated errno otherwise.  -EIO means the firmware answered but
@@ -17152,7 +18032,8 @@ static void k1_rtl8852bs_runtime_port_log(FAR const char *phase)
  *
  ****************************************************************************/
 
-static int k1_rtl8852bs_runtime_join_info_submit(void)
+static int k1_rtl8852bs_runtime_join_info_submit(FAR const char *label,
+                                                uint8_t sequence)
 {
   struct k1_rtl8852bs_join_info_s join =
   {
@@ -17180,15 +18061,16 @@ static int k1_rtl8852bs_runtime_join_info_submit(void)
   ret = k1_rtl8852bs_runtime_control_h2c_submit(
     content, sizeof(content), K1_RTL8852BS_JOININFO_CATEGORY,
     K1_RTL8852BS_JOININFO_CLASS, K1_RTL8852BS_JOININFO_FUNCTION,
-    K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE, true, &fifo_address,
-    &available_pages);
+    sequence, true, &fifo_address, &available_pages);
   if (ret < 0)
     {
       return ret;
     }
 
-  k1_early_puts("K1 Wi-Fi GPL: join info H2C queued sequence=");
-  k1_early_puthex(K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE);
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" H2C queued sequence=");
+  k1_early_puthex(sequence);
   k1_early_puts(" pages=");
   k1_early_puthex(available_pages);
   k1_early_puts(" FIFO=");
@@ -17197,14 +18079,15 @@ static int k1_rtl8852bs_runtime_join_info_submit(void)
 
   ret = k1_rtl8852bs_runtime_done_ack_wait(
     K1_RTL8852BS_JOININFO_CATEGORY, K1_RTL8852BS_JOININFO_CLASS,
-    K1_RTL8852BS_JOININFO_FUNCTION, K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE,
-    &firmware_return);
+    K1_RTL8852BS_JOININFO_FUNCTION, sequence, &firmware_return);
   if (ret < 0)
     {
       return ret;
     }
 
-  k1_early_puts("K1 Wi-Fi GPL: join info done-ack return=");
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" done-ack return=");
   k1_early_puthex(firmware_return);
   k1_early_puts("\r\n");
 
@@ -17240,6 +18123,10 @@ static int k1_rtl8852bs_runtime_join_info_submit(void)
  *   receive loop.
  *
  * Input Parameters:
+ *   label    - console label for this submission's two lines, because the
+ *              command is sent once by the join step and once more by the
+ *              association step with the granted association identifier
+ *   sequence - the H2C sequence number to submit under and to wait for
  *   self_mac - the eFuse self MAC the role and the address CAM were created
  *              with
  *   bssid    - the target access point's BSSID
@@ -17254,7 +18141,8 @@ static int k1_rtl8852bs_runtime_join_info_submit(void)
  ****************************************************************************/
 
 static int k1_rtl8852bs_runtime_join_addr_cam_submit(
-  FAR const uint8_t *self_mac, FAR const uint8_t *bssid, uint16_t aid)
+  FAR const char *label, uint8_t sequence, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid, uint16_t aid)
 {
   struct k1_rtl8852bs_addr_cam_info_s cam =
   {
@@ -17275,7 +18163,7 @@ static int k1_rtl8852bs_runtime_join_addr_cam_submit(
   uint32_t fifo_address = 0;
   int ret;
 
-  if (self_mac == NULL || bssid == NULL ||
+  if (label == NULL || self_mac == NULL || bssid == NULL ||
       !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
       !k1_rtl8852bs_addr_cam_mac_valid(bssid))
     {
@@ -17296,15 +18184,16 @@ static int k1_rtl8852bs_runtime_join_addr_cam_submit(
   ret = k1_rtl8852bs_runtime_control_h2c_submit(
     content, sizeof(content), K1_RTL8852BS_ADDR_CAM_CATEGORY,
     K1_RTL8852BS_ADDR_CAM_CLASS, K1_RTL8852BS_ADDR_CAM_FUNCTION,
-    K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE, true, &fifo_address,
-    &available_pages);
+    sequence, true, &fifo_address, &available_pages);
   if (ret < 0)
     {
       return ret;
     }
 
-  k1_early_puts("K1 Wi-Fi GPL: join CAM H2C queued sequence=");
-  k1_early_puthex(K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE);
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" H2C queued sequence=");
+  k1_early_puthex(sequence);
   k1_early_puts(" pages=");
   k1_early_puthex(available_pages);
   k1_early_puts(" FIFO=");
@@ -17313,14 +18202,15 @@ static int k1_rtl8852bs_runtime_join_addr_cam_submit(
 
   ret = k1_rtl8852bs_runtime_done_ack_wait(
     K1_RTL8852BS_ADDR_CAM_CATEGORY, K1_RTL8852BS_ADDR_CAM_CLASS,
-    K1_RTL8852BS_ADDR_CAM_FUNCTION, K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE,
-    &firmware_return);
+    K1_RTL8852BS_ADDR_CAM_FUNCTION, sequence, &firmware_return);
   if (ret < 0)
     {
       return ret;
     }
 
-  k1_early_puts("K1 Wi-Fi GPL: join CAM done-ack return=");
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" done-ack return=");
   k1_early_puthex(firmware_return);
   k1_early_puts("\r\n");
 
@@ -17598,7 +18488,8 @@ int k1_rtl8852bs_fwdl_runtime_join_diagnostic(FAR const uint8_t *self_mac)
                                          "prejoin-after", bssid, channel,
                                          &result, &prejoin);
 
-  ret = k1_rtl8852bs_runtime_join_info_submit();
+  ret = k1_rtl8852bs_runtime_join_info_submit(
+    "join info", K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE);
   if (ret < 0)
     {
       goto error;
@@ -17610,7 +18501,8 @@ int k1_rtl8852bs_fwdl_runtime_join_diagnostic(FAR const uint8_t *self_mac)
                                          "joininfo-after", bssid, channel,
                                          &result, &info);
 
-  ret = k1_rtl8852bs_runtime_join_addr_cam_submit(self_mac, bssid, 0u);
+  ret = k1_rtl8852bs_runtime_join_addr_cam_submit(
+    "join CAM", K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE, self_mac, bssid, 0u);
   if (ret < 0)
     {
       goto error;
@@ -17678,6 +18570,637 @@ int k1_rtl8852bs_fwdl_runtime_join_diagnostic(FAR const uint8_t *self_mac)
 
 error:
   k1_early_puts("K1 Wi-Fi GPL: station join error=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_report
+ *
+ * Description:
+ *   Print the one line that separates the ways the association exchange can
+ *   end: never accepted by the transmit path, transmitted and unanswered,
+ *   answered with a refusal, or answered with an association identifier.  The
+ *   label is a parameter because the exchange is attempted more than once in a
+ *   run and each attempt needs a line the acceptance harness can tell apart.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_assoc_report(FAR const char *label)
+{
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" req=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.requests);
+  k1_early_puts(" req-sn=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.request_sequence);
+  k1_early_puts(" req-bytes=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.request_bytes);
+  k1_early_puts(" tx-status=");
+  k1_early_puthex((uintreg_t)
+                  (g_k1_rtl8852bs_assoc_action.transmit_status < 0 ?
+                   -g_k1_rtl8852bs_assoc_action.transmit_status : 0));
+  k1_early_puts(" frames=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.frames_seen);
+  k1_early_puts(" rsp-self=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.responses_to_self);
+  k1_early_puts(" rsp-target=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.responses_from_target);
+  k1_early_puts(" rsp-cap=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.response_capability);
+  k1_early_puts(" status=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.response_status);
+  k1_early_puts(" aid=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.response_aid);
+  k1_early_puts(" a2=");
+  k1_rtl8852bs_scanofld_log_bytes(g_k1_rtl8852bs_assoc_action.response_a2, 6);
+  k1_early_puts("\r\n");
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_target_select
+ *
+ * Description:
+ *   Choose the access point the association step aims at.  Two things
+ *   disqualify a candidate, and both are properties of this port rather than
+ *   of the access point.
+ *
+ *   The first is Privacy.  An access point that sets the Privacy bit requires
+ *   a cipher suite in the Association Request and a key exchange afterwards,
+ *   and this component has no security engine initialized and no key of any
+ *   kind, so asking one to associate would produce a refusal that says nothing
+ *   about this port's frame path.  Such an access point is skipped rather than
+ *   attempted.
+ *
+ *   The second is that the access point has to answer this host's
+ *   Authentication Request, because IEEE 802.11 clause 11.3 lets an
+ *   Association Request through only from state 2.  An access point already
+ *   proven to answer in this run is therefore preferred, exactly as the join
+ *   step prefers it and for the same reason: the question this step asks is
+ *   what the Association Request does, and it can only be read against a peer
+ *   whose authentication behaviour is already known.
+ *
+ * Input Parameters:
+ *   result - a completed sweep
+ *   proven - set to true when the returned entry is the access point that
+ *            already answered an Authentication Request, false when it is this
+ *            function's own choice among the open ones
+ *
+ * Returned Value:
+ *   The selected entry, or NULL when the sweep saw no access point this port
+ *   is able to ask.
+ *
+ ****************************************************************************/
+
+static FAR const struct k1_rtl8852bs_scan_bss_s *
+k1_rtl8852bs_runtime_assoc_target_select(
+  FAR const struct k1_rtl8852bs_scan_result_s *result, FAR bool *proven)
+{
+  FAR const struct k1_rtl8852bs_scan_bss_s *best = NULL;
+  unsigned int index;
+
+  if (proven != NULL)
+    {
+      *proven = false;
+    }
+
+  if (result == NULL)
+    {
+      return NULL;
+    }
+
+  for (index = 0; index < result->bss_count &&
+       index < K1_RTL8852BS_SCAN_BSS_MAX; index++)
+    {
+      FAR const struct k1_rtl8852bs_scan_bss_s *bss = &result->bss[index];
+
+      if (bss->channel == 0 ||
+          (bss->capability & K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY) != 0)
+        {
+          continue;
+        }
+
+      if (g_k1_rtl8852bs_auth_proven.valid &&
+          memcmp(bss->bssid, g_k1_rtl8852bs_auth_proven.bssid,
+                 sizeof(g_k1_rtl8852bs_auth_proven.bssid)) == 0)
+        {
+          if (proven != NULL)
+            {
+              *proven = true;
+            }
+
+          return bss;
+        }
+
+      if (best == NULL || bss->beacon_frames > best->beacon_frames)
+        {
+          best = bss;
+        }
+    }
+
+  return best;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_sibling_ssid
+ *
+ * Description:
+ *   Look for an SSID this port may reasonably try on a BSS that suppresses its
+ *   own.  An access point which hides one BSS very often broadcasts another on
+ *   the same channel from the same radio, and the two BSSIDs then differ only
+ *   in their first octet, which is where the locally-administered and
+ *   multi-BSSID bits live.  That neighbour's SSID is a labelled guess at the
+ *   hidden BSS's name -- nothing in the frames proves the two belong together,
+ *   so every line this produces says the SSID came from a sibling and not from
+ *   the target itself.
+ *
+ * Input Parameters:
+ *   result      - a completed sweep
+ *   bssid       - the target's BSSID
+ *   channel     - the target's channel
+ *   ssid        - receives the sibling's SSID
+ *   ssid_length - receives its length
+ *
+ * Returned Value:
+ *   true when a sibling with a non-empty SSID was found.
+ *
+ ****************************************************************************/
+
+static bool k1_rtl8852bs_runtime_assoc_sibling_ssid(
+  FAR const struct k1_rtl8852bs_scan_result_s *result,
+  FAR const uint8_t *bssid, uint8_t channel, FAR uint8_t *ssid,
+  FAR uint8_t *ssid_length)
+{
+  unsigned int index;
+
+  if (result == NULL || bssid == NULL || ssid == NULL || ssid_length == NULL)
+    {
+      return false;
+    }
+
+  for (index = 0; index < result->bss_count &&
+       index < K1_RTL8852BS_SCAN_BSS_MAX; index++)
+    {
+      FAR const struct k1_rtl8852bs_scan_bss_s *bss = &result->bss[index];
+
+      if (bss->channel != channel || !bss->ssid_present ||
+          bss->ssid_length == 0 ||
+          bss->ssid_length > K1_RTL8852BS_IEEE80211_SSID_MAX ||
+          memcmp(bss->bssid + 1, bssid + 1, 5) != 0 ||
+          bss->bssid[0] == bssid[0])
+        {
+          continue;
+        }
+
+      memcpy(ssid, bss->ssid, bss->ssid_length);
+      *ssid_length = bss->ssid_length;
+      return true;
+    }
+
+  return false;
+}
+
+/* What one association attempt observed.  The authentication result is kept
+ * beside the association one because an attempt whose Authentication Request
+ * went unanswered never transmitted an Association Request at all, and that is
+ * a different failure from an Association Request the access point ignored.
+ */
+
+struct k1_rtl8852bs_assoc_attempt_s
+{
+  uint16_t beacon_frames;
+  uint8_t bss_count;
+  bool auth_response;
+  bool response;
+  uint16_t status;
+  uint16_t aid;
+  int sweep_ret;
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_attempt
+ *
+ * Description:
+ *   Run one authentication-then-association exchange against one access point
+ *   inside a single sweep and record what it produced.  Both frames are armed
+ *   before the sweep starts: the Authentication Request is transmitted when the
+ *   firmware reports it entered the target's channel, and the Association
+ *   Request is transmitted from the receive loop the moment the access point's
+ *   Authentication Response is decoded, which is the only moment this host is
+ *   in IEEE 802.11 state 2 with the radio still parked on that channel.
+ *
+ * Input Parameters:
+ *   label        - label for this attempt's own lines
+ *   auth_label   - label for the authentication exchange report and for the
+ *                  transmit-counter line, kept distinct from label so the two
+ *                  exchange reports of one attempt cannot be confused
+ *   ssid_source  - "advertised" or "sibling", printed so a guessed SSID is
+ *                  never mistaken for something the target said
+ *   bssid        - the access point to aim at
+ *   channel      - the channel it advertises
+ *   ssid         - the SSID to put in the Association Request
+ *   ssid_length  - its length, which may be zero
+ *   result       - sweep result buffer, overwritten by this attempt
+ *   attempt      - filled in with what this attempt observed
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_assoc_attempt(
+  FAR const char *label, FAR const char *auth_label,
+  FAR const char *ssid_source, FAR const uint8_t *bssid, uint8_t channel,
+  FAR const uint8_t *ssid, uint8_t ssid_length,
+  FAR struct k1_rtl8852bs_scan_result_s *result,
+  FAR struct k1_rtl8852bs_assoc_attempt_s *attempt)
+{
+  struct k1_rtl8852bs_tx_state_s before;
+  struct k1_rtl8852bs_tx_state_s after;
+  bool before_valid;
+
+  if (attempt == NULL || result == NULL)
+    {
+      return;
+    }
+
+  memset(attempt, 0, sizeof(*attempt));
+
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" begin ssid-source=");
+  k1_early_puts(ssid_source);
+  k1_early_puts(" ssid-len=");
+  k1_early_puthex(ssid_length);
+  k1_early_puts(" channel=");
+  k1_early_puthex(channel);
+  k1_early_puts(" bssid=");
+  k1_rtl8852bs_scanofld_log_bytes(bssid, 6);
+  k1_early_puts("\r\n");
+
+  before_valid = k1_rtl8852bs_runtime_tx_state_sample(&before) == OK;
+
+  k1_rtl8852bs_runtime_auth_arm(bssid, channel);
+  k1_rtl8852bs_runtime_assoc_arm(bssid, channel, ssid, ssid_length);
+  attempt->sweep_ret = k1_rtl8852bs_runtime_scanofld_passive_scan(result);
+  k1_rtl8852bs_runtime_auth_disarm();
+  k1_rtl8852bs_runtime_assoc_disarm();
+
+  if (k1_rtl8852bs_runtime_tx_state_sample(&after) == OK)
+    {
+      k1_rtl8852bs_runtime_tx_state_log(auth_label, &after,
+                                        before_valid ? &before : NULL);
+    }
+
+  k1_rtl8852bs_runtime_auth_report(auth_label);
+  k1_rtl8852bs_runtime_assoc_report(label);
+
+  attempt->bss_count = result->bss_count;
+  attempt->beacon_frames = k1_rtl8852bs_runtime_scan_beacon_frames(result,
+                                                                  bssid);
+  attempt->auth_response = g_k1_rtl8852bs_auth_action.response_valid;
+  attempt->response = g_k1_rtl8852bs_assoc_action.response_valid;
+  attempt->status = g_k1_rtl8852bs_assoc_action.response_status;
+  attempt->aid = g_k1_rtl8852bs_assoc_action.response_aid;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_fwdl_runtime_assoc_diagnostic
+ *
+ * Description:
+ *   Ask one real access point to associate this host, and require its
+ *   Association Response back.  This is the frame that follows authentication
+ *   in IEEE 802.11 clause 11.3, and the first one whose answer carries
+ *   something the access point allocates rather than merely echoes: an
+ *   association identifier.
+ *
+ *   The exchange is chained inside a single sweep.  Authentication leaves this
+ *   host in state 2 only until the access point ages that state out, so the
+ *   Association Request cannot wait for the next sweep three seconds later; it
+ *   is transmitted from the receive loop the moment the Authentication Response
+ *   is decoded, while the radio is still parked on the target's channel.  Both
+ *   frames are therefore armed before the sweep starts and the sweep's own
+ *   receive drain is what observes both answers.
+ *
+ *   Only an access point that advertises no Privacy is asked.  This component
+ *   has no security engine initialized and holds no key, so it can offer no
+ *   cipher suite; an Association Request without an RSN element to a Privacy
+ *   access point is refused for that reason alone and would say nothing about
+ *   this port.  Such an access point is skipped by the target selection rather
+ *   than attempted, and a run with nothing else in range fails with
+ *   -EOPNOTSUPP, which is an honest description of this port and not of the
+ *   radio environment.
+ *
+ *   Up to two attempts are made, and the difference between them is the SSID.
+ *   The first uses what the target advertised, zero length included: a BSS that
+ *   suppresses its own name is asked with the empty element it sent, because
+ *   that is the only SSID this host actually has evidence for.  An access point
+ *   comparing that against its configured SSID may refuse it, so when the
+ *   target advertised no SSID and the first attempt did not associate, a second
+ *   attempt uses the SSID of a sibling BSS -- one on the same channel whose
+ *   BSSID differs from the target's only in the first octet, which is how one
+ *   radio's multiple BSSIDs look.  That is a guess, and every line it produces
+ *   says ssid-source=sibling so it can never be read as evidence.
+ *
+ *   When an access point does grant an association identifier, the two connect
+ *   commands are re-sent with it, in the order upstream uses: upstream
+ *   rtw_hal_mac_addr_cam_set_aid() stores the AID and calls _change_role(),
+ *   which sends MEDIA_RPT/JOININFO and then one MAC/ADDR_CAM_UPDATE.  This port
+ *   does the same two submissions with their own H2C sequence numbers, and both
+ *   done acknowledgements have to return zero.
+ *
+ *   A confirming sweep then follows, and the step fails if it no longer
+ *   receives the target's beacons.  An address CAM that has just been given an
+ *   association identifier is exactly the kind of change that can start
+ *   filtering receive traffic, and a run that reported an association while
+ *   quietly having stopped receiving would be worse than a failure.
+ *
+ *   What this does NOT do: no key of any kind is installed, no four-way
+ *   handshake is run, no data frame is sent or received, no network device
+ *   changes behaviour, no IP address is configured, and the port's TSF is still
+ *   frozen and not synchronised to the access point's beacons, because
+ *   mac_port_init() is not ported yet.  An association identifier granted by an
+ *   access point is not a working link.  Nothing is written to eMMC, SPI flash,
+ *   eFuse or the U-Boot environment.
+ *
+ * Input Parameters:
+ *   self_mac - The eFuse self MAC.  It has to be the address the role and the
+ *              address CAM were configured with, because a response is only
+ *              counted as an answer to this host when its A1 matches.
+ *
+ * Returned Value:
+ *   OK when an Association Response addressed to this host arrived, whatever
+ *   status code it carried, because the answered exchange is the milestone this
+ *   step is named for; the console line "RTL8852BS2 station association
+ *   complete" is printed only for status 0 with a non-zero association
+ *   identifier.  Otherwise a negated errno: -ENODATA when the request went
+ *   unanswered, -EHOSTUNREACH when the sweep found no access point at all,
+ *   -EOPNOTSUPP when every access point in range requires a cipher this port
+ *   cannot offer, -EPROTO when the association identifier update cost this host
+ *   the target's beacons, and -EIO when the firmware rejected one of the two
+ *   re-sent commands.
+ *
+ ****************************************************************************/
+
+int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
+{
+  struct k1_rtl8852bs_scan_result_s result;
+  FAR const struct k1_rtl8852bs_scan_bss_s *target;
+  struct k1_rtl8852bs_assoc_attempt_s advertised;
+  struct k1_rtl8852bs_assoc_attempt_s sibling;
+  FAR const struct k1_rtl8852bs_assoc_attempt_s *decided;
+  uint8_t bssid[6];
+  uint8_t ssid[K1_RTL8852BS_IEEE80211_SSID_MAX];
+  uint8_t sibling_ssid[K1_RTL8852BS_IEEE80211_SSID_MAX];
+  uint8_t ssid_length;
+  uint8_t sibling_length = 0;
+  uint8_t channel;
+  uint16_t confirm_beacons;
+  bool sibling_valid;
+  bool sibling_tried = false;
+  bool proven;
+  int ret;
+
+  if (self_mac == NULL || !k1_rtl8852bs_addr_cam_mac_valid(self_mac))
+    {
+      ret = -EINVAL;
+      goto error;
+    }
+
+  k1_rtl8852bs_scanofld_set_self_mac(self_mac);
+
+  ret = k1_rtl8852bs_runtime_scanofld_passive_scan(&result);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  target = k1_rtl8852bs_runtime_assoc_target_select(&result, &proven);
+  if (target == NULL)
+    {
+      /* Separate the two ways there can be nothing to aim at: a sweep that
+       * heard no access point at all, and a sweep whose access points all
+       * require a cipher this port cannot offer.  The second is a limitation
+       * of this component and has to be reported as one.
+       */
+
+      ret = result.bss_count == 0 ? -EHOSTUNREACH : -EOPNOTSUPP;
+      goto error;
+    }
+
+  /* The selection points into the sweep result, which every later sweep
+   * overwrites, so copy out everything still needed.
+   */
+
+  memcpy(bssid, target->bssid, sizeof(bssid));
+  channel = target->channel;
+  ssid_length = target->ssid_present ? target->ssid_length : 0u;
+  if (ssid_length > sizeof(ssid))
+    {
+      ssid_length = sizeof(ssid);
+    }
+
+  memset(ssid, 0, sizeof(ssid));
+  if (ssid_length > 0)
+    {
+      memcpy(ssid, target->ssid, ssid_length);
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: assoc target bssid=");
+  k1_rtl8852bs_scanofld_log_bytes(bssid, sizeof(bssid));
+  k1_early_puts(" channel=");
+  k1_early_puthex(channel);
+  k1_early_puts(" beacons=");
+  k1_early_puthex(target->beacon_frames);
+  k1_early_puts(" cap=");
+  k1_early_puthex(target->capability);
+  k1_early_puts(" privacy=");
+  k1_early_puthex((target->capability &
+                   K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY) != 0 ? 1u : 0u);
+  k1_early_puts(" ssid-len=");
+  k1_early_puthex(ssid_length);
+  k1_early_puts(" rsn=");
+  k1_early_puthex(target->rsn_present ? 1u : 0u);
+  k1_early_puts(" proven=");
+  k1_early_puthex(proven ? 1u : 0u);
+  k1_early_puts("\r\n");
+
+  memset(sibling_ssid, 0, sizeof(sibling_ssid));
+  sibling_valid = k1_rtl8852bs_runtime_assoc_sibling_ssid(
+    &result, bssid, channel, sibling_ssid, &sibling_length);
+
+  k1_early_puts("K1 Wi-Fi GPL: assoc sibling found=");
+  k1_early_puthex(sibling_valid ? 1u : 0u);
+  k1_early_puts(" ssid-len=");
+  k1_early_puthex(sibling_length);
+  k1_early_puts("\r\n");
+
+  k1_rtl8852bs_runtime_port_log("pre-assoc");
+
+  memset(&sibling, 0, sizeof(sibling));
+  k1_rtl8852bs_runtime_assoc_attempt("assoc advertised",
+                                     "assoc advertised auth", "advertised",
+                                     bssid, channel, ssid, ssid_length,
+                                     &result, &advertised);
+  decided = &advertised;
+
+  /* The sibling SSID is only worth trying when the target named itself in no
+   * other way.  If the target did advertise an SSID and the access point still
+   * refused, a different name is not the missing piece.
+   */
+
+  if (sibling_valid && ssid_length == 0 &&
+      !(advertised.response &&
+        advertised.status == K1_RTL8852BS_ASSOC_STATUS_SUCCESS &&
+        advertised.aid != 0))
+    {
+      sibling_tried = true;
+      k1_rtl8852bs_runtime_assoc_attempt("assoc sibling", "assoc sibling auth",
+                                         "sibling", bssid, channel,
+                                         sibling_ssid, sibling_length,
+                                         &result, &sibling);
+
+      /* The sibling becomes the reported attempt when it got further than the
+       * advertised one.  Association is the whole point, so an associated
+       * sibling wins outright and so does an Association Response the
+       * advertised attempt never drew.  Failing both, an Authentication
+       * Response still ranks: run 26 reported auth-rsp=0x0 for an exchange in
+       * which the access point had authenticated this host on the sibling
+       * attempt, which reads as an access point that ignored us when in fact
+       * the very next frame was ours to send.
+       */
+
+      if ((sibling.response &&
+           sibling.status == K1_RTL8852BS_ASSOC_STATUS_SUCCESS &&
+           sibling.aid != 0) ||
+          (sibling.response && !advertised.response) ||
+          (!sibling.response && !advertised.response &&
+           sibling.auth_response && !advertised.auth_response))
+        {
+          decided = &sibling;
+        }
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: assoc attempts advertised-rsp=");
+  k1_early_puthex(advertised.response ? 1u : 0u);
+  k1_early_puts(" advertised-status=");
+  k1_early_puthex(advertised.status);
+  k1_early_puts(" advertised-aid=");
+  k1_early_puthex(advertised.aid);
+  k1_early_puts(" advertised-auth-rsp=");
+  k1_early_puthex(advertised.auth_response ? 1u : 0u);
+  k1_early_puts(" advertised-beacons=");
+  k1_early_puthex(advertised.beacon_frames);
+  k1_early_puts(" sibling-tried=");
+  k1_early_puthex(sibling_tried ? 1u : 0u);
+  k1_early_puts(" sibling-rsp=");
+  k1_early_puthex(sibling.response ? 1u : 0u);
+  k1_early_puts(" sibling-status=");
+  k1_early_puthex(sibling.status);
+  k1_early_puts(" sibling-aid=");
+  k1_early_puthex(sibling.aid);
+  k1_early_puts(" sibling-auth-rsp=");
+  k1_early_puthex(sibling.auth_response ? 1u : 0u);
+  k1_early_puts("\r\n");
+
+  /* One line carries the decided attempt, because that is the one this step
+   * reports on and the one the acceptance harness reads.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: assoc exchange rsp=");
+  k1_early_puthex(decided->response ? 1u : 0u);
+  k1_early_puts(" status=");
+  k1_early_puthex(decided->status);
+  k1_early_puts(" aid=");
+  k1_early_puthex(decided->aid);
+  k1_early_puts(" auth-rsp=");
+  k1_early_puthex(decided->auth_response ? 1u : 0u);
+  k1_early_puts(" beacons=");
+  k1_early_puthex(decided->beacon_frames);
+  k1_early_puts(" bss=");
+  k1_early_puthex(decided->bss_count);
+  k1_early_puts(" sweep=");
+  k1_early_puthex((uintreg_t)(decided->sweep_ret < 0 ?
+                              -decided->sweep_ret : 0));
+  k1_early_puts(" bssid=");
+  k1_rtl8852bs_scanofld_log_bytes(bssid, sizeof(bssid));
+  k1_early_puts("\r\n");
+
+  if (decided->sweep_ret < 0)
+    {
+      ret = decided->sweep_ret;
+      goto error;
+    }
+
+  if (!decided->response)
+    {
+      ret = -ENODATA;
+      goto error;
+    }
+
+  if (decided->status != K1_RTL8852BS_ASSOC_STATUS_SUCCESS ||
+      decided->aid == 0)
+    {
+      /* The access point answered and refused, or accepted without giving an
+       * identifier.  That is a real result about this port's Association
+       * Request and it is reported as what it is, without touching the address
+       * CAM: there is no identifier to put in it.
+       */
+
+      k1_early_puts("K1 Wi-Fi GPL: assoc refused status=");
+      k1_early_puthex(decided->status);
+      k1_early_puts(" aid=");
+      k1_early_puthex(decided->aid);
+      k1_early_puts("\r\n");
+      return OK;
+    }
+
+  /* Upstream order for an association identifier: JOININFO first, then the
+   * address CAM update carrying the AID.
+   */
+
+  ret = k1_rtl8852bs_runtime_join_info_submit(
+    "assoc info", K1_RTL8852BS_ASSOC_INFO_H2C_SEQUENCE);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  ret = k1_rtl8852bs_runtime_join_addr_cam_submit(
+    "assoc CAM", K1_RTL8852BS_ASSOC_CAM_H2C_SEQUENCE, self_mac, bssid,
+    decided->aid);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  k1_rtl8852bs_runtime_port_log("post-assoc-cam");
+
+  ret = k1_rtl8852bs_runtime_scanofld_passive_scan(&result);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  confirm_beacons = k1_rtl8852bs_runtime_scan_beacon_frames(&result, bssid);
+
+  k1_early_puts("K1 Wi-Fi GPL: assoc confirm bss=");
+  k1_early_puthex(result.bss_count);
+  k1_early_puts(" beacons=");
+  k1_early_puthex(confirm_beacons);
+  k1_early_puts(" aid=");
+  k1_early_puthex(decided->aid);
+  k1_early_puts("\r\n");
+
+  if (result.bss_count == 0 || confirm_beacons == 0)
+    {
+      ret = -EPROTO;
+      goto error;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station association complete\r\n");
+  return OK;
+
+error:
+  k1_early_puts("K1 Wi-Fi GPL: station association error=");
   k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
   k1_early_puts("\r\n");
   return ret;

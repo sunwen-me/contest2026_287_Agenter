@@ -1,0 +1,48 @@
+# RTL8852BS2 association: ask one real access point to associate this host and
+# require its Association Response back.
+#
+# The parent is the station-join profile whose whole chain already passed on the
+# board, so one run of this image re-validates everything proven before -
+# firmware download, the runtime control plane, the no-link role and CAM, the
+# passive 2.4 GHz 1-13 sweep with real Beacon RX, the wlan0 netdev whose wapi
+# scan reports those access points, the Probe Request/Response exchange, the
+# directed Authentication Request/Response, and the JOININFO + ADDR_CAM_UPDATE
+# that tell the firmware and the hardware this host is a station in that BSS -
+# and then adds the one new frame.
+#
+# That frame is the Association Request. It carries the capability information
+# an 802.11ax part honestly has (ESS, short preamble, short slot time, Privacy
+# clear), a listen interval of one beacon, the SSID and the same two rate
+# elements the Probe Request advertises. There is no RSN element, because this
+# host has no security engine initialized and holds no key, so the step only
+# ever aims at an access point that advertises no Privacy and reports
+# EOPNOTSUPP when there is none in range.
+#
+# Authentication and association go out inside one sweep. IEEE 802.11 clause
+# 11.3 accepts an Association Request only while the access point still holds
+# this host in state 2 from its Authentication Response, so the request is
+# transmitted from the receive loop the moment that response is decoded, with
+# the radio still parked on the target's channel by the scan-offload dwell.
+#
+# Up to two attempts are made, differing only in the SSID: first what the
+# target advertised - zero length included, which is the only SSID there is
+# evidence for - and then, when the target suppressed its SSID and the first
+# attempt did not associate, the SSID of a sibling BSS on the same channel
+# whose BSSID differs only in the first octet. That second one is a labelled
+# guess and every line it produces says ssid-source=sibling.
+#
+# An answered exchange is the result whatever status code it carries. Only
+# status 0 with a non-zero association identifier prints the completion line,
+# and only then are the two connect commands re-sent with that identifier, in
+# the vendor order (JOININFO, then ADDR_CAM_UPDATE), followed by a confirming
+# sweep that must still receive the target's Beacons.
+#
+# This is not a link. No key is installed, no four-way handshake is run, no
+# data frame is sent or received, no wlan0 behaviour changes, no IP address is
+# configured, and the port's TSF is still frozen because mac_port_init() is not
+# ported yet. Still RAM-only: nothing written to eMMC, SPI flash, eFuse or the
+# U-Boot environment.
+
+#include "../wireless_join_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC=y

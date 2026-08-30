@@ -986,6 +986,28 @@ int k1_wireless_initialize(void)
                       ret = probe_ret;
                     }
                 }
+
+#      ifdef CONFIG_K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
+
+              /* The association runs last, after the join has told the
+               * firmware and the address CAM which BSS this host belongs to,
+               * because that is the order IEEE 802.11 and the vendor connect
+               * path both use.  It re-runs the authentication exchange itself
+               * inside each of its own sweeps, since an Association Request is
+               * only accepted while the access point still holds this host in
+               * state 2 from that answer.
+               */
+
+              if (probe_ret >= 0)
+                {
+                  probe_ret =
+                    k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(wifi_mac);
+                  if (probe_ret < 0)
+                    {
+                      ret = probe_ret;
+                    }
+                }
+#      endif
 #    endif
 #  endif
 #endif

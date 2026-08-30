@@ -269,6 +269,20 @@ def parse_args() -> argparse.Namespace:
               "still work afterwards"),
     )
     parser.add_argument(
+        "--require-runtime-assoc-response", action="store_true",
+        help=("fail unless an Association Request is transmitted to an access "
+              "point that advertises no Privacy and an Association Response "
+              "addressed to the eFuse self MAC is received back, whatever "
+              "status code it carries"),
+    )
+    parser.add_argument(
+        "--require-runtime-assoc", action="store_true",
+        help=("fail unless that Association Response grants a non-zero "
+              "association identifier, the firmware acknowledges the JOININFO "
+              "and address CAM update carrying it, and the confirming sweep "
+              "still receives the target's Beacons"),
+    )
+    parser.add_argument(
         "--require-wlan0-scan", action="store_true",
         help=("fail unless wlan0 registers and a wapi passive scan returns at "
               "least one Beacon/Probe-Response BSS through SIOCGIWSCAN"),
@@ -1535,6 +1549,99 @@ def main() -> int:
             )
             if join_end_result is None:
                 missing.append("RTL8852BS2 station join completion")
+        if args.require_runtime_assoc_response or args.require_runtime_assoc:
+            # Everything is judged from the lines the association step prints,
+            # sliced from its own target line so none of the earlier steps'
+            # reports can satisfy these checks.  The target line also has to
+            # say privacy=0x0: this port offers no cipher suite, so an
+            # association claimed against a Privacy access point would mean the
+            # target selection had been bypassed rather than that the exchange
+            # worked.
+            assoc_target_result = None
+            for candidate in re.finditer(
+                    rb"K1 Wi-Fi GPL: assoc target bssid=([0-9a-f]{12}) "
+                    rb"channel=(?:0x)?0*[1-9a-fA-F][^\r\n]* privacy=0x0+"
+                    rb"(?![0-9a-fA-F])",
+                    started):
+                if candidate.group(1).strip(b"0"):
+                    assoc_target_result = candidate
+                    break
+
+            if assoc_target_result is None:
+                missing.append(
+                    "RTL8852BS2 association target BSS without Privacy")
+                assoc = started
+            else:
+                assoc = started[assoc_target_result.end():]
+
+            # The first attempt always uses the SSID the target advertised.  A
+            # run whose only attempt was the sibling guess would be a different
+            # experiment and is not accepted as this one.
+            assoc_advertised_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc advertised begin "
+                rb"ssid-source=advertised",
+                assoc,
+            )
+            if assoc_advertised_result is None:
+                missing.append(
+                    "RTL8852BS2 association attempt with the advertised SSID")
+
+            assoc_tx_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc request tx channel=(?:0x)?0*"
+                rb"[1-9a-fA-F][^\r\n]* status=0x0+(?![0-9a-fA-F])",
+                assoc,
+            )
+            if assoc_tx_result is None:
+                missing.append("RTL8852BS2 Association Request transmit")
+
+            # rsp on the exchange line is set only by an Association Response
+            # whose A1 was compared against the eFuse self MAC in host
+            # software, so no register setting can let another station's frame
+            # satisfy it.
+            assoc_response_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc exchange rsp=(?:0x)?0*[1-9a-fA-F]",
+                assoc,
+            )
+            if assoc_response_result is None:
+                missing.append("RTL8852BS2 Association Response RX")
+        if args.require_runtime_assoc:
+            # A granted association identifier, both re-sent connect commands
+            # acknowledged with it, and a confirming sweep that still hears the
+            # target.  The completion line is printed only for status 0 with a
+            # non-zero identifier, so a refusal cannot satisfy this.
+            assoc_info_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc info done-ack "
+                rb"return=0x0+(?![0-9a-fA-F])",
+                assoc,
+            )
+            if assoc_info_result is None:
+                missing.append(
+                    "RTL8852BS2 association JOININFO done-ack with the AID")
+
+            assoc_cam_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc CAM done-ack "
+                rb"return=0x0+(?![0-9a-fA-F])",
+                assoc,
+            )
+            if assoc_cam_result is None:
+                missing.append(
+                    "RTL8852BS2 association address CAM done-ack with the AID")
+
+            assoc_confirm_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc confirm bss=(?:0x)?0*[1-9a-fA-F]"
+                rb"[^\r\n]* beacons=(?:0x)?0*[1-9a-fA-F]",
+                assoc,
+            )
+            if assoc_confirm_result is None:
+                missing.append(
+                    "RTL8852BS2 Beacon RX after the association AID update")
+
+            assoc_end_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 station association complete\r?\n",
+                assoc,
+            )
+            if assoc_end_result is None:
+                missing.append("RTL8852BS2 station association completion")
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

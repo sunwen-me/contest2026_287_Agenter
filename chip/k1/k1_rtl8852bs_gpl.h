@@ -79,6 +79,21 @@ struct k1_rtl8852bs_mgmt_frame_s
   bool is_probe_response;
   bool bssid_valid;
   bool ssid_present;
+
+  /* The RSN element, decoded only as far as the three facts that decide
+   * whether a station could ever be associated by this BSS: its group cipher
+   * suite, whether CCMP is offered as a pairwise cipher, and whether the
+   * pre-shared key suite is offered for key management.  rsn_length is the
+   * element's own advertised length, kept so a truncated element is
+   * distinguishable from an absent one.  No key material is parsed, stored or
+   * derived here.
+   */
+
+  uint8_t rsn_length;
+  uint8_t rsn_group_cipher;
+  bool rsn_present;
+  bool rsn_pairwise_ccmp;
+  bool rsn_akm_psk;
 };
 
 /* The maximum number of access points one passive scan sweep reports.  The
@@ -108,7 +123,12 @@ struct k1_rtl8852bs_scan_bss_s
   uint16_t beacon_interval;
   uint16_t beacon_frames;
   uint16_t probe_response_frames;
+  uint8_t rsn_length;
+  uint8_t rsn_group_cipher;
   bool ssid_present;
+  bool rsn_present;
+  bool rsn_pairwise_ccmp;
+  bool rsn_akm_psk;
 };
 
 /* The outcome of one passive scan sweep.  The counters describe what the
@@ -331,6 +351,7 @@ int k1_rtl8852bs_runtime_scanofld_passive_scan(
   FAR struct k1_rtl8852bs_scan_result_s *result);
 int k1_rtl8852bs_fwdl_runtime_auth_diagnostic(FAR const uint8_t *self_mac);
 int k1_rtl8852bs_fwdl_runtime_join_diagnostic(FAR const uint8_t *self_mac);
+int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac);
 int k1_rtl8852bs_fwdl_preboot_diagnostic(void);
 int k1_rtl8852bs_fwdl_h2c_tx_diagnostic(void);
 int k1_rtl8852bs_fwdl_fw_header_packet_diagnostic(void);
