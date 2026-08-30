@@ -413,7 +413,7 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   **失败不中断关联**：`FUNC_EN` 一旦写下去，中途放弃会留下半配置的 port 并把这一轮要收集的
   握手证据一起丢掉；代价是 `RTL8852BS2 port init complete` 只在「序列跑完 ＋ TSF 在走」
   时才打，`--require-runtime-port-init` 认这一行加 `status=0x0 tsf=0x1` 的结果行。
-- **已实现、上板跑过 run 36／run 37、修完待上板 run 38（增量 3h）：不跑扫描的驻留收发窗口。**
+- **已实现、run 38 上板通过（增量 3h）：不跑扫描的驻留收发窗口。**
   Kconfig 符号 `K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC`（`depends on
   K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC`，只有 wpa profile 打开），跑在装钥匙之后。
   它先把 3e/3f/3g 那句「没有驻留信道」证伪（见上面「尚未完成，禁止误报」里那段更正），
@@ -450,15 +450,47 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   这是所有 unparked sweep 共有的竞态，run 37 是第一次撞上。
   runner 在同一个 flag 里多认两条：`RTL8852BS2 station resident park complete`，以及
   `resident park after`／`resident window parked=` 两行的 `parked=` 与 `target=` 数值相等。
-- **下一步优先级**：(1) 发送描述符的安全字段（`sec_type`/`sec_cam_idx`）：这是第一次可能
+  **run 38（`k1-wpa-20260830T230957Z.log`）35 条 `--require-*` 全过**，这一节的判据到这一轮
+  才齐：两趟 unparked sweep 都判成完成（`complete-at=0x77f polls=0x7a0`、
+  `complete-at=0x715 polls=0x734`，竞态确实修掉了）；park 把射频从确认 sweep 留下的信道 13
+  带回 1（`parked=0xd bb-ch=0xd` → `parked=0x1 bb-ch=0x1`，`sweep-err=0x0`，这趟停驻 sweep
+  自己收了 30 帧目标 Beacon）；三秒窗口里 `frames=0x6b beacons=0x5c bcn-target=0x2a
+  probes=0x1 probe-rsp=0x4 probe-rsp-self=0x1 data-target=0x4 deauth=0x0 parse-err=0x0
+  ch-stable=0x1 rx=0x0 filter=0x0`——**没有任何 dwell 在跑，本端自己放宽滤波器就持续收到目标
+  Beacon，并在 dwell 之外完成了一次定向 Probe Request/Response**，进出两次寄存器采样逐项相等，
+  三个滤波器全部原值写回。`unclassified=0x5` 是另一台 station 的广播 Probe Request
+  （`head=40000000ffffffffffff…`），滤波器放宽后本该收到。意外收获、也是下一步的材料：
+  `data=0x6` 其中 `data-target=0x4`，关联的 AP 在这三秒里发了 4 帧数据帧过来，本端只数了帧头，
+  还没读 RX 描述符的 `HW_DEC`（DW3 BIT(2)）／`ICV_ERR`（DW3 BIT(10)）／`SEC_TYPE`
+  （DW7 [20:17]）——读出来就能一帧不发地证明装进去的 GTK 在解组播帧。
+- **下一步优先级**：(1) 先解码 RX 描述符的解密状态位（`HW_DEC` DW3 BIT(2)、`ICV_ERR`
+  DW3 BIT(10)、`SEC_TYPE` DW7 [20:17]、`SEC_CAM_IDX` DW5 [7:0]）：run 38 的驻留窗口已经收到
+  4 帧来自目标 AP 的数据帧，读这四个位就能**一帧不发**地证明装进去的 GTK 真的在解密；本端
+  解析器现在只留了 `descriptor0`／`descriptor3`，`SEC_TYPE` 要长描述符（32 字节）才有。
+  接着才是发送描述符的安全字段（`sec_type`/`sec_cam_idx`）：这是第一次可能
   有「被 CCMP 保护的数据帧」。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
   信道本来就是驻留的（增量 3h 的更正一），所以挡在「密钥装好」和「能收发数据」之间的
   只剩这一条——描述符不引用安全 CAM index，硬件就不会去加密。
+  字段位置和取值现在都有出处：WD info dword2（描述符偏移 `24+8`）里 `sec_type` [12:9]、
+  `sec_hw_enc` BIT(8)、`sec_cam_idx` [7:0]（原厂 `trx_desc_8852b.c:295-297` 与
+  `txdesc.h:136-140`，和 mainline `RTW89_TXWD_INFO2_SEC_*` 逐位相同；8852B 的 WD body
+  不带安全字段，`AX_TXD_SEC_KEYID` 那一路是别的芯片用的）。`sec_type` 取的**就是安全
+  CAM 那一项的 `type`**：mainline `core.c` 的 `rtw89_core_tx_update_sec_key()` 里
+  `desc_info->sec_type = sec_type`，而 `cam.c:433` 的 `sec_cam->type = hw_key_type` 是
+  同一个 `enum rtw89_sec_key_type`，CCMP-128 = 6，正是本移植已经写进安全 CAM 的
+  `K1_RTL8852BS_SEC_CAM_ENC_CCMP128`——先前怀疑的 `MAC_TXD_OFLD_HW_ENC_CCMP128= 0x8`
+  属于另一张表（`mac_txd_ofld_wp_offset`），不是这里，不要用。
+  还有一条决定帧怎么拼：8852B 的 `hw_sec_hdr = false`（mainline `rtw8852b.c:1007`），
+  `cam.c:523` 因此给密钥加上 `IEEE80211_KEY_FLAG_GENERATE_IV`——**CCMP 头那 8 字节
+  （PN 与 KeyID）必须由主机自己放进帧里，硬件只负责加密并在尾部追加 8 字节 MIC**，
+  描述符里的帧长不含这 8 字节。让 MAC 自己建头的那条路（`mac_ax_dctl_info` 的
+  `sec_hw_enc`/`sec_cam_idx`、48 位 `aes_iv_l`+`aes_iv_h` 硬件 PN、`with_llc`、
+  `mhdr_len`）是另一套机制，本移植的裸 802.11 发送路径用不到。
   **这一条原先写的是「`rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1」排第一，理由是
   「仍然在停驻的扫描 dwell 上发帧」；那个理由被 3h 证伪了**，`set_channel` 因此降级成
   「以后要切信道时才需要」，不再是数据面的前提。3b/3c/3d 欠的 `JOININFO` 顺序已在 3g
   还清（认证前 `disconn=0x1`、关联时 `disconn=0x0`）。增量 3h 自己（不跑扫描的驻留收发
-  窗口）代码已实现、构建干净，**待上板 run 36**。
+  窗口）已上板跑过 run 36／run 37／run 38，前两轮的失败都已定位修完，**run 38 一次跑通**。
   (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
   发送正确性与 RSSI 精度要靠它；同一批还有 `set_enable_bb_rf(hal, 0)` 的 disable 半边、
   `halbb_dm_init()`/`halrf_dm_init()` 正文、五张 `init_rf_reg` store 表、halbb `phy_reg_gain`。
@@ -581,8 +613,9 @@ Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手�
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
 **当前实际下一步是数据面：发送描述符的安全字段**——密钥已经在硬件里、port 也已经使能、
 信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），但没有任何一条发送路径去引用
-安全 CAM index，所以仍然一帧 CCMP 都没有。中间夹着增量 3h 本身：不跑扫描的驻留收发窗口，
-代码已实现、两个镜像都构建干净，**待上板 run 36**（`--require-runtime-resident`）。
+安全 CAM index，所以仍然一帧 CCMP 都没有。增量 3h 本身（不跑扫描的驻留收发窗口）
+已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题
+都已修完）。
 做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e/3f/3g/3h 镜像：
 
 ```bash

@@ -5687,7 +5687,7 @@ TSF 在 `FUNC_EN` **之前**就已经是 AP 自己的计时器（run 34 的 `c43
 
 代码已实现，上板跑过两轮：**run 36 证伪了本节的一个设计假设**（关联跑完射频并不在目标
 信道上），**run 37 撞上 sweep 完成判定里的一个竞态**（它自己把关联和四次握手全过了，
-`mic=0x1 msg4=0x1`，但确认 sweep 报了 `-ETIMEDOUT`）。两个原因都已修，**run 38 待上板**。
+`mic=0x1 msg4=0x1`，但确认 sweep 报了 `-ETIMEDOUT`）。两个原因都修完之后 **run 38 一次跑通**，本节的判据到这一轮才全部拿到证据。
 除了下面三条更正——它们的证据来自 run 35——本节的设计与判据都是写在上板之前的，
 两轮板上结果和它们引出的改动补在本节末尾。
 
@@ -5967,19 +5967,100 @@ run 37  3065 C2H ch=0xd reason=0x3      3066 C2H ch=0xd reason=0x5    3068 next-
 `complete-at=`／`polls=`：**「走完了但 drain 没做完」和「根本没走完」以后是两个可区分的
 读数**，而不是同一个 `-ETIMEDOUT`。
 
+#### 板上结果三：run 38 把本节的判据跑齐了
+
+串口 `out/k1-serial/k1-wpa-20260830T230957Z.log`，35 条 `--require-*` 全过，其中包含
+`--require-runtime-resident`。关联仍然落在 `SB` 的 `504f3be2e6d2`（`aid=0x1 status=0x0
+wpa=0x1 msg1=0x1 msg2=0x1 msg3=0x1 mic=0x1 msg4=0x1`），port init、四次握手、装钥匙都在
+原位一次过。
+
+先看竞态修没修掉。两趟 unparked sweep（`enter-mask=0x1fff`）这次都判成了完成：
+
+```
+passive scan walk enter-mask=0x1fff next=0x1ffe fw-next=0x1 end=0x1 complete-at=0x77f polls=0x7a0
+passive scan walk enter-mask=0x1fff next=0x1ff1 fw-next=0xe end=0x1 complete-at=0x715 polls=0x734
+```
+
+`complete-at` 每次都比 `polls` 小一小段——判定成立之后还剩几十轮在做 drain，正是新读数要
+区分的那两件事；`-ETIMEDOUT` 一次没有。
+
+再看新加的 park 步骤。装完钥匙时射频确实停在确认 sweep 留下的信道 13 上，park 把它带回 1：
+
+```
+resident channel park-before … bb0734=0x000d0000 … rf18-a=0x1c0d rf18-b=0x1c0d
+resident park before parked=0xd bb-ch=0xd target=0x1 sweep=0x1
+resident park after  parked=0x1 bb-ch=0x1 target=0x1 sweep-err=0x0 bss=0x8 bcn-target=0x1e
+RTL8852BS2 station resident park complete
+```
+
+`sweep=0x1` 是「需要一趟停驻 sweep」，`bcn-target=0x1e` 是这趟 sweep 自己收到的 30 帧目标
+Beacon；两个信道读法（RF `0x18` 低八位、BB `0x0734` [23:16]）一致地从 13 变成 1。
+
+然后是这一节真正要的那三秒。窗口自己不开 sweep，只把三个接收滤波器放宽再放回去：
+
+```
+resident window enter channel=0x1 ssid-len=0x2 window-ms=0xbb8
+resident window parked=0x1 bb-ch=0x1 target=0x1
+scan RX filter before ce20=0xf0170001 ce30=0x00000000
+scan RX filter scan   ce20=0xf017000f ce30=0x55550055
+resident probe tx sn=0xc bytes=0x2c status=0x0
+scan RX filter after  ce20=0xf0170001 ce30=0x00000000
+resident window channel=0x1 polls=0xd23 rx-reads=0x264 frames=0x6b beacons=0x5c
+  bcn-target=0x2a probes=0x1 probe-status=0x0 probe-rsp=0x4 probe-rsp-self=0x1
+  data-target=0x4 deauth=0x0 reason=0x0 parse-err=0x0 oversize=0x0 ch-stable=0x1
+  rx=0x0 filter=0x0
+resident window frames total=0x6b mgmt=0x65 ctrl=0x0 data=0x6 ext=0x0 data-all=0x6
+  self-tx=0x0 mgmt-other=0x5 subtypes=0x10 unclassified=0x5
+resident window unclassified head=40000000ffffffffffff02d1d4dc3116
+```
+
+读数逐条对上判据：3363 轮轮询里 612 次读到东西，107 帧，92 帧 Beacon——其中 42 帧来自关联
+的那个 AP；一帧定向 Probe Request 发了出去（`status=0x0`），回来 4 帧 Probe Response，其中
+1 帧的 A1 是本机（`probe-rsp-self=0x1`）；`ch-stable=0x1` 是进出两次采样的信道寄存器逐个
+相等（`resident-enter` 与 `resident-exit` 都是 `rf18-a/b=0x1c01`、`bb0734=0x00010000`），
+`filter=0x0` 是三个滤波器都放回了原值（`ce20`／`ce30` 前后一致），`deauth=0x0` 是 AP 没有
+把这条关联踢掉，`parse-err=0x0 oversize=0x0` 是 107 帧全部解析成功。**「信道是本端驻留的」
+这句话到这里才有证据**：没有任何 dwell 在跑，本端自己放宽滤波器就持续收到目标 Beacon，
+并且在 dwell 之外完成了一次定向 Probe Request/Response。
+
+`unclassified=0x5` 那 5 帧不是异常：头 16 字节 `40 00 0000 ffffffffffff 02d1d4dc3116` 是另
+一台 station 广播的 Probe Request（`FC=0x0040`，A2 是一个本地管理位置 1 的随机 MAC），滤波器
+放宽之后本来就该收到——它顺带说明收到的确实是空口上的第三方帧，不是本端自己的回环。
+
+还有一条读数是写这一节时没预料到的，下一步会用上：`data=0x6`，其中 `data-target=0x4`——
+关联的那个 AP 在这三秒里发了 4 帧数据帧过来（滤波器放宽之后能收到的，多半是它转发给整个
+BSS 的组播）。本端只按帧头数了个数，**没有**去看硬件有没有用装进去的 GTK 把它们解开：
+RX 描述符的 `HW_DEC`／`ICV_ERR`（DW3 BIT(2)／BIT(10)）和 `SEC_TYPE`（DW7 [20:17]）本端还
+没解码。
+
 #### 还没做的
 
-**这仍然不是一条通的链路。** 这一增量哪怕全过，也只是证明「不跑扫描时收发循环还活着」：
-发送描述符的安全字段仍然没填，仍然没有一帧被 CCMP 保护过，`wlan0` 的行为一个字节没变，
-没有 DHCP、没有联网。密钥的三层处理照旧（profile 留空、构建脚本从 `~/.config/k1-wifi-psk.env`
+**这仍然不是一条通的链路。** run 38 全过，证明的也只是「不跑扫描时收发循环还活着」：
+发送描述符的安全字段仍然没填，本端仍然没有发出过一帧被 CCMP 保护的帧；窗口里收到的那 6 帧
+数据帧只按帧头数了个数，硬件到底有没有用装进去的钥匙解开它们，本端还没读 RX 描述符的解密
+状态位，所以也不算证据。`wlan0` 的行为一个字节没变，没有 DHCP、没有联网。密钥的三层处理照旧（profile 留空、构建脚本从 `~/.config/k1-wifi-psk.env`
 读、`out/k1-wpa` 不发布），这一步新增的打印里没有任何由密钥派生的值。仍然是 RAM-only：
 eMMC / SPI flash / eFuse / U-Boot 环境一个都没写。
 
 #### 下一步
 
-1. 上板跑 run 38（需要用户按 RST，`--boot-timeout 900`）：确认 sweep 的竞态修掉之后
-   走到 park 步骤和驻留窗口，把本节最后一块证据补齐。
+1. 解码 RX 描述符的解密状态位——`HW_DEC`（DW3 BIT(2)）、`ICV_ERR`（DW3 BIT(10)）、
+   `SEC_TYPE`（DW7 [20:17]）、`SEC_CAM_IDX`（DW5 [7:0]），把驻留窗口里那几帧来自目标 AP
+   的数据帧按这四个读数分类打出来。这是**一帧都不用发**就能拿到的证据：硬件若报
+   `HW_DEC=1 ICV_ERR=0 SEC_TYPE=6`，装进去的 GTK 就真的在解组播帧，`sec_ent_mode`、
+   ADDR_CAM 的槽号、安全 CAM 的那三十二字节一次全被证明。注意 `SEC_TYPE` 在 DW7，
+   只有长描述符（32 字节，`descriptor0` BIT(31)）才有，本端的解析器目前只留了
+   `descriptor0`／`descriptor3`（增量 3i 的前半）。
 2. 发送描述符的安全字段（`sec_type` / `sec_cam_idx`）——密钥在 CAM 里、槽也有了、信道是
-   驻留的、port 是使能的，缺的只是发送路径去引用安全 CAM index（增量 3i）。
+   驻留的、port 是使能的，缺的只是发送路径去引用安全 CAM index（增量 3i 的后半）。
+   字段与取值现在都有出处：WD info dword2（描述符偏移 `24+8`）的 `sec_type` [12:9]、
+   `sec_hw_enc` BIT(8)、`sec_cam_idx` [7:0]（原厂 `trx_desc_8852b.c:295-297` ＋
+   `txdesc.h:136-140`，与 mainline `RTW89_TXWD_INFO2_SEC_*` 逐位相同），`sec_type` 取的就是
+   安全 CAM 那一项的 `type`（mainline `core.c` 的 `rtw89_core_tx_update_sec_key()` 与
+   `cam.c:433` 用同一个 `enum rtw89_sec_key_type`），CCMP-128 = 6，正是本移植已经写进安全
+   CAM 的那个值；`MAC_TXD_OFLD_HW_ENC_CCMP128 = 0x8` 属于另一张表，不要用。另外 8852B 的
+   `hw_sec_hdr = false`（mainline `rtw8852b.c:1007`，`cam.c:523` 因此给密钥加
+   `IEEE80211_KEY_FLAG_GENERATE_IV`）：**CCMP 头那 8 字节要主机自己拼进帧里，硬件只加密并在
+   尾部追加 8 字节 MIC，描述符里的帧长不含这 8 字节**。
 3. `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI）那一批，以及把
    认证／关联响应的前 32 字节原样打到串口这条一直没补的证据。
