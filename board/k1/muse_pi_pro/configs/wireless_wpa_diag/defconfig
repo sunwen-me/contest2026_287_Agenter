@@ -64,15 +64,37 @@
 # console carries which frame arrived, which one went out, and whether the
 # integrity code verified.
 #
+# The association also programs CMAC port 0 now, which is the band 0 / port 0
+# infrastructure subset of the vendor's mac_port_init() and the first time this
+# port writes that register block rather than only reading it. It runs where
+# upstream runs it - after JOININFO and the address CAM update, on the
+# association that granted an identifier - and every field it programs has to
+# read back. Most of the block already holds what a station wants, left there
+# by the firmware's own bring-up, so what actually changes is the network type,
+# the function enable, the two beacon report enables and the prohibit window's
+# hold and setup times; the console names each field with what it held and what
+# it holds afterwards. The two absences are named rather than dropped: the
+# disable flow cannot apply to a port initialised once per boot, and
+# mac_wde_pkt_drop()'s body is not in the vendor source this port was written
+# against, so the high-queue release is a read of the beacon drop register and a
+# logged no-op.
+#
+# The same run therefore also settles what the earlier profiles could only note:
+# the port's TSF was never frozen. It reads as the access point's own timer well
+# before this step, because the receive BSSID filter and the TSF update enable
+# were already set and the address CAM holds the BSSID, and dly_port_us() - the
+# TSF-based wait mac_port_init() places between the function enable and the
+# beacon early time - is what says so from inside the sequence.
+#
 # This is still not a working link. The keys are installed and acknowledged by
-# the firmware, which is all this claims: nothing is encrypted or decrypted
-# yet, because the transmit descriptor's security fields are not filled in and
-# there is no data path to fill them for. No data frame beyond the unprotected
-# EAPOL-Key frames is sent or received, no wlan0 behaviour changes, no IP
-# address is configured, and the port's TSF is still frozen because
-# mac_port_init() is not ported yet. Still RAM-only: nothing written to eMMC,
-# SPI flash, eFuse or the U-Boot environment.
+# the firmware, and the port is enabled, which is all this claims: nothing is
+# encrypted or decrypted yet, because the transmit descriptor's security fields
+# are not filled in and there is no data path to fill them for. No data frame
+# beyond the unprotected EAPOL-Key frames is sent or received, no wlan0
+# behaviour changes and no IP address is configured. Still RAM-only: nothing
+# written to eMMC, SPI flash, eFuse or the U-Boot environment.
 
 #include "../wireless_assoc_diag/defconfig"
 
+CONFIG_K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC=y
 CONFIG_K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC=y

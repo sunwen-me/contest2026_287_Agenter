@@ -810,10 +810,70 @@ config K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
 		completion line is printed only for status 0 with a non-zero identifier,
 		and a refusal is reported as a refusal. An identifier is not a working
 		link: no key is installed, no data frame is sent or received, no network
-		device changes behaviour, no IP address is configured, and the port's TSF
-		is still frozen because mac_port_init() is not ported yet. This option
-		runs no four-way handshake; K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC is the
-		one that does. Nothing is written to eMMC, SPI flash, eFuse or the U-Boot
+		device changes behaviour and no IP address is configured. On its own this
+		option also leaves CMAC port 0 unenabled - its function enable clear and
+		its network type still reading no-link - because mac_port_init() runs
+		under K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC. The port's TSF does
+		follow the access point regardless: the receive BSSID filter and the TSF
+		update enable are set by the firmware's own bring-up, so once the address
+		CAM holds the BSSID the port's timer tracks the Beacons it matches, which
+		the register block this step logs on both sides of a join shows. This
+		option runs no four-way handshake; K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC
+		is the one that does. Nothing is written to eMMC, SPI flash, eFuse or the
+		U-Boot environment.
+
+config K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC
+	bool "Program RTL8852BS2 CMAC port 0 at association"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
+	---help---
+		Run the band 0 / port 0 infrastructure subset of the vendor's
+		mac_port_init() when an access point grants an association identifier,
+		and require every field it programs to read back.
+
+		Until this option the port's register block was read and never written.
+		The firmware's own bring-up already leaves most of it in the state a
+		station wants - the receive BSSID filter, the TSF update from received
+		Beacons, the TBTT prohibition, beacon transmission off, the 100 TU
+		spacing, the beacon and TBTT early times - which is why the port's timer
+		already follows the access point's Beacons before this runs. What it does
+		not leave set is the part that makes the port a station of that BSS: the
+		network type still reads no-link and the function enable is clear. Those
+		two, the two beacon report enables and the prohibit window's hold and
+		setup times are what this option changes, and the console names each
+		field with what it held and what it holds afterwards, so a run says which
+		writes this step was responsible for rather than that it issued them.
+
+		The order is the vendor's, including the parts that matter for the
+		result: the function enable is written last of the block, the port is
+		only then an infrastructure station, and only after that do the three
+		beacon-timing validators - which return success without reading anything
+		while the port is still disabled - inspect the hardware for the beacon
+		early, setup and TBTT early times. Between the enable and those three
+		writes sits dly_port_us(), which waits for the port's own TSF to advance
+		rather than for host time, and reports a timer that reads the same value
+		twice as a stopped one.
+
+		Three parts of the upstream routine are not here and each is named on the
+		console instead of being dropped silently. The disable flow only applies
+		to a port that was already initialised, which cannot happen here because
+		one association step runs per boot. mac_wde_pkt_drop()'s body is not in
+		the vendor source this port was written against, so the high-queue
+		release is a read of the beacon drop register and a logged no-op - with a
+		high-queue window and a DTIM period of zero, a station has nothing queued
+		there. The multi-BSSID sub-interval split and the TBTT shift feature are
+		both access-point-only.
+
+		This is not a working link and it is not what stands between this port
+		and one. An enabled port is a precondition for a data path, not a data
+		path: no transmit descriptor references a security CAM index yet, so
+		nothing is encrypted or decrypted, no frame beyond the unprotected
+		EAPOL-Key frames is sent or received, no network device changes behaviour
+		and no IP address is configured. A failure here is logged and does not
+		abort the association step, because the four-way handshake that follows
+		in the confirming sweep is what the run exists to collect; the acceptance
+		harness requires this step's own completion line, so a failure fails the
+		run there. Nothing is written to eMMC, SPI flash, eFuse or the U-Boot
 		environment.
 
 config K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC

@@ -39,11 +39,17 @@
 # sweep that must still receive the target's Beacons.
 #
 # This is not a link. No key is installed, no data frame is sent or received,
-# no wlan0 behaviour changes, no IP address is configured, and the port's TSF is
-# still frozen because mac_port_init() is not ported yet. This profile runs no
-# four-way handshake; wireless_wpa_diag is the profile that does. Still
-# RAM-only: nothing written to eMMC, SPI flash, eFuse or the U-Boot
-# environment.
+# no wlan0 behaviour changes and no IP address is configured. CMAC port 0 is
+# also left unenabled here - its function enable clear and its network type
+# still reading no-link - because mac_port_init() runs under
+# CONFIG_K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC, which wireless_wpa_diag
+# sets and this profile does not. The port's TSF follows the access point
+# regardless: the firmware's bring-up leaves the receive BSSID filter and the
+# TSF update enable set, so once the address CAM holds the BSSID the port's
+# timer tracks the Beacons it matches, which the register block this profile
+# logs on both sides of the join shows. This profile runs no four-way
+# handshake; wireless_wpa_diag is the profile that does. Still RAM-only:
+# nothing written to eMMC, SPI flash, eFuse or the U-Boot environment.
 
 #include "../wireless_join_diag/defconfig"
 

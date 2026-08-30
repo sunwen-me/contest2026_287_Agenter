@@ -470,24 +470,98 @@ extern void k1_early_puthex(uintreg_t value);
 /* CMAC port 0.  The firmware is told which BSS a MACID belongs to over
  * MEDIA_RPT/JOININFO, but the beacon timing, the network type and the TSF the
  * hardware itself uses live in this register block, which mac_port_init()
- * programs upstream.  This port does not program it yet, so these are read
- * only, to record what the hardware believes while a join is reported.
+ * programs upstream.  Every step before the association reads it for evidence
+ * only; the association step programs the band 0 / port 0 infrastructure
+ * subset of that routine when
+ * CONFIG_K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC is set.
+ *
+ * The three registers whose field widths differ from a whole dword are named
+ * for the access mac_port_init() uses: the beacon early and TBTT early fields
+ * share the dword at 0xc40c, the TBTT aggregation count is the byte at
+ * 0xc413 inside the 16-bit register at 0xc412, and the DTIM count is the byte
+ * at 0xc427 inside the 16-bit register at 0xc426.  The last two are written a
+ * byte at a time because the dword holding them also holds
+ * R_AX_BCN_ERR_FLAG_P0 at 0xc424, which a read-modify-write would rewrite.
  */
 
 #define K1_RTL8852BS_PORT_CFG_P0             0xc400u
+#define K1_RTL8852BS_PORT_CFG_RXBCN_RPT_EN   (1u << 0)
+#define K1_RTL8852BS_PORT_CFG_TXBCN_RPT_EN   (1u << 1)
+#define K1_RTL8852BS_PORT_CFG_FUNC_EN        (1u << 2)
+#define K1_RTL8852BS_PORT_CFG_TSF_UDT_EN     (1u << 3)
+#define K1_RTL8852BS_PORT_CFG_RX_BSSID_FIT   (1u << 4)
+#define K1_RTL8852BS_PORT_CFG_NET_TYPE_MASK  0x00000c00u
+#define K1_RTL8852BS_PORT_CFG_NET_TYPE_SHIFT 10u
+#define K1_RTL8852BS_PORT_CFG_BCNTX_EN       (1u << 12)
+#define K1_RTL8852BS_PORT_CFG_TBTT_PROHIB_EN (1u << 13)
+#define K1_RTL8852BS_PORT_CFG_BRK_SETUP      (1u << 16)
+#define K1_RTL8852BS_PORT_NET_TYPE_NO_LINK   0u
+#define K1_RTL8852BS_PORT_NET_TYPE_INFRA     2u
 #define K1_RTL8852BS_TBTT_PROHIB_P0          0xc404u
+#define K1_RTL8852BS_TBTT_HOLD_P0_MASK       0x0fff0000u
+#define K1_RTL8852BS_TBTT_HOLD_P0_SHIFT      16u
+#define K1_RTL8852BS_TBTT_SETUP_P0_MASK      0x000000ffu
 #define K1_RTL8852BS_BCN_AREA_P0             0xc408u
+#define K1_RTL8852BS_BCN_MSK_AREA_P0_MASK    0x0fff0000u
+#define K1_RTL8852BS_BCN_MSK_AREA_P0_SHIFT   16u
 #define K1_RTL8852BS_BCNERLYINT_CFG_P0       0xc40cu
+#define K1_RTL8852BS_BCNERLY_P0_MASK         0x00000fffu
+#define K1_RTL8852BS_TBTTERLY_P0_MASK        0x0fff0000u
+#define K1_RTL8852BS_TBTTERLY_P0_SHIFT       16u
 #define K1_RTL8852BS_TBTT_AGG_P0_WORD        0xc410u
+#define K1_RTL8852BS_TBTT_AGG_P0_NUM_BYTE    0xc413u
 #define K1_RTL8852BS_BCN_SPACE_CFG_P0        0xc414u
+#define K1_RTL8852BS_BCN_SPACE_P0_MASK       0x0000ffffu
+#define K1_RTL8852BS_SUB_BCN_SPACE_P0_MASK   0x00ff0000u
+#define K1_RTL8852BS_DTIM_NUM_P0_BYTE        0xc427u
 #define K1_RTL8852BS_TSFTR_LOW_P0            0xc438u
 #define K1_RTL8852BS_TSFTR_HIGH_P0           0xc43cu
+#define K1_RTL8852BS_BCN_DROP_ALL0           0xc560u
+#define K1_RTL8852BS_BCN_DROP_ALL_P0         (1u << 0)
+#define K1_RTL8852BS_P0MB_HGQ_WINDOW_CFG_0   0xc590u
+
+/* mac_port_init() parameters.  The five defaults are BCN_ERLY_DEF,
+ * BCN_SETUP_DEF, BCN_HOLD_DEF, BCN_MASK_DEF and TBTT_ERLY_DEF from mport.h,
+ * in the units that header uses: beacon early, setup, hold and mask area
+ * count in 32 us beacon-setup ticks, TBTT early counts in TU.  The beacon
+ * interval and the aggregation count are what rtw_hal_mac_port_init() fills
+ * in for an infrastructure station, and TU_TO_BCN_SET converts the interval
+ * into the tick the validators compare against.
+ */
+
+#define K1_RTL8852BS_PORT_BCN_ERLY_DEF       160u
+#define K1_RTL8852BS_PORT_BCN_SETUP_DEF      4u
+#define K1_RTL8852BS_PORT_BCN_HOLD_DEF       400u
+#define K1_RTL8852BS_PORT_BCN_MASK_DEF       0u
+#define K1_RTL8852BS_PORT_TBTT_ERLY_DEF      5u
+#define K1_RTL8852BS_PORT_TBTT_AGG_DEF       1u
+#define K1_RTL8852BS_PORT_BCN_INTERVAL_DEF   100u
+#define K1_RTL8852BS_PORT_TU_TO_BCN_SET      32u
+#define K1_RTL8852BS_PORT_BCN_SET_TO_US      32u
+#define K1_RTL8852BS_PORT_BCN_ERLY_SET_DLY   10u
+#define K1_RTL8852BS_PORT_DLY_US_CNT_LMT     200u
+
+/* enum port_stat from mport.h.  Only the two values this port can reach are
+ * named: a port that has never been initialised, and an infrastructure
+ * station.  The distinction is not cosmetic -- three of mac_port_init()'s
+ * beacon-timing validators return success unconditionally while the port is
+ * still PORT_ST_DIS, so which of them actually inspect the hardware depends on
+ * where in the sequence the port stops being disabled.
+ */
+
+#define K1_RTL8852BS_PORT_ST_DIS             0u
+#define K1_RTL8852BS_PORT_ST_INFRA           3u
 
 #define K1_RTL8852BS_PTCL_COMMON_SETTING0    0xc600u
 #define K1_RTL8852BS_TB_PPDU_CTRL            0xc60cu
 #define K1_RTL8852BS_PTCLRPT_FULL_HDL        0xc660u
+#define K1_RTL8852BS_PTCL_BSS_COLOR_0        0xc6a0u
+#define K1_RTL8852BS_BSS_COLOR_P0_MASK       0x0000003fu
 #define K1_RTL8852BS_RXDMA_CTRL0             0xc804u
 #define K1_RTL8852BS_TCR0                    0xca00u
+#define K1_RTL8852BS_MD_TSFT_STMP_CTL        0xca08u
+#define K1_RTL8852BS_MD_TSFT_UPD_TIMIE       (1u << 0)
+#define K1_RTL8852BS_MD_TSFT_UPD_HGQMD       (1u << 1)
 #define K1_RTL8852BS_TXD_FIFO_CTRL           0xca1cu
 #define K1_RTL8852BS_TRXPTCL_RESP0           0xcc04u
 #define K1_RTL8852BS_MAC_LOOPBACK            0xcc20u
@@ -20605,14 +20679,751 @@ static void k1_rtl8852bs_runtime_port_log(FAR const char *phase)
   k1_rtl8852bs_scan_rx_filter_log(phase, &filter);
 }
 
+#ifdef CONFIG_K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_port_field
+ *
+ * Description:
+ *   Program one field of one CMAC port register the way mac_port_cfg() does:
+ *   read the register, leave it alone when the field already holds the wanted
+ *   value, and otherwise write it and read it back.  Every call prints what
+ *   the field held and what it holds afterwards, because the point of this
+ *   step is not that the writes were issued but that the hardware took them.
+ *
+ *   The skip is upstream behaviour and not an optimisation this port invented:
+ *   mac_port_cfg() guards each of its writes with "if (w_val32 != val32)".  It
+ *   matters for the log more than for the part -- half of what
+ *   mac_port_init() sets on this chip is already set by the firmware's own
+ *   bring-up, and a run whose log says "skip" for those is a run that shows
+ *   which fields this step is actually responsible for.
+ *
+ * Input Parameters:
+ *   name    - short field name for the console line
+ *   address - the register
+ *   mask    - the field, as a mask over the 32-bit register
+ *   value   - the wanted field contents, already shifted into the mask
+ *
+ * Returned Value:
+ *   OK, or a negated errno.  -EIO means the field did not read back.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_port_field(FAR const char *name,
+                                           uint32_t address,
+                                           uint32_t mask,
+                                           uint32_t value)
+{
+  uint32_t before = 0;
+  int ret;
+
+  ret = k1_rtl8852bs_mac_read32(address, &before);
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: port init ");
+      k1_early_puts(name);
+      k1_early_puts(" read-error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: port init ");
+  k1_early_puts(name);
+  k1_early_puts(" was=");
+  k1_early_puthex(before & mask);
+  k1_early_puts(" set=");
+  k1_early_puthex(value);
+
+  if ((before & mask) == value)
+    {
+      k1_early_puts(" skip\r\n");
+      return OK;
+    }
+
+  ret = k1_rtl8852bs_mac_update_field_checked(address, mask, value);
+  if (ret < 0)
+    {
+      k1_early_puts(" error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      return ret;
+    }
+
+  k1_early_puts(" written\r\n");
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_port_byte
+ *
+ * Description:
+ *   The same for the three fields mac_port_init() reaches with an 8-bit
+ *   access.  A byte write is what upstream issues and it is also what this
+ *   port has to issue: the DTIM count at 0xc427 shares its dword with
+ *   R_AX_BCN_ERR_FLAG_P0 at 0xc424, and a read-modify-write of that dword
+ *   would rewrite an error-flag register whose semantics on a write are not
+ *   documented in the vendor header.  The driver's indirect path carries a
+ *   byte write natively, so nothing has to be approximated here.
+ *
+ * Input Parameters:
+ *   name    - short field name for the console line
+ *   address - the byte
+ *   clear   - bits to clear first; 0xff for the plain writes upstream does
+ *   set     - bits to set
+ *
+ * Returned Value:
+ *   OK, or a negated errno.  -EIO means the byte did not read back.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_port_byte(FAR const char *name,
+                                          uint32_t address,
+                                          uint8_t clear,
+                                          uint8_t set)
+{
+  uint8_t before = 0;
+  uint8_t after = 0;
+  uint8_t wanted;
+  int ret;
+
+  ret = k1_rtl8852bs_read(address, &before);
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: port init ");
+      k1_early_puts(name);
+      k1_early_puts(" read-error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      return ret;
+    }
+
+  wanted = (uint8_t)((before & (uint8_t)~clear) | set);
+
+  k1_early_puts("K1 Wi-Fi GPL: port init ");
+  k1_early_puts(name);
+  k1_early_puts(" was=");
+  k1_early_puthex(before);
+  k1_early_puts(" set=");
+  k1_early_puthex(wanted);
+
+  if (before == wanted)
+    {
+      k1_early_puts(" skip\r\n");
+      return OK;
+    }
+
+  ret = k1_rtl8852bs_write(address, wanted);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_read(address, &after);
+    }
+
+  if (ret < 0)
+    {
+      k1_early_puts(" error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      return ret;
+    }
+
+  if (after != wanted)
+    {
+      k1_early_puts(" readback=");
+      k1_early_puthex(after);
+      k1_early_puts("\r\n");
+      return -EIO;
+    }
+
+  k1_early_puts(" written\r\n");
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_port_tsf_delay
+ *
+ * Description:
+ *   dly_port_us() from mport.c: wait the requested number of microseconds by
+ *   watching the port's own TSF advance, not by counting host time.
+ *   mac_port_init() uses it once, between enabling the port and writing the
+ *   beacon early time, because that write is only meaningful after the port's
+ *   timer has started.
+ *
+ *   The distinction the routine draws is the useful part: a TSF that reads the
+ *   same value twice is a TSF that is not running, which upstream reports as a
+ *   hardware error rather than waiting out the count.  On this port the answer
+ *   is evidence in its own right -- port 0's TSF is expected to be following
+ *   the access point's Beacons through the address CAM BSSID match by the time
+ *   the association is granted.
+ *
+ * Input Parameters:
+ *   delay_us - microseconds of port time to wait for
+ *
+ * Returned Value:
+ *   OK once the TSF has advanced that far, -EIO when it is not running at all,
+ *   -ETIMEDOUT when it moved but not far enough within the count upstream
+ *   allows, or a negated errno from the read.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_port_tsf_delay(uint32_t delay_us)
+{
+  uint32_t count = delay_us * K1_RTL8852BS_PORT_DLY_US_CNT_LMT;
+  uint32_t origin = 0;
+  uint32_t value = 0;
+  int ret;
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_TSFTR_LOW_P0, &origin);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  up_udelay(10);
+
+  while (count > 0)
+    {
+      ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_TSFTR_LOW_P0, &value);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      if ((value >= origin && value - origin >= delay_us) ||
+          (value < origin && origin - value + 1 >= delay_us))
+        {
+          return OK;
+        }
+
+      if (value == origin)
+        {
+          return -EIO;
+        }
+
+      up_udelay(10);
+      count--;
+    }
+
+  return -ETIMEDOUT;
+}
+
+/* What the ported mac_port_init() did to CMAC port 0, so that one console line
+ * says whether the port is running and the acceptance harness has something to
+ * require.  stat mirrors pinfo->stat in the vendor's port_info table: a port
+ * that has never been initialised is PORT_ST_DIS, and it is that value which
+ * makes the first call skip the disable flow and which keeps the three
+ * beacon-timing validators inert until the sequence has declared the port an
+ * infrastructure station.
+ *
+ * Nothing here is a secret and nothing here is a key; these are register
+ * contents and a status.
+ */
+
+struct k1_rtl8852bs_port_init_s
+{
+  uint8_t stat;
+  bool attempted;
+  bool tsf_running;
+  bool complete;
+  int status;
+  int tsf_status;
+  uint32_t cfg_before;
+  uint32_t cfg_after;
+  uint32_t prohib_before;
+  uint32_t prohib_after;
+  uint32_t drop_all;
+};
+
+static struct k1_rtl8852bs_port_init_s g_k1_rtl8852bs_port_init =
+{
+  .stat = K1_RTL8852BS_PORT_ST_DIS
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_port_init
+ *
+ * Description:
+ *   mac_port_init() from mport.c, for band 0, port 0, network type INFRA and
+ *   no multi-BSSID, in that routine's own order.  This is the register block
+ *   every step before it only read: the port's network type, the TBTT prohibit
+ *   window, the beacon interval and early times, and the function enable that
+ *   starts the port's own timer.  Upstream reaches it from
+ *   rtw89_ops_bss_info_changed() on BSS_CHANGED_ASSOC, which is why this port
+ *   calls it from the association step, after JOININFO and the address CAM
+ *   update have told the firmware which BSS the MACID belongs to and with what
+ *   association identifier.
+ *
+ *   The parameters are what rtw_hal_mac_port_init() fills in for a station:
+ *   beacon interval from the association capability or 100 TU, BSS colour zero
+ *   for a legacy 2.4 GHz station, and high-queue window, DTIM period and
+ *   multi-BSSID count all zero because a station owns no beacon of its own.
+ *   The five timing defaults are mport.h's.
+ *
+ *   Three parts of the upstream routine are deliberately not here, and each is
+ *   named on the console rather than dropped silently.  The disable flow
+ *   _patch_port_dis_flow() only runs for a port that was already initialised,
+ *   which cannot happen in this port because exactly one association step runs
+ *   per boot; a second call therefore reports the state and returns instead of
+ *   half-performing a disable.  mac_wde_pkt_drop()'s body is not in the vendor
+ *   source available here, so the high-queue release is a read of
+ *   R_AX_BCN_DROP_ALL0 and a logged no-op rather than a guessed command -- with
+ *   a high-queue window and a DTIM period of zero there is nothing queued on
+ *   this port's high queue for it to release.  The MBSSID sub-space split and
+ *   the TBTT shift feature are both AP-only.
+ *
+ *   Nothing is written that was already correct, which is upstream's own rule
+ *   and which makes the log read as a list of what this step is responsible
+ *   for: on this chip the firmware's bring-up has already set the receive
+ *   BSSID filter, the TSF update enable, the TBTT prohibition and the beacon
+ *   spacing, so the fields that actually change are the network type, the
+ *   function enable, the two beacon report enables and the prohibit window's
+ *   hold and setup times.
+ *
+ * Returned Value:
+ *   OK when every field this step is responsible for read back, a negated
+ *   errno otherwise.  A TSF that is not running is reported in the result line
+ *   rather than returned, because the three fields written after the delay are
+ *   read back on their own and a stopped timer must not leave the port
+ *   half-programmed.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_port_init(void)
+{
+  const uint32_t bcn_interval = K1_RTL8852BS_PORT_BCN_INTERVAL_DEF;
+  uint32_t erly = K1_RTL8852BS_PORT_BCN_ERLY_DEF;
+  uint32_t setup = K1_RTL8852BS_PORT_BCN_SETUP_DEF;
+  uint32_t tbtt_erly = K1_RTL8852BS_PORT_TBTT_ERLY_DEF;
+  uint32_t limit;
+  uint32_t value = 0;
+  int ret;
+
+  if (g_k1_rtl8852bs_port_init.stat != K1_RTL8852BS_PORT_ST_DIS)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: port init already run stat=");
+      k1_early_puthex(g_k1_rtl8852bs_port_init.stat);
+      k1_early_puts("\r\n");
+      return OK;
+    }
+
+  g_k1_rtl8852bs_port_init.attempted = true;
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_PORT_CFG_P0,
+                               &g_k1_rtl8852bs_port_init.cfg_before);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_TBTT_PROHIB_P0,
+                               &g_k1_rtl8852bs_port_init.prohib_before);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: port init begin stat=");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.stat);
+  k1_early_puts(" net-type=");
+  k1_early_puthex(K1_RTL8852BS_PORT_NET_TYPE_INFRA);
+  k1_early_puts(" bcn-intv=");
+  k1_early_puthex(bcn_interval);
+  k1_early_puts("\r\n");
+
+  /* PCFG_TX_RPT and PCFG_RX_RPT off: the beacon transmit and receive report
+   * paths belong to a driver that consumes their C2H, and upstream clears both
+   * before it touches anything else.
+   */
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "tx-rpt", K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_PORT_CFG_TXBCN_RPT_EN, 0u);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "rx-rpt", K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_PORT_CFG_RXBCN_RPT_EN, 0u);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* The network type, and the four fields upstream derives from it: beacon
+   * protection on for anything that is not a no-link port, the receive BSSID
+   * filter and the TSF update from received beacons on for a station, and
+   * beacon transmission off for anything that is not an access point or an
+   * ad-hoc station.
+   */
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "net-type", K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_PORT_CFG_NET_TYPE_MASK,
+    K1_RTL8852BS_PORT_NET_TYPE_INFRA <<
+    K1_RTL8852BS_PORT_CFG_NET_TYPE_SHIFT);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "bcn-prct", K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_PORT_CFG_TBTT_PROHIB_EN |
+    K1_RTL8852BS_PORT_CFG_BRK_SETUP,
+    K1_RTL8852BS_PORT_CFG_TBTT_PROHIB_EN |
+    K1_RTL8852BS_PORT_CFG_BRK_SETUP);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "rx-sw", K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_PORT_CFG_RX_BSSID_FIT,
+    K1_RTL8852BS_PORT_CFG_RX_BSSID_FIT);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "rx-sync", K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_PORT_CFG_TSF_UDT_EN,
+    K1_RTL8852BS_PORT_CFG_TSF_UDT_EN);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "tx-sw", K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_PORT_CFG_BCNTX_EN, 0u);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* The beacon interval the access point advertised, and the HE BSS colour,
+   * which is zero for a station that associated without one.
+   */
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "bcn-intv", K1_RTL8852BS_BCN_SPACE_CFG_P0,
+    K1_RTL8852BS_BCN_SPACE_P0_MASK, bcn_interval);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "bss-clr", K1_RTL8852BS_PTCL_BSS_COLOR_0,
+    K1_RTL8852BS_BSS_COLOR_P0_MASK, 0u);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_byte(
+    "tbtt-agg", K1_RTL8852BS_TBTT_AGG_P0_NUM_BYTE, 0xffu,
+    (uint8_t)K1_RTL8852BS_PORT_TBTT_AGG_DEF);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* The high-queue window and the DTIM count, both zero for a station: the
+   * window is the number of beacon intervals a high-priority queue may hold a
+   * frame for, and the count is the DTIM period a beacon would announce.  The
+   * 0xca08 bits are the update enables upstream sets before writing the count,
+   * and it sets them with a read-modify-write of that one byte.
+   */
+
+  ret = k1_rtl8852bs_runtime_port_byte(
+    "hiq-win", K1_RTL8852BS_P0MB_HGQ_WINDOW_CFG_0, 0xffu, 0u);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_byte(
+    "hiq-upd", K1_RTL8852BS_MD_TSFT_STMP_CTL, 0u,
+    K1_RTL8852BS_MD_TSFT_UPD_TIMIE | K1_RTL8852BS_MD_TSFT_UPD_HGQMD);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_byte(
+    "dtim-num", K1_RTL8852BS_DTIM_NUM_P0_BYTE, 0xffu, 0u);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* Where mac_wde_pkt_drop(REL_HIQ_PORT) would go.  Its body is not in the
+   * vendor source available to this port, so the beacon drop register is read
+   * and named instead of an H2C being guessed.
+   */
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_BCN_DROP_ALL0,
+                               &g_k1_rtl8852bs_port_init.drop_all);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: port init hiq-release c560=");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.drop_all);
+  k1_early_puts(" p0=");
+  k1_early_puthex((g_k1_rtl8852bs_port_init.drop_all &
+                   K1_RTL8852BS_BCN_DROP_ALL_P0) ? 1u : 0u);
+  k1_early_puts(" not-ported\r\n");
+
+  /* port0_subspc_set() with no multi-BSSID: the sub-interval a port splits its
+   * beacon interval into is cleared, leaving the whole interval to port 0.
+   */
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "sub-spc", K1_RTL8852BS_BCN_SPACE_CFG_P0,
+    K1_RTL8852BS_SUB_BCN_SPACE_P0_MASK, 0u);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* The TBTT prohibit hold time and the beacon mask area.  Upstream validates
+   * both against the beacon interval, and both validators return success
+   * without reading anything while the port is still disabled, which it is
+   * here -- the enable is four steps further down.  The limit they would have
+   * applied is computed and logged anyway, because a hold time that did not
+   * fit the interval would be a real defect that this order hides.
+   */
+
+  limit = bcn_interval * K1_RTL8852BS_PORT_TU_TO_BCN_SET -
+          K1_RTL8852BS_PORT_BCN_ERLY_DEF;
+
+  k1_early_puts("K1 Wi-Fi GPL: port init hold-limit=");
+  k1_early_puthex(limit);
+  k1_early_puts(" hold=");
+  k1_early_puthex(K1_RTL8852BS_PORT_BCN_HOLD_DEF);
+  k1_early_puts(" checked=0\r\n");
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "bcn-hold", K1_RTL8852BS_TBTT_PROHIB_P0,
+    K1_RTL8852BS_TBTT_HOLD_P0_MASK,
+    K1_RTL8852BS_PORT_BCN_HOLD_DEF << K1_RTL8852BS_TBTT_HOLD_P0_SHIFT);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "bcn-mask", K1_RTL8852BS_BCN_AREA_P0,
+    K1_RTL8852BS_BCN_MSK_AREA_P0_MASK,
+    K1_RTL8852BS_PORT_BCN_MASK_DEF << K1_RTL8852BS_BCN_MSK_AREA_P0_SHIFT);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* The function enable, which upstream writes last of the block and which is
+   * what starts the port.  Everything after this point runs against a port
+   * that is already an infrastructure station, which is also what makes the
+   * three validators below inspect the hardware for real.
+   */
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "func-en", K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_PORT_CFG_FUNC_EN, K1_RTL8852BS_PORT_CFG_FUNC_EN);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  g_k1_rtl8852bs_port_init.stat = K1_RTL8852BS_PORT_ST_INFRA;
+
+  g_k1_rtl8852bs_port_init.tsf_status =
+    k1_rtl8852bs_runtime_port_tsf_delay(K1_RTL8852BS_PORT_BCN_ERLY_SET_DLY);
+  g_k1_rtl8852bs_port_init.tsf_running =
+    g_k1_rtl8852bs_port_init.tsf_status >= 0;
+
+  k1_early_puts("K1 Wi-Fi GPL: port init tsf-delay running=");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.tsf_running ? 1u : 0u);
+  k1_early_puts(" error=");
+  k1_early_puthex((uintreg_t)(g_k1_rtl8852bs_port_init.tsf_status < 0 ?
+                              -g_k1_rtl8852bs_port_init.tsf_status : 0));
+  k1_early_puts("\r\n");
+
+  /* _bcn_erly_chk: the beacon early time has to sit above the setup time and
+   * above the TBTT early time expressed in the same ticks, and below what the
+   * beacon interval leaves once the hold time is taken out.  Upstream clamps a
+   * value that does not fit and has mac_port_init() retry the write with the
+   * clamped one, so a clamp is logged here rather than treated as an error.
+   */
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_TBTT_PROHIB_P0, &value);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  if (erly <= (value & K1_RTL8852BS_TBTT_SETUP_P0_MASK))
+    {
+      erly = (value & K1_RTL8852BS_TBTT_SETUP_P0_MASK) + 1u;
+    }
+
+  limit = bcn_interval * K1_RTL8852BS_PORT_TU_TO_BCN_SET -
+          ((value & K1_RTL8852BS_TBTT_HOLD_P0_MASK) >>
+           K1_RTL8852BS_TBTT_HOLD_P0_SHIFT);
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_BCNERLYINT_CFG_P0, &value);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  value = ((value & K1_RTL8852BS_TBTTERLY_P0_MASK) >>
+           K1_RTL8852BS_TBTTERLY_P0_SHIFT) /
+          K1_RTL8852BS_PORT_BCN_SET_TO_US;
+  if (erly <= value)
+    {
+      erly = value + 1u;
+    }
+
+  if (erly >= limit)
+    {
+      erly = limit - 1u;
+    }
+
+  if (erly != K1_RTL8852BS_PORT_BCN_ERLY_DEF)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: port init bcn-erly clamped=");
+      k1_early_puthex(erly);
+      k1_early_puts(" limit=");
+      k1_early_puthex(limit);
+      k1_early_puts("\r\n");
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "bcn-erly", K1_RTL8852BS_BCNERLYINT_CFG_P0,
+    K1_RTL8852BS_BCNERLY_P0_MASK, erly);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* _bcn_setup_chk: the setup time has to sit below the beacon early time the
+   * previous step just wrote.
+   */
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_BCNERLYINT_CFG_P0, &value);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  if (setup >= (value & K1_RTL8852BS_BCNERLY_P0_MASK))
+    {
+      setup = (value & K1_RTL8852BS_BCNERLY_P0_MASK) - 1u;
+      k1_early_puts("K1 Wi-Fi GPL: port init bcn-setup clamped=");
+      k1_early_puthex(setup);
+      k1_early_puts("\r\n");
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "bcn-setup", K1_RTL8852BS_TBTT_PROHIB_P0,
+    K1_RTL8852BS_TBTT_SETUP_P0_MASK, setup);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* _tbtt_erly_chk: the TBTT early time, which counts in TU, has to sit below
+   * the beacon early time converted into the same unit.
+   */
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_BCNERLYINT_CFG_P0, &value);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  limit = (value & K1_RTL8852BS_BCNERLY_P0_MASK) *
+          K1_RTL8852BS_PORT_BCN_SET_TO_US;
+  if (tbtt_erly >= limit)
+    {
+      tbtt_erly = limit - 1u;
+      k1_early_puts("K1 Wi-Fi GPL: port init tbtt-erly clamped=");
+      k1_early_puthex(tbtt_erly);
+      k1_early_puts("\r\n");
+    }
+
+  ret = k1_rtl8852bs_runtime_port_field(
+    "tbtt-erly", K1_RTL8852BS_BCNERLYINT_CFG_P0,
+    K1_RTL8852BS_TBTTERLY_P0_MASK,
+    tbtt_erly << K1_RTL8852BS_TBTTERLY_P0_SHIFT);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  g_k1_rtl8852bs_port_init.complete = true;
+  g_k1_rtl8852bs_port_init.status = OK;
+
+done:
+  if (ret < 0)
+    {
+      g_k1_rtl8852bs_port_init.status = ret;
+    }
+
+  k1_rtl8852bs_mac_read32(K1_RTL8852BS_PORT_CFG_P0,
+                          &g_k1_rtl8852bs_port_init.cfg_after);
+  k1_rtl8852bs_mac_read32(K1_RTL8852BS_TBTT_PROHIB_P0,
+                          &g_k1_rtl8852bs_port_init.prohib_after);
+
+  k1_early_puts("K1 Wi-Fi GPL: port init result stat=");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.stat);
+  k1_early_puts(" c400=");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.cfg_before);
+  k1_early_puts("->");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.cfg_after);
+  k1_early_puts(" c404=");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.prohib_before);
+  k1_early_puts("->");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.prohib_after);
+  k1_early_puts(" tsf=");
+  k1_early_puthex(g_k1_rtl8852bs_port_init.tsf_running ? 1u : 0u);
+  k1_early_puts(" erly=");
+  k1_early_puthex(erly);
+  k1_early_puts(" setup=");
+  k1_early_puthex(setup);
+  k1_early_puts(" tbtt-erly=");
+  k1_early_puthex(tbtt_erly);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(g_k1_rtl8852bs_port_init.status < 0 ?
+                              -g_k1_rtl8852bs_port_init.status : 0));
+  k1_early_puts("\r\n");
+
+  if (g_k1_rtl8852bs_port_init.complete &&
+      g_k1_rtl8852bs_port_init.tsf_running)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 port init complete\r\n");
+    }
+
+  return g_k1_rtl8852bs_port_init.status;
+}
+
+#endif /* CONFIG_K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC */
+
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_join_info_submit
  *
  * Description:
- *   Tell the firmware that the recorded MACID is now a station joined to one
- *   access point.  This is the first half of what upstream _change_role()
- *   does with MAC_AX_ROLE_CON_DISCONN and opmode MAC_AX_ROLE_CONNECT: it
- *   sends MEDIA_RPT/JOININFO and deliberately does not resend
+ *   Tell the firmware which access point the recorded MACID belongs to, and
+ *   whether it counts as connected to it yet.  This is the first half of what
+ *   upstream _change_role() does with MAC_AX_ROLE_CON_DISCONN and the opmode
+ *   its caller asks for: it sends MEDIA_RPT/JOININFO and does not resend
  *   FWROLE_MAINTAIN, because the firmware role created during bring-up is
  *   kept and only its contents change.  The command asks for a done
  *   acknowledgement, which is where the firmware gets to reject its shape.
@@ -20635,6 +21446,15 @@ static void k1_rtl8852bs_runtime_port_log(FAR const char *phase)
  *   sequence - the H2C sequence number to submit under and to wait for.  Each
  *              submission uses its own, so a late acknowledgement cannot be
  *              charged to the other one.
+ *   disconn  - what to put in the opmode field, which upstream calls
+ *              MAC_AX_ROLE_DISCONN when set and MAC_AX_ROLE_CONNECT when
+ *              clear.  Upstream reaches an association through both values:
+ *              rtw89_core_sta_add() sends the command with the field set
+ *              before the authentication exchange, so that the firmware holds
+ *              a MACID that is not yet connected, and
+ *              rtw89_core_sta_assoc() resends it clear once an association
+ *              identifier has been granted.  This port passes true from the
+ *              join step and false from the association step for that reason.
  *
  * Returned Value:
  *   OK when the command was accepted and its done acknowledgement returned
@@ -20644,7 +21464,8 @@ static void k1_rtl8852bs_runtime_port_log(FAR const char *phase)
  ****************************************************************************/
 
 static int k1_rtl8852bs_runtime_join_info_submit(FAR const char *label,
-                                                uint8_t sequence)
+                                                uint8_t sequence,
+                                                bool disconn)
 {
   struct k1_rtl8852bs_join_info_s join =
   {
@@ -20653,7 +21474,7 @@ static int k1_rtl8852bs_runtime_join_info_submit(FAR const char *label,
     .network_type = K1_RTL8852BS_JOIN_NETWORK_TYPE_INFRA,
     .wifi_role = K1_RTL8852BS_JOIN_WIFI_ROLE_STATION,
     .self_role = 0u,
-    .disconnected = false
+    .disconnected = disconn
   };
 
   uint8_t content[K1_RTL8852BS_JOININFO_SIZE];
@@ -20682,6 +21503,8 @@ static int k1_rtl8852bs_runtime_join_info_submit(FAR const char *label,
   k1_early_puts(label);
   k1_early_puts(" H2C queued sequence=");
   k1_early_puthex(sequence);
+  k1_early_puts(" disconn=");
+  k1_early_puthex(disconn ? 1u : 0u);
   k1_early_puts(" pages=");
   k1_early_puthex(available_pages);
   k1_early_puts(" FIFO=");
@@ -21472,7 +22295,7 @@ int k1_rtl8852bs_fwdl_runtime_join_diagnostic(FAR const uint8_t *self_mac)
                                          &result, &prejoin);
 
   ret = k1_rtl8852bs_runtime_join_info_submit(
-    "join info", K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE);
+    "join info", K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE, true);
   if (ret < 0)
     {
       goto error;
@@ -22621,7 +23444,7 @@ static int k1_rtl8852bs_runtime_station_diagnostic(
    */
 
   ret = k1_rtl8852bs_runtime_join_info_submit(
-    "assoc info", K1_RTL8852BS_ASSOC_INFO_H2C_SEQUENCE);
+    "assoc info", K1_RTL8852BS_ASSOC_INFO_H2C_SEQUENCE, false);
   if (ret < 0)
     {
       goto error;
@@ -22636,6 +23459,25 @@ static int k1_rtl8852bs_runtime_station_diagnostic(
     }
 
   k1_rtl8852bs_runtime_port_log("post-assoc-cam");
+
+#ifdef CONFIG_K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC
+  /* mac_port_init() for band 0 / port 0, in the place upstream runs it: after
+   * JOININFO and the address CAM update, on the association that granted an
+   * identifier.  Until this call every step only read the port's register
+   * block; this is where the port's network type becomes infrastructure and its
+   * function enable is set.
+   *
+   * Its failure does not abort the step.  The routine logs its own result line
+   * and the acceptance harness requires its completion marker, so a failure
+   * fails the run there; aborting here instead would throw away the four-way
+   * handshake that runs inside the confirming sweep below, which is the
+   * evidence this image exists to collect and which passed without the port
+   * programming before it.
+   */
+
+  (void)k1_rtl8852bs_runtime_port_init();
+  k1_rtl8852bs_runtime_port_log("post-port-init");
+#endif
 
   ret = k1_rtl8852bs_runtime_scanofld_passive_scan(&result);
   if (ret < 0)

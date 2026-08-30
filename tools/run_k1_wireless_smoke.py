@@ -283,6 +283,14 @@ def parse_args() -> argparse.Namespace:
               "still receives the target's Beacons"),
     )
     parser.add_argument(
+        "--require-runtime-port-init", action="store_true",
+        help=("fail unless the band 0 / port 0 infrastructure subset of "
+              "mac_port_init() runs on that association, every field it "
+              "programs reads back, the port's network type and function "
+              "enable end up set, and the port's own TSF is running when the "
+              "vendor's TSF-based delay asks"),
+    )
+    parser.add_argument(
         "--require-runtime-wpa-msg1", action="store_true",
         help=("fail unless a pairwise master key is derived from a configured "
               "passphrase and the access point sends a first EAPOL-Key frame "
@@ -1575,7 +1583,8 @@ def main() -> int:
             )
             if join_end_result is None:
                 missing.append("RTL8852BS2 station join completion")
-        if args.require_runtime_assoc_response or args.require_runtime_assoc:
+        if (args.require_runtime_assoc_response or args.require_runtime_assoc
+                or args.require_runtime_port_init):
             # Everything is judged from the lines the association step prints,
             # sliced from its own target line so none of the earlier steps'
             # reports can satisfy these checks.  The target line also has to
@@ -1678,6 +1687,72 @@ def main() -> int:
             )
             if assoc_end_result is None:
                 missing.append("RTL8852BS2 station association completion")
+        if args.require_runtime_port_init:
+            # mac_port_init()'s band 0 / port 0 subset, judged from the lines it
+            # prints inside the association slice.  The begin line has to report
+            # a port that was still disabled and the station parameters, so a
+            # second call that skipped the sequence cannot satisfy this.
+            port_begin_result = re.search(
+                rb"K1 Wi-Fi GPL: port init begin stat=0x0+ "
+                rb"net-type=0x0*2(?![0-9a-fA-F]) "
+                rb"bcn-intv=0x0*64(?![0-9a-fA-F])",
+                assoc,
+            )
+            if port_begin_result is None:
+                missing.append(
+                    "RTL8852BS2 port 0 mac_port_init() start from a disabled "
+                    "port")
+
+            # The two fields that make the port a station of this BSS, each
+            # required to have been written rather than found already set.  On
+            # this firmware both start clear, which is what makes the step
+            # responsible for them; a build where they no longer do would be a
+            # different claim and has to be re-read rather than pass quietly.
+            port_net_type_result = re.search(
+                rb"K1 Wi-Fi GPL: port init net-type was=0x0+ "
+                rb"set=0x0*800(?![0-9a-fA-F]) written",
+                assoc,
+            )
+            if port_net_type_result is None:
+                missing.append("RTL8852BS2 port 0 network type set to INFRA")
+
+            port_func_en_result = re.search(
+                rb"K1 Wi-Fi GPL: port init func-en was=0x0+ "
+                rb"set=0x0*4(?![0-9a-fA-F]) written",
+                assoc,
+            )
+            if port_func_en_result is None:
+                missing.append("RTL8852BS2 port 0 function enable set")
+
+            # dly_port_us() between the enable and the beacon early time: the
+            # port's own timer has to advance, which is a property of the
+            # hardware and not of any value this host wrote.
+            port_tsf_result = re.search(
+                rb"K1 Wi-Fi GPL: port init tsf-delay running=0x0*1"
+                rb"(?![0-9a-fA-F]) error=0x0+(?![0-9a-fA-F])",
+                assoc,
+            )
+            if port_tsf_result is None:
+                missing.append("RTL8852BS2 port 0 TSF running at the port delay")
+
+            # The result line carries the port state the sequence reached and
+            # the status every read-back verification folded into.
+            port_result_result = re.search(
+                rb"K1 Wi-Fi GPL: port init result stat=0x0*3(?![0-9a-fA-F])"
+                rb"[^\r\n]* tsf=0x0*1(?![0-9a-fA-F])"
+                rb"[^\r\n]* status=0x0+(?![0-9a-fA-F])",
+                assoc,
+            )
+            if port_result_result is None:
+                missing.append(
+                    "RTL8852BS2 port 0 mac_port_init() field read-back")
+
+            port_end_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 port init complete\r?\n",
+                assoc,
+            )
+            if port_end_result is None:
+                missing.append("RTL8852BS2 port 0 initialisation completion")
         if (args.require_runtime_wpa_msg1 or args.require_runtime_wpa_mic
                 or args.require_runtime_wpa or args.require_runtime_wpa_keys):
             # Everything is judged from the handshake's own lines, sliced from
