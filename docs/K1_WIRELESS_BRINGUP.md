@@ -4919,9 +4919,10 @@ harness 判据 `--require-runtime-join`。板上 run 25
 这一步做的事情，和它**没有**做的事情要分清：它把原厂 connect 路径发的两条命令按原厂的
 顺序和内容发出去，然后要求同一次交换在固件和硬件都相信「本机是这个 BSS 的 station」
 之后**仍然成立**。它不是关联：没有 Association Request，没有 AID（报告里的 `aid=0x0`
-是真值不是占位），没有装密钥，没有创建网络设备，没有数据通路，port 的 TSF 也没有和
-AP 的 Beacon 同步——port 0 依旧读到 `PORT_FUNC_EN=0`、`NET_TYPE=0`、TSF 冻结，因为
-`mac_port_init()` 还没移植。
+是真值不是占位），没有装密钥，没有创建网络设备，没有数据通路——port 0 依旧读到
+`PORT_FUNC_EN=0`、`NET_TYPE=0`，因为 `mac_port_init()` 还没移植。
+（这里原来还写了「port 的 TSF 也没有和 AP 的 Beacon 同步 …… TSF 冻结」。**那句是错的**：
+增量 3g 证明 TSF 在 `PORT_FUNC_EN=0` 时就已经跟着 AP 走了，见该节「更正」。）
 
 三段实现都在 `chip/k1/k1_rtl8852bs_gpl.c`：
 
@@ -5529,4 +5530,155 @@ K1 Wi-Fi GPL: RTL8852BS2 station WPA2 keys installed
    然后才是发送描述符的安全字段——这三件凑齐才能谈「被 CCMP 保护的数据帧」。
 2. 还掉 3b/3c/3d 欠的原厂 `JOININFO` 顺序。
 3. `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
+   以及把认证／关联响应的前 32 字节原样打到串口这条一直没补的证据。
+
+### 增量 3g：把 CMAC port 0 按原厂顺序打开（顺带证伪「TSF 被冻住」）
+
+提交 `3aadcd8`，板上 run 35，日志 `out/k1-serial/k1-wpa-20260830T194339Z.log`，
+镜像 `wireless_wpa_diag`，ELF SHA-256
+`d5a8f93651b35260668b03d7384812c45b453da5ab9666870f080e12f7ff84c7`。
+**本 runner 的 34 项 `--require-*` 一条没失败**，最后一行是
+`PASS: K1 wireless RAM image reached NSH`，其中 `--require-runtime-port-init` 是本轮新增。
+
+#### 原厂顺序照抄，功能使能排在最后
+
+`mac_port_init()`（`mport.c:2010`）在 band 0 / port 0 / INFRA / `mbid_num=0` 这条路径上
+的写入顺序，本端一步不差地复现：两个 beacon 上报使能清零 → 网络类型 2 →
+TBTT prohibit 窗口 → 收 BSSID 过滤 → TSF 更新使能 → beacon 发送关 → beacon 间隔 100 →
+BSS colour 0 → TBTT aggregate 1 → 高优先队列窗口和它的两个 update 位 → DTIM 0 →
+sub-space 清零 → beacon hold 400 → beacon mask 0 → **最后才是 `PORT_FUNC_EN`** →
+`dly_port_us(10)` → 然后才是被原厂校验函数管着的三条：beacon early 160、
+beacon setup 4、TBTT early 5。
+
+顺序里唯一值得强调的就是「功能使能排在最后」：前面所有字段都要在 port 开始按 TBTT 干活
+之前就位，原厂把 `FUNC_EN` 放在第 16 步，本端也放在第 16 步。
+
+#### 大部分字段固件自己已经摆对了
+
+每一次写都是「读—比较—写」，并且把字段名、写前的值、要写的值都打出来，所以串口直接回答了
+一个之前只能猜的问题：这些字段里有多少是固件 bring-up 已经留成 station 想要的样子的。
+答案是大部分：
+
+```
+port init tx-rpt   was=0x2   set=0x0   written
+port init rx-rpt   was=0x1   set=0x0   written
+port init net-type was=0x0   set=0x800 written
+port init bcn-prct was=0x12000 set=0x12000 skip
+port init rx-sw    was=0x10  set=0x10  skip
+port init rx-sync  was=0x8   set=0x8   skip
+port init tx-sw    was=0x0   set=0x0   skip
+port init bcn-intv was=0x64  set=0x64  skip
+port init bss-clr  was=0x0   set=0x0   skip
+port init tbtt-agg was=0x1   set=0x1   skip
+port init hiq-win  was=0x2   set=0x0   written
+port init hiq-upd  was=0x0   set=0x3   written
+port init dtim-num was=0x1   set=0x0   written
+port init sub-spc  was=0x0   set=0x0   skip
+port init bcn-hold was=0xc80000 set=0x1900000 written
+port init bcn-mask was=0x0   set=0x0   skip
+port init func-en  was=0x0   set=0x4   written
+port init bcn-erly was=0xa0  set=0xa0  skip
+port init bcn-setup was=0x2  set=0x4   written
+port init tbtt-erly was=0x50000 set=0x50000 skip
+```
+
+真正变了的是网络类型、功能使能、两个 beacon 上报使能、高队列窗口和它的 update 位、
+DTIM、beacon hold、beacon setup 这几项；整块寄存器的差值就是
+**`c400 0x1e01b -> 0x1e81c`** 和 **`c404 0x00c80002 -> 0x01900004`**，
+和写代码时按原厂算出来的预期完全一致（`c408`/`c40c`/`c410`/`c414` 一位没动）。
+
+#### 三个校验函数连 clamp 一起复现
+
+原厂对最后三条写入各有一个校验：`_bcn_setup_chk`（`mport.c:562`）、
+`_bcn_erly_chk`（`:735`）、`_tbtt_erly_chk`（`:820`）。它们做两件事：越界直接
+`MACFUNCINPUT` 报错，以及和相邻字段比较后**把值夹一下**（例如 setup ≥ 当前 bcn-erly 就
+夹成 `up_lmt-1`）。本端把三个都复现了，包括夹的算法，而且一旦会夹就单独打一行
+`... clamped=`，绝不悄悄改掉调用者给的值。run 35 三条一次都没夹。
+
+顺带记一条读原厂才看清的事：`bcn_hold` 和 `bcn_mask` 也各有检查，但原厂调用它们的位置在
+`FUNC_EN` 之前，那时 `port_stat` 还是 `DIS`，而两个检查开头就是「stat==DIS 直接返回成功」
+——所以在原厂的这个顺序里它们是空转的。本端照样按空转处理，并把 `hold-limit` 打出来备查
+（`hold-limit=0xbe0 hold=0x190 checked=0`）。
+
+#### 为什么必须按字节写
+
+`0xc413`（TBTT aggregate）、`0xc427`（DTIM）、`0xca08`（TSF 时间戳控制）、
+`0xc590`（高队列窗口）四个地方原厂用的是 `MAC_REG_W8`。这不是风格问题：`0xc427` 所在
+dword 的起始地址是 `0xc424`，那是 `R_AX_BCN_ERR_FLAG_P0`，一次 dword 读改写会把它一起
+重写。本端的寄存器访问在 `0x1000-0x1f00` 之外走的是间接 CMD52 路径，字节访问是原生的，
+所以直接按字节写，和原厂一致。
+
+#### 3b/3c/3d 欠的 `JOININFO` 顺序还掉了
+
+原厂（`rtw89_core_sta_add()` / `rtw89_core_sta_assoc()`）发两次 station join：认证之前那次
+带 `dis_conn=true`，关联成功之后重发一次才翻成 `false`。本端之前两次都发 `false`，等于在
+还没认证的时候就跟固件说「这个 STA 已经连上了」。现在这个状态是函数参数，板上：
+
+```
+K1 Wi-Fi GPL: join info  H2C queued sequence=0xa disconn=0x1 pages=0x20 FIFO=0x1c006
+K1 Wi-Fi GPL: assoc info H2C queued sequence=0xc disconn=0x0 pages=0x20 FIFO=0x1c006
+```
+
+#### 两处点名不猜
+
+* **disable 流程没移植**：原厂 `mac_port_init()` 开头对已经在跑的 port 有一段
+  停用流程。本端一次 boot 只会跑一个诊断（assoc **或** wpa，`k1_wireless.c` 里是
+  `#ifdef/#else`），port 只被初始化一次，所以第二次调用是幂等的提前返回并打
+  `port init already run stat=`，不是假装做了 teardown。
+* **`mac_wde_pkt_drop()` 的正文不在手上的原厂子集里**：所以第 12 步的
+  `REL_HIQ_PORT` 是读一下 `R_AX_BCN_DROP_ALL0`（`0xc560`）然后打一行
+  `not-ported` 的空操作，不去猜一条 H2C。板上 `c560=0x0 p0=0x0`，没有待丢的 beacon，
+  这个空操作在本路径上也确实无事可做。
+
+#### 失败为什么不中断关联
+
+`port init` 的返回值调用方不看。理由是 `FUNC_EN` 一旦写下去，从中间放弃会留下一个
+半配置的 port，而且会把这一轮跑起来就是为了收集的四次握手证据一起丢掉。取而代之的是：
+`RTL8852BS2 port init complete` 只在「序列跑完 **且** TSF 在走」时才打，
+`--require-runtime-port-init` 认的就是这一行加上 `status=0x0`、`tsf=0x1` 的结果行，
+所以回归照样让整轮失败。
+
+#### 更正：port 的 TSF 从来没被冻住
+
+3d/3e/3f 的文档和 `wireless_assoc_diag` 的注释都写过「`mac_port_init()` 没移植，所以
+port 的 TSF 还是冻着的」。这句话是错的，本轮从序列内部证伪：`dly_port_us(10)` 是原厂
+放在 `FUNC_EN` 和 beacon early 之间的一个**基于 TSF 的等待**，它靠反复读 `c438` 判断
+时间有没有前进，读到不动就返回「tsf not running」。板上：
+
+```
+port init tsf-delay running=0x1 error=0x0
+port0 post-assoc-cam c438=0x320d1d86 ...
+port0 post-port-init c438=0x3211044e ...
+```
+
+TSF 在 `FUNC_EN` **之前**就已经是 AP 自己的计时器（run 34 的 `c438=0x121_xxxxxxxx`
+在 `FUNC_EN=0` 时就在走），原因是固件 bring-up 已经把收 BSSID 过滤和 TSF 更新使能留成
+开着的，而地址 CAM 里有 BSSID。`FUNC_EN` 管的是这个 port 要不要按 TBTT 干活，不是计时器
+要不要走。Kconfig 帮助和那条 profile 注释都改过来了。
+
+#### port 打开之后握手仍然一次过
+
+这是写代码前记下的风险（INFRA ＋ `FUNC_EN` 可能扰动目前从停驻扫描 dwell 上发 EAPOL 的
+路径）。run 35 的结果和 run 34 一模一样：`eapol=0x4`、`wpa msg2 tx` 三次
+（`sn=0x8/0x9/0xa`，AP 重传了两次 Msg1）、`mic=0x1 mic-fail=0x0 complete=0x1`、
+两把密钥照样装进硬件（`sec-valid=0x5`、四条 done-ack 全 0）。也就是说打开 port 既没有
+修好「在 dwell 之间发不出去」，也没有把它弄坏——修它要靠下一步的驻留信道。
+
+#### 这一步证明了什么、没证明什么
+
+证明的是：本端能按原厂顺序把 band0/port0 配成 INFRA 并使能，每一个字段都读回来了，
+三个校验函数的边界本端算得和原厂一致，port 的计时器是 AP 的，`JOININFO` 的连接状态
+不再骗固件。
+
+**没有证明任何一帧被 CCMP 保护过，也没有证明本端驻留在了信道 1。** 发送描述符的安全字段
+仍然是空的，帧仍然从停驻的扫描 dwell 上发出去；`wlan0` 的行为一个字节没变，仍然只会扫描，
+没有 DHCP、没有联网。仍然是 RAM-only：eMMC / SPI flash / eFuse / U-Boot 环境一个都没写。
+
+#### 下一步
+
+1. `rtw8852b_set_channel_{mac,bb,rf}`：真正驻留信道 1，不再从 parked dwell 上发帧
+   （增量 3h）。
+2. 发送描述符的安全字段（`sec_type` / `sec_cam_idx`）——密钥已经在 CAM 里、槽也有了，
+   缺的只是发送路径去引用它，这是第一次有机会发出一帧被 CCMP 保护的数据帧（增量 3i）。
+3. `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI）那一批，
    以及把认证／关联响应的前 32 字节原样打到串口这条一直没补的证据。

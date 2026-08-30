@@ -50,7 +50,8 @@
   target MAC/BSSID），两条 done ack 都返回 0，并要求同一次认证交换在命令之前、
   两条之间、两条之后都仍然被 AP 回答、sweep 也仍然在收 Beacon（run 25，
   `wireless_join_diag`，28 项 `--require-*` 全过，提交 `20c3191`）。
-  **仍然不是关联**：无 Association Request、无 AID、无密钥、TSF 未同步
+  **仍然不是关联**：无 Association Request、无 AID、无密钥、port 未使能
+  （当时以为 TSF 也没同步，增量 3g 证明它其实一直跟着 AP 走）
 - **可重复的管理帧交换 ＋ station join 全链（增量 3c）**：交换 armed 期间把 13 条
   scan-offload 信道表项全部填成目标信道（parked），按表项数逐条重新装填 host dwell，
   认证/关联各最多 3 次带新序列号的重传，armed 期间关掉一切轮询串口输出。效果是 join
@@ -122,6 +123,26 @@
   **这只说明固件接受了密钥**：发送描述符的安全字段没填、没有数据路径，
   一帧 CCMP 都没发生过。本轮 `eapol=0x4`（3e 是 `0x2`）是 AP 重传了两次 Msg1，
   因为本端仍在停驻的扫描 dwell 之间才发得出 Msg2。
+- **CMAC port 0 按原厂顺序配好并使能（run 35，提交 `3aadcd8`）。**
+  `mac_port_init()`（`mport.c:2010`）的 band0/port0/INFRA/`mbid_num=0` 子集，写入顺序、
+  三个校验函数（`_bcn_setup_chk`/`_bcn_erly_chk`/`_tbtt_erly_chk`）连 clamp 一起复现，
+  `PORT_FUNC_EN` 排最后、之后 `dly_port_us(10)` 再写 beacon early 160/setup 4/TBTT early 5。
+  板上 `c400 0x1e01b → 0x1e81c`、`c404 0x00c80002 → 0x01900004`（其余 port 寄存器一位没动），
+  `stat=0x3(INFRA) tsf=0x1 status=0x0`，末尾 `RTL8852BS2 port init complete`。
+  同一轮还掉了 3b/3c/3d 欠的 `JOININFO` 顺序：认证前 `disconn=0x1`、关联时 `disconn=0x0`。
+  34 条 `--require-*`（新增 `--require-runtime-port-init`）一条没失败，日志
+  `out/k1-serial/k1-wpa-20260830T194339Z.log`，ELF SHA-256
+  `d5a8f93651b35260668b03d7384812c45b453da5ab9666870f080e12f7ff84c7`。
+  **顺带证伪了之前三份文档写过的「TSF 被冻住」**：`dly_port_us` 是原厂放在 `FUNC_EN` 与
+  beacon early 之间的 TSF 等待，它直接读到时间在走（`c438 0x320d1d86 → 0x3211044e`），
+  而 run 34 在 `FUNC_EN=0` 时 `c438` 就已经是 AP 的计时器——固件 bring-up 留着收 BSSID
+  过滤和 TSF 更新使能、地址 CAM 里有 BSSID；`FUNC_EN` 管的是这个 port 要不要按 TBTT
+  干活，不是计时器走不走。
+  两处点名不猜：disable 流程不移植（一次 boot 只跑一个诊断、port 只初始化一次，第二次是
+  幂等提前返回），`mac_wde_pkt_drop()` 正文不在手上的原厂子集里（读 `0xc560` 后记一行
+  `not-ported`，板上 `c560=0x0` 本来也无事可做）。
+  **握手在 port 使能之后仍然一次过**（`eapol=0x4`、`mic=0x1 mic-fail=0x0 complete=0x1`、
+  `sec-valid=0x5`）：打开 port 既没修好也没弄坏「两个 dwell 之间发不出去」。
 - H5 版本结果：HCI `0x0b/0x000b`，manufacturer `0x005d`，LMP subversion `0x8852`
 
 最新已通过的扫描/PHY/FW 日志（运行 12，13 信道被动扫描）：
@@ -150,20 +171,20 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   全是明文，增量 3e 已经在板上证明；安全引擎是握手**之后**装密钥才要的。
   3d 里那一帧 Deauthentication（reason 15 = 握手超时）在 run 33/34 都不再出现，
   `deauth-self=0x0 deauth-reason=0xffff`。
-  另外 port 0 到密钥装完仍然是 `c400=0x1e01b`：**bit2 `PORT_FUNC_EN`=0、
-  `NET_TYPE`=0（NO_LINK）**，整个认证/关联/握手/装密钥都是在 scan-offload 停驻的 dwell 上
-  由软件收发帧完成的，硬件层面这个 port 根本没被使能，`mac_port_init()` 仍未移植。
-  run 34 的 `eapol=0x4`（3e 是 `0x2`）就是这个代价的直接读数：AP 重传了两次 Msg1，
-  因为本端在两个 dwell 之间发不出 Msg2。
+  另外：port 0 从增量 3g（run 35）起是**被使能的**（`c400=0x1e81c`、`NET_TYPE`=2(INFRA)、
+  bit2 `PORT_FUNC_EN`=1），但**帧仍然从 scan-offload 停驻的 dwell 上发出去**，因为还没有
+  驻留信道（`rtw8852b_set_channel_{mac,bb,rf}` 未移植）。run 35 的 `eapol=0x4`
+  （和 run 34 一样）就是这个代价的直接读数：AP 重传了两次 Msg1，因为本端在两个 dwell
+  之间发不出 Msg2——使能 port 没有改变这一点。
   说「完成了 WPA2-PSK 四次握手、密钥已被固件接受」是对的，
   说「Wi-Fi 通了」「能收发数据」「流量已加密」是误报。
-- **认证、join、关联、四次握手、装密钥五步都过了，仍然不等于「Wi-Fi 通了」。** run 20/run 25 收到的是 AP 的
+- **认证、join、关联、四次握手、装密钥、port 使能六步都过了，仍然不等于「Wi-Fi 通了」。** run 20/run 25 收到的是 AP 的
   Authentication Response（`status=0`）；增量 3b 之后固件和 ADDR_CAM 知道本机属于这个 BSS；
   增量 3d 又拿到了 Association Response 和 AID 1；增量 3e（run 33）把四次握手做完，
   AP 用 Msg3 的 MIC 认了本端算出来的 PTK；增量 3f（run 34）把 TK 与 GTK 装进安全 CAM，
-  固件四条命令全部 ack。缺的是这五步之后的东西：发送描述符的安全字段（装好的密钥现在没有
+  固件四条命令全部 ack；增量 3g（run 35）把 CMAC port 0 按原厂顺序配成 INFRA 并使能。
+  缺的是这六步之后的东西：发送描述符的安全字段（装好的密钥现在没有
   任何一条发送路径去引用它）、
-  一个真正被使能的 port（`mac_port_init()`）、
   一个静态工作信道（`rtw8852b_set_channel_{mac,bb,rf}`，现在还是从停驻的扫描 dwell 上发包）、
   以及 BB/RF 的 DM 校准（DACK/RCK/IQK/DPK/TSSI）。
   说「能和 AP 完成 open-system 认证 ＋ 关联 ＋ WPA2-PSK 四次握手，并且把两把密钥装进
@@ -342,7 +363,7 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   clause 10.3.2.14 重复检测的输入——AP 在 MAC 层 ACK 之后就丢掉重复帧，看起来就像
   「只回第一次然后沉默」。现在有一个 12 位本机计数器，同时写进帧和 WD BODY dword3。
   **仍然不是关联**：没有 Association Request/AID/密钥，port 0 仍
-  `PORT_FUNC_EN=0`/`NET_TYPE=0`/TSF 冻结。
+  `PORT_FUNC_EN=0`/`NET_TYPE=0`（这里原来还写了「TSF 冻结」，是错的，见增量 3g）。
 - **已完成（2026-08-30，增量 3c）：管理帧交换变成可重复的，join 全链在同一次运行里跑完。**
   run 30，镜像 `wireless_assoc_diag`，本 runner 的 30 条 `--require-*` 过 27 条，
   提交 `7c1cbe4`。四个改动：(a) 交换 armed 期间把 13 条信道表项全部填成目标信道（parked）；
@@ -371,28 +392,33 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   发送、以及在关联完成路径上「握手完成」那行之后调用。槽位照抄原厂：mode 2 下
   单播 0–1／组播 2–4，所以 TK 用 slot 0（entry 0）、GTK 用 slot 2（entry 1），
   `sec-valid=0x5`。**这只证明固件接受了密钥，不证明任何一帧被加密**，见本节第一条。
-- **下一步优先级**：(1) `mac_port_init()` 的 band0/port0 子集 ＋
-  `rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1 ＋ 发送描述符的安全字段：这三件凑齐才
-  第一次可能有「被 CCMP 保护的数据帧」。密钥已经在硬件里（增量 3f），现在挡在
-  「密钥装好」和「能收发数据」之间的是发送路径——描述符不引用安全 CAM index，
-  硬件就不会去加密，而且仍然是在停驻的扫描 dwell 上发帧（run 34 的 `eapol=0x4`
-  就是 AP 因此重传了两次 Msg1）。同一批要把 3b/3c/3d 欠的原厂顺序补回来：
-  `JOININFO` `dis_conn=true` 在认证之前，`dis_conn=false` + INFRA port +
-  `mac_port_init()` 只在关联时。
-  (2) 上面那条里 `mac_port_init()` 的具体寄存器顺序（band0/port0，NO_LINK/INFRA，
-  不做 MBSSID/AP/DBCC）。输入已收集齐（`mport.c:2010-2305`、`mport.h` 的 DEF 常量）；对 STA 而言就是把
-  `R_AX_PORT_CFG_P0`(0xC400) 按顺序写成：先 `FUNC_SW=0`，`TXBCN_RPT_EN`(bit0)/
-  `RXBCN_RPT_EN`(bit1) 清零，`NET_TYPE`(bit11:10)=2(INFRA)，`TBTT_PROHIB_EN`(bit13)＋
-  `BRK_SETUP`(bit16)=1，`RX_BSSID_FIT_EN`(bit4)=1，`TSF_UDT_EN`(bit3)=1，
-  `BCNTX_EN`(bit12)=0，再配 `BCN_INTV`/`BSS_CLR`/`TBTT_AGG=1`/`HIQ_WIN`/`HIQ_DTIM`/
-  hiq pkt_drop/`BCN_HOLD_TIME=400`/`BCN_MASK_AREA=0`，**最后**才 `PORT_FUNC_EN`(bit2)=1，
-  延时 10 µs 再写 `BCN_ERLY=160`/`BCN_SETUP_TIME=4`/`TBTT_ERLY=5`。
-  run 31 结束时实测 `c400=0x1e01b`，bit2 与 `NET_TYPE` 都还是 0。
-  (3) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
+- **已完成（2026-08-31，增量 3g）：CMAC port 0 按原厂顺序配好并使能，`JOININFO` 顺序还清。**
+  run 35，镜像 `wireless_wpa_diag`，本 runner 的 34 条 `--require-*` 一条没失败，
+  提交 `3aadcd8`。`mac_port_init()` 的 band0/port0/INFRA 子集共 21 步（`FUNC_EN` 最后、
+  然后 `dly_port_us(10)`、然后三条被原厂校验函数管着的写入），四处按字节写
+  （`0xc413` TBTT aggregate、`0xc427` DTIM、`0xca08` TSF 时间戳控制、`0xc590` 高队列窗口
+  ——`0xc427` 所在 dword 的起点是 `R_AX_BCN_ERR_FLAG_P0`，dword 读改写会把它一起重写；
+  本端寄存器访问在 `0x1000-0x1f00` 之外走间接 CMD52，字节访问是原生的）。
+  每一次写都打「字段名 ＋ 写前 ＋ 要写 ＋ written/skip」，于是串口直接回答了固件 bring-up
+  已经摆对了多少：大部分都对，真变的只有网络类型、功能使能、两个 beacon 上报使能、
+  高队列窗口和它的 update 位、DTIM、beacon hold、beacon setup。
+  Kconfig 符号 `K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC`（只有 wpa profile 打开；
+  关掉时 assoc 镜像里这段代码整块不在、无新告警）。
+  **失败不中断关联**：`FUNC_EN` 一旦写下去，中途放弃会留下半配置的 port 并把这一轮要收集的
+  握手证据一起丢掉；代价是 `RTL8852BS2 port init complete` 只在「序列跑完 ＋ TSF 在走」
+  时才打，`--require-runtime-port-init` 认这一行加 `status=0x0 tsf=0x1` 的结果行。
+- **下一步优先级**：(1) `rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1 ＋ 发送描述符的
+  安全字段（`sec_type`/`sec_cam_idx`）：这两件凑齐才第一次可能有「被 CCMP 保护的数据帧」。
+  密钥已经在硬件里（增量 3f）、port 也已经使能（增量 3g），现在挡在「密钥装好」和
+  「能收发数据」之间只剩两条——描述符不引用安全 CAM index，硬件就不会去加密；
+  以及仍然是在停驻的扫描 dwell 上发帧（run 35 的 `eapol=0x4` 就是 AP 因此重传了两次
+  Msg1，使能 port 并没有改变它）。3b/3c/3d 欠的 `JOININFO` 顺序已在 3g 还清
+  （认证前 `disconn=0x1`、关联时 `disconn=0x0`）。
+  (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
   发送正确性与 RSSI 精度要靠它；同一批还有 `set_enable_bb_rf(hal, 0)` 的 disable 半边、
   `halbb_dm_init()`/`halrf_dm_init()` 正文、五张 `init_rf_reg` store 表、halbb `phy_reg_gain`。
-  (4) 真正的 STA 链路最终还是要把 `rtw8852b_set_channel_{mac,bb,rf}` 移植进来，
-  让信道控制不再依赖扫描卸载状态机。
+  (3) 真正的 STA 链路最终还是要把 `rtw8852b_set_channel_{mac,bb,rf}` 移植进来，
+  让信道控制不再依赖扫描卸载状态机——也就是 (1) 的前半条。
 
 ## 当前最重要的技术结论
 
@@ -507,20 +533,22 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 命令被固件接受（run 25 / 增量 3b）、join 全链 ＋ 可重复的管理帧交换（run 30 / 增量 3c）、
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
-（run 34 / 增量 3f）。
-**当前实际下一步是数据面：`mac_port_init()` 的 band0/port0 子集 ＋
-`rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1 ＋ 发送描述符的安全字段**——密钥已经在
-硬件里了，但没有任何一条发送路径去引用它的安全 CAM index，所以仍然一帧 CCMP 都没有；
-而且发帧仍然发生在停驻的扫描 dwell 上（run 34 的 `eapol=0x4` 就是 AP 因此重传了两次
-Msg1）。做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e/3f 镜像：
+（run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
+**当前实际下一步是数据面：`rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1 ＋ 发送描述符的
+安全字段**——密钥已经在硬件里、port 也已经使能了，但没有任何一条发送路径去引用它的安全
+CAM index，所以仍然一帧 CCMP 都没有；而且发帧仍然发生在停驻的扫描 dwell 上（run 35 的
+`eapol=0x4` 就是 AP 因此重传了两次 Msg1，使能 port 没有改变它）。做法与欠账见
+「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e/3f/3g 镜像：
 
 ```bash
 tools/build_k1_wpa.sh             # profile board/k1/muse_pi_pro/configs/wireless_wpa_diag
 ```
 
-板上验收是 33 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`），
-run 34 一条没失败、以 `PASS: K1 wireless RAM image reached NSH` 收尾，日志
-`out/k1-serial/k1-wpa-20260830T174332Z.log`（run 33 是其中 31 条，日志
+板上验收是 34 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
+＋ `--require-runtime-port-init`），run 35 一条没失败、以
+`PASS: K1 wireless RAM image reached NSH` 收尾，日志
+`out/k1-serial/k1-wpa-20260830T194339Z.log`（run 34 是其中 33 条，日志
+`out/k1-serial/k1-wpa-20260830T174332Z.log`；run 33 是 31 条，日志
 `out/k1-serial/k1-wpa-20260830T145145Z.log`）。跟踪的 profile defconfig **不含**
 口令：脚本从 `${K1_WIFI_PSK_ENV:-~/.config/k1-wifi-psk.env}`（0600，仓库外）读出
 `K1_WIFI_PASSPHRASE`/`K1_WIFI_SSID`，生成一份 `include` 该 profile 的
