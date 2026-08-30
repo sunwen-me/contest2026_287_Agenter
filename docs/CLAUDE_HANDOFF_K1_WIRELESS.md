@@ -80,6 +80,33 @@
   `2fe2282ddb4113892d8ac983d3e75c42f495cb368caf45e9fe4fe9b7a07b199e`。
   与 run 30 的唯一差别就是请求内容：run 30 对隐藏 SSID 的开放 VAP 发了 6 次都没人理，
   run 31 对同一台 AP 的 WPA2-PSK VAP 只发 1 次就拿到了 AID。
+- **WPA2-PSK 四次握手跑通，Msg3 的 MIC 验过（run 33，提交 `b712b4e`）。**
+  卡住握手的不是密码学，是接收侧的一个复位值：`R_AX_MGNT_FLTR (0xce28)`
+  与 `R_AX_CTRL_FLTR (0xce2c)` 出厂就是 `0x55555555`（所以 3a–3d 的管理帧收得到），
+  但 **`R_AX_DATA_FLTR (0xce30)` 复位是 `0x00000000`，每一个数据帧都被丢掉** ——
+  EAPOL Msg1 是单播 QoS 数据帧，密码学写得再对也到不了主机。上游是
+  `cmac_init()` 里的 `rx_fltr_init()` 一次性把三类过滤器全设成 forward-to-host，
+  本移植只复刻了 `cmac_init()` 的静态子集。dwell 期间把 `0xce30` 写成
+  forward-to-host、结束后恢复，握手一次就跑通：`wpa pmk ssid-len=0x2 status=0x0`、
+  `msg1=1 msg2=1 msg3=1 mic=1 msg4=1`、`mic-fail=0x0 complete=0x1`、
+  `msg2-bytes=0x99 msg4-bytes=0x83`（与上板前主机侧 21 条自测逐字节一致）、
+  `data-self=0x2`（正好 Msg1 和 Msg3 两帧）、`deauth-self=0x0 deauth-reason=0xffff`
+  （AP 不再踢我们；对比 3d 那一帧 Deauthentication，reason 15 = 握手超时，
+  也就是「密码错」会长的样子）、`oversize=0 parse-err=0 crc-err=0 icv-err=0`。
+  31 条 `--require-*` **全部通过**，退出码 0。日志
+  `out/k1-serial/k1-wpa-20260830T145145Z.log`，镜像 `wireless_wpa_diag`，ELF SHA-256
+  `3632ba044f2feeada25743a44d3ab601f4de9e4781c28477d9d83cae2cd47b4e`。
+  两个可复用的结论：（a）`0xce30` **只部分可写**——写 `0x55555555` 读回
+  `0x55550055`，子类型 4-7（Null / CF-Ack / CF-Poll / CF-Ack+CF-Poll，都不带 body）
+  固定在 drop，所以校验只能看 Data（bit 1:0）和 QoS Data（bit 17:16），掩码
+  `0x00030003`；run 32 就是因为整寄存器相等比较返 `-EIO`，一整轮 37 个下游
+  判据全灭。（b）**Msg3 的 MIC 是承重证据**：AP 只可能用同一个 PMK、按同一套
+  字节序推出的 PTK 才算得出它，验过一次就同时确认了口令、PBKDF2、
+  key expansion、nonce/地址排序，以及 Msg2 的每一个字节。
+  口令只存在仓库外的 `/home/sw/.config/k1-wifi-psk.env`（0600，`K1_WIFI_SSID` /
+  `K1_WIFI_PASSPHRASE`），不进跟踪文件、不进串口日志（已逐一核对：仓库 0 命中、
+  串口日志 0 命中）；但链接后的镜像 `.rodata` 里有这个串，
+  **`out/k1-wpa/` 不要发布**。
 - H5 版本结果：HCI `0x0b/0x000b`，manufacturer `0x005d`，LMP subversion `0x8852`
 
 最新已通过的扫描/PHY/FW 日志（运行 12，13 信道被动扫描）：
@@ -98,30 +125,35 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 
 ## 尚未完成，禁止误报
 
-- **关联完成了，但链路还不能用：没有密钥、没有四次握手、没有数据面。** run 31 拿到的
-  AID 是真的，但 RSN element 只是「声明要求」，本端没有 PMK/PTK，也没有移植
-  `sec_eng_init`/`sec_info_tbl_init`，所以 AP 发起的四次握手一帧都答不上来。
-  证据就在同一次运行的确认 sweep 里：目标 BSS 的 `mgmt-other=0x1`、管理帧子类型直方图
-  index 12 = 1，**即 AP 发了一帧 Deauthentication**（本端没有按 A1 过滤 deauth，
-  所以「这一帧是发给本机的」只是强推断，不是证明）。也就是说 AP 承认了这次关联，
-  然后因为握手超时把这个 station 踢掉——这正是预期行为，不是回归。
-  另外 port 0 到关联结束仍然是 `c400=0x1e01b`：**bit2 `PORT_FUNC_EN`=0、
-  `NET_TYPE`=0（NO_LINK）**，整个认证/关联是在 scan-offload 停驻的 dwell 上由软件收发
-  管理帧完成的，硬件层面这个 port 根本没被使能，`mac_port_init()` 仍未移植。
-  说「完成了 802.11 关联、AP 授予了 AID」是对的，说「Wi-Fi 通了」「能收发数据」是误报。
-- **认证、join、关联三步都过了，仍然不等于「Wi-Fi 通了」。** run 20/run 25 收到的是 AP 的
+- **四次握手过了，但链路还是不能用：密钥没装进硬件，没有数据面。** run 33 算出来的
+  PTK 是真的（Msg3 的 MIC 对上了），但 `sec_eng_init` / `sec_info_tbl_init` 还没移植，
+  TK 没写进安全 CAM，Msg3 带来的 GTK 也仍然是 AES-wrap 原文（没做 RFC 3394 解封，
+  MIC 覆盖的就是收到时的那些字节），所以本端一帧 CCMP 数据都收不了、发不了。
+  顺带更正 3d 在这里写过的「下一步」：**四次握手本身不需要安全引擎**——EAPOL 四帧
+  全是明文，增量 3e 已经在板上证明；安全引擎是握手**之后**装密钥才要的。
+  3d 里那一帧 Deauthentication（reason 15 = 握手超时）在 run 33 不再出现，
+  `deauth-self=0x0 deauth-reason=0xffff`。
+  另外 port 0 到握手结束仍然是 `c400=0x1e01b`：**bit2 `PORT_FUNC_EN`=0、
+  `NET_TYPE`=0（NO_LINK）**，整个认证/关联/握手都是在 scan-offload 停驻的 dwell 上由
+  软件收发帧完成的，硬件层面这个 port 根本没被使能，`mac_port_init()` 仍未移植。
+  说「完成了 WPA2-PSK 四次握手、AP 认了本端算出来的 MIC」是对的，
+  说「Wi-Fi 通了」「能收发数据」是误报。
+- **认证、join、关联、四次握手四步都过了，仍然不等于「Wi-Fi 通了」。** run 20/run 25 收到的是 AP 的
   Authentication Response（`status=0`）；增量 3b 之后固件和 ADDR_CAM 知道本机属于这个 BSS；
-  增量 3d 又拿到了 Association Response 和 AID 1。缺的是这三步之后的东西：密钥（四次握手，
-  需要 `sec_eng_init`/`sec_info_tbl_init`）、一个真正被使能的 port（`mac_port_init()`）、
+  增量 3d 又拿到了 Association Response 和 AID 1；增量 3e（run 33）把四次握手做完，
+  AP 用 Msg3 的 MIC 认了本端算出来的 PTK。缺的是这四步之后的东西：把密钥装进硬件
+  （`sec_eng_init`/`sec_info_tbl_init` ＋ 安全 CAM 里的 TK ＋ GTK 的 RFC 3394 解封）、
+  一个真正被使能的 port（`mac_port_init()`）、
   一个静态工作信道（`rtw8852b_set_channel_{mac,bb,rf}`，现在还是从停驻的扫描 dwell 上发包）、
   以及 BB/RF 的 DM 校准（DACK/RCK/IQK/DPK/TSSI）。
-  说「能和 AP 完成 open-system 认证 ＋ 关联并拿到 AID」是对的，
-  说「关联上了就等于联网了」是误报。
+  说「能和 AP 完成 open-system 认证 ＋ 关联 ＋ WPA2-PSK 四次握手」是对的，
+  说「握手过了就等于联网了」是误报。
   （原来这里写的「硬件不会 ACK 这一帧，AP 会重传几次然后超时」是没有证据的推测，
   已删除：run 25 里每一次被回答的交换 `TX PPDU.lcck` 恰好 +2、run 24 里每一次没被回答
   的只 +1，多出来的那一个 PPDU 只能是本机发的。详见 `K1_WIRELESS_BRINGUP.md` 增量 3b。）
-- **`wlan0` 这个网络接口自己仍然不做关联、WPA、DHCP 或联网。**（增量 3d 的关联发生在
-  `wireless_assoc_diag` 的诊断路径里，不在 `wlan0` 的 ioctl 后面。）`wireless_wlan0_scan_diag` 里那个**只报告扫描结果**的
+- **`wlan0` 这个网络接口自己仍然不做关联、WPA、DHCP 或联网。**（增量 3d 的关联在
+  `wireless_assoc_diag`、增量 3e 的四次握手在 `wireless_wpa_diag`，都是诊断路径，
+  不在 `wlan0` 的 ioctl 后面。）`wireless_wlan0_scan_diag` 里那个**只报告扫描结果**的
   `wlan0` 已经在实板通过 25 项 `--require-*` 全链（run 7，见下），但它的范围就只有扫描：
   `SIOCSIWSCAN` 同步跑一次 13 信道被动 sweep、`SIOCGIWSCAN` 读回结果——**没有 TX、
   没有数据 RX 路径、不关联、不认证、无密钥、无 RSSI（不伪造 `IWEVQUAL`）、无 IP**。
@@ -227,9 +259,10 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `tools/k1_rtl8852bs_rf_table_gen.py` 重新生成，运行时 guard 会拒绝不匹配的组合
 - RF calibration/RFK 尚未移植
 - 蓝牙厂商固件下载、完整 HCI 数据传输、Host 扫描和主动连接尚未作为交付验收
-- 不要仅注册一个 `wlan0` 或返回假扫描结果来宣称 Wi-Fi 完成。26 项验收现在全过，但**扫描
-  以上的东西一个都没有**：没有关联、没有认证、没有 4-way、没有数据收发，蓝牙也只到 HCI
-  打开。「Wi-Fi 能扫到 AP」不等于「Wi-Fi 完成」
+- 不要仅注册一个 `wlan0` 或返回假扫描结果来宣称 Wi-Fi 完成。认证、关联、四次握手都过了，
+  但那都发生在诊断 profile 里（3a/3d/3e），**`wlan0` 后面仍然只有扫描**：没有装进硬件的
+  密钥、没有数据收发、没有 IP，蓝牙也只到 HCI 打开。
+  「Wi-Fi 能扫到 AP」「握手过了」都不等于「Wi-Fi 完成」
 - **已完成（2026-08-30，原优先级 1 与 3）**：
   - `K1 Wi-Fi SDIO:` 逐命令打印改成编译期开关 `CONFIG_K1_SDIO_WIFI_COMMAND_TRACE`
     （`chip/k1/Kconfig`，默认 `n`；`k1_sdio.c` 里 `trace` 在没定义时直接 `false`）。
@@ -250,8 +283,9 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
     （`R_AX_SIFS_SETTING 0xC624`、`R_AX_PTCL_FSM_MON 0xC6E8`、`R_AX_RX_TIME_MON 0xCEEC`、
     `R_AX_AGG_LEN_VHT_0 0xC618`）都已证明不适用，`R_AX_DLK_PROTECT_CTL 0xCE02`
     是 `R_AX_RCR 0xCE00` 那个 32 位字的高半字、早就写了。**剩下唯一没审的是
-    `sec_eng_init` / `sec_info_tbl_init`**（本地原厂缓存里没有正文），只影响加密，
-    要到 WPA2 4-way 才需要。细节见 `docs/K1_WIRELESS_BRINGUP.md` 续十四。
+    `sec_eng_init` / `sec_info_tbl_init`**（本地原厂缓存里没有正文），只影响加密：
+    **4-way 本身不需要它**（EAPOL 四帧都是明文，增量 3e 已在板上证明），
+    要到握手之后把 TK/GTK 装进安全 CAM 才需要。细节见 `docs/K1_WIRELESS_BRINGUP.md` 续十四。
 - **已完成（2026-08-30，原优先级 1 的前半 = 增量 3a）：认证（open system）已在板上打通。**
   run 20，镜像 `wireless_auth_diag`，27 条 `--require-*` 全过、`RUN_EXIT=0`，
   基线（原 26 条）无回归。AP `50:4f:3b:e2:e6:d2`（ch1）回了
@@ -304,9 +338,11 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   本端说不清其要求的 Privacy BSS（只有 TKIP 成对密码、厂商私有 suite、只有 SAE）
   仍然跳过并返回 `-EOPNOTSUPP`。`K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE` 96 → 128。
   **关联之后的链路仍然不通**，见「尚未完成，禁止误报」第一条。
-- **下一步优先级**：(1) `sec_eng_init` / `sec_info_tbl_init` ＋ WPA2 四次握手：
-  这是现在唯一挡在「关联成功」和「能收发数据」之间的东西——run 31 已经证明 AP 会授予 AID、
-  也会在握手超时后发 Deauthentication。同一批要把 3b/3c/3d 欠的原厂顺序补回来：
+- **下一步优先级**：(1) `sec_eng_init` / `sec_info_tbl_init` ＋ 把 TK 装进安全 CAM
+  ＋ GTK 的 RFC 3394 解封：四次握手已经在 run 33 过了（增量 3e），PTK 是算出来、
+  并且被 AP 的 MIC 认过的，所以现在挡在「握手成功」和「能收发数据」之间的就是这一步
+  ——密钥还只在内存里，硬件不会加解密任何一帧 CCMP。同一批要把 3b/3c/3d 欠的原厂
+  顺序补回来：
   `JOININFO` `dis_conn=true` 在认证之前，`dis_conn=false` + INFRA port +
   `mac_port_init()` 只在关联时。
   (2) `mac_port_init()` 的 band0/port0 子集（NO_LINK/INFRA，不做 MBSSID/AP/DBCC）。
@@ -434,10 +470,25 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 
 上面这段「第一块砖是 TX」已经完成：Probe Request 真发出去并收到 Probe Response
 （run 14）、open-system 认证收到 AP 的成功回复（run 20 / 增量 3a）、station join 的两条
-命令被固件接受（run 25 / 增量 3b）、join 全链 ＋ 可重复的管理帧交换（run 30 / 增量 3c）。
-**当前实际下一步是增量 3e：WPA2 四次握手（`sec_eng_init`/`sec_info_tbl_init`）**，
-因为增量 3d 已经在 run 31 拿到 AID 1、并观察到 AP 在握手超时后发 Deauthentication。
-做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3d 镜像：
+命令被固件接受（run 25 / 增量 3b）、join 全链 ＋ 可重复的管理帧交换（run 30 / 增量 3c）、
+Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
+验过（run 33 / 增量 3e）。
+**当前实际下一步是把密钥装进硬件：`sec_eng_init`/`sec_info_tbl_init` ＋ 安全 CAM 里的
+TK ＋ GTK 的 RFC 3394 解封**——握手算出来的 PTK 现在只在内存里，硬件不会加解密任何
+一帧 CCMP。做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e 镜像：
+
+```bash
+tools/build_k1_wpa.sh             # profile board/k1/muse_pi_pro/configs/wireless_wpa_diag
+```
+
+板上验收是 31 条 `--require-*`（30 条关联链 ＋ 握手链），run 33 全过、退出码 0，
+日志 `out/k1-serial/k1-wpa-20260830T145145Z.log`。跟踪的 profile defconfig **不含**
+口令：脚本从 `${K1_WIFI_PSK_ENV:-~/.config/k1-wifi-psk.env}`（0600，仓库外）读出
+`K1_WIFI_PASSPHRASE`/`K1_WIFI_SSID`，生成一份 `include` 该 profile 的
+`cmake_out/k1-wpa-config/defconfig`（0600，仓库外）再编译；`--no-key` 可以不带口令构建。
+**链接后的镜像 `.rodata` 里会有这个串，`out/k1-wpa/` 不要发布**。
+
+复现 3d 镜像：
 
 ```bash
 tools/build_k1_assoc.sh           # profile board/k1/muse_pi_pro/configs/wireless_assoc_diag
@@ -544,9 +595,16 @@ C2H result 等待机制，但使用原厂定义的 `source=RF`、RF path A/B、m
 - `wlan0` 扫描 netdev（Apache-2.0，只调 GPL 组件公开 API）：
   `chip/k1/k1_rtl8852bs_netdev.c`、`chip/k1/k1_rtl8852bs_netdev.h`
 - `wlan0` profile：`board/k1/muse_pi_pro/configs/wireless_wlan0_scan_diag/defconfig`
-- 认证/join profile 与构建脚本：
+- 认证/join/关联/WPA profile 与构建脚本：
   `board/k1/muse_pi_pro/configs/wireless_auth_diag/`＋`tools/build_k1_auth.sh`、
-  `board/k1/muse_pi_pro/configs/wireless_join_diag/`＋`tools/build_k1_join.sh`
+  `board/k1/muse_pi_pro/configs/wireless_join_diag/`＋`tools/build_k1_join.sh`、
+  `board/k1/muse_pi_pro/configs/wireless_assoc_diag/`＋`tools/build_k1_assoc.sh`、
+  `board/k1/muse_pi_pro/configs/wireless_wpa_diag/`＋`tools/build_k1_wpa.sh`
+- 测试 AP 的凭据（**仓库外**，0600）：`/home/sw/.config/k1-wifi-psk.env`，
+  变量 `K1_WIFI_SSID` / `K1_WIFI_PASSPHRASE`。`tools/build_k1_wpa.sh` 从这里读出来，
+  写进同样在仓库外的 `cmake_out/k1-wpa-config/defconfig`（0600）；
+  **不要把口令写进跟踪文件、不要打到串口、不要发布 `out/k1-wpa/`**
+  （链接后的 `.rodata` 里有这个串）
 - PHY CR：`chip/k1/k1_rtl8852bs_phy_reg_8852b.inc`
 - Wi-Fi 固件：`chip/k1/k1_rtl8852bs_u2_nic_fw.inc`、`chip/k1/k1_rtl8852bs_u2_nicce_fw.inc`
 - 蓝牙 H5：`chip/k1/k1_bt_uart.c`

@@ -5259,3 +5259,135 @@ subtype 8（Beacon）=0x31。**一次请求就被回答**，而 run 30 是六次
 （原厂 `mport.c:2010-2305`、常量在 `mport.h:23-31`）。
 另外值得顺手补的证据：把认证/关联响应的前 32 字节原样打到串口——run 31 的响应帧字节
 被 armed 期间的输出抑制吃掉了，判据只能依赖解析后的字段。
+
+### 增量 3e：WPA2-PSK 四次握手跑通（Msg3 的 MIC 验过）
+
+提交 `b712b4e`，板上 run 33，日志 `out/k1-serial/k1-wpa-20260830T145145Z.log`，
+镜像 `wireless_wpa_diag`，ELF SHA-256
+`3632ba044f2feeada25743a44d3ab601f4de9e4781c28477d9d83cae2cd47b4e`。
+**本 runner 的 31 项 `--require-*` 全部通过，退出码 0**，其中三项是本轮新增的。
+
+#### 卡住四次握手的不是密码学，是接收侧的一个复位值
+
+`R_AX_DATA_FLTR (0xce30)` 在这颗片子上的复位值是 `0x00000000`——16 个数据帧子类型
+每个 2 bit 全为 `0b00` = drop。也就是说 RMAC 把**所有数据帧**都丢了，一帧都不转给
+SDIO 主机。EAPOL-Key 的第一条消息是单播数据帧，所以在补上这个写之前，无论 PMK 派生、
+PTK 展开、MIC 计算写得多对，握手都不可能开始。
+
+上游 `rx_fltr_init()`（在 `cmac_init()` 里）把管理、控制、数据三类过滤器统统设成
+forward-to-host；本组件只复刻了 `cmac_init()` 的一个静态子集，三个都没写。管理帧过滤器
+`0xce28` 复位值本来就是 `0x55555555`，这正是 3a–3d 的 Authentication/Association
+Response 和 Beacon 能收到、而 3d 结尾那帧 Deauthentication 也能看到的原因——运气而非设计。
+控制帧过滤器 `0xce2c` 复位值同样是 `0x55555555`。
+
+现在扫描 dwell 前后快照并打印 `0xce28/0xce2c/0xce30` 三个值，只把数据帧过滤器写成
+forward-to-host，结束后还原；控制帧过滤器只记录不写（ACK/BA 由硬件应答，主机不需要，
+把繁忙信道上的全部控制帧灌进 SDIO 接收路径纯属浪费带宽）。三行日志（run 33）：
+
+```
+before ce20=0xf0170001 ce28=0x55555555 ce2c=0x55555555 ce30=0x00000000
+scan   ce20=0xf017000f ce28=0x55555555 ce2c=0x55555555 ce30=0x55550055
+after  ce20=0xf0170001 ce28=0x55555555 ce2c=0x55555555 ce30=0x00000000
+```
+
+写 `0x55555555` 回读是 `0x55550055`：子类型 4–7（Null、CF-Ack、CF-Poll、
+CF-Ack+CF-Poll，都不带 body）硬件不接受这个写，保持 drop；0–3 和 8–15 生效。因此回读
+判据只校验能承载 EAPOL 的两个子类型——Data(0) 的 bit 1:0 与 QoS Data(8) 的 bit 17:16，
+掩码 `0x00030003`，整寄存器值照旧打串口。
+
+**run 32 就是死在这条判据上**（不是硬件问题，是我把判据写成了整寄存器逐位相等）：
+过滤器使能返回 `-EIO`，扫描以 `passive scan-offload error=0x5` 收场，后面 37 项 marker
+一个都没跑。记在这里是因为它示范了一件事：给硬件寄存器写回读判据时，先确认哪些位是可写的。
+
+另外把扫描 RX 聚合缓冲从 8 KiB 提到 16 KiB——数据帧现在会进主机，聚合会变大，而超长聚合
+是「跳过并计数」，代价是它后面那些帧一起丢。run 33 实测没用上：`oversize=0`
+`oversize-max=0` `parse-err=0` `crc-err=0` `icv-err=0`，13 个 180 ms parked dwell 里
+一共只上来 `data=0x22`（34 帧）数据帧。
+
+#### 加了什么
+
+四个原语，自下而上：SHA-1、HMAC-SHA1、PBKDF2-SHA1、IEEE 802.11 的 PRF，然后是成对密钥
+展开。`PMK = PBKDF2(passphrase, SSID, 4096, 32)`；
+`PTK = PRF-384(PMK, "Pairwise key expansion",
+min(AA,SPA)||max(AA,SPA)||min(ANonce,SNonce)||max(ANonce,SNonce))`；
+KCK/KEK/TK 是 PTK 的三个 16 字节段。PMK 在 sweep **之前**派生：4096 轮 PBKDF2 约 16384 次
+SHA-1 压缩，塞不进一个 180 ms 的 dwell。
+
+本端要发的两帧：Msg2 153 字节，带本机 nonce 和一条 RSN element——**这条元素是从已发出的
+Association Request 里逐字节抄回来的**，clause 12.7.2 要求两处必须完全一致；Msg4 131 字节。
+MIC 是把 802.1X 头加整个 key frame、其中 MIC 字段读作全零，做 HMAC-SHA1-128；验 Msg3 走
+同一段代码。Key Descriptor Version 3（AES-128-CMAC / AES-SIV）**拒绝并计数**，不拿
+HMAC-SHA1 去糊一个必然错的答案。组密钥不解包：Msg3 的 MIC 覆盖的是**到达时的密文字节**，
+所以不需要 AES 实现、也不需要一个能放结果的安全引擎就能验。
+
+#### 上板之前先在主机上验了 21 条
+
+SHA-1/HMAC/PBKDF2 的 ground truth 取自 Python 的 `hashlib`/`hmac`；PRF、成对密钥展开和
+EAPOL-Key 帧按标准**第二次独立实现**一遍，让 C 和一个独立实现对比，而不是和自己对比。
+覆盖 RFC 2202 的 HMAC 向量、超过一个 block 的密钥、两个 PBKDF2 向量、PRF-160、
+「交换两端得到同一个 PTK」的对称性、Msg2/Msg4 的完整字节、「自己签的自己能验」、
+「翻一个 bit MIC 就变」，以及五条拒绝路径。Msg2 = 153 字节、Msg4 = 131 字节，
+和板上的 `msg2-bytes=0x99`、`msg4-bytes=0x83` 完全一致。
+
+#### 板上证据（run 33）
+
+```
+K1 Wi-Fi GPL: wpa pmk ssid-len=0x2 status=0x0
+K1 Wi-Fi GPL: wpa msg2 tx bytes=0x99 sn=0x7 status=0x0
+K1 Wi-Fi GPL: wpa msg4 tx bytes=0x83 sn=0x8 status=0x0
+K1 Wi-Fi GPL: assoc exchange rsp=0x1 status=0x0 aid=0x1 auth-rsp=0x1
+  beacons=0x19 bss=0xd data-self=0x2 deauth-self=0x0 deauth-reason=0xffff
+  wpa=0x1 msg1=0x1 msg2=0x1 msg3=0x1 mic=0x1 msg4=0x1 bssid=504f3be2e6d2
+K1 Wi-Fi GPL: assoc advertised eapol=0x2 eapol-self=0x2 malformed=0x0
+  ver-refused=0x0 rsn-ie=0x16 msg1=0x1 msg1-info=0x8a anonce=659fb5c5
+  ptk=0x1 msg2=0x1 msg2-bytes=0x99 msg2-status=0x0 msg3=0x1
+  msg3-info=0x13ca msg3-keydata=0x38 mic=0x1 mic-fail=0x0 msg4=0x1
+  msg4-status=0x0 complete=0x1
+K1 Wi-Fi GPL: RTL8852BS2 station WPA2 four-way handshake complete
+```
+
+`data-self=0x2` 是整轮里发给本机的数据帧总数，正好是 Msg1 和 Msg3 两帧，没有多余的。
+`msg1-info=0x8a` = version 2 ＋ Pairwise ＋ Ack、无 MIC 无 Secure，是教科书里的 Msg1；
+`msg3-info=0x13ca` = version 2 ＋ Pairwise ＋ Install ＋ Ack ＋ MIC ＋ Secure ＋
+Encrypted Key Data，`msg3-keydata=0x38`（56 字节）是包好的组密钥。`rsn-ie=0x16`（22 字节）
+是抄回来的那条 element。`deauth-self=0x0`、`deauth-reason=0xffff`：**AP 这次没踢我们**，
+而 3d 那轮结尾它踢了——reason 15（四次握手超时）正是密码错或答不上时会看到的样子。
+
+#### 为什么一次 MIC 验证就够
+
+Msg3 的 MIC 只能由「用同一个 PMK、按同样的字节顺序派生出同一个 PTK」的一端算出来。所以
+`mic=0x1 mic-fail=0x0` 这一项同时确认了：密码对、PBKDF2 对、PRF-384 的 label 和拼接顺序
+对、地址与 nonce 的 min/max 排序对、以及本端 Msg2 的**每一个字节**都被 AP 按同样的解释读到了。
+这比自测能给的强，因为对面不是我们写的。
+
+#### 密码怎么处理的
+
+三层，密码一次也没进仓库：被提交的 profile 把
+`CONFIG_K1_RTL8852BS2_RUNTIME_WPA_PASSPHRASE` 留空，运行时老实返回 `-ENOKEY`；
+`tools/build_k1_wpa.sh` 从 `~/.config/k1-wifi-psk.env`（0600，仓库外）读值，在 `cmake_out`
+下用 `umask 077` 生成一个 0600 的 defconfig，它 `#include` 被提交的 profile 再追加这一行。
+**链接出来的镜像 .rodata 里带着这个字符串**（在 flat bin 里 grep 得到 1 处、ELF 里 2 处），
+所以 `out/k1-wpa` 不能发布——脚本自己的头注释就写着这句。上板后按 env 文件里的变量
+grep 过：仓库 0 命中、串口日志 0 命中。
+
+#### 对 3d「下一步」的一条更正
+
+3d 结尾写的是「增量 3e：`sec_eng_init` / `sec_info_tbl_init` ＋ 四次握手」。**握手不需要
+安全引擎**：四条 EAPOL 帧全部是不加密的明文帧，安全引擎是握手**之后**装密钥、让数据帧被
+CCMP 保护才需要的东西。这次把顺序拆对了，握手先跑通，密钥安装留给下一增量。
+
+#### 还没做的
+
+握手完成**不等于链路能收发数据**：本端没有把 TK 装进安全引擎（没有 `sec_eng_init` /
+`sec_info_tbl_init`），组密钥也没解包，所以这之后的每一帧仍然是明文，AP 侧已经在等
+CCMP 保护的帧了。`mac_port_init()` 仍未移植，仍然是在 parked 的扫描 dwell 里发帧而不是
+驻留在一个工作信道上，`wlan0` 仍然只会扫描，没有 DHCP、没有联网。
+
+#### 下一步
+
+1. `sec_eng_init` / `sec_info_tbl_init` ＋ 把 TK 写进 security CAM，让数据帧真的被 CCMP
+   保护；顺带 RFC 3394 的 AES key unwrap 把 GTK 解出来装组密钥。
+2. 还掉 3b/3c/3d 欠的原厂顺序（`JOININFO` 认证前 `dis_conn=true`、关联时才翻
+   `dis_conn=false` 并把 port 设成 INFRA），以及 `mac_port_init()` 的 band0/port0 子集
+   （寄存器顺序见 3d 的「下一步」）。
+3. `rtw8852b_set_channel_{mac,bb,rf}`：驻留在信道 1，不再从 parked dwell 里发帧。
