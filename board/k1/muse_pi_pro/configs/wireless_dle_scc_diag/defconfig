@@ -1,0 +1,8 @@
+# K1 RTL8852BS2 SDIO/SCC DLE diagnostic profile.
+#
+# This applies the GPL-derived volatile page-pool and quota setup before
+# firmware download. It is RAM-only and does not register Wi-Fi.
+
+#include "../wireless_first_vendor_cmd53_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_DLE_SCC_DIAGNOSTIC=y

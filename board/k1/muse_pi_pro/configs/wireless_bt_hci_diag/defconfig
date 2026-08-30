@@ -1,0 +1,9 @@
+# RTL8852BS2 Bluetooth H5 and /dev/ttyHCI0 registration validation.
+#
+# This configuration inherits the existing RAM-only Wi-Fi electrical bring-up,
+# then registers the UART2 H5 transport through NuttX. It does not load any
+# Bluetooth vendor firmware and performs no persistent storage writes.
+
+#include "../wireless/defconfig"
+
+CONFIG_K1_BT_H5_LOCAL_VERSION_PROBE=y

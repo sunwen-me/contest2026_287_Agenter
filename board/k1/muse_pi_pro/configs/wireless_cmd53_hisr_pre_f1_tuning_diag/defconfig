@@ -1,0 +1,8 @@
+# K1 RTL8852BS2 HISR CMD53 read with Linux card/Function timing order.
+#
+# The bounded read remains RAM-only.  It completes SDR104 and CMD19 tuning
+# before Function 1 enable and its 512-byte block-size write.
+
+#include "../wireless_cmd53_hisr_read_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_TUNE_BEFORE_F1_ENABLE_DIAGNOSTIC=y

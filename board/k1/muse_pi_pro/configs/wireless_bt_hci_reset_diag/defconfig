@@ -1,0 +1,7 @@
+# RTL8852BS2 Bluetooth H5 standard HCI Reset validation.
+#
+# The raw H5 diagnostic first identifies the controller, then verifies one
+# standard reliable HCI command. It does not send a vendor firmware packet.
+
+#include "../wireless_bt_hci_diag/defconfig"
+CONFIG_K1_BT_H5_RESET_PROBE=y

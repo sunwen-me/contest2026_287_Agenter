@@ -1,0 +1,10 @@
+# RTL8852BS2 physical eFuse MAC and post-download WCPU runtime validation.
+#
+# The parent performs the complete GPL U2 NIC transfer into volatile WCPU RAM.
+# This child additionally decodes the read-only Wi-Fi eFuse map and checks that
+# the firmware-ready WCPU and its clock remain enabled. It never uses a
+# persistent board-storage write.
+
+#include "../wireless_fw_full_download_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_RUNTIME_DIAGNOSTIC=y

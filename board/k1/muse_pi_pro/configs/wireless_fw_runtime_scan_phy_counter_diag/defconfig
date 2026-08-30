@@ -1,0 +1,15 @@
+# RMAC receive counters sampled around the passive scan, on top of the BB
+# reset profile.
+#
+# Same RAM-only flow as wireless_fw_runtime_bb_reset_rx_diag, plus one
+# baseline and one final sample of the per-PPDU-type CRC-pass, CRC-fail and
+# false-alarm counters of the original mac_rx_cnt(). The scan that ends
+# without a BSS cannot say whether the baseband demodulated anything at all;
+# these counters can, which decides whether the next missing piece is the RF
+# calibration or the path from the receive MAC to this host. It does not
+# transmit a probe, register a Wi-Fi network device, associate, authenticate,
+# or write eMMC, SPI flash, eFuse, or the U-Boot environment.
+
+#include "../wireless_fw_runtime_bb_reset_rx_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_PHY_COUNTER_DIAGNOSTIC=y

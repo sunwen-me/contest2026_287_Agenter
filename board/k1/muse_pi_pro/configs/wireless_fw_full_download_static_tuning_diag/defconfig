@@ -1,0 +1,10 @@
+# K1 RTL8852BS2 complete U2 NIC firmware download to volatile WCPU RAM.
+#
+# The parent profile retains the independently verified image-layout and
+# legacy MSS selector checks. This child sends the full GPL-derived U2 NIC
+# image and leaves the WCPU running only after its firmware-ready status.
+# It never writes persistent board storage.
+
+#include "../wireless_fw_mss_legacy_signature_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_FULL_DOWNLOAD_DIAGNOSTIC=y

@@ -1,0 +1,8 @@
+# RTL8852BS2 address/BSSID CAM H2C serialization after control-plane setup.
+#
+# This profile builds a non-live, unicast create vector in RAM only.  It never
+# submits the 60-byte payload or allocates a firmware address/BSSID CAM entry.
+
+#include "../wireless_fw_runtime_control_plane_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_ADDRESS_CAM_DIAGNOSTIC=y

@@ -1,0 +1,8 @@
+# K1 RTL8852BS2 DLE/SCC diagnostic with the DTS RX delay.
+#
+# This isolates post-DLE CMD53 traffic from variability in the software CMD19
+# sweep. It remains a RAM-only diagnostic and does not register Wi-Fi.
+
+#include "../wireless_dle_scc_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_STATIC_TUNING_DIAGNOSTIC=y

@@ -1,0 +1,13 @@
+# Python bytecode from the host-side K1 tools.
+tools/__pycache__/
+
+# Locally generated Realtek firmware payloads.  The vendor package installed on
+# this board states no redistribution license for its firmware binaries, so the
+# extracted arrays stay out of the contest repository.  Regenerate them with
+# tools/extract_rtl8852bs_bt_patch.py (Bluetooth patch/config) when
+# CONFIG_K1_BT_H5_VENDOR_FIRMWARE is enabled.  The Wi-Fi NICCE image kept in
+# chip/k1/k1_rtl8852bs_u2_nicce_fw.inc is deliberately NOT ignored: it is part
+# of the GPL-2.0-only component and docs/K1_SOURCE_AND_LICENSES.md records its
+# provenance, length and SHA-256.
+chip/k1/k1_rtl8852bs_bt_patch.inc
+chip/k1/k1_rtl8852bs_u2_nic_fw.inc

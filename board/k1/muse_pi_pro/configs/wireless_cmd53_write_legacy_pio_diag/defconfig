@@ -1,0 +1,8 @@
+# K1 RTL8852BS2 Function 1 CMD53 write legacy-clock PIO profile.
+#
+# This keeps the write PIO A/B request at the four-bit legacy transfer clock.
+# It is RAM-only and is not a Wi-Fi feature profile.
+
+#include "../wireless_cmd53_write_pio_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_LEGACY_CMD53_WRITE_PIO_DIAGNOSTIC=y

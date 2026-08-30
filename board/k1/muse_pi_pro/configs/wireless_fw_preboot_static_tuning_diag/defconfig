@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 firmware-download preboot diagnostic with fixed SDIO tuning.
+#
+# The parent profile proves DLE/SCC, HCI flow-control, and SDIO pre-init.
+# This adds the reversible WLAN CPU/H2C readiness probe only; it does not
+# embed or transfer a firmware image and remains RAM-only.
+
+#include "../wireless_hci_fc_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_PREBOOT_DIAGNOSTIC=y

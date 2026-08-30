@@ -1,0 +1,8 @@
+# RTL8852BS2 firmware role-control H2C serialization after MAC-core setup.
+#
+# This profile proves the upstream FWROLE_MAINTAIN/JOININFO payload layouts in
+# RAM only.  It does not submit either command or create a Wi-Fi role/netdev.
+
+#include "../wireless_fw_runtime_mac_core_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_CONTROL_PLANE_DIAGNOSTIC=y

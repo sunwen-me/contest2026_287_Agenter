@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 Function 0 CMD53 PIO A/B profile.
+#
+# This inherits the wireless bring-up image and replaces the default ADMA
+# common-function probe with one read-only four-byte PIO transaction.  It is
+# RAM-only and does not write eMMC, U-Boot environment, FDL, or fastboot data.
+
+#include "../wireless/defconfig"
+
+CONFIG_K1_SDIO_WIFI_CMD53_PIO_DIAGNOSTIC=y

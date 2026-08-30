@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 Function 0 CMD53 PIO recovery A/B profile.
+#
+# This performs one read-only four-byte CCCR CMD53.  If it times out, the
+# lower-half resets the command/data state machines and repeats that exact
+# read once.  It is RAM-only and never writes card registers or storage.
+
+#include "../wireless_cmd53_pio_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_CMD53_PIO_RETRY_DIAGNOSTIC=y

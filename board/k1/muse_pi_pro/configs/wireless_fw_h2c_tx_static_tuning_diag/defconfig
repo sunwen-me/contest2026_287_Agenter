@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 firmware H2C TX resource/descriptor diagnostic.
+#
+# This profile reads only the SDIO page-status table and builds a descriptor
+# in RAM after the reversible WCPU H2C preboot. It does not write an SDIO TX
+# FIFO or embed any firmware image.
+
+#include "../wireless_fw_preboot_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_H2C_TX_DIAGNOSTIC=y

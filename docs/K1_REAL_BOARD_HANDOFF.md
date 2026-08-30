@@ -1,6 +1,6 @@
 # K1 MUSE Pi Pro 实板交接记录
 
-> 更新时间：2026-08-14（Asia/Shanghai）
+> 更新时间：2026-08-22（Asia/Shanghai）
 >
 > 这份文档记录当前这块真实 MUSE Pi Pro 的实测结果，优先级高于只描述
 > 参考流程的 `K1_UBOOT_BRINGUP.md`。后续继续上板时先读本文件，不要重新猜
@@ -64,6 +64,19 @@ K1 eMMC: mmcsd_slotinitialize ret=0x0000000000000000
 驱动当前仍为只读，文件系统挂载和写入未验收；完整寄存器修复、SHA256 和复现
 命令见 `docs/K1_EMMC_BRINGUP.md`。
 
+无线当前检查点：完整 RTL8852BS2 U2 NIC firmware download 的 RAM-only profile 已完成
+静态 CI、上游映像逐字节比对、干净构建、ELF 校验与 GPL 对应源码打包。待测包为
+`/home/sw/Dev/k1-workspace/out/k1-wireless-fw-full-download-static-tuning/`；当前修复版 ELF SHA-256 为
+`c068a9c3a53e4d91dee492f37cc05c6ea867ed0cddf66bcb44b995864b91c607`，flat payload SHA-256 为
+`bc8993e4a3e0e5acb0ceb21218343055917bab5767f505aac5d17c079175e144`。首次有效上板记录为
+`out/k1-serial/k1-wireless-fw-full-download-static-tuning-20260822T100036Z.log`，SHA-256
+`7088e1d82e4e12033b89b0431190477b36f7ff16bd6ce21214d34e08f513edc4`：它确认前置阶段和 H5 正常，
+但完整 profile 错把 2048-byte FWDL packet 的 block-mode/ADMA 条件限定到旧的单包 config，故首个
+section packet 在主机预检返回 `-EINVAL`，没有提交 CMD53 block transfer。该门控已修复并重建；之后
+两次 60/180 秒监听日志均为 0 bytes，尚未实际运行修复版。下一次上板必须先开监听、再按 RST，并只
+使用 `loadx + go`；不使用 `saveenv`、FDL、fastboot 或任何 eMMC/SPI/eFuse 写入。详细验收条件见
+`docs/K1_WIRELESS_BRINGUP.md`。
+
 ## 2. 板卡和连接事实
 
 ### 2.1 板卡
@@ -78,7 +91,7 @@ K1 eMMC: mmcsd_slotinitialize ret=0x0000000000000000
 | 板载 eMMC Linux 设备 | `/dev/mmcblk2` |
 | U-Boot bootfs | `mmc 2:5` |
 | ADB 序列号 | `BPMIM102080642256` |
-| 主机串口 | `/dev/ttyUSB0` |
+| 主机串口 | `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`（当前指向 `/dev/ttyUSB1`；`ttyUSB*` 编号会随重新枚举变化） |
 
 ### 2.2 USB-TTL 接线
 
@@ -164,7 +177,7 @@ sha256: 3bee62b539b3feaa63337c13fe2b61be992ebc5c31691c3a8f6f49298e688b70
 
 ```bash
 /home/sw/Dev/k1-workspace/contest2026_287_Agenter/tools/capture_k1_serial.sh \
-  --device /dev/ttyUSB0 \
+  --device /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0 \
   --duration 120
 ```
 
@@ -172,7 +185,7 @@ sha256: 3bee62b539b3feaa63337c13fe2b61be992ebc5c31691c3a8f6f49298e688b70
 
 ```bash
 /home/sw/Dev/k1-workspace/contest2026_287_Agenter/tools/console_k1_serial.sh \
-  --device /dev/ttyUSB0
+  --device /dev/serial/by-id/usb-1a86_USB_Serial-if00-port0
 ```
 
 该控制台在 U-Boot 提示符下把 Enter 发为 `CR`，在 `nsh>` 下把 Enter 发为 `LF`。
@@ -180,9 +193,9 @@ sha256: 3bee62b539b3feaa63337c13fe2b61be992ebc5c31691c3a8f6f49298e688b70
 
 自动抢 U-Boot 时，监听器必须在 `adb reboot` 之前打开。该板从主 `U-Boot 2022`
 banner 到 `Autoboot in 0 seconds` 约有 2.4 秒；使用
-`console_k1_serial.sh --stop-autoboot` 时，脚本会在识别主 banner 后等待 1.8 秒，
-然后每 100 ms 发送一次 `s`，在看到 `=>` 后立即停止。不要在 banner 刚出现时只发
-一次 `s`，该字符会过早丢失。
+`console_k1_serial.sh --stop-autoboot` 时，脚本会在识别主 banner 后等待 2.2 秒，
+然后只发送一个 `s`。不要在 banner 刚出现时发送该字符，且不要用多字符批量中断，
+否则残留字符会被后续 U-Boot 命令拼接。
 
 ### 4.2 U-Boot 命令
 
@@ -361,6 +374,23 @@ NuttX 的串口输入、timer、`uptime` 和至少数分钟连续运行。
 SSTC 版本 `uptime` 复核通过；之前较早的 120 秒日志
 `k1-20260812T080606Z.log` 记录的是官方 Linux 关机，不是 NuttX 成功日志，
 不要混淆。
+
+RTL8852BS2 MSS eFuse selector 已完成 RAM-only 实板验收。使用
+`out/k1-wireless-fw-mss-efuse-static-tuning/` 的 wrapper 和 payload 从 U-Boot `loadx + go`
+启动，串口记录为
+`/home/sw/Dev/k1-workspace/out/k1-serial/k1-wireless-fw-mss-efuse-static-tuning-20260822T090959Z.log`
+（SHA-256 `4b91ffb9b382b06a392578af612bb77b73e794d76f88910a9c6a27fc1d39a954`）。它确认 Wi-Fi
+Function 1、DLE/SCC、HCI flow-control、SDIO pre-init、image layout、eFuse `0x5ec/0x5ed` 和
+Bluetooth H5 local-version 均通过；selector 为 `ff/ff`，对应原厂 default MSS pool type `f`、
+customer/key index `0/0`。注意：该输出是 newer key-pool 格式的 selector，而当前 U2 NIC image 的
+`MSSC=2` 实际走 legacy `__mss_index()`；对应 profile
+`wireless_fw_mss_legacy_signature_static_tuning_diag` 已完成 RAM-only 实板验收。串口记录为
+`/home/sw/Dev/k1-workspace/out/k1-serial/k1-wireless-fw-mss-legacy-signature-static-tuning-20260822T092901Z.log`
+（SHA-256 `3876f1cd0a34f6ab70ac5875894b194508e59f901d1ffb0c6cc76b2a536a0789`）。它确认 `ff/ff`
+按 legacy mapping 选择 index `0`，并验证 signature source `0x43440`、target `0x42e00`、长度
+`0x200`、首尾 word、完成标志、Bluetooth H5 local-version 和 `nsh>`。两项 profile 都没有复制
+signature、进入 FWDL preboot、写 eFuse、eMMC、U-Boot 环境或 firmware FIFO；Wi-Fi MAC/netdev
+仍未实现，详见 `K1_WIRELESS_BRINGUP.md`。
 
 串口采集目录：
 

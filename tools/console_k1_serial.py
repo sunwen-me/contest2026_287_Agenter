@@ -91,6 +91,7 @@ def main() -> int:
     output_tail = bytearray()
     stopping_autoboot = False
     autoboot_stopped = False
+    autoboot_sent = False
     autoboot_send_at = 0.0
     autoboot_stop_at = 0.0
 
@@ -132,6 +133,7 @@ def main() -> int:
                     if b"U-Boot SPL" in data:
                         stopping_autoboot = False
                         autoboot_stopped = False
+                        autoboot_sent = False
                         output_tail.clear()
 
                     output_tail.extend(data)
@@ -161,24 +163,24 @@ def main() -> int:
                         if not stopping_autoboot:
                             stopping_autoboot = True
                             now = time.monotonic()
-                            autoboot_send_at = now + 1.8
+                            autoboot_sent = False
+                            autoboot_send_at = now + 2.2
                             autoboot_stop_at = now + 5.0
                             print("\n[Waiting for K1 U-Boot stop window]",
                                   file=sys.stderr)
 
             # K1 reaches "Autoboot in 0 seconds" about 2.4 seconds after
-            # the main U-Boot banner.  Start shortly before that point and
-            # keep sending until U-Boot confirms its prompt or the short
-            # window closes.  This runs after prompt detection so the last
-            # interrupt batch cannot become an NSH/U-Boot command.
+            # the main U-Boot banner.  Send exactly one character shortly
+            # before that point.  A repeated batch leaves stale characters
+            # in the U-Boot input FIFO after it reaches the prompt.
             if stopping_autoboot and not autoboot_stopped:
                 now = time.monotonic()
                 if now >= autoboot_stop_at:
                     stopping_autoboot = False
                     print("\n[U-Boot stop window expired]", file=sys.stderr)
-                elif now >= autoboot_send_at:
-                    write_serial(serial_fd, b"ssss")
-                    autoboot_send_at = now + 0.1
+                elif not autoboot_sent and now >= autoboot_send_at:
+                    write_serial(serial_fd, b"s")
+                    autoboot_sent = True
 
             if not args.exit_on_uboot and stdin_fd in readable:
                 data = os.read(stdin_fd, 4096)

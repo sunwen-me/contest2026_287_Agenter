@@ -88,13 +88,19 @@ awk '
 pass "K1 watchdog uses manual control only"
 
 wifi_sdio_source="${CONTEST_ROOT}/chip/k1/k1_sdio.c"
-if [[ "$(grep -c 'SDIO_CCCR_IOEN' "${wifi_sdio_source}")" != "1" ]] ||
+if [[ "$(grep -c 'SDIO_CCCR_IOEN' "${wifi_sdio_source}")" != "3" ]] ||
    ! grep -Eq \
-     'k1_sdio_wifi_cmd52\(dev, false, SDIO_CCCR_IOEN, 0,' \
+     'int k1_sdio_wifi_enable_function\(uint8_t function, uint16_t blocksize,' \
+     "${wifi_sdio_source}" ||
+   ! grep -Eq \
+     'k1_sdio_wifi_cmd52\(dev, true, 0, SDIO_CCCR_IOEN, io_enable, NULL\)' \
+     "${wifi_sdio_source}" ||
+   ! grep -Eq \
+     'io_ready & \(1u << function\)' \
      "${wifi_sdio_source}"; then
-  fail "Wi-Fi enumeration must only read SDIO_CCCR_IOEN"
+  fail "Wi-Fi Function 1 enable must use the bounded IOEN/IORDY path"
 fi
-pass "Wi-Fi enumeration leaves SDIO IOEN untouched"
+pass "Wi-Fi Function 1 enable path is constrained"
 
 bt_h5_source="${CONTEST_ROOT}/chip/k1/k1_bt_uart.c"
 wireless_defconfig="${CONTEST_ROOT}/board/k1/muse_pi_pro/configs/wireless/defconfig"

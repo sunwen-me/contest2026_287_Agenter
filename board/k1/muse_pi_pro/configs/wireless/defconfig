@@ -6,12 +6,33 @@
 
 #include "../nsh/defconfig"
 
+# UART2 H5 and SDH1 use polling only.  Keep the experimental K1 PLIC path
+# disabled even when the inherited NSH profile enables it for other boards.
+# CONFIG_K1_PLIC is not set
+
 # SDH1 Wi-Fi electrical/pinmux initialization and non-destructive CMD5.
 CONFIG_K1_SDIO=y
 CONFIG_K1_SDIO_WIFI=y
 CONFIG_K1_RTL8852BS2_WIFI=y
 
-# UART2 H5 SYNC/CONFIG only. It is deliberately not registered as a generic
-# H4 device, and no vendor firmware/configuration is included in this tree.
+# Narrow GPL-2.0-only Realtek MAC power-on bootstrap.  It is intentionally
+# limited to CMD52 power bootstrap and post-power register access. An optional
+# CMD53 transport diagnostic is disabled by default and must ship with GPL
+# source/text.
+CONFIG_K1_RTL8852BS2_GPL_BOOTSTRAP=y
+
+# UART2 is a polled H5 transport registered as /dev/ttyHCI0 through the NuttX
+# H5/SLIP layer. The reference Linux rootfs has matching vendor blobs, but
+# this tree neither redistributes nor loads them.
 CONFIG_K1_RTL8852BS2_BT=y
 CONFIG_K1_BT_UART_TX_TIMEOUT_USEC=100000
+CONFIG_K1_BT_H5_RX_FRAME_MAX=16384
+# The raw-HCI smoke test uses bt_slip's active-link trace as its completion
+# marker.  Keep this diagnostic visible in the dedicated wireless profile.
+CONFIG_DEBUG_WIRELESS=y
+CONFIG_DEBUG_WIRELESS_INFO=y
+# The board-late task executes the full SDIO firmware transfer, runtime MAC
+# diagnostics, and H5 preflight before it spawns NSH. The generic 2 KiB stack
+# corrupts its inherited environment and faults in env_dup() at task creation.
+CONFIG_BOARD_INITTHREAD_STACKSIZE=16384
+CONFIG_SCHED_LPWORKSTACKSIZE=8192

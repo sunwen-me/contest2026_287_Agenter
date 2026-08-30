@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 HISR CMD53 read with the standard CCCR_ABORT reset.
+#
+# Keep CCCR_ABORT.RES isolated from the base wireless profile.  This profile
+# exists to reproduce the optional Linux-style recovery step after RAM-only
+# handoffs.
+
+#include "../wireless_cmd53_hisr_read_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_CCCR_ABORT_RESET=y

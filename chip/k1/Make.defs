@@ -14,7 +14,7 @@ ifeq ($(CONFIG_K1_PLIC),y)
 CHIP_CSRCS += k1_plic.c
 endif
 
-ifneq ($(filter y,$(CONFIG_K1_EMAC) $(CONFIG_K1_FB) $(CONFIG_K1_USBDEV) $(CONFIG_USBHOST_XHCI_K1)),)
+ifneq ($(filter y,$(CONFIG_K1_EMAC) $(CONFIG_K1_FB) $(CONFIG_K1_SDIO) $(CONFIG_K1_USBDEV) $(CONFIG_USBHOST_XHCI_K1)),)
 CHIP_CSRCS += k1_cache.c
 endif
 
@@ -36,6 +36,10 @@ endif
 
 ifeq ($(CONFIG_K1_RTL8852BS2_BT),y)
 CHIP_CSRCS += k1_bt_uart.c
+endif
+
+ifeq ($(CONFIG_K1_RTL8852BS2_GPL_BOOTSTRAP),y)
+CHIP_CSRCS += k1_rtl8852bs_gpl.c
 endif
 
 ifeq ($(CONFIG_K1_PWM),y)

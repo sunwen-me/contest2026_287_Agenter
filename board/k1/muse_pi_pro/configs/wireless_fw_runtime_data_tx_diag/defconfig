@@ -1,0 +1,9 @@
+# RTL8852BS2 normal-data descriptor and SDIO queue preflight validation.
+#
+# The parent proves the running firmware and H2C/C2H transport. This child
+# only builds a normal 24-byte data TX descriptor and reads TXPG_WP; it never
+# submits an 802.11 frame before MACID, association, and security exist.
+
+#include "../wireless_fw_runtime_h2c_loopback_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_DATA_TX_DIAGNOSTIC=y

@@ -1,0 +1,10 @@
+# RTL8852BS2 one-shot passive scan-offload event diagnostic.
+#
+# The parent creates and firmware-acknowledges a volatile no-link role/CAM
+# plus a passive 2.4 GHz 1-13 scan table. This child starts it once and
+# requires all
+# C2H channel-entry events and scan-end; it neither probes nor exposes wlan0.
+
+#include "../wireless_fw_runtime_scanofld_channel_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_OFLD_PASSIVE_DIAGNOSTIC=y

@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 HCI flow-control diagnostic with fixed SDIO tuning.
+#
+# The parent profile repeatedly proves DLE/SCC and SDIO pre-init at the MUSE
+# Pi Pro DTS RX delay. This adds only the GPL-derived HCI FC register setup.
+# It remains RAM-only and does not register Wi-Fi.
+
+#include "../wireless_dle_scc_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_HCI_FC_DIAGNOSTIC=y

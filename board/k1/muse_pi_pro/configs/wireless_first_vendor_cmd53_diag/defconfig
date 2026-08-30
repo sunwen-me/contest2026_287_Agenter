@@ -1,0 +1,8 @@
+# K1 RTL8852BS2 exact first-vendor-CMD53 diagnostic profile.
+#
+# This submits only the original Linux hci_func_en() window request after the
+# command-only bootstrap.  It is RAM-only and not a Wi-Fi feature profile.
+
+#include "../wireless/defconfig"
+
+CONFIG_K1_SDIO_WIFI_FIRST_VENDOR_CMD53_DIAGNOSTIC=y

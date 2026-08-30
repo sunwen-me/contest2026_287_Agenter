@@ -1,0 +1,29 @@
+# RTL8852BS2 active scan: transmit a Probe Request, receive a Probe Response.
+#
+# The parent is the wlan0 profile whose whole chain already passed on the board,
+# so one run of this image re-validates everything that was proven before -
+# firmware download, the runtime control plane, the no-link role and CAM, the
+# passive 2.4 GHz 1-13 sweep with real Beacon RX, and the wlan0 netdev whose
+# wapi scan reports those access points - and then adds the one new step.
+#
+# That step is the first transmit in this port.  A wildcard Probe Request is
+# stored in the firmware packet-offload table with MAC/FW_OFLD/PACKET_OFLD and
+# the scan-offload channel table is resubmitted with the original chinfo
+# tx_pkt bit and probe_req_pkt_id naming that packet, so the firmware builds
+# the transmit descriptor and transmits once per dwell. No host transmit ring
+# is involved, exactly as in the original phl and in mainline rtw89.
+#
+# The image fails unless a Probe Response comes back. That frame is sent by an
+# access point only in reply to a Probe Request and is addressed to the eFuse
+# self MAC carried in ours, so it is evidence that the request was radiated;
+# every firmware acknowledgement before it only reports an accepted command,
+# and a Beacon proves nothing here because the passive sweep receives those.
+#
+# Still RAM-only. One Probe Request per channel dwell, nothing retransmitted,
+# no association, no authentication, no key, no data path, no IP address, and
+# nothing written to eMMC, SPI flash, eFuse or the U-Boot environment. wlan0
+# keeps reporting the passive sweep only: its scan path is unchanged.
+
+#include "../wireless_wlan0_scan_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_OFLD_ACTIVE_DIAGNOSTIC=y

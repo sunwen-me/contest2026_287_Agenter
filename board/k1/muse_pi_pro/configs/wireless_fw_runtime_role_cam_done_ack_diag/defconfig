@@ -1,0 +1,8 @@
+# RTL8852BS2 volatile no-link station role and address/BSSID CAM diagnostic.
+#
+# It uses the eFuse self MAC, waits for the firmware done acknowledgement of
+# each H2C, and retains no Wi-Fi state after the RAM image is reset.
+
+#include "../wireless_fw_runtime_address_cam_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_ROLE_CAM_DONE_ACK_DIAGNOSTIC=y

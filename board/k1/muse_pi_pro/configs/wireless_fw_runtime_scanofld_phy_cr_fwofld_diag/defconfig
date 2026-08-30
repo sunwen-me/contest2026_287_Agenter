@@ -1,0 +1,9 @@
+# RTL8852BS2 PHY CR image through the original firmware command-offload path.
+#
+# The host submits only the imported fixed BB table to the running NICCE
+# firmware. It starts with High-Speed SDIO, avoids CMD19/SDR104, and does not
+# write eMMC, SPI flash, eFuse, or U-Boot environment.
+
+#include "../wireless_fw_runtime_scanofld_phy_cr_highspeed_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_PHY_CR_FWOFLD_DIAGNOSTIC=y

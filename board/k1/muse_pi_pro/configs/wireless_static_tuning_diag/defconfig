@@ -1,0 +1,8 @@
+# K1 RTL8852BS2 one-shot CMD19 tuning diagnostic.
+#
+# Preserve the ordinary wireless reset and enumeration sequence, then validate
+# the DTS RX delay once before the GPL bootstrap and bounded CMD53 paths.
+
+#include "../wireless/defconfig"
+
+CONFIG_K1_SDIO_WIFI_STATIC_TUNING_DIAGNOSTIC=y

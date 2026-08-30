@@ -1,0 +1,10 @@
+# RTL8852BS2 board RF context report.
+#
+# The host reads the chip cut version and the logical eFuse RF fields before
+# the firmware is downloaded and prints them, so the RF table selection is
+# based on the real board instead of an assumption. It reads only: no eFuse
+# write, no eMMC, SPI flash, or U-Boot environment write.
+
+#include "../wireless_fw_runtime_scanofld_phy_cr_fwofld_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RF_CONTEXT_DIAGNOSTIC=y

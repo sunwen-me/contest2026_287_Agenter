@@ -1,0 +1,14 @@
+# RTL8852BS2 BLE Host active-central diagnostic.
+#
+# Extends the volatile Realtek vendor-patch profile with enough stack for the
+# scan-stop/create-connection path.  This image is loaded only through the
+# RAM-only U-Boot XMODEM flow.
+
+#include "../wireless_bt_vendor_firmware_diag/defconfig"
+
+CONFIG_DEBUG_WIRELESS_INFO=y
+CONFIG_IDLETHREAD_STACKSIZE=16384
+CONFIG_SCHED_HPWORKSTACKSIZE=16384
+CONFIG_SCHED_LPWORKSTACKSIZE=16384
+CONFIG_BTSAK_STACKSIZE=16384
+CONFIG_BLUETOOTH_TXCMD_STACKSIZE=16384

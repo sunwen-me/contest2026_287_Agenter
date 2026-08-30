@@ -29,14 +29,15 @@
 #define K1_CLK_FUNCTION_ENABLE          (1ul << 1)
 #define K1_CLK_RESET                    (1ul << 2)
 
-/* UART clock-select field.  The Linux K1 clock driver selects the slow
- * 14.7456 MHz UART parent with value 1, which gives an exact 115200 baud
- * divisor of eight.
+/* UART clock-select field.  Linux mainline defines the UART parents as
+ * 57.6 MHz (0), 14.7456 MHz (1), and 48 MHz (2).  The two slow parents give
+ * exact divisors for the RTL8852BS H5 attach rates: 115200 and 1.5 Mbaud.
  */
 
 #define K1_APBC_UART_CLK_SEL_SHIFT       4
 #define K1_APBC_UART_CLK_SEL_MASK        (7ul << K1_APBC_UART_CLK_SEL_SHIFT)
 #define K1_APBC_UART_CLK_SEL_SLOW_14M    (1ul << K1_APBC_UART_CLK_SEL_SHIFT)
+#define K1_APBC_UART_CLK_SEL_SLOW_48M    (2ul << K1_APBC_UART_CLK_SEL_SHIFT)
 
 /* K1 multi-function pin registers.  The offsets follow the Linux mainline
  * spacemit_k1_pin_to_offset() mapping.  GPIO91 and GPIO92 are after a
@@ -118,7 +119,10 @@
 #define K1_MFPR_EDGE_RISE              (1ul << 4)
 #define K1_MFPR_EDGE_FALL              (1ul << 5)
 #define K1_MFPR_EDGE_CLEAR             (1ul << 6)
-#define K1_MFPR_DRIVE_1V8_DS2          (2ul << 10)
+/* K1 1.8 V drive-strength field occupies bits 12:10. */
+
+#define K1_MFPR_DRIVE_1V8_DS2          (2ul << 11)
+#define K1_MFPR_DRIVE_1V8_DS3          (3ul << 11)
 /* K1 3.3 V drive codes are ordered 0, 2, 4, 6, 1, 3, 5, 7. */
 
 #define K1_MFPR_DRIVE_3V3_DS4          (1ul << 10)

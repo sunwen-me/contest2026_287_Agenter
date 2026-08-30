@@ -1,0 +1,8 @@
+# K1 RTL8852BS2 vendor-shaped Function 1 HISR CMD53 read profile.
+#
+# This uses the regular SDR104 ADMA path and runs one read-only, four-byte
+# CMD53 from F1/HISR 0x1104 after the CMD52 bootstrap.  It is RAM-only.
+
+#include "../wireless/defconfig"
+
+CONFIG_K1_SDIO_WIFI_CMD53_HISR_READ_DIAGNOSTIC=y

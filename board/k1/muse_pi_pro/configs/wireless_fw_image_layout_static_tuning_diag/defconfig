@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 original U2 NIC image-layout diagnostic.
+#
+# The parent profile proves the board's SDIO/DLE/HCI preparation at the DTS
+# RX delay. This child parses only GPL-derived firmware header metadata; it
+# sends no firmware packet and remains entirely RAM-only.
+
+#include "../wireless_hci_fc_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_IMAGE_LAYOUT_DIAGNOSTIC=y

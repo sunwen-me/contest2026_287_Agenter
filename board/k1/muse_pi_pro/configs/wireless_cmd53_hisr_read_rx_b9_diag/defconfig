@@ -1,0 +1,8 @@
+# K1 RTL8852BS2 HISR CMD53 read with vendor-captured RX DLINE code.
+#
+# This changes only the RX delay code from the locally selected tuning point
+# to 0xb9 immediately before the existing F1/HISR read.  It is RAM-only.
+
+#include "../wireless_cmd53_hisr_read_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_CMD53_HISR_READ_RX_B9_DIAGNOSTIC=y

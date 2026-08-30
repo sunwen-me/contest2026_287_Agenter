@@ -105,6 +105,11 @@ install -m 0644 \
 install -m 0644 \
   "${CONTEST_ROOT}/docs/K1_HOST_TOOLING.md" \
   "${OUTPUT}/K1_HOST_TOOLING.md"
+if [[ -f "${CONTEST_ROOT}/docs/K1_WIRELESS_BRINGUP.md" ]]; then
+  install -m 0644 \
+    "${CONTEST_ROOT}/docs/K1_WIRELESS_BRINGUP.md" \
+    "${OUTPUT}/K1_WIRELESS_BRINGUP.md"
+fi
 if [[ -f "${CONTEST_ROOT}/docs/K1_USB_DISPLAY_BRINGUP.md" ]]; then
   install -m 0644 \
     "${CONTEST_ROOT}/docs/K1_USB_DISPLAY_BRINGUP.md" \
@@ -153,6 +158,14 @@ if [[ -f "${CONTEST_ROOT}/tools/run_k1_ethernet_smoke.py" ]]; then
     "${CONTEST_ROOT}/tools/run_k1_ethernet_smoke.py" \
     "${OUTPUT}/run_k1_ethernet_smoke.py"
 fi
+if [[ -f "${CONTEST_ROOT}/tools/run_k1_wireless_smoke.py" ]]; then
+  install -m 0755 \
+    "${CONTEST_ROOT}/tools/run_k1_wireless_smoke.py" \
+    "${OUTPUT}/run_k1_wireless_smoke.py"
+  install -m 0644 \
+    "${CONTEST_ROOT}/tools/load_k1_xmodem.py" \
+    "${OUTPUT}/load_k1_xmodem.py"
+fi
 install -m 0644 \
   "${CONTEST_ROOT}/LICENSE" \
   "${OUTPUT}/licenses/CONTEST-LICENSE"
@@ -164,6 +177,22 @@ if [[ -f "${WORKSPACE_ROOT}/nuttx/NOTICE" ]]; then
   install -m 0644 \
     "${WORKSPACE_ROOT}/nuttx/NOTICE" \
     "${OUTPUT}/licenses/NUTTX-NOTICE"
+fi
+
+if grep -qx 'CONFIG_K1_RTL8852BS2_GPL_BOOTSTRAP=y' "${CONFIG}"; then
+  mkdir -p "${OUTPUT}/sources/rtl8852bs-gpl"
+  install -m 0644 \
+    "${CONTEST_ROOT}/LICENSES/GPL-2.0-only.txt" \
+    "${OUTPUT}/licenses/GPL-2.0-only.txt"
+  install -m 0644 \
+    "${CONTEST_ROOT}/chip/k1/k1_rtl8852bs_gpl.c" \
+    "${OUTPUT}/sources/rtl8852bs-gpl/k1_rtl8852bs_gpl.c"
+  install -m 0644 \
+    "${CONTEST_ROOT}/chip/k1/k1_rtl8852bs_gpl.h" \
+    "${OUTPUT}/sources/rtl8852bs-gpl/k1_rtl8852bs_gpl.h"
+  install -m 0644 \
+    "${CONTEST_ROOT}/chip/k1/k1_rtl8852bs_u2_nicce_fw.inc" \
+    "${OUTPUT}/sources/rtl8852bs-gpl/k1_rtl8852bs_u2_nicce_fw.inc"
 fi
 
 CHECK_ARGS=(
@@ -230,6 +259,7 @@ Files:
   K1_UBOOT_BRINGUP.md       Bring-up and recovery guide
   TEST_RECORD.md            First-board evidence template
   K1_HOST_TOOLING.md        Serial capture, trap decode and CI commands
+  K1_WIRELESS_BRINGUP.md    RTL8852BS2 wireless scope and board evidence
   K1_USB_DISPLAY_BRINGUP.md USB/display scope and real-board test procedure
   K1_ETHERNET_DESIGN.md     Ethernet implementation and board evidence
   K1_WATCHDOG_BRINGUP.md    K1 watchdog safety boundary and smoke procedure
@@ -242,7 +272,10 @@ Files:
   k1_flash_manifest_check.py Read-only image/recovery manifest preflight
   decode_k1_trap.py         Standalone trap parser/symbolizer
   run_k1_ethernet_smoke.py  RAM-only ICMP/UDP Ethernet smoke test (when included)
-  licenses/                 Contest and NuttX license/notice files
+  run_k1_wireless_smoke.py  RAM-only SDIO/H5 wireless smoke test (when included)
+  load_k1_xmodem.py         XMODEM transport used by wireless smoke test
+  licenses/                 Contest, NuttX, and enabled GPL component licenses
+  sources/rtl8852bs-gpl/    GPL RTL8852BS2 component source (when enabled)
 EOF
 
 printf 'K1 U-Boot bring-up package generated\n'

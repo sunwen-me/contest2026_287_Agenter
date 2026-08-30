@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 Function 1 CMD53 write PIO A/B profile.
+#
+# This keeps the vendor-observed 12-byte write shape, but routes exactly that
+# request through the SDHCI buffer register instead of ADMA.  It is RAM-only
+# and is not a Wi-Fi feature profile.
+
+#include "../wireless_cmd53_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_CMD53_WRITE_PIO_DIAGNOSTIC=y

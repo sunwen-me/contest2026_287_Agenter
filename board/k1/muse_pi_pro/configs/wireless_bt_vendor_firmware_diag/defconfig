@@ -1,0 +1,10 @@
+# RTL8852BS2 Bluetooth vendor patch and BLE Host validation.
+#
+# The firmware include is generated locally from the board's installed files
+# and loaded only into volatile controller RAM. It is intentionally absent
+# from version control.
+
+#include "../wireless_bt_host_scan_diag/defconfig"
+
+CONFIG_K1_BT_H5_LOCAL_VERSION_PROBE=y
+CONFIG_K1_BT_H5_VENDOR_FIRMWARE=y

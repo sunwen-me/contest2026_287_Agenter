@@ -1,0 +1,10 @@
+# RTL8852BS2 running-WCPU SDIO transport read diagnostic.
+#
+# The parent downloads the GPL-derived firmware into volatile WCPU RAM and
+# validates the read-only eFuse MAC/runtime state. This child additionally
+# reads HIMR, HISR, RX request length, and the 28-byte TX-page window via
+# Function 1 CMD53. It does not touch persistent board storage or RX FIFO.
+
+#include "../wireless_fw_runtime_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_TRANSPORT_DIAGNOSTIC=y

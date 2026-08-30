@@ -1,0 +1,8 @@
+# RTL8852BS2 PHY CR image after a clean full High-Speed SDIO initialization.
+#
+# This profile deliberately skips SDR104/CMD19 to reproduce the K1 Linux
+# CRC fallback boundary without changing persistent board storage.
+
+#include "../wireless_fw_runtime_scanofld_phy_cr_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_HIGHSPEED_ONLY_DIAGNOSTIC=y

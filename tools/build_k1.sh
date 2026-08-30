@@ -139,6 +139,14 @@ if [[ "${BUILD_DIR}" != /* ]]; then
   BUILD_DIR="${WORKSPACE_ROOT}/${BUILD_DIR}"
 fi
 
+if [[ "${CONFIG_PATH}" != /* &&
+      -f "${CONTEST_ROOT}/${CONFIG_PATH}/defconfig" ]]; then
+  # Allow a board configuration relative to this contest repository.  The
+  # underlying openVela build runs from WORKSPACE_ROOT, where that path would
+  # otherwise be resolved incorrectly.
+  CONFIG_PATH="${CONTEST_ROOT}/${CONFIG_PATH}"
+fi
+
 if [[ -n "${PACKAGE_DIR}" && "${PACKAGE_DIR}" != /* ]]; then
   PACKAGE_DIR="${WORKSPACE_ROOT}/${PACKAGE_DIR}"
 fi

@@ -1,0 +1,10 @@
+# K1 RTL8852BS2 U2 NIC legacy MSS signature selection diagnostic.
+#
+# The U2 NIC image's secure section has MSSC=2. This profile reads only the
+# two Wi-Fi eFuse selector bytes and validates the original two-entry legacy
+# MSS signature mapping; it does not alter the secure section or send any
+# firmware packet.
+
+#include "../wireless_fw_image_layout_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_MSS_LEGACY_SIGNATURE_DIAGNOSTIC=y

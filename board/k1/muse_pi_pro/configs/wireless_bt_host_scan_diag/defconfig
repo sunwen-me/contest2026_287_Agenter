@@ -1,0 +1,31 @@
+# RTL8852BS2 NuttX BLE Host and btsak scan validation.
+#
+# This profile lets the NuttX H5/SLIP layer own the initial link session,
+# registers the controller as a Bluetooth netdev, and includes btsak. It does
+# not load a Realtek vendor firmware image or write persistent storage.
+
+#include "../wireless_bt_hci_only_diag/defconfig"
+
+CONFIG_ALLOW_BSD_COMPONENTS=y
+CONFIG_NET=y
+CONFIG_NETDEV_LATEINIT=y
+CONFIG_WIRELESS=y
+CONFIG_K1_BT_H5_HOST=y
+# CONFIG_BLUETOOTH_SLIP is not set
+CONFIG_BTSAK=y
+CONFIG_BTSAK_PROGNAME="bt"
+
+# Keep failed inbound connection setup observable in this diagnostic image.
+CONFIG_DEBUG_WIRELESS_ERROR=y
+CONFIG_DEBUG_WIRELESS_WARN=y
+# CONFIG_DEBUG_WIRELESS_INFO is not set
+
+# bt_slip encodes an H5 frame in a 2048-byte automatic buffer. H5 setup and
+# its RX/retry paths run on the LPWORK/HPWORK threads, so keep all paths above
+# that frame.
+CONFIG_IDLETHREAD_STACKSIZE=8192
+CONFIG_SCHED_HPWORKSTACKSIZE=8192
+CONFIG_SCHED_LPWORKSTACKSIZE=8192
+CONFIG_BTSAK_STACKSIZE=8192
+CONFIG_BLUETOOTH_TXCMD_STACKSIZE=8192
+CONFIG_BLUETOOTH_TXCONN_STACKSIZE=4096

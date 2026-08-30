@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 legacy-clock CMD53 PIO profile.
+#
+# This is RAM-only and leaves the card at the existing four-bit transfer
+# clock after CMD52 enumeration and Function 1 enable.  It changes neither
+# eMMC nor U-Boot environment, FDL, or fastboot data.
+
+#include "../wireless_cmd53_pio_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_LEGACY_CMD53_DIAGNOSTIC=y

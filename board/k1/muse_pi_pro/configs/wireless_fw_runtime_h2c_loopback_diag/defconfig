@@ -1,0 +1,9 @@
+# RTL8852BS2 runtime H2C/C2H SDIO loopback diagnostic.
+#
+# The parent loads the GPL-derived NIC image into volatile WCPU RAM and
+# confirms the running SDIO transport. This child sends the original H2C
+# loopback packet and validates its C2H FIFO response without persistent I/O.
+
+#include "../wireless_fw_runtime_transport_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_H2C_LOOPBACK_DIAGNOSTIC=y

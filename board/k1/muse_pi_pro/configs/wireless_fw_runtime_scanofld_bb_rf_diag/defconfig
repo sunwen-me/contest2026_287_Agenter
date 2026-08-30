@@ -1,0 +1,8 @@
+# RTL8852BS2 passive 2.4 GHz 1-13 scan after the original BB/RF release.
+#
+# This RAM-only profile proves the BB/RF release and the pre-existing scan
+# control chain. It does not require a Beacon/Probe Response.
+
+#include "../wireless_fw_runtime_scanofld_passive_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_BB_RF_DIAGNOSTIC=y

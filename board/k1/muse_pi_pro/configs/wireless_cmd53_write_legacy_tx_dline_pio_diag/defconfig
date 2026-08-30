@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 Function 1 CMD53 write legacy-clock TX DLINE PIO profile.
+#
+# This retains the write PIO request at the four-bit legacy transfer clock
+# and applies only the vendor TX delay-line setup immediately before CMD53.
+# It is RAM-only and is not a Wi-Fi feature profile.
+
+#include "../wireless_cmd53_write_legacy_pio_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_LEGACY_CMD53_WRITE_TX_DLINE_DIAGNOSTIC=y

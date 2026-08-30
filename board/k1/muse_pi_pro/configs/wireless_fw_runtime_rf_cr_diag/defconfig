@@ -1,0 +1,11 @@
+# RTL8852BS2 RF radio A/B image through the original firmware command-offload
+# path.
+#
+# The host replays the original headline selection against the board RF
+# context, then submits the two generated radio parameter images to the
+# running NICCE firmware. It starts with High-Speed SDIO, avoids CMD19/SDR104,
+# and does not write eMMC, SPI flash, eFuse, or U-Boot environment.
+
+#include "../wireless_fw_runtime_rf_context_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_RF_CR_DIAGNOSTIC=y

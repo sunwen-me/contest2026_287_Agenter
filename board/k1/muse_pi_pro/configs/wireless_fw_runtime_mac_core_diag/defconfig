@@ -1,0 +1,9 @@
+# RTL8852BS2 static MAC-core configuration after verified firmware runtime.
+#
+# The child keeps the normal-data descriptor preflight but adds only the
+# field-verified subset of the vendor MAC_AX_TRX_SW_MODE initialization. It
+# does not configure a role, MACID peer, key, scan, association, or netdev.
+
+#include "../wireless_fw_runtime_data_tx_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_MAC_CORE_DIAGNOSTIC=y

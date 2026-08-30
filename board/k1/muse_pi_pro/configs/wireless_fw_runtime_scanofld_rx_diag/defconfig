@@ -1,0 +1,9 @@
+# RTL8852BS2 passive scan-offload with real Beacon/BSS RX validation.
+#
+# This remains a RAM-only one-shot diagnostic. It requires a valid BSSID from
+# a Beacon or Probe Response before reporting success; it does not create
+# wlan0, associate, authenticate, or obtain an IP address.
+
+#include "../wireless_fw_runtime_scanofld_passive_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_OFLD_RX_DIAGNOSTIC=y

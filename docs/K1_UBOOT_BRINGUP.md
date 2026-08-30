@@ -26,7 +26,17 @@ OpenSBI -> U-Boot -> NuttX payload -> K1 early log -> nx_start -> NSH
 - 首轮不执行 `saveenv`，不修改持久化 `bootcmd`；
 - 不向整盘写入自动生成镜像；
 - 不加载到低地址保留区、显示保留区或 OpenSBI 保留区；
-- UART 保留 U-Boot 的 115200 8N1 配置；
+- UART 保留 U-Boot 的 115200 8N1 配置；大于 128 bytes 的 RAM payload 使用
+  XMODEM-CRC 1024-byte STX blocks，小 wrapper 仍使用 128-byte SOH blocks。K1 U-Boot
+  2022.10 的 `xyzModem` receiver 同时支持这两种 framing；1 KiB blocks 避免完整 Wi-Fi
+  runtime payload 因逐块 ACK 延迟撞上约 60 秒 watchdog 窗口。接收端在 `loadx` 后可能
+  返回 `C`，这在 K1 U-Boot 的 `xyzModem` 中表示当前包超时、帧异常或 CRC 错误，工具会
+  重发该包而不重置会话；对每个 1 KiB ACK 后还保留 5 ms 间隔，避免 K1 U-Boot console
+  接收端在持续突发时落后。若同一个 1 KiB 包耗尽有界重试，工具会先发送 CAN 取消失败的
+  `loadx` session，再打开新的 RAM-only `loadx` session，从 block 1 自动改用 128-byte
+  blocks 重传完整 payload。这不改变板端状态。
+  虽然这版 U-Boot 语法接受 `loadx <addr> <baud>`，实板切至 57600 后的 UART 输出失真，
+  因此当前工具只使用已验证的 115200 路径；不要在实板上修改 U-Boot 波特率。
 - 当前实板路径将 wrapper 暂存于 `0x12000000`，flat NuttX payload 装到
   `0x11000000`，再执行 `go 0x12000000`；旧的 ELF/`bootelf -p` 路径仅作历史参考。
 
@@ -57,6 +67,7 @@ out/k1-bringup-final/
 ├── capture_k1_serial.py
 ├── decode_k1_trap.py
 ├── licenses/
+├── sources/rtl8852bs-gpl/  # only for a GPL wireless image
 └── PACKAGE_MANIFEST.txt
 ```
 

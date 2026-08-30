@@ -1,0 +1,10 @@
+# K1 RTL8852BS2 one-packet firmware static-header diagnostic.
+#
+# The parent profile proves the H2C resource calculation without a FIFO
+# write. This child sends only the GPL U2 NIC static header with its FWDL H2C
+# envelope, then clears the WCPU download state. It never sends a section,
+# dynamic header, or full firmware image and remains RAM-only.
+
+#include "../wireless_fw_h2c_tx_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_HEADER_PACKET_DIAGNOSTIC=y

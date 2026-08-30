@@ -1,0 +1,11 @@
+# K1 RTL8852BS2 28-byte post-first-packet compatibility diagnostic.
+#
+# The profile sends one static header, the first 2020-byte section-zero packet,
+# and 28 bytes from the start of the next original packet. It then clears WCPU
+# firmware-download state. The 28 bytes are not a section tail. The profile
+# does not complete the section, check firmware-ready, register a MAC, or
+# create a network device.
+
+#include "../wireless_fw_section0_packet_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_SECTION0_TAIL_PACKET_DIAGNOSTIC=y

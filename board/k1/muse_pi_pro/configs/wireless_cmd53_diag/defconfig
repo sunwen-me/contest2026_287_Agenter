@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 CMD53 transport diagnostic profile.
+#
+# This inherits the wireless bring-up image and enables exactly one additional
+# non-destructive 12-byte Function 1 CMD53 write probe. It is for RAM-only
+# hardware diagnosis and is not the default wireless or contest profile.
+
+#include "../wireless/defconfig"
+
+CONFIG_K1_SDIO_WIFI_CMD53_WRITE_DIAGNOSTIC=y

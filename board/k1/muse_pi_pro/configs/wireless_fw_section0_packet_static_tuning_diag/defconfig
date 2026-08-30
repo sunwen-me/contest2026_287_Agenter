@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 one-packet firmware section-zero diagnostic.
+#
+# The profile sends exactly one static header and then exactly one 2020-byte
+# first section packet, followed by WCPU cleanup. It never sends a second
+# packet, checksum, full image, MAC registration, or netdev setup.
+
+#include "../wireless_fw_header_packet_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_SECTION_PACKET_DIAGNOSTIC=y

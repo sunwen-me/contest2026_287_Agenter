@@ -1,0 +1,9 @@
+# K1 RTL8852BS2 U2 NIC MSS eFuse selector diagnostic.
+#
+# This profile inherits the no-FWDL image-layout check, then reads only the
+# two Wi-Fi eFuse selector bytes needed for the original MSS signature choice.
+# It has no eFuse programming, firmware FIFO transfer, MAC, or netdev path.
+
+#include "../wireless_fw_image_layout_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_MSS_EFUSE_DIAGNOSTIC=y

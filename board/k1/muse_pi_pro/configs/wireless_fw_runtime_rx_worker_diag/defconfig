@@ -1,0 +1,7 @@
+# Runtime RX worker validation extends the proven firmware/runtime/H2C path.
+# It keeps all firmware and loopback data in volatile RAM and deliberately
+# stops before 802.11 MAC registration, scan, association, or IP networking.
+
+#include "../wireless_fw_runtime_h2c_loopback_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_RX_WORKER_DIAGNOSTIC=y

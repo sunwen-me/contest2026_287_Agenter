@@ -1,0 +1,13 @@
+# Host side radio read-back around the passive scan, on top of the RMAC
+# receive counter profile.
+#
+# The counters showed that RMAC is handed nothing at all during the channel
+# dwells, not even a clear channel assessment, so this profile adds a read-only
+# sample of the radio itself to separate a radio that was never tuned from one
+# that is tuned but uncalibrated.  RAM-only: it transmits no probe, registers
+# no Wi-Fi network device, does not associate, authenticate, or write eMMC,
+# SPI flash, eFuse, or the U-Boot environment.
+
+#include "../wireless_fw_runtime_scan_phy_counter_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_RF_READBACK_DIAGNOSTIC=y

@@ -1,0 +1,13 @@
+# RTL8852BS2 BB reset pulse on top of the RF radio A/B image and the RX gate.
+#
+# Same RAM-only flow as wireless_fw_runtime_rf_cr_rx_diag, plus the second
+# half of the original BB register initialisation: the BB reset pulse that
+# follows the PHY CR image, submitted as one acknowledged firmware
+# command-offload batch. It answers whether the missing BB reset is what
+# keeps the radio from receiving. It does not transmit a probe, register a
+# Wi-Fi network device, associate, authenticate, or write eMMC, SPI flash,
+# eFuse, or the U-Boot environment.
+
+#include "../wireless_fw_runtime_rf_cr_rx_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_BB_RESET_DIAGNOSTIC=y

@@ -1,0 +1,10 @@
+# K1 RTL8852BS2 section-zero third-packet diagnostic.
+#
+# The profile sends one static header followed by the first three original
+# 2020-byte packets from the 0x3f420-byte section zero. It then clears WCPU
+# firmware-download state. It does not complete the section, check
+# firmware-ready, register a MAC, or create a network device.
+
+#include "../wireless_fw_section0_packet_static_tuning_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_FW_SECTION0_THIRD_PACKET_DIAGNOSTIC=y

@@ -1,0 +1,10 @@
+# RTL8852BS2 passive 2.4 GHz 1-13 scan-offload table diagnostic.
+#
+# The parent creates the volatile no-link role/CAM state. This child submits
+# passive 2.4 GHz channel-list entries for 1 through 13 and checks their
+# shared firmware done ack; it
+# deliberately does not start SCANOFLD or expose any Wi-Fi network interface.
+
+#include "../wireless_fw_runtime_role_cam_done_ack_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_OFLD_CHANNEL_DIAGNOSTIC=y

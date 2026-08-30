@@ -168,14 +168,14 @@ config K1_SPI_POLL_TIMEOUT_USEC
 endif # K1_SPI
 
 config K1_SDIO
-	bool "K1 SDH controller support (polling PIO)"
+	bool "K1 SDH controller support (polling)"
 	default n
 	select ARCH_HAVE_SDIO
 	---help---
-		Enable the polling PIO K1 SDH lower-half.  SDH2 supports the MUSE Pi
-		Pro eMMC path and SDH1 is available for the RTL8852BS2 SDIO CMD5
-		probe.  DMA, high-speed timing, and SDHCI interrupts are not yet
-		implemented.
+		Enable the polling K1 SDH lower-half.  SDH2 supports the MUSE Pi Pro
+		eMMC path and SDH1 provides the RTL8852BS2 SDIO CMD5/CMD53 diagnostic.
+		The Wi-Fi path uses bounded ADMA2 transfers and an SDR104 calibration
+		probe, but does not implement SDHCI interrupts or an 802.11 MAC driver.
 
 if K1_SDIO
 
@@ -185,9 +185,772 @@ config K1_SDIO_WIFI
 	---help---
 		Enable the SDH1 1.8 V, four-bit SDIO controller instance connected to
 		the MUSE Pi Pro RTL8852BS2 Wi-Fi function.  It selects the SDIO card,
-		switches its common control interface to four-bit mode, and reads the
-		CCCR/FBR identification registers.  It does not enable an I/O function
-		or provide an 802.11 MAC driver.
+		switches its common control interface to four-bit mode, enables Function
+		1, selects the standard High-Speed fallback, and exposes bounded CMD52/
+		CMD53 ADMA2 transfers.  It does not
+		provide an 802.11 MAC driver.
+
+config K1_SDIO_WIFI_LINUX_SIGNAL_DIAGNOSTIC
+	bool "Mirror Linux SDH1 interrupt gates during CMD53 diagnostic"
+	default n
+	depends on !K1_PLIC
+	---help---
+		Temporarily program SDH1 INT_STATUS_ENABLE and INT_SIGNAL_ENABLE with
+		the values observed from the stock Linux image while executing the
+		bounded RTL8852BS2 CMD53 probe.  The driver first masks PLIC source
+		100 directly, so this remains a polling-only experiment even if a
+		previous boot stage left PLIC state behind.  It does not install an
+		interrupt handler and must not be enabled together with the
+		experimental K1 PLIC path.
+
+config K1_SDIO_WIFI_CMD53_COMMON_DIAGNOSTIC
+	bool "Probe SDIO Function 0 with CMD53"
+	default n
+	depends on K1_RTL8852BS2_WIFI
+	---help---
+		Read the first four CCCR bytes through a bounded Function 0 CMD53
+		transaction after the normal CMD52 enumeration and RTL8852BS2
+		bootstrap.  This is a RAM-only transport diagnostic: it performs no
+		writes and does not make Wi-Fi available.  Enable it only to determine
+		whether the K1 SDH1 CMD53 failure affects the common register function
+		as well as Realtek Function 1.
+
+config K1_SDIO_WIFI_CMD53_PIO_DIAGNOSTIC
+	bool "Probe SDIO Function 0 with PIO CMD53"
+	default n
+	depends on K1_RTL8852BS2_WIFI
+	---help---
+		Run one read-only four-byte Function 0 CMD53 through the SDHCI buffer
+		register with the DMA selector cleared.  This is a RAM-only A/B test
+		against the ADMA diagnostic and is not a Wi-Fi data path.
+
+config K1_SDIO_WIFI_CMD53_PIO_RETRY_DIAGNOSTIC
+	bool "Retry one PIO CMD53 after controller error recovery"
+	default n
+	depends on K1_SDIO_WIFI_CMD53_PIO_DIAGNOSTIC
+	---help---
+		After the bounded, read-only Function 0 CMD53 PIO probe fails, run the
+		SDHCI command/data reset path and retry the exact same four-byte CCCR
+		read once.  This isolates MMC request recovery from initial CMD53 launch
+		without writing card registers, loading firmware, or enabling Wi-Fi.
+
+config K1_SDIO_WIFI_LEGACY_CMD53_DIAGNOSTIC
+	bool "Keep SDIO at legacy clock before PIO CMD53"
+	default n
+	depends on K1_SDIO_WIFI_CMD53_PIO_DIAGNOSTIC
+	---help---
+		After CMD52 enumeration and Function 1 enable, retain the existing
+		four-bit legacy transfer clock instead of selecting High-Speed and
+		SDR104.  This runs the same bounded Function 0 PIO CMD53 probe at
+		about 11.7 MHz to isolate UHS timing from the data-phase diagnostic.
+		It is not a production SDIO clock policy.
+
+config K1_SDIO_WIFI_LEGACY_CMD53_WRITE_PIO_DIAGNOSTIC
+	bool "Keep SDIO at legacy clock before PIO CMD53 write"
+	default n
+	depends on K1_SDIO_WIFI_CMD53_WRITE_PIO_DIAGNOSTIC
+	---help---
+		After CMD52 enumeration and Function 1 enable, retain the four-bit
+		legacy transfer clock and run the bounded Function 1, address 0x1040,
+		12-byte PIO write.  This isolates high-speed/UHS timing from the
+		write-direction CMD53 data CRC diagnostic.  It is not a production
+		SDIO clock policy.
+
+config K1_SDIO_WIFI_LEGACY_CMD53_WRITE_TX_DLINE_DIAGNOSTIC
+	bool "Apply the vendor TX delay line before legacy PIO CMD53 write"
+	default n
+	depends on K1_SDIO_WIFI_LEGACY_CMD53_WRITE_PIO_DIAGNOSTIC
+	---help---
+		Keep the four-bit legacy transfer clock, but prepare the K1 transmit
+		delay line with the original Linux SDIO host's DLINE register 0 and
+		0xa8 delay code before the bounded Function 1 PIO CMD53 write.  This
+		isolates the transmit delay-line setup from high-speed/UHS clocking.
+		It is a RAM-only diagnostic and not a production SDIO clock policy.
+
+config K1_SDIO_WIFI_MAINLINE_RESET_DIAGNOSTIC
+	bool "Mirror Linux mainline SDIO reset before PIO CMD53"
+	default n
+	depends on K1_SDIO_WIFI_CMD53_PIO_DIAGNOSTIC
+	---help---
+		On SDH1 reset, apply the complete SDIO sequence from Linux mainline:
+		PHY function and pad setup, the legacy pad clock, and the OP_EXT
+		output-clock override.  This is deliberately limited to the bounded
+		PIO CMD53 diagnostic because an earlier OP_EXT-only reset experiment
+		prevented CMD5 from completing.  It is not a production reset policy.
+
+config K1_SDIO_WIFI_CMD53_WRITE_DIAGNOSTIC
+	bool "Replay the vendor's 12-byte Function 1 CMD53 write"
+	default n
+	depends on K1_RTL8852BS2_GPL_BOOTSTRAP
+	---help---
+		Run one bounded RAM-only transport probe with Function 1, incrementing
+		address 0x1040, and a 12-byte payload.  The target MAC register is read
+		through CMD52 first and written back unchanged.  The request reproduces
+		the vendor Linux argument 0x9420800c without downloading firmware or
+		registering Wi-Fi.  Enable this only while diagnosing CMD53.
+
+config K1_SDIO_WIFI_FIRST_VENDOR_CMD53_DIAGNOSTIC
+	bool "Replay the first vendor CMD53 request"
+	default n
+	depends on K1_RTL8852BS2_GPL_BOOTSTRAP
+	---help---
+		After the bounded Realtek CMD52 bootstrap but before HCI/DMAC setup,
+		submit the exact twelve-byte indirect-window write emitted by the
+		vendor hci_func_en() path: target R_AX_HCI_FUNC_EN (0x8380), read
+		operation, Function 1 address 0x1040, byte mode, length 12.  Its
+		CMD53 argument is 0x9420800c.  It is a RAM-only transport diagnostic;
+		it does not load firmware or register Wi-Fi.
+
+config K1_RTL8852BS2_DLE_SCC_DIAGNOSTIC
+	bool "Initialize RTL8852BS2 SDIO DLE SCC before firmware"
+	default n
+	depends on K1_RTL8852BS2_GPL_BOOTSTRAP
+	---help---
+		After the bounded power bootstrap and HCI/DMAC pre-initialization,
+		apply the GPL-derived RTL8852B SDIO/SCC DLE page-pool and quota setup.
+		It waits for the WDE and PLE ready bits and clears DLE enable on an
+		error.  This is RAM-only hardware-state validation; it does not load
+		firmware, register a Wi-Fi MAC, or create a network device.
+
+config K1_RTL8852BS2_HCI_FC_DIAGNOSTIC
+	bool "Initialize RTL8852BS2 SDIO HCI flow-control before firmware"
+	default n
+	depends on K1_RTL8852BS2_DLE_SCC_DIAGNOSTIC
+	---help---
+		After the GPL-derived RTL8852B SDIO/SCC DLE setup, apply the SDIO
+		HCI flow-control page quotas from hfc_init(adapter, 1, 1, 1): six
+		active channels use 2/102 pages, the public page pool is 112 pages,
+		and H2C reserves 40 pages. Each written register is read back through
+		bounded Function 1 indirect CMD53 access. A failure disables the HCI
+		flow-control and H2C enable bits. This is RAM-only validation; it does
+		not load firmware, register a Wi-Fi MAC, or create a network device.
+
+config K1_RTL8852BS2_FW_PREBOOT_DIAGNOSTIC
+	bool "Probe RTL8852BS2 firmware-download H2C preboot"
+	default n
+	depends on K1_RTL8852BS2_HCI_FC_DIAGNOSTIC
+	---help---
+		Run the GPL-derived mac_enable_cpu(..., dlfw=1) and fwdl_phase0() preboot
+		diagnostic after SDIO pre-initialization and wait for the WLAN CPU H2C
+		path-ready bit. It clears the vendor's pending SER/FWDL state but omits
+		fwdl_precheck(), whose DLE debug-port query is not yet ported. On both
+		success and failure it follows mac_disable_cpu() to turn the CPU, download
+		flags, and CPU clock back off; success additionally reads those bits back
+		as zero. It does not include or transfer a firmware image, register a
+		Wi-Fi MAC, or create a network device.
+
+config K1_RTL8852BS2_FW_IMAGE_LAYOUT_DIAGNOSTIC
+	bool "Validate RTL8852BS2 U2 NICCE firmware image layout"
+	default n
+	depends on K1_RTL8852BS2_GPL_BOOTSTRAP
+	---help---
+		Parse the GPL-derived U2 NICCE image's 80-byte static header, 80-byte
+		dynamic header, and three section records with the same lengths and
+		checksum-tail rule as the original Realtek fwhdr parser. It prints the
+		resulting section offsets and validates all bounds against the upstream
+		341216-byte image size. It performs no firmware-download state change,
+		SDIO write, MAC registration, or network operation.
+
+config K1_RTL8852BS2_FW_MSS_EFUSE_DIAGNOSTIC
+	bool "Read RTL8852BS2 firmware MSS eFuse selector"
+	default n
+	depends on K1_RTL8852BS2_FW_IMAGE_LAYOUT_DIAGNOSTIC
+	---help---
+		Use the GPL-derived RTL8852B Wi-Fi eFuse read sequence to read only
+		the external-PN and customer bytes at physical offsets 0x5ec and 0x5ed.
+		It applies and then removes the vendor's eFuse read power gate, polls
+		the ready bit, and prints the decoded MSS device type, customer index,
+		and key number. It never unlocks, programs, or burns eFuse bits; it
+		does not import a signature, send firmware, register a MAC, or create a
+		network device.
+
+config K1_RTL8852BS2_FW_MSS_LEGACY_SIGNATURE_DIAGNOSTIC
+	bool "Validate RTL8852BS2 legacy MSS signature selection"
+	default n
+	depends on K1_RTL8852BS2_FW_IMAGE_LAYOUT_DIAGNOSTIC
+	---help---
+		Validate the actual U2 NICCE image's MSSC=2 legacy path from the GPL
+		Realtek parser. It reads the same two eFuse selector bytes through the
+		temporary read-only power gate, maps them with the original two-entry
+		OTP table, and validates the selected 512-byte signature's source and
+		destination offsets. The GPL component contains the exact 1024-byte
+		trailer solely for this bounded verification. It does not copy the
+		signature into a firmware section, send firmware, register a MAC, or
+		create a network device.
+
+config K1_RTL8852BS2_FW_FULL_DOWNLOAD_DIAGNOSTIC
+	bool "Download the complete RTL8852BS2 U2 NICCE firmware to WCPU RAM"
+	default n
+	depends on K1_RTL8852BS2_HCI_FC_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_PREBOOT_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_H2C_TX_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_HEADER_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_TAIL_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_SECOND_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_THIRD_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_FOURTH_PACKET_DIAGNOSTIC
+	---help---
+		Download the GPL-derived 341216-byte U2 NICCE image through the verified
+		SDIO H2C FIFO sequence. Before downloading, it validates the static and
+		dynamic headers, all three section bounds, trailer integrity, and the
+		legacy MSS eFuse mapping. It inserts the selected 512-byte legacy MSS
+		signature only into the current secure-section TX packet, then checks
+		R_AX_WCPU_FW_CTRL[7:5] for the original firmware-ready or error states.
+		The download targets volatile WLAN CPU RAM only; it does not program
+		eFuse, eMMC, SPI flash, or U-Boot environment. It leaves WCPU running on
+		firmware-ready and still does not register an 802.11 MAC or netdev.
+
+config K1_RTL8852BS2_FW_RUNTIME_DIAGNOSTIC
+	bool "Validate RTL8852BS2 eFuse MAC and running WCPU state"
+	default n
+	depends on K1_RTL8852BS2_FW_FULL_DOWNLOAD_DIAGNOSTIC
+	---help---
+		Read all 1536 bytes of the Wi-Fi physical eFuse through the temporary
+		read-only power gate, decode the original WLAN two-byte records into its
+		2048-byte logical map, and validate the logical MAC at offset 0x41a.
+		After the complete U2 NICCE image reaches firmware-ready, verify its WCPU
+		status, enable bit, and CPU clock bit. It does not program eFuse, register
+		a Wi-Fi MAC, create a netdev, scan, associate, or use persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_TRANSPORT_DIAGNOSTIC
+	bool "Read RTL8852BS2 post-firmware SDIO transport state"
+	default n
+	depends on K1_RTL8852BS2_FW_RUNTIME_DIAGNOSTIC
+	---help---
+		After the WCPU reaches firmware-ready, read the Realtek SDIO interrupt
+		mask/status and RX-request-length registers through Function 1 CMD53,
+		then read the existing 28-byte TX-page resource window. The diagnostic
+		is strictly read-only: it does not enable or acknowledge interrupts,
+		read the RX FIFO, register a Wi-Fi MAC, create a netdev, scan, associate,
+		or use persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_H2C_LOOPBACK_DIAGNOSTIC
+	bool "Validate RTL8852BS2 runtime H2C/C2H SDIO loopback"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_TRANSPORT_DIAGNOSTIC
+	---help---
+		Submit the original Realtek CMD_PATH H2C loopback packet through the
+		running WCPU's Function 1 SDIO TX FIFO, then poll RX-request length,
+		read the fixed-address RX FIFO, and validate the C2H descriptor, header,
+		and returned 24-byte payload. This verifies the post-firmware command
+		and response transport without enabling interrupts, registering a Wi-Fi
+		MAC, scanning, associating, writing persistent board storage, or changing
+		U-Boot state. The firmware, command packet, and all received data live
+		only in volatile RAM.
+
+config K1_RTL8852BS2_RUNTIME_MAC_CORE_DIAGNOSTIC
+	bool "Initialize the static RTL8852BS2 runtime MAC core fields"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_H2C_LOOPBACK_DIAGNOSTIC
+	---help---
+		After the running firmware and H2C/C2H transport are proven, apply the
+		GPL-derived static DMAC/CMAC/RMAC fields from the RTL8852B
+		MAC_AX_TRX_SW_MODE path and read each field back. The diagnostic
+		deliberately omits scheduler, address-CAM, MACID, role, station,
+		security, scan and association configuration. It never submits an
+		802.11 frame, creates a network device, or changes persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_BB_RF_DIAGNOSTIC
+	bool "Release the RTL8852BS2 BB/RF runtime reset state"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_MAC_CORE_DIAGNOSTIC
+	---help---
+		Replay the small RTL8852B set_enable_bb_rf(..., 1) sequence after the
+		firmware and static MAC core are ready: release BB reset, enable the
+		analog-front-end digital control edge, program the two volatile WLAN RF
+		crystal controls, and select the PHY register cycle. Every step is
+		read-back verified. It deliberately excludes the large PHY/RF parameter
+		images, calibration, scan, association, network-device registration, and
+		all persistent storage writes.
+
+config K1_RTL8852BS2_RUNTIME_PHY_CR_DIAGNOSTIC
+	bool "Load the static RTL8852BS2 BB PHY CR image"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_BB_RF_DIAGNOSTIC
+	---help---
+		Replay the complete default RTL8852B array_mp_8852b_phy_reg BB
+		parameter image in original order after the BB/RF release, then
+		read back five spread sentinels. This only writes volatile Wi-Fi
+		registers through the existing SDIO indirect window. It deliberately
+		excludes RF parameter images, calibration, scanning, association,
+		network-device registration, and all persistent storage writes.
+
+config K1_RTL8852BS2_RUNTIME_PHY_CR_FWOFLD_DIAGNOSTIC
+	bool "Submit the RTL8852BS2 BB PHY CR image through firmware I/O offload"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_PHY_CR_DIAGNOSTIC
+	---help---
+	Submit only the fixed imported RTL8852B default BB PHY CR table through
+		the original MAC/FW_OFLD/CMD_OFLD_PKT firmware protocol. Each bounded
+		batch is accepted only after its matching successful CMD_OFLD_RSP C2H
+		response. This matches the original firmware-offload completion path and
+		avoids the host issuing one indirect CMD53 transaction per table entry.
+		It is a RAM-only diagnostic: it exposes no generic register-write
+		interface and does not touch RF calibration, scanning, association,
+		network-device registration, or persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_BB_RESET_DIAGNOSTIC
+	bool "Pulse the RTL8852BS2 BB reset after the PHY CR image"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_PHY_CR_FWOFLD_DIAGNOSTIC
+	---help---
+		Run the second half of the original BB register initialisation. After
+		the PHY CR image is loaded the original driver pulses the BB reset with
+		the TSSI protection bits raised, and it submits that whole sequence
+		through the same firmware I/O offload protocol when the firmware offers
+		it, which is the case here. The eleven writes go out as one bounded
+		batch that is accepted only after its matching successful CMD_OFLD_RSP
+		C2H response, and a failed response ends the stage instead of replaying
+		a reset the firmware may already have applied.
+
+		This is a RAM-only diagnostic on volatile Wi-Fi registers. It touches
+		no RF calibration, scanning, association, network-device registration,
+		or persistent storage.
+
+config K1_RTL8852BS2_RF_CONTEXT_DIAGNOSTIC
+	bool "Report the RTL8852BS2 board RF context before firmware download"
+	default n
+	depends on K1_RTL8852BS2_FW_FULL_DOWNLOAD_DIAGNOSTIC
+	---help---
+		Read and print the RF context the original driver keys its RF tables
+		on: the chip cut version from SYS_CFG1, and the logical eFuse RFE
+		type, board option, channel plan, crystal trim, thermal meter
+		references, TSSI de-emphasis range, and RX gain compensation range.
+		Unprogrammed cells are reported as blank together with the default
+		the original driver would substitute, so a board without RF
+		calibration data is visible instead of assumed. The values are
+		cached for the RF radio image guard below.
+
+		This reads only. It performs no eFuse write, no register write, and
+		no persistent storage access, and it registers no network device.
+
+config K1_RTL8852BS2_RUNTIME_RF_CR_DIAGNOSTIC
+	bool "Submit the RTL8852BS2 RF radio A/B image through firmware I/O offload"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_PHY_CR_FWOFLD_DIAGNOSTIC
+	depends on K1_RTL8852BS2_RF_CONTEXT_DIAGNOSTIC
+	---help---
+		Submit the two generated RTL8852B radio parameter images, radio A
+		then radio B, through the same MAC/FW_OFLD/CMD_OFLD_PKT protocol the
+		BB PHY CR image uses, but with the original RF source, radio path,
+		and mask/value semantics. RF D-die entries are routed to the BB
+		aperture exactly as the original halrf write helper does. Each
+		bounded batch is accepted only after its matching successful
+		CMD_OFLD_RSP C2H response, and the first failing batch stops the
+		stage without replaying a batch the firmware may already have
+		accepted.
+
+		The original tables are conditional packages keyed by RFE type and
+		chip cut version, and only the selected branch is compiled in. Before
+		anything is submitted, the original headline selection is replayed
+		against the board RF context reported above; if this board would
+		select a different branch, the stage refuses instead of writing the
+		wrong radio parameters.
+
+		It is a RAM-only diagnostic: it exposes no generic register-write
+		interface and does not touch RF calibration convergence, scanning,
+		association, network-device registration, or persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_CONTROL_PLANE_DIAGNOSTIC
+	bool "Validate RTL8852BS2 firmware role-control serialization"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_MAC_CORE_DIAGNOSTIC
+	---help---
+		Build and verify the Realtek MEDIA_RPT/FWROLE_MAINTAIN and
+		MEDIA_RPT/JOININFO payloads entirely in RAM. The serializer rejects
+		RTL8852B-invalid band and WMM values and clears JOININFO reserved
+		dwords. It does not submit either H2C, create a firmware role, configure
+		address/BSSID CAM, register a Wi-Fi MAC, scan, associate, or change
+		persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_ADDRESS_CAM_DIAGNOSTIC
+	bool "Validate RTL8852BS2 address/BSSID CAM serialization"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_CONTROL_PLANE_DIAGNOSTIC
+	---help---
+		Build and verify the 60-byte Realtek MAC/ADDR_CAM_UPDATE/ADDRCAM_INFO
+		payload entirely in RAM. It accepts the no-link station form with a real
+		self MAC and zero peer/BSSID, plus the non-zero unicast RTL8852B band-0
+		station/AP forms; it clears security, WOL and reserved state. It does not
+		submit an H2C, allocate a CAM entry, register a Wi-Fi MAC, scan,
+		associate, or change persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_ROLE_CAM_DONE_ACK_DIAGNOSTIC
+	bool "Validate RTL8852BS2 no-link role and CAM done acknowledgements"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_ADDRESS_CAM_DIAGNOSTIC
+	---help---
+		Use the genuine eFuse self MAC to create one volatile no-link station
+		role and its address/BSSID CAM record, checking the Realtek C2H done
+		acknowledgement and firmware return code after each H2C. The profile
+		never uses a peer/BSSID, scans, associates, registers a Wi-Fi MAC or
+		network device, or changes persistent storage. The role and CAM vanish
+		on reset.
+
+config K1_RTL8852BS2_RUNTIME_SCAN_OFLD_CHANNEL_DIAGNOSTIC
+	bool "Validate RTL8852BS2 passive scan channel-list done acknowledgement"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_ROLE_CAM_DONE_ACK_DIAGNOSTIC
+	---help---
+		After a volatile no-link station role and address/BSSID CAM have been
+		accepted, submit one MAC/FW_OFLD/ADD_SCANOFLD_CH table containing
+		passive 2.4 GHz entries for every primary channel, 1 through 13, and
+		validate its generic firmware done acknowledgement. It deliberately does
+		not issue SCANOFLD, change RF channel, transmit a probe, collect beacons,
+		create a Wi-Fi MAC or network device, associate, or change persistent
+		storage.
+
+config K1_RTL8852BS2_RUNTIME_SCAN_OFLD_PASSIVE_DIAGNOSTIC
+	bool "Validate RTL8852BS2 one-shot passive scan-offload events"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_SCAN_OFLD_CHANNEL_DIAGNOSTIC
+	---help---
+		Start the accepted passive 2.4 GHz 1-13 scan-offload table once, wait
+		250 ms after each channel-enter C2H, issue the matching original NEXT_CH
+		host control, and require the scan-end C2H. It sends no probe, does not
+		collect beacons, create a Wi-Fi MAC or network device, associate, or
+		change persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_SCAN_OFLD_RX_DIAGNOSTIC
+	bool "Require RTL8852BS2 passive scan Beacon/BSS RX"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_SCAN_OFLD_PASSIVE_DIAGNOSTIC
+	---help---
+		Run the one-shot passive scan-offload event diagnostic and parse the
+		ordinary RTL8852BS2 RX FIFO for Beacon and Probe Response management
+		frames. The diagnostic records one bounded BSSID/SSID result and the
+		firmware per-channel scan report. It fails if no valid BSS is received.
+		It does not transmit a probe, register a Wi-Fi MAC or network device,
+		associate, authenticate, perform DHCP, or change persistent storage.
+
+config K1_RTL8852BS2_RUNTIME_SCAN_OFLD_ACTIVE_DIAGNOSTIC
+	bool "Require an RTL8852BS2 Probe Response to a transmitted Probe Request"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_SCAN_OFLD_RX_DIAGNOSTIC
+	---help---
+		Put one wildcard Probe Request into the firmware packet-offload table
+		with MAC/FW_OFLD/PACKET_OFLD, resubmit the 2.4 GHz 1-13 scan-offload
+		channel table with the original chinfo tx_pkt bit and probe_req_pkt_id
+		naming that packet, run the sweep again, and require at least one Probe
+		Response back. The firmware builds the transmit descriptor for an
+		offloaded packet itself, so this needs no host transmit ring, exactly as
+		in the original phl and in mainline rtw89.
+
+		This is the first path in this component that puts a frame in the air,
+		and the acceptance criterion is chosen so that it cannot pass without
+		one: a Probe Response is sent by an access point only in reply to a
+		Probe Request and is addressed to the eFuse self MAC carried in that
+		request, whereas every firmware acknowledgement on the way only reports
+		that a command was accepted. A Beacon does not satisfy it, because a
+		passive sweep receives Beacons too.
+
+		Before the packet is offloaded, contention transmit is enabled for the
+		CMAC scheduler management queues MGQ and CPUMGQ. The static
+		dmac_init()/cmac_init() subset this port programs leaves the scheduler
+		alone, so R_AX_CTN_TXEN keeps its reset contents, and the original
+		reaches its running state through rtw_hal_tx_pause(false), which enables
+		every queue. Only the two management queues are enabled here: CPUMGQ is
+		the queue the firmware transmits its own frames from, and this component
+		has no data path. The value read before the write is logged.
+
+		The sweep is bracketed by a transmit-side snapshot: the TMAC transmit
+		PPDU counters of the vendor tx_cnt_dump() for LCCK, SCCK, OFDM and HT,
+		plus the registers mac_tx_status_dump() reads when a queued frame does
+		not reach the air. Those counters separate a Probe Request that was
+		never transmitted from one that was transmitted and not answered, and
+		they are sampled and logged even when the sweep fails.
+
+		The transmit initialization this port has not finished - the disable
+		half of set_enable_bb_rf(), halbb_dm_init(), the body of halrf_dm_init(),
+		the five init_rf_reg store tables and the halbb per-band gain table - is
+		still missing, so a failure here is not evidence of a MAC-layer problem
+		until those are in place.
+
+		RAM-only: one Probe Request per channel dwell and nothing retransmitted,
+		no association, no authentication, no key, no network device, no data
+		path, and nothing written to eMMC, SPI flash, eFuse or the U-Boot
+		environment.
+
+config K1_RTL8852BS2_WLAN_NETDEV
+	bool "Register the RTL8852BS2 wlan0 scan network device"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_SCAN_OFLD_RX_DIAGNOSTIC
+	depends on NETDEV_WIRELESS_IOCTL && DRIVERS_IEEE80211 && NET_ETHERNET
+	---help---
+		Register wlan0 and answer the two wireless-extensions scan requests on
+		it, so the validated passive 2.4 GHz 1-13 scan-offload can be repeated
+		from NSH and its results read with wapi. A set-scan request runs one
+		sweep synchronously and a get-scan request returns the access points
+		that sweep actually received.
+
+		Only an access point backed by a received Beacon or Probe Response is
+		reported. A BSSID seen solely in a data frame is counted and dropped,
+		because it is not evidence of a reachable BSS.
+
+		This device is deliberately incomplete, and its interface reflects that
+		rather than hiding it: there is no transmit or receive data path, no
+		association or authentication, no DHCP, and no signal-strength
+		reporting, since RSSI needs the baseband and RF data-manager
+		initialization this port does not perform yet. Every other wireless
+		request returns ENOTTY instead of a plausible default, an active-scan
+		request is carried out as the same passive sweep and transmits no probe,
+		and a request for a single SSID or a channel subset is not honoured.
+		Nothing is written to eMMC, SPI flash, eFuse or the U-Boot environment.
+
+config K1_RTL8852BS2_RUNTIME_SCAN_PHY_COUNTER_DIAGNOSTIC
+	bool "Sample RTL8852BS2 RMAC receive counters around the passive scan"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_SCAN_OFLD_PASSIVE_DIAGNOSTIC
+	---help---
+		Read the per-PPDU-type CRC-pass, CRC-fail and false-alarm counters that
+		the original mac_rx_cnt() exposes, once with the scan receive filter in
+		place before the scan starts and once after it ends, and log both the
+		absolute values and their differences. The counters answer whether the
+		baseband handed the receive MAC any PPDU during the channel dwells, so a
+		scan that reports no BSS can be attributed either to a baseband that
+		demodulates nothing or to frames dropped on the way to this host.
+
+		The same sweep reads the counters that are not tied to a PPDU type, so a
+		snapshot also says whether the baseband reported any clear channel
+		assessment at all and whether a received frame was dropped by the receive
+		filter, inside RMAC, or on the way to the bus, and it keeps the selection
+		word so the low bits can be checked to read back the index just written.
+		Selecting a counter writes only the index byte of the counter window and
+		never its reset trigger, and a failed sample is logged without changing
+		the result of the scan. Nothing else is written: this is a RAM-only
+		diagnostic that transmits no frame, registers no network device, does not
+		associate or authenticate, and does not touch eMMC, SPI flash, eFuse or
+		the U-Boot environment.
+
+config K1_RTL8852BS2_RUNTIME_SCAN_RF_READBACK_DIAGNOSTIC
+	bool "Read back RTL8852BS2 radio state around the passive scan"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_SCAN_OFLD_PASSIVE_DIAGNOSTIC
+	---help---
+		Read the RF mode, channel and RC calibration registers of both radio
+		paths from this host through the A-die serial interface window that the
+		original halbb_read_rf_reg_8852b_a() uses, once before the passive scan
+		and once after it. The low byte of the channel register is the channel
+		the radio is tuned to, so the sample taken after the scan says whether
+		the firmware tuned the radio for the channel dwells at all. That is the
+		first question raised when the receive counters report no clear channel
+		assessment, because it separates a radio that was never tuned from one
+		that is tuned but uncalibrated.
+
+		This is a read-only path: it writes only the read select register of the
+		serial interface, never an RF register, and every RF write in this
+		component stays with the firmware through CMD_OFLD. A failed sample is
+		logged without changing the result of the scan. RAM-only, transmits no
+		frame, registers no network device, does not associate or authenticate,
+		and does not touch eMMC, SPI flash, eFuse or the U-Boot environment.
+
+config K1_RTL8852BS2_RUNTIME_DATA_TX_DIAGNOSTIC
+	bool "Validate RTL8852BS2 runtime data TX descriptor preflight"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_H2C_LOOPBACK_DIAGNOSTIC
+	---help---
+		Build the GPL-derived 24-byte normal-data descriptor for the configured
+		SDIO ACH0 queue, calculate its fixed-address FIFO encoding, and read one
+		28-byte TXPG_WP flow-control snapshot. It does not submit a frame: no
+		MACID peer, association, encryption context, MAC/netdev, scan, or
+		persistent board state exists yet.
+
+config K1_RTL8852BS2_RUNTIME_RX_WORKER_DIAGNOSTIC
+	bool "Run RTL8852BS2 runtime RX FIFO worker diagnostic"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_H2C_LOOPBACK_DIAGNOSTIC
+	select SCHED_LPWORK
+	---help---
+		After firmware startup and the synchronous H2C/C2H loopback check, queue a
+		second volatile loopback response and consume it from an LPWORK worker. The
+		worker reads RX_REQ_LEN/RXFF, parses every descriptor in each aggregate,
+		and classifies data versus C2H frames with CRC/ICV drops counted. It does
+		not enable SDIO interrupts, register an 802.11 MAC or netdev, scan,
+		associate, or change persistent board storage.
+
+config K1_RTL8852BS2_FW_H2C_TX_DIAGNOSTIC
+	bool "Validate RTL8852BS2 firmware H2C TX resources"
+	default n
+	depends on K1_RTL8852BS2_FW_PREBOOT_DIAGNOSTIC
+	---help---
+		After the reversible firmware-download H2C preboot completes, read the
+		28-byte SDIO TX-page status table and check channel 12 against the pages
+		required by a header-only firmware-download H2C envelope. It also builds
+		and validates the corresponding 24-byte TX descriptor and SDIO FIFO
+		address in RAM. It never submits a CMD53 write to the FIFO, embeds
+		firmware, registers a Wi-Fi MAC, or creates a network device.
+
+config K1_RTL8852BS2_FW_HEADER_PACKET_DIAGNOSTIC
+	bool "Send one RTL8852BS2 firmware static-header H2C packet"
+	default n
+	depends on K1_RTL8852BS2_FW_H2C_TX_DIAGNOSTIC
+	---help---
+		Send exactly one fixed-address Function 1 CMD53 TX FIFO packet after
+		re-entering the reversible WCPU firmware-download state. The packet is
+		strictly limited to its 24-byte TX descriptor, 8-byte FWDL H2C header,
+		and the 80-byte static header prefix from the GPL 8852B U2 NICCE image.
+		It polls the FWDL-ready bit, then clears the CPU and download state on
+		both success and failure. It cannot send firmware sections, a dynamic
+		header, or a complete image; it does not register Wi-Fi or create a
+		network device.
+
+config K1_RTL8852BS2_FW_SECTION_PACKET_DIAGNOSTIC
+	bool "Send first RTL8852BS2 firmware section packet"
+	default n
+	depends on K1_RTL8852BS2_FW_HEADER_PACKET_DIAGNOSTIC
+	---help---
+		Send exactly one bounded first packet from section zero of the GPL U2 NICCE
+		image. It re-enters the WCPU firmware-download state, sends the 80-byte
+		static header, waits for FWDL-ready, clears the H2C/C2H halt controls, and
+		then sends only the first 2020-byte section packet with its 24-byte FWDL
+		TX descriptor and four zero padding bytes. Both FIFO writes use
+		fixed-address Function 1 CMD53 and
+		the WCPU/firmware-download state is cleared on success or failure. It does
+		not send a second section packet, a checksum, a complete image, or create
+		a Wi-Fi MAC or network device.
+
+config K1_RTL8852BS2_FW_SECTION0_TAIL_PACKET_DIAGNOSTIC
+	bool "Send RTL8852BS2 28-byte post-first-packet probe"
+	default n
+	depends on K1_RTL8852BS2_FW_SECTION_PACKET_DIAGNOSTIC
+	---help---
+		After the static header and first 2020-byte section-zero packet, send
+		exactly 28 source bytes at offset 0x884 from the GPL U2 NICCE image. This
+		is a compatibility transport probe, not the end of section zero: the
+		real section is 0x4f108 bytes. The WCPU/download state is cleared on
+		success and failure. It neither completes a section nor checks firmware
+		readiness, and it does not create a Wi-Fi MAC or network device.
+
+config K1_RTL8852BS2_FW_SECTION0_SECOND_PACKET_DIAGNOSTIC
+	bool "Send the second RTL8852BS2 firmware section-zero packet"
+	default n
+	depends on K1_RTL8852BS2_FW_SECTION_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_TAIL_PACKET_DIAGNOSTIC
+	---help---
+		After the static header and first 2020-byte section-zero packet, send
+		exactly the next 2020-byte GPL source packet at offset 0x884. Both
+		section packets use one fixed-address, four-block CMD53 FIFO write with
+		the original FWDL descriptor, then the WCPU/download state is cleared.
+		It sends only two of the 0x4f108 bytes in section zero; it does not
+		check firmware readiness or create a Wi-Fi MAC or network device.
+
+config K1_RTL8852BS2_FW_SECTION0_THIRD_PACKET_DIAGNOSTIC
+	bool "Send the third RTL8852BS2 firmware section-zero packet"
+	default n
+	depends on K1_RTL8852BS2_FW_SECTION_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_TAIL_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_SECOND_PACKET_DIAGNOSTIC
+	---help---
+		After the static header and first section-zero packet, send the original
+		second and third 2020-byte GPL source packets at offsets 0x884 and 0x1068.
+		Each uses one fixed-address, four-block CMD53 FIFO write with the original
+		FWDL descriptor. The WCPU/download state is then cleared. It sends only
+		three packets of the 0x4f108-byte section; it does not send a checksum,
+		check firmware readiness, or create a Wi-Fi MAC or network device.
+
+config K1_RTL8852BS2_FW_SECTION0_FOURTH_PACKET_DIAGNOSTIC
+	bool "Send the fourth RTL8852BS2 firmware section-zero packet"
+	default n
+	depends on K1_RTL8852BS2_FW_SECTION_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_TAIL_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_SECOND_PACKET_DIAGNOSTIC
+	depends on !K1_RTL8852BS2_FW_SECTION0_THIRD_PACKET_DIAGNOSTIC
+	---help---
+		After the static header and first three section-zero packets, send exactly
+		the fourth original 2020-byte GPL source packet at offset 0x184c. Each
+		section packet uses one fixed-address, four-block CMD53 FIFO write with
+		the original FWDL descriptor, then the WCPU/download state is cleared.
+		It sends only four packets of the 0x4f108-byte section; it does not send
+		a checksum, check firmware readiness, or create a Wi-Fi MAC or network
+		device.
+
+config K1_SDIO_WIFI_CMD53_WRITE_PIO_DIAGNOSTIC
+	bool "Replay the vendor's 12-byte Function 1 CMD53 write with PIO"
+	default n
+	depends on K1_SDIO_WIFI_CMD53_WRITE_DIAGNOSTIC
+	depends on !K1_SDIO_WIFI_CMD53_PIO_DIAGNOSTIC
+	---help---
+		Run only the bounded Function 1, address 0x1040, 12-byte write
+		transport probe through the SDHCI buffer register with ADMA disabled.
+		This A/B test distinguishes the CMD53 write ADMA path from the SDIO
+		write data path.  It does not download firmware or register Wi-Fi.
+
+config K1_SDIO_WIFI_CMD53_HISR_READ_DIAGNOSTIC
+	bool "Replay the vendor Function 1 HISR CMD53 read"
+	default n
+	depends on K1_RTL8852BS2_GPL_BOOTSTRAP
+	---help---
+		After the bounded Realtek CMD52 bootstrap, read four incrementing bytes
+		from Function 1 HISR address 0x1104 through CMD53.  This reproduces the
+		read-only request captured from the vendor Linux driver
+		(argument 0x14220804) without downloading firmware or registering Wi-Fi.
+		It is a RAM-only transport diagnostic.
+
+config K1_SDIO_WIFI_CMD53_HISR_READ_RX_B9_DIAGNOSTIC
+	bool "Use RX DLINE code 0xb9 for the HISR CMD53 read"
+	default n
+	depends on K1_SDIO_WIFI_CMD53_HISR_READ_DIAGNOSTIC
+	---help---
+		Override the selected RX delay code with 0xb9 immediately before the
+		otherwise unchanged Function 1 HISR CMD53 diagnostic.  This is the
+		RX DLINE value captured from a successful vendor RTL8852BS trace on
+		this board.  It is a single-variable RAM-only timing experiment and
+		does not enable Wi-Fi or transfer firmware.
+
+config K1_SDIO_WIFI_CCCR_ABORT_RESET
+	bool "Reset SDIO I/O functions through CCCR_ABORT before enumeration"
+	default n
+	depends on K1_SDIO_WIFI
+	---help---
+		Before CMD0/CMD5, read CCCR_ABORT, set its RES bit, and write it back
+		to reset stale SDIO I/O-function state inherited across a RAM-only
+		handoff.  This mirrors the optional Linux sdio_reset() recovery step.
+		It is disabled by default: on the MUSE Pi Pro, a successful RES write
+		requires an additional card-recovery sequence before SDR104 tuning can
+		be considered usable.  A failed early reset is recorded but does not
+		prevent the ordinary enumeration sequence.
+
+config K1_SDIO_WIFI_CCCR_ABORT_RESET_DIAGNOSTIC
+	bool
+	default n
+	---help---
+		Legacy compatibility symbol retained for existing diagnostic
+		defconfigs.  Use K1_SDIO_WIFI_CCCR_ABORT_RESET for new configurations.
+
+config K1_SDIO_WIFI_STATIC_TUNING_DIAGNOSTIC
+	bool "Validate the DTS RX delay with one CMD19 transaction"
+	default n
+	depends on K1_SDIO_WIFI
+	---help---
+		After the ordinary High-Speed and SDR104 transitions, perform exactly
+		one CMD19 transfer using the MUSE Pi Pro DTS RX delay value instead of
+		the software delay sweep.  This is a bounded RAM-only diagnostic that
+		distinguishes a sweep-state failure from a physical SDIO data failure.
+		It does not make Wi-Fi available.
+
+config K1_SDIO_WIFI_HIGHSPEED_ONLY_DIAGNOSTIC
+	bool "Run Wi-Fi diagnostics at SDIO High-Speed only"
+	default n
+	depends on K1_SDIO_WIFI
+	depends on !K1_SDIO_WIFI_TUNE_BEFORE_F1_ENABLE_DIAGNOSTIC
+	---help---
+		Keep the complete SDIO/RTL8852BS2 diagnostic sequence at legacy
+		High-Speed after Function 1 is enabled.  It deliberately skips the
+		SDR104 CCCR selection and CMD19 tuning so a full card initialization
+		can validate K1 Linux's CRC fallback boundary.  This is a RAM-only
+		diagnostic and does not register a Wi-Fi MAC or network device.
+
+config K1_SDIO_WIFI_TUNE_BEFORE_F1_ENABLE_DIAGNOSTIC
+	bool "Tune SDIO before enabling Function 1"
+	default n
+	depends on K1_SDIO_WIFI_CMD53_HISR_READ_DIAGNOSTIC
+	---help---
+		Mirror Linux SDIO-card initialization order for the bounded Function 1
+		HISR CMD53 read: complete High-Speed, SDR104, and CMD19 tuning before
+		enabling Function 1 and programming its block size.  The normal
+		wireless configuration retains its existing ordering.  This diagnostic
+		does not load firmware or make Wi-Fi available.
 
 endif # K1_SDIO
 
@@ -197,20 +960,99 @@ config K1_RTL8852BS2_WIFI
 	depends on K1_SDIO_WIFI
 	---help---
 		Configure the RTL8852BS2 power sequence and SDH1 pinmux, then perform
-		SDIO card enumeration and CCCR/FBR identification.  It deliberately
-		does not enable the WLAN function, load Realtek firmware, register a
-		network device, or claim working Wi-Fi connectivity.
+		SDIO card enumeration and enable Function 1.  Optional CMD52/CMD53
+		transport probes remain explicitly bounded.  It deliberately does not
+		load Realtek firmware, register a network device, or claim working Wi-Fi
+		connectivity.
+
+config K1_RTL8852BS2_GPL_BOOTSTRAP
+	bool "RTL8852BS2 GPL-2.0 MAC power-on bootstrap"
+	default n
+	depends on K1_RTL8852BS2_WIFI
+	---help---
+		Run the narrowly adapted GPL-2.0-only Realtek RTL8852B SDIO MAC
+		power-on table after Function 1 is enabled and before the optional CMD53
+		diagnostic. The power-on table and post-power HCI/DMAC setup use bounded
+		Function 1 CMD52 local and indirect access. It does not download firmware,
+		register a network device, or provide Wi-Fi connectivity. A build that enables this
+		option links GPL-2.0-only code and must be distributed with its
+		corresponding source and GPL license text.
 
 config K1_RTL8852BS2_BT
-	bool "MUSE Pi Pro RTL8852BS2 Bluetooth H5 link diagnostic"
+	bool "MUSE Pi Pro RTL8852BS2 Bluetooth H5 transport"
 	default n
+	select DRIVERS_WIRELESS
+	select DRIVERS_BLUETOOTH
+	select SCHED_HPWORK
+	select SCHED_LPWORK
 	---help---
 		Configure the RTL8852BS2 reset sequence, UART2 pinmux, and the H5
 		SYNC/CONFIG link handshake documented by the vendor MUSE Pi Pro
-		startup script, then issue the standard HCI Read Local Version command.
-		UART2 runs at 115200 8E1 without RTS/CTS and remains fully polled with
-		IER disabled. This diagnostic neither registers an H4 device nor
-		downloads vendor firmware, so it is not usable Bluetooth.
+		startup script. UART2 runs at 115200 8E1 without RTS/CTS and remains
+		fully polled with IER disabled. Select the raw HCI endpoint for external
+		HCI users, or the BLE Host stack for NuttX scanning and connection APIs.
+
+choice
+	prompt "RTL8852BS2 H5 transport consumer"
+	default K1_BT_H5_RAW_HCI
+	depends on K1_RTL8852BS2_BT
+
+config K1_BT_H5_RAW_HCI
+	bool "Raw HCI serial endpoint (/dev/ttyHCI0)"
+	select UART_BTH4
+	select BLUETOOTH_SLIP
+	---help---
+		Expose the NuttX H5/SLIP transport as the raw H4-compatible endpoint
+		/dev/ttyHCI0. This is suitable for external HCI users and retains the
+		original K1 wireless diagnostic behavior.
+
+config K1_BT_H5_HOST
+	bool "NuttX BLE Host stack and Bluetooth netdev"
+	depends on ALLOW_BSD_COMPONENTS && NET && WIRELESS
+	select K1_BT_H5_LOCAL_VERSION_PROBE
+	select WIRELESS_BLUETOOTH
+	select NET_BLUETOOTH
+	---help---
+		Register the active H5 transport directly with NuttX's Bluetooth netdev
+		and BLE Host stack instead of /dev/ttyHCI0. This enables the standard
+		bt/btsak interface for LE scanning and other Host-side operations.
+
+endchoice
+
+config K1_BT_H5_LOCAL_VERSION_PROBE
+	bool "Probe H5 local version before registering the NuttX transport"
+	default n
+	depends on K1_RTL8852BS2_BT
+	---help---
+		Perform a bounded raw H5 SYNC/CONFIG exchange and HCI Read Local Version
+		before registering the NuttX transport. This records the RTL8852BS2
+		controller identity and leaves it in an active CRC-protected H5 session.
+		Keep it disabled for the raw-HCI endpoint: bt_slip must own the initial
+		SYNC/CONFIG exchange from reset. Host mode selects this option and inherits
+		the configured H5 link directly.
+
+config K1_BT_H5_RESET_PROBE
+	bool "Probe standard HCI Reset after the H5 local-version check"
+	default n
+	depends on K1_BT_H5_LOCAL_VERSION_PROBE
+	---help---
+		Issue the standard HCI Reset command (opcode 0x0c03) through the raw,
+		CRC-protected H5 diagnostic session and require a successful Command
+		Complete event. This verifies one reliable HCI command after link setup;
+		it does not download Realtek firmware or enable Bluetooth scanning.
+
+config K1_BT_H5_VENDOR_FIRMWARE
+	bool "Load a locally supplied RTL8852BS Bluetooth patch over H5"
+	default n
+	depends on K1_BT_H5_LOCAL_VERSION_PROBE
+	---help---
+		Load the board-matched RTL8852BS Bluetooth patch and config into volatile
+		controller RAM before NuttX registers the H5 transport. The patch payload
+		must be generated locally with tools/extract_rtl8852bs_bt_patch.py as
+		chip/k1/k1_rtl8852bs_bt_patch.inc; it is intentionally not distributed in
+		the contest repository because the vendor package supplied with this board
+		does not state a redistributable firmware license. The download uses only
+		H5 vendor commands and is lost on reset or power-off.
 
 config K1_BT_UART_TX_TIMEOUT_USEC
 	int "UART2 Bluetooth transmit timeout (microseconds)"
@@ -220,6 +1062,16 @@ config K1_BT_UART_TX_TIMEOUT_USEC
 	---help---
 		Maximum time one H5 byte waits for UART2 transmitter space. This bounds
 		failure while the controller is unavailable during a link diagnostic.
+
+config K1_BT_H5_RX_FRAME_MAX
+	int "Maximum escaped UART2 H5 receive frame"
+	default 16384
+	range 512 65536
+	depends on K1_RTL8852BS2_BT
+	---help---
+		Maximum encoded H5 frame accepted by the polled UART2 transport. The
+		default accommodates an 8 KiB HCI payload after SLIP escaping without
+		placing a large static buffer in BSS.
 
 config K1_PWM
 	bool "K1 PWM controller support"

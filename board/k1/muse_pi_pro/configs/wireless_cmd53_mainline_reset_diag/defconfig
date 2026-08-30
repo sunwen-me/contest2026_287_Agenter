@@ -1,0 +1,9 @@
+# K1 SDIO CMD53 PIO profile with the Linux-mainline SDIO reset sequence.
+#
+# The image is RAM-only.  It changes neither eMMC nor U-Boot environment,
+# FDL, or fastboot data.  It exists solely to validate the paired
+# LEGACY_CONTROL/OP_EXT reset behavior before generalizing it.
+
+#include "../wireless_cmd53_pio_diag/defconfig"
+
+CONFIG_K1_SDIO_WIFI_MAINLINE_RESET_DIAGNOSTIC=y

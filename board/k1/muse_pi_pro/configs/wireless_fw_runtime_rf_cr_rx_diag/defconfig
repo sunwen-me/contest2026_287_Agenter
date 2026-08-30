@@ -1,0 +1,11 @@
+# RTL8852BS2 RF radio A/B image with the existing Beacon/BSS RX gate enabled.
+#
+# Same RAM-only flow as wireless_fw_runtime_rf_cr_diag, plus parsing of the
+# ordinary RX FIFO after the passive scan-offload. It answers whether the RF
+# parameter image makes the radio receive: it does not transmit a probe,
+# register a Wi-Fi network device, associate, authenticate, or write eMMC,
+# SPI flash, eFuse, or the U-Boot environment.
+
+#include "../wireless_fw_runtime_rf_cr_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_OFLD_RX_DIAGNOSTIC=y

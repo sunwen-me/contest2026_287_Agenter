@@ -1,0 +1,75 @@
+# RTL8852BS2 wlan0 passive scan netdev validation.
+#
+# The parent is the exact profile whose 2.4 GHz 1-13 passive sweep was
+# validated on the board against real Beacon/Probe Response RX (runs 8, 11 and
+# 12).  It is wireless_fw_runtime_scan_rf_readback_diag rather than the shorter
+# wireless_fw_runtime_scanofld_rx_diag, because the receiver only hears anything
+# with the BB/RF release, the board RF context read, the PHY CR image, its
+# firmware I/O-offload replay, the BB reset pulse and the RF radio A/B image
+# (which carries the A-die pad enable) all present; the shorter chain enables
+# none of those and its sweep would find no BSS at all.  This child adds
+# nothing to the radio path: it only attaches that same sweep to a wlan0 netdev
+# and adds wapi so SIOCSIWSCAN/SIOCGIWSCAN can be exercised from NSH.
+#
+# It stays a RAM-only diagnostic.  wlan0 reports scan results only: there is
+# no TX or RX data path, no association, no authentication, no keys, no
+# RSSI and no IP address, and every other wireless request returns ENOTTY.
+
+#include "../wireless_fw_runtime_scan_rf_readback_diag/defconfig"
+
+# wapi is BSD-2-Clause (Volkan YAZICI, adapted for NuttX by Gregory Nutt).
+CONFIG_ALLOW_BSD_COMPONENTS=y
+
+# SOCK_CTRL bypasses the address families, so the wireless ioctls need no
+# IPv4/IPv6/TCP/UDP stack at all.  Only the link-layer plumbing that
+# netdev_register(NET_LL_IEEE80211) requires is enabled: NET_ETHERNET supplies
+# CONFIG_NET_ETH_PKTSIZE and the d_mac.ether address.  Nothing here routes,
+# transports or buffers packets.
+CONFIG_NET=y
+CONFIG_NET_ETHERNET=y
+CONFIG_NETDEV_WIRELESS_IOCTL=y
+CONFIG_DRIVERS_WIRELESS=y
+CONFIG_DRIVERS_IEEE80211=y
+
+# wlan0 is registered from board late initialization after a successful boot
+# sweep, so there is no arch-level netdev initialization.  This also keeps the
+# EMAC driver (which depends on !NETDEV_LATEINIT) out of the image.
+CONFIG_NETDEV_LATEINIT=y
+
+CONFIG_K1_RTL8852BS2_WLAN_NETDEV=y
+
+# wapi calls netlib_getifstatus(), so the netlib support library is required.
+CONFIG_NETUTILS_NETLIB=y
+CONFIG_WIRELESS_WAPI=y
+CONFIG_WIRELESS_WAPI_CMDTOOL=y
+
+# SIOCSIWSCAN runs the multi-second sweep synchronously in the caller's task.
+# No wireless ioctl takes net_lock, so only the wapi task blocks; give it the
+# same headroom the sweep gets on the board initialization thread.
+CONFIG_WIRELESS_WAPI_STACKSIZE=8192
+
+# There is no IP configuration to bring up and no DHCP client in this image.
+# NSH's network initialization would only advertise an interface that cannot
+# carry traffic.
+# CONFIG_NSH_NETINIT is not set
+
+# The wlan0 sweep summary line and the warnings about what this device does
+# not implement are netdev diagnostics, so the network debug channel has to be
+# visible.  This image carries no traffic, so the channel stays quiet
+# otherwise.
+CONFIG_DEBUG_NET=y
+CONFIG_DEBUG_NET_ERROR=y
+CONFIG_DEBUG_NET_WARN=y
+CONFIG_DEBUG_NET_INFO=y
+
+# The inherited K1 debug configuration disables compiler inlining.  Build
+# out-of-line recursive mutex helpers for the netdev d_lock users.
+CONFIG_LIBC_SEM_MUTEX_NOINLINE=y
+
+# wapi prints the scan report's frequency column with "%g" and reads it back
+# through pow(10, iw_freq.e), so the value is a double.  Without floating-point
+# printf support NuttX emits the literal "*float*" there and the channel each
+# BSS was heard on becomes unreadable from userspace, which is the one column
+# this diagnostic exists to prove.  pow() already comes from the toolchain libm
+# (CONFIG_LIBM_TOOLCHAIN), so only the printf side has to be enabled.
+CONFIG_LIBC_FLOATINGPOINT=y

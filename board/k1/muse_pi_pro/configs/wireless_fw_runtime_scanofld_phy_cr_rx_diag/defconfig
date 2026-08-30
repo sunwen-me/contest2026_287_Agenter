@@ -1,0 +1,5 @@
+# RTL8852BS2 BB PHY CR image with the existing Beacon/BSS RX gate enabled.
+
+#include "../wireless_fw_runtime_scanofld_phy_cr_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_OFLD_RX_DIAGNOSTIC=y

@@ -1,0 +1,9 @@
+# RTL8852BS2 passive scan RX observation after the original BB/RF release.
+#
+# This RAM-only child keeps the Beacon/BSS gate enabled so a later successful
+# run is meaningful. During bring-up it can also be run without that smoke
+# gate to inspect the per-channel RX counters after the release sequence.
+
+#include "../wireless_fw_runtime_scanofld_bb_rf_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_SCAN_OFLD_RX_DIAGNOSTIC=y

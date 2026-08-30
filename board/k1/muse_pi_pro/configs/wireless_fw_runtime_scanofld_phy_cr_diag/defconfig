@@ -1,0 +1,8 @@
+# RTL8852BS2 default BB PHY CR image followed by passive 2.4 GHz 1-13 scan.
+#
+# The GPL-derived table is applied only to volatile Wi-Fi registers through
+# the existing CMD53 indirect access path. It has no RF image or calibration.
+
+#include "../wireless_fw_runtime_scanofld_bb_rf_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_PHY_CR_DIAGNOSTIC=y

@@ -1,0 +1,11 @@
+# RTL8852BS2 H5 registration with bt_slip as the only H5 link owner.
+#
+# The raw local-version probe leaves the controller in a CRC-protected H5
+# session. Disable it here so /dev/ttyHCI0 establishes H5 from reset.
+
+#include "../wireless_bt_hci_diag/defconfig"
+# CONFIG_K1_BT_H5_LOCAL_VERSION_PROBE is not set
+
+# Keep this dedicated RAM-only diagnostic observable at the NuttX H5 layer.
+CONFIG_DEBUG_WIRELESS=y
+CONFIG_DEBUG_WIRELESS_INFO=y
