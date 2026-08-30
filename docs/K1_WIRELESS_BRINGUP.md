@@ -4793,3 +4793,96 @@ Probe Response 接收都不产生作用。
 run 16 听到 3 个 AP、run 17 是 2 个、run 18 一个都没回、run 19 又是 3 个。
 `--require-runtime-scanofld-active` 回归时的第一步永远是**原样重跑一次**，
 确认是确定性缺陷之后再动代码。
+
+
+### 增量 3a：向真实 AP 发 Authentication Request 并收到它的回复
+
+这是本移植第一次把帧发给**单个对端**，也是第一次要求一个「只有接受了我们请求的 AP
+才会发出」的回复。实现分五块，都在 `chip/k1/k1_rtl8852bs_gpl.c`：
+
+1. `k1_rtl8852bs_runtime_auth_request_build()`：24 字节 802.11 头 + 6 字节 body
+   （alg=0 open system、seq=1、status=0）。A1/A3 = AP 的 BSSID，A2 = eFuse 自身 MAC；
+   frame control `0x00b0`（type=management, subtype=11）。序列控制字段留 0，由描述符负责。
+2. `k1_rtl8852bs_runtime_mgmt_tx_build()` 增加 `bool broadcast` 参数。原来它硬写
+   `info1 = K1_RTL8852BS_MGMT_TXI_BMC`，因为唯一调用者发的是广播 Probe Request。
+   **单播管理帧必须清掉这个位**，否则硬件既不会等 AP 的 ACK，也不会在 ACK 缺失时重传。
+   现有的 Probe Request 调用点传 `true`，行为不变。
+3. `k1_rtl8852bs_runtime_mgmt_tx_frame()`：精简发送核心。描述符、固定地址 CMD53、
+   页计数排空轮询都和已经被证明能穿到 TMAC 并真辐射的
+   `k1_rtl8852bs_runtime_mgmt_tx_probe()` 完全一致，只是把十几行仪表输出去掉、
+   把状态返回而不是打印——因为它跑在 scan-offload 的 dwell 里面，控制台是轮询式的，
+   在 250 ms 的窗口里打印十行会吃掉相当一部分等回复的时间。
+4. 发送时机挂在**进入信道通知**上（`k1_rtl8852bs_runtime_scanofld_passive_match()`
+   里 `match->dwell_pending = true` 之后）。这一条是整个增量的关键：
+
+   > SCANOFLD holds the current channel until this FW_OFLD/SCANOFLD_DRV_CTRL/NEXT_CH
+   > command is received.  （`k1_rtl8852bs_gpl.c:9563` 自带注释）
+
+   固件进入一个信道后会**一直停在那里**，直到 host 发 NEXT_CH；本移植的 NEXT_CH 是
+   由 RX 循环里的 dwell 截止时间发出的（`K1_RTL8852BS_SCAN_OFLD_PASSIVE_PERIOD_MSEC`
+   = 250 ms）。所以从进入信道到截止时间之间，射频**确定**停在目标 AP 的信道上，
+   既能发也能在同一信道收到回复。这是原厂状态机自己的行为，不是绕过它的 hack——
+   本移植还没有 `rtw8852b_set_channel_{mac,bb,rf}`，这是目前唯一能在指定信道发送的办法。
+5. `k1_rtl8852bs_fwdl_runtime_auth_diagnostic()`：跑两轮 sweep。第一轮普通被动扫描，
+   只为选目标——取**收到 Beacon 最多**的那个 AP（`bss[i].channel` 已经实现了
+   「优先 DS Parameter Set 里的信道，否则用 dwell 信道」的偏好）；然后
+   `auth_arm(bssid, channel)`，第二轮 sweep 在进入该信道时发出请求，同一轮 sweep 的
+   RX drain 负责观察回复；最后 disarm 并打印报告。
+
+判据是**发给本机的 Authentication 帧**：`k1_rtl8852bs_scanofld_observe_wifi()` 里新增的
+观察块只在 `A1 == 自身 MAC` 时才计入 `rsp-self` 并解析 alg/seq/status，而这个比较和
+Probe Response 的那个一样是 **host 侧软件逐字节 memcmp**，没有任何寄存器能让别的 STA
+的帧算成给我们的回复。sweep 期间接收过滤是放开的（嗅探模式），所以必须靠 A1 判定。
+
+**这一步不是关联，也不声称链路建立。** ADDR_CAM 里仍然是 no-link role，硬件不会 ACK
+AP 的回复，AP 会重传然后把这次交换超时掉。能**看到**它的 Authentication Response 就是
+这一步的成果；ACK 与 Association 属于增量 3b（用 AP 的 BSSID 更新 ADDR_CAM/role：
+`struct k1_rtl8852bs_addr_cam_info_s` 里的 `network_type`/`self_role`/`bssid`/`aid`
+已经就位，现在只填了 `self_mac`）。仍然是 RAM-only：不装密钥、无数据通路、无 IP、
+不动 wlan0 行为，也不写 eMMC/SPI flash/eFuse/U-Boot 环境变量。
+
+新增开关与产物：`CONFIG_K1_RTL8852BS2_RUNTIME_AUTH_DIAGNOSTIC`（依赖
+`..._SCAN_OFLD_ACTIVE_DIAGNOSTIC`）、profile
+`board/k1/muse_pi_pro/configs/wireless_auth_diag/`、构建脚本 `tools/build_k1_auth.sh`、
+harness 判据 `--require-runtime-auth`（同时检查目标 BSSID 非零、发送 `status=0x0`、
+报告行里 `req=` 与 `rsp-self=` 均非零、以及完成行）。
+
+#### run 20：AP 回了 Authentication Response，status=0（成功）
+
+镜像 `wireless_auth_diag`，`tools/build_k1_auth.sh`（`BUILD_EXIT=0`，只有 6 条既有的
+`defined but not used` 警告，新代码零警告），`--nsh-reboot` 两阶段恢复，无需按 RST。
+27 条 `--require-*` 全通过（上一轮 26 条 + 新增的 `--require-runtime-auth`），
+`RUN_EXIT=0`，基线没有回归：
+
+```
+K1 Wi-Fi GPL: auth target bssid=504f3be2e6d2 channel=0x1 beacons=0x7 ssid-len=0x2
+K1 Wi-Fi GPL: auth request tx channel=0x1 bytes=0x1e status=0x0
+K1 Wi-Fi GPL: auth req=0x1 tx-status=0x0 frames=0x1 rsp-self=0x1 rsp-target=0x1
+              alg=0x0 seq=0x2 status=0x0 a2=504f3be2e6d2
+K1 Wi-Fi GPL: RTL8852BS2 authentication response complete
+PASS: K1 wlan0 passive scan reported 3 BSS (data-only=3 dropped=0):
+      ea:12:2d:f6:42:46 ch11, 56:4f:3b:e2:e6:d2 ch1, 50:4f:3b:e2:e6:d2 ch1
+PASS: K1 wireless RAM image reached NSH
+```
+
+逐字段读这份报告：
+
+| 字段 | 值 | 含义 |
+| --- | --- | --- |
+| `bytes` | `0x1e` = 30 | 24 字节头 + 6 字节 body，帧长与构建函数一致 |
+| `tx-status` | `0x0` | 描述符建好、管理队列有页、CMD53 被接受、页计数排空 |
+| `frames` | `0x1` | sweep 期间一共看到 1 个 subtype=11 的管理帧 |
+| `rsp-target` | `0x1` | 它的 A2 是我们选的那个 BSSID |
+| `rsp-self` | `0x1` | 它的 A1 是本机 eFuse MAC——host 侧 memcmp 判定 |
+| `alg` / `seq` / `status` | `0x0` / `0x2` / `0x0` | open system、Authentication **Response**、**成功** |
+| `a2` | `504f3be2e6d2` | 与目标 BSSID 逐字节相同 |
+
+`status=0` 是 AP 自己给出的成功码：它收到了我们的 Authentication Request，
+接受了这次 open-system 认证，并把结果发回给本机 MAC。这条链路上第一次出现
+「只能由接受了本机请求的那台设备产生」的证据，之前的 Probe Response 只证明请求被辐射了。
+
+**仍然要按实际情况报告**：这不是关联，也不是链路。硬件没有 ACK 这一帧（ADDR_CAM 里还是
+no-link role、单播地址匹配关掉、接收过滤放开），AP 会重传若干次然后把交换超时掉。
+下一步（增量 3b）才是用 BSSID/aid 更新 ADDR_CAM 与 role，让硬件 ACK，然后
+Association Request/Response。Wi-Fi 整体依然未完成：没有四次握手、没有数据通路，
+蓝牙也只到 HCI open。

@@ -946,6 +946,27 @@ int k1_wireless_initialize(void)
                     }
                 }
 #  endif
+
+#  ifdef CONFIG_K1_RTL8852BS2_RUNTIME_AUTH_DIAGNOSTIC
+
+              /* The directed exchange runs after the broadcast one, because it
+               * depends on it: the target it aims at comes from a sweep, and
+               * the channel it transmits on is the channel the firmware parks
+               * the radio on during that sweep's dwell.  It is also the only
+               * step that addresses a single access point, so it runs last and
+               * gates nothing after it.
+               */
+
+              if (probe_ret >= 0)
+                {
+                  probe_ret =
+                    k1_rtl8852bs_fwdl_runtime_auth_diagnostic(wifi_mac);
+                  if (probe_ret < 0)
+                    {
+                      ret = probe_ret;
+                    }
+                }
+#  endif
 #endif
 
 #ifdef CONFIG_K1_RTL8852BS2_FW_PREBOOT_DIAGNOSTIC

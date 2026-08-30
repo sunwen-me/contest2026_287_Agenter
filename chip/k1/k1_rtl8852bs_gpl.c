@@ -1160,6 +1160,7 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_PROBE_REQUEST 4u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_PROBE_RESPONSE 5u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_BEACON   8u
+#define K1_RTL8852BS_IEEE80211_SUBTYPE_AUTHENTICATION 11u
 #define K1_RTL8852BS_IEEE80211_HEADER_SIZE      24u
 #define K1_RTL8852BS_IEEE80211_BEACON_FIXED_SIZE 12u
 #define K1_RTL8852BS_IEEE80211_SSID_IE          0u
@@ -1439,6 +1440,30 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_PROBE_REQUEST_SUPPORTED_RATES_IE 1u
 #define K1_RTL8852BS_PROBE_REQUEST_EXTENDED_RATES_IE  50u
 #define K1_RTL8852BS_PROBE_REQUEST_MAX_SIZE         64u
+
+/* One open-system Authentication Request, IEEE 802.11 clause 9.3.3.11.  The
+ * frame control is a management frame of subtype 11 with every flag clear: an
+ * Authentication frame is neither to nor from the distribution system, and it
+ * is sent unprotected because open-system authentication has nothing to
+ * protect it with.  Address 1 is the access point, which makes the frame
+ * unicast and therefore acknowledged, so the transmit descriptor must not
+ * carry the broadcast/multicast bit the Probe Request needs.
+ *
+ * The body is the three little-endian 16-bit fields of clause 9.4.1:
+ * algorithm number 0 (open system), transaction sequence number 1 for the
+ * request, and a status code that is reserved in the request and carries the
+ * access point's verdict in the response.  No challenge text element exists
+ * in open system, so the frame is exactly thirty bytes.
+ */
+
+#define K1_RTL8852BS_AUTH_FRAME_CONTROL             0x00b0u
+#define K1_RTL8852BS_AUTH_ALGORITHM_OPEN            0u
+#define K1_RTL8852BS_AUTH_SEQUENCE_REQUEST          1u
+#define K1_RTL8852BS_AUTH_SEQUENCE_RESPONSE         2u
+#define K1_RTL8852BS_AUTH_STATUS_SUCCESS            0u
+#define K1_RTL8852BS_AUTH_BODY_SIZE                 6u
+#define K1_RTL8852BS_AUTH_FRAME_SIZE                \
+  (K1_RTL8852BS_IEEE80211_HEADER_SIZE + K1_RTL8852BS_AUTH_BODY_SIZE)
 #define K1_RTL8852BS_SCAN_OFLD_START_OPERATION      1u
 #define K1_RTL8852BS_SCAN_OFLD_START_OPERATION_SHIFT 20u
 #define K1_RTL8852BS_SCAN_OFLD_START_NOTIFY_END      (1u << 0)
@@ -3066,6 +3091,12 @@ static uint32_t k1_rtl8852bs_read_le32(FAR const uint8_t *buffer)
          (uint32_t)buffer[1] << 8 |
          (uint32_t)buffer[2] << 16 |
          (uint32_t)buffer[3] << 24;
+}
+
+static void k1_rtl8852bs_write_le16(FAR uint8_t *buffer, uint16_t value)
+{
+  buffer[0] = (uint8_t)value;
+  buffer[1] = (uint8_t)(value >> 8);
 }
 
 static void k1_rtl8852bs_write_le32(FAR uint8_t *buffer, uint32_t value)
@@ -5296,6 +5327,62 @@ static bool k1_rtl8852bs_scanofld_is_self_mac(FAR const uint8_t *address)
   return g_k1_rtl8852bs_scan_self_mac_valid && address != NULL &&
          memcmp(address, g_k1_rtl8852bs_scan_self_mac,
                 sizeof(g_k1_rtl8852bs_scan_self_mac)) == 0;
+}
+
+/* The one Authentication Request this component transmits, and the account of
+ * what came back.  It is module state rather than a parameter because the
+ * frame has to be handed to the hardware from inside the scan-offload receive
+ * loop: that loop is the only place that knows the radio is parked on the
+ * access point's channel, since the firmware holds a channel from its
+ * enter-channel notification until the host asks for the next one.  Arming it
+ * before a sweep and disarming it afterwards keeps every existing caller of
+ * the sweep unchanged and keeps the sweep passive when nothing is armed.
+ */
+
+struct k1_rtl8852bs_auth_action_s
+{
+  uint8_t bssid[6];
+  uint8_t channel;
+  bool armed;
+  bool transmitted;
+  int transmit_status;
+  uint16_t requests;
+  uint16_t responses_to_self;
+  uint16_t responses_from_target;
+  uint16_t frames_seen;
+  bool response_valid;
+  uint16_t response_algorithm;
+  uint16_t response_sequence;
+  uint16_t response_status;
+  uint8_t response_a2[6];
+};
+
+static struct k1_rtl8852bs_auth_action_s g_k1_rtl8852bs_auth_action;
+
+static int k1_rtl8852bs_runtime_mgmt_tx_frame(FAR const uint8_t *frame,
+                                              size_t frame_length,
+                                              uint16_t sequence,
+                                              bool broadcast);
+
+static void k1_rtl8852bs_runtime_auth_arm(FAR const uint8_t *bssid,
+                                          uint8_t channel)
+{
+  memset(&g_k1_rtl8852bs_auth_action, 0, sizeof(g_k1_rtl8852bs_auth_action));
+  if (bssid == NULL || channel == 0)
+    {
+      return;
+    }
+
+  memcpy(g_k1_rtl8852bs_auth_action.bssid, bssid,
+         sizeof(g_k1_rtl8852bs_auth_action.bssid));
+  g_k1_rtl8852bs_auth_action.channel = channel;
+  g_k1_rtl8852bs_auth_action.transmit_status = -ENODATA;
+  g_k1_rtl8852bs_auth_action.armed = true;
+}
+
+static void k1_rtl8852bs_runtime_auth_disarm(void)
+{
+  g_k1_rtl8852bs_auth_action.armed = false;
 }
 
 /****************************************************************************
@@ -9247,6 +9334,130 @@ static int k1_rtl8852bs_runtime_probe_request_build(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_auth_request_build
+ *
+ * Description:
+ *   Serialize one open-system Authentication Request for the host transmit
+ *   path.  Unlike the Probe Request this is never handed to firmware packet
+ *   offload: the frame is unicast to one access point on one channel, so it is
+ *   written into the band-0 management FIFO with a host descriptor in front of
+ *   it, which is the descriptor k1_rtl8852bs_runtime_mgmt_tx_build() already
+ *   proved reaches the protocol engine.
+ *
+ *   The sequence-control field is left zero.  The management descriptor
+ *   selects neither hardware sequence numbering nor a MAC-table sequence
+ *   counter, so the number in the descriptor owns the frame and no station
+ *   record has to have been configured for the transmit to be legal.
+ *
+ * Input Parameters:
+ *   frame        - Receives the frame.
+ *   frame_length - Size of frame in bytes.
+ *   self_mac     - The eFuse self MAC, used as transmitter address.
+ *   bssid        - The access point selected from a scan result.  It is both
+ *                  the destination and the BSSID of the frame.
+ *   length       - Receives the number of bytes written.
+ *
+ * Returned Value:
+ *   OK on success, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_auth_request_build(
+  FAR uint8_t *frame, size_t frame_length, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid, FAR size_t *length)
+{
+  size_t offset;
+
+  if (frame == NULL || length == NULL || self_mac == NULL || bssid == NULL ||
+      !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(bssid) ||
+      frame_length < K1_RTL8852BS_AUTH_FRAME_SIZE)
+    {
+      return -EINVAL;
+    }
+
+  memset(frame, 0, frame_length);
+  frame[0] = (uint8_t)(K1_RTL8852BS_AUTH_FRAME_CONTROL & 0xffu);
+  frame[1] = (uint8_t)(K1_RTL8852BS_AUTH_FRAME_CONTROL >> 8);
+
+  /* Duration stays zero for the hardware to fill.  Address 1 is the access
+   * point, address 2 this host and address 3 the BSSID, which for an
+   * infrastructure management frame is the access point again.
+   */
+
+  memcpy(frame + 4, bssid, 6);
+  memcpy(frame + 10, self_mac, 6);
+  memcpy(frame + 16, bssid, 6);
+  offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+  k1_rtl8852bs_write_le16(frame + offset, K1_RTL8852BS_AUTH_ALGORITHM_OPEN);
+  k1_rtl8852bs_write_le16(frame + offset + 2,
+                          K1_RTL8852BS_AUTH_SEQUENCE_REQUEST);
+  k1_rtl8852bs_write_le16(frame + offset + 4, 0u);
+  offset += K1_RTL8852BS_AUTH_BODY_SIZE;
+
+  *length = offset;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_auth_transmit
+ *
+ * Description:
+ *   Transmit the armed Authentication Request.  This is called from the
+ *   scan-offload receive loop at the moment the firmware reports it has
+ *   entered the access point's channel, because that notification is the only
+ *   point at which this port knows what the radio is tuned to: the firmware
+ *   holds a channel until the host submits the next-channel command, so the
+ *   whole dwell is available to transmit into and to receive the answer on.
+ *
+ *   It is deliberately quiet.  The console is polled, and the dwell it runs
+ *   inside is the same dwell the answer has to arrive in, so a full
+ *   descriptor dump here would spend a large part of that dwell printing.
+ *   One line before the transfer and the result line the diagnostic prints
+ *   afterwards are enough; the verbose descriptor evidence already exists in
+ *   k1_rtl8852bs_runtime_mgmt_tx_probe().
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_auth_transmit(void)
+{
+  uint8_t frame[K1_RTL8852BS_AUTH_FRAME_SIZE];
+  size_t frame_length = 0;
+  int ret;
+
+  g_k1_rtl8852bs_auth_action.transmitted = true;
+  if (!g_k1_rtl8852bs_scan_self_mac_valid)
+    {
+      g_k1_rtl8852bs_auth_action.transmit_status = -EINVAL;
+      return;
+    }
+
+  ret = k1_rtl8852bs_runtime_auth_request_build(
+    frame, sizeof(frame), g_k1_rtl8852bs_scan_self_mac,
+    g_k1_rtl8852bs_auth_action.bssid, &frame_length);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_runtime_mgmt_tx_frame(frame, frame_length, 0u,
+                                                false);
+      if (ret >= 0)
+        {
+          g_k1_rtl8852bs_auth_action.requests++;
+        }
+    }
+
+  g_k1_rtl8852bs_auth_action.transmit_status = ret;
+
+  k1_early_puts("K1 Wi-Fi GPL: auth request tx channel=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.channel);
+  k1_early_puts(" bytes=");
+  k1_early_puthex((uintreg_t)frame_length);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_pkt_ofld_add
  *
  * Description:
@@ -11792,6 +12003,53 @@ static void k1_rtl8852bs_scanofld_observe_wifi(
       match->dwell_management[dwell_index]++;
     }
 
+  /* An Authentication frame is only evidence of an answer to this host when
+   * its A1 is this host's own address, on exactly the same reasoning the
+   * Probe Response accounting below uses: the sweep runs with unicast address
+   * matching off, so an Authentication frame an access point sent to a
+   * different station is delivered here as well.  The three body fields are
+   * read from the payload rather than from the parsed header subset, which
+   * carries no Authentication body, and only the first answer is kept: what
+   * matters is the algorithm the access point agreed to, the transaction it
+   * believes it is in, and its status code.
+   */
+
+  if (frame_subtype == K1_RTL8852BS_IEEE80211_SUBTYPE_AUTHENTICATION &&
+      g_k1_rtl8852bs_auth_action.armed)
+    {
+      g_k1_rtl8852bs_auth_action.frames_seen++;
+      if (mgmt.addr2_valid &&
+          memcmp(mgmt.addr2, g_k1_rtl8852bs_auth_action.bssid,
+                 sizeof(g_k1_rtl8852bs_auth_action.bssid)) == 0)
+        {
+          g_k1_rtl8852bs_auth_action.responses_from_target++;
+        }
+
+      if (mgmt.addr1_valid && k1_rtl8852bs_scanofld_is_self_mac(mgmt.addr1))
+        {
+          g_k1_rtl8852bs_auth_action.responses_to_self++;
+          if (!g_k1_rtl8852bs_auth_action.response_valid &&
+              payload_length >= K1_RTL8852BS_AUTH_FRAME_SIZE)
+            {
+              FAR const uint8_t *body =
+                payload + K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+              g_k1_rtl8852bs_auth_action.response_valid = true;
+              g_k1_rtl8852bs_auth_action.response_algorithm =
+                k1_rtl8852bs_read_le16(body);
+              g_k1_rtl8852bs_auth_action.response_sequence =
+                k1_rtl8852bs_read_le16(body + 2);
+              g_k1_rtl8852bs_auth_action.response_status =
+                k1_rtl8852bs_read_le16(body + 4);
+              if (mgmt.addr2_valid)
+                {
+                  memcpy(g_k1_rtl8852bs_auth_action.response_a2, mgmt.addr2,
+                         sizeof(g_k1_rtl8852bs_auth_action.response_a2));
+                }
+            }
+        }
+    }
+
   if (mgmt.is_beacon)
     {
       match->beacon_frames++;
@@ -12392,6 +12650,22 @@ static int k1_rtl8852bs_runtime_scanofld_passive_match(
            */
 
           match->rx_frames_logged = 0;
+
+          /* The radio is now parked on this channel and stays there until the
+           * dwell deadline above submits the next-channel command, so this is
+           * the one point in the sweep at which a host-built management frame
+           * can be handed to the hardware knowing what it will be radiated
+           * on.  The transmit is armed by a diagnostic and is a no-op in
+           * every other sweep, so the passive path is unchanged when nothing
+           * armed it.
+           */
+
+          if (g_k1_rtl8852bs_auth_action.armed &&
+              !g_k1_rtl8852bs_auth_action.transmitted &&
+              channel == g_k1_rtl8852bs_auth_action.channel)
+            {
+              k1_rtl8852bs_runtime_auth_transmit();
+            }
         }
     }
   else if (reason == K1_RTL8852BS_SCAN_OFLD_C2H_SCAN_END)
@@ -15556,9 +15830,14 @@ static void k1_rtl8852bs_runtime_tx_prerequisites_report(void)
  *     WD INFO dword0  a fixed rate is selected, that rate is 1 Mbit/s CCK,
  *                     and data rate fallback is disabled, so nothing about
  *                     this transmit depends on a rate table.
- *     WD INFO dword1  the broadcast/multicast bit, because a Probe Request
- *                     with the broadcast destination is not acknowledged and
- *                     must not be retried as if it were.
+ *     WD INFO dword1  the broadcast/multicast bit, set only when the caller
+ *                     says the frame is broadcast.  A Probe Request with the
+ *                     broadcast destination is not acknowledged and must not
+ *                     be retried as if it were, so it needs the bit; a
+ *                     unicast Authentication Request is acknowledged by the
+ *                     access point and must not carry it, or the hardware
+ *                     would neither wait for that acknowledgement nor retry
+ *                     the frame when it is missing.
  *
  *   Everything else is zero: no encryption, no aggregation, no RTS, no
  *   lifetime override and no header conversion.
@@ -15569,7 +15848,7 @@ static void k1_rtl8852bs_runtime_tx_prerequisites_report(void)
  ****************************************************************************/
 
 static int k1_rtl8852bs_runtime_mgmt_tx_build(
-  size_t frame_length, uint16_t sequence,
+  size_t frame_length, uint16_t sequence, bool broadcast,
   FAR uint8_t *descriptor, size_t descriptor_length,
   FAR struct k1_rtl8852bs_data_tx_layout_s *layout)
 {
@@ -15605,7 +15884,7 @@ static int k1_rtl8852bs_runtime_mgmt_tx_build(
           ((uint32_t)K1_RTL8852BS_MGMT_TXI_DATARATE_CCK1 <<
            K1_RTL8852BS_MGMT_TXI_DATARATE_SHIFT) |
           K1_RTL8852BS_MGMT_TXI_DISDATAFB;
-  info1 = K1_RTL8852BS_MGMT_TXI_BMC;
+  info1 = broadcast ? (uint32_t)K1_RTL8852BS_MGMT_TXI_BMC : 0u;
 
   memset(descriptor, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE);
   k1_rtl8852bs_write_le32(descriptor, body0);
@@ -15703,7 +15982,7 @@ static void k1_rtl8852bs_runtime_mgmt_tx_probe(FAR const uint8_t *self_mac)
   if (ret == OK)
     {
       ret = k1_rtl8852bs_runtime_mgmt_tx_build(
-        frame_length, 0u, packet, sizeof(packet), &layout);
+        frame_length, 0u, true, packet, sizeof(packet), &layout);
     }
 
   if (ret < 0)
@@ -15819,6 +16098,109 @@ static void k1_rtl8852bs_runtime_mgmt_tx_probe(FAR const uint8_t *self_mac)
   k1_rtl8852bs_runtime_put_word(
     after_res_valid ? after_res.wp_available_pages : 0xffffffffu);
   k1_early_puts("\r\n");
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_mgmt_tx_frame
+ *
+ * Description:
+ *   Transmit one caller-built management frame through the band-0 management
+ *   queue.  This is the same descriptor, the same fixed-address CMD53 and the
+ *   same drain poll that k1_rtl8852bs_runtime_mgmt_tx_probe() already proved
+ *   reaches the TMAC and radiates, with the instrumentation removed and the
+ *   status returned instead of printed.
+ *
+ *   The instrumentation is what makes it a separate function rather than a
+ *   parameter on the existing one.  This path runs inside a scan-offload
+ *   dwell, on a polled console, and the answer to the frame has to arrive in
+ *   that same dwell; the probe variant prints on the order of ten lines per
+ *   transmit, which at the console's byte rate is a large part of the two
+ *   hundred and fifty millisecond window.  The verbose evidence is kept where
+ *   it belongs, on the positive control that exists to produce it.
+ *
+ * Returned Value:
+ *   OK when the transfer was accepted and the queue drained, a negated errno
+ *   otherwise.  -ENOSPC means the queue had no room, so nothing was written.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_mgmt_tx_frame(FAR const uint8_t *frame,
+                                              size_t frame_length,
+                                              uint16_t sequence,
+                                              bool broadcast)
+{
+  uint8_t packet[K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                 K1_RTL8852BS_PROBE_REQUEST_MAX_SIZE];
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_resources_s before_res;
+  struct k1_rtl8852bs_data_tx_resources_s after_res;
+  unsigned int drained;
+  int ret;
+
+  if (frame == NULL || frame_length < K1_RTL8852BS_IEEE80211_HEADER_SIZE ||
+      frame_length > sizeof(packet) - K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE)
+    {
+      return -EINVAL;
+    }
+
+  memset(packet, 0, sizeof(packet));
+  memcpy(packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, frame, frame_length);
+
+  ret = k1_rtl8852bs_runtime_mgmt_tx_build(frame_length, sequence, broadcast,
+                                           packet, sizeof(packet), &layout);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  /* Best effort, exactly as in the probe variant: the helper only ORs the two
+   * management-queue enables in, so a path that already enabled them is
+   * unaffected and its failure is not fatal to the transfer.
+   */
+
+  k1_rtl8852bs_runtime_sch_tx_en_management();
+
+  ret = k1_rtl8852bs_data_tx_resources_read(
+    K1_RTL8852BS_MGMT_TXD_CH_DMA_B0MG, &before_res);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if (before_res.channel_used_pages +
+      layout.required_wde_pages > before_res.channel_max_pages ||
+      before_res.wp_available_pages <
+      layout.required_ple_pages + K1_RTL8852BS_DATA_TX_PLE_RESERVE)
+    {
+      return -ENOSPC;
+    }
+
+  ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
+                           layout.transfer_length);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  /* The same page-counter poll the probe variant uses: a counter that goes up
+   * and comes back down is a frame the dispatcher consumed.  A frame that is
+   * still charged when the poll runs out is not an error here, because the
+   * dwell has to be left for the answer either way.
+   */
+
+  for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
+    {
+      if (k1_rtl8852bs_data_tx_resources_read(
+            K1_RTL8852BS_MGMT_TXD_CH_DMA_B0MG, &after_res) != OK ||
+          after_res.channel_used_pages == before_res.channel_used_pages)
+        {
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  return OK;
 }
 
 /****************************************************************************
@@ -16213,6 +16595,162 @@ int k1_rtl8852bs_runtime_scanofld_passive_scan(
 
   return k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
     false, false, result);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_fwdl_runtime_auth_diagnostic
+ *
+ * Description:
+ *   Transmit one open-system Authentication Request to a real access point
+ *   and require its Authentication Response back.  This is the first frame
+ *   this component addresses to a single peer rather than to the broadcast
+ *   address, and the first reply it asks for that only an access point which
+ *   accepted the request can send.
+ *
+ *   Two sweeps are run.  The first is an ordinary passive sweep whose only
+ *   job is to choose a target: it reports the access points in range with the
+ *   channel each of them advertises, and the strongest evidence available for
+ *   "this one is really there" is the number of beacons received from it, so
+ *   the access point with the most beacons is chosen.  The Authentication
+ *   Request is then armed for that BSSID and channel and a second sweep is
+ *   run.  When the firmware reports it has entered that channel, the request
+ *   is transmitted from inside the receive loop, and the same sweep's receive
+ *   drain is what observes the answer.
+ *
+ *   The reason the transmit lives inside a sweep is that the firmware parks
+ *   the radio.  Scan offload holds the channel it entered until the host
+ *   submits the next-channel command, which this port does from a deadline in
+ *   the receive loop; so between the enter-channel notification and that
+ *   deadline the radio is tuned to the target's channel for a quarter of a
+ *   second, which is the vendor state machine's own behaviour and not a
+ *   detour around it.  This port has no baseband or radio channel setter yet,
+ *   so this is the only way it can currently transmit on a chosen channel.
+ *
+ *   What this does NOT do, stated plainly because the distinction decides how
+ *   the result may be reported: it does not associate, it installs no key, it
+ *   creates no network device, it carries no data, and the hardware does not
+ *   acknowledge the access point's response.  The sweep runs with the receive
+ *   filter opened up and the address CAM still holding a no-link role, so the
+ *   answer is received but not acknowledged, and the access point will retry
+ *   it and then time the exchange out.  Seeing the response is the milestone;
+ *   a link is not claimed.  Nothing is written to eMMC, SPI flash, eFuse or
+ *   the U-Boot environment.
+ *
+ * Input Parameters:
+ *   self_mac - The eFuse self MAC.  It has to be the address the no-link role
+ *              and the address CAM were configured with, because the response
+ *              is only counted as an answer to this host when its A1 matches.
+ *
+ * Returned Value:
+ *   OK when an Authentication frame addressed to this host arrived, a negated
+ *   errno otherwise.  -ENODATA means the request was transmitted and no
+ *   response addressed to this host arrived; -EHOSTUNREACH means the target
+ *   sweep found no access point to aim at.
+ *
+ ****************************************************************************/
+
+int k1_rtl8852bs_fwdl_runtime_auth_diagnostic(FAR const uint8_t *self_mac)
+{
+  struct k1_rtl8852bs_scan_result_s result;
+  FAR const struct k1_rtl8852bs_scan_bss_s *target = NULL;
+  unsigned int index;
+  int sweep_ret;
+  int ret;
+
+  if (self_mac == NULL || !k1_rtl8852bs_addr_cam_mac_valid(self_mac))
+    {
+      ret = -EINVAL;
+      goto error;
+    }
+
+  k1_rtl8852bs_scanofld_set_self_mac(self_mac);
+
+  ret = k1_rtl8852bs_runtime_scanofld_passive_scan(&result);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  for (index = 0; index < result.bss_count &&
+       index < K1_RTL8852BS_SCAN_BSS_MAX; index++)
+    {
+      FAR const struct k1_rtl8852bs_scan_bss_s *bss = &result.bss[index];
+
+      if (bss->channel == 0 ||
+          !k1_rtl8852bs_addr_cam_mac_valid(bss->bssid))
+        {
+          continue;
+        }
+
+      if (target == NULL || bss->beacon_frames > target->beacon_frames)
+        {
+          target = bss;
+        }
+    }
+
+  if (target == NULL)
+    {
+      ret = -EHOSTUNREACH;
+      goto error;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: auth target bssid=");
+  k1_rtl8852bs_scanofld_log_bytes(target->bssid, 6);
+  k1_early_puts(" channel=");
+  k1_early_puthex(target->channel);
+  k1_early_puts(" beacons=");
+  k1_early_puthex(target->beacon_frames);
+  k1_early_puts(" ssid-len=");
+  k1_early_puthex(target->ssid_length);
+  k1_early_puts("\r\n");
+
+  k1_rtl8852bs_runtime_auth_arm(target->bssid, target->channel);
+  sweep_ret = k1_rtl8852bs_runtime_scanofld_passive_scan(&result);
+  k1_rtl8852bs_runtime_auth_disarm();
+
+  k1_early_puts("K1 Wi-Fi GPL: auth req=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.requests);
+  k1_early_puts(" tx-status=");
+  k1_early_puthex((uintreg_t)
+                  (g_k1_rtl8852bs_auth_action.transmit_status < 0 ?
+                   -g_k1_rtl8852bs_auth_action.transmit_status : 0));
+  k1_early_puts(" frames=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.frames_seen);
+  k1_early_puts(" rsp-self=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.responses_to_self);
+  k1_early_puts(" rsp-target=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.responses_from_target);
+  k1_early_puts(" alg=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_algorithm);
+  k1_early_puts(" seq=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_sequence);
+  k1_early_puts(" status=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_status);
+  k1_early_puts(" a2=");
+  k1_rtl8852bs_scanofld_log_bytes(g_k1_rtl8852bs_auth_action.response_a2, 6);
+  k1_early_puts("\r\n");
+
+  if (sweep_ret < 0)
+    {
+      ret = sweep_ret;
+      goto error;
+    }
+
+  if (!g_k1_rtl8852bs_auth_action.response_valid)
+    {
+      ret = -ENODATA;
+      goto error;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 authentication response "
+                "complete\r\n");
+  return OK;
+
+error:
+  k1_early_puts("K1 Wi-Fi GPL: authentication response error=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+  return ret;
 }
 
 int k1_rtl8852bs_fwdl_preboot_diagnostic(void)

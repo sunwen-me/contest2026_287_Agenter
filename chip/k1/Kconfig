@@ -689,6 +689,41 @@ config K1_RTL8852BS2_RUNTIME_SCAN_OFLD_ACTIVE_DIAGNOSTIC
 		path, and nothing written to eMMC, SPI flash, eFuse or the U-Boot
 		environment.
 
+config K1_RTL8852BS2_RUNTIME_AUTH_DIAGNOSTIC
+	bool "Require an RTL8852BS2 Authentication Response from an access point"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_SCAN_OFLD_ACTIVE_DIAGNOSTIC
+	---help---
+		Transmit one open-system Authentication Request to a real access point
+		and require its Authentication Response back. The target is chosen by a
+		passive sweep - the access point with the most received Beacons, using
+		the channel it advertises in its DS Parameter Set - and the request is
+		then transmitted from inside the receive loop of a second sweep, at the
+		moment the firmware reports it entered that channel.
+
+		That timing is the point. Scan offload parks the radio on the channel it
+		entered until the host submits the next-channel command, which this port
+		does from a deadline in the receive loop, so the whole dwell is a window
+		in which the radio is known to be tuned to the target and the answer can
+		arrive on the same channel. This component has no baseband or radio
+		channel setter yet, so this is the only way it can currently transmit on
+		a chosen channel, and it is the vendor firmware's own behaviour rather
+		than a detour around it.
+
+		The frame is the first one this component addresses to a single peer, so
+		the transmit descriptor drops the broadcast/multicast bit the Probe
+		Request needs: a unicast management frame is acknowledged by its
+		recipient and the hardware has to expect that acknowledgement. The
+		response is only counted when its A1 is the eFuse self MAC, compared in
+		host software, because the sweep runs with the receive filter opened up.
+
+		This does NOT associate. The address CAM still holds the no-link role, so
+		this host does not acknowledge the access point's response and the access
+		point will retry it and time the exchange out. Receiving the response is
+		the result; a link is not claimed. No key is installed, no network device
+		is created, no data is carried, and nothing is written to eMMC, SPI
+		flash, eFuse or the U-Boot environment.
+
 config K1_RTL8852BS2_WLAN_NETDEV
 	bool "Register the RTL8852BS2 wlan0 scan network device"
 	default n

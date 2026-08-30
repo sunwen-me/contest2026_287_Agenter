@@ -255,6 +255,13 @@ def parse_args() -> argparse.Namespace:
               "received"),
     )
     parser.add_argument(
+        "--require-runtime-auth", action="store_true",
+        help=("fail unless an open-system Authentication Request is "
+              "transmitted to an access point chosen by a sweep and an "
+              "Authentication frame addressed to the eFuse self MAC is "
+              "received back"),
+    )
+    parser.add_argument(
         "--require-wlan0-scan", action="store_true",
         help=("fail unless wlan0 registers and a wapi passive scan returns at "
               "least one Beacon/Probe-Response BSS through SIOCGIWSCAN"),
@@ -1411,6 +1418,52 @@ def main() -> int:
                 )
                 if probe_response_result is None:
                     missing.append("RTL8852BS2 Probe Response RX")
+        if args.require_runtime_auth:
+            # The whole exchange is judged from the report line the diagnostic
+            # prints, plus the completion line, because the report is what
+            # separates the two ways this can fail: a request that was never
+            # accepted by the transmit path, and one that was transmitted and
+            # not answered.  rsp-self is counted in host software by comparing
+            # A1 against the eFuse self MAC, so no register setting can make
+            # another station's frame satisfy it.
+            auth_target_result = None
+            for candidate in re.finditer(
+                    rb"K1 Wi-Fi GPL: auth target bssid=([0-9a-f]{12}) "
+                    rb"channel=(?:0x)?0*[1-9a-fA-F]",
+                    started):
+                if candidate.group(1).strip(b"0"):
+                    auth_target_result = candidate
+                    break
+
+            if auth_target_result is None:
+                missing.append("RTL8852BS2 authentication target BSS")
+                auth = started
+            else:
+                auth = started[auth_target_result.end():]
+
+            auth_tx_result = re.search(
+                rb"K1 Wi-Fi GPL: auth request tx channel=(?:0x)?0*"
+                rb"[1-9a-fA-F][^\r\n]* status=0x0+(?![0-9a-fA-F])",
+                auth,
+            )
+            if auth_tx_result is None:
+                missing.append("RTL8852BS2 Authentication Request transmit")
+
+            auth_response_result = re.search(
+                rb"K1 Wi-Fi GPL: auth req=(?:0x)?0*[1-9a-fA-F][^\r\n]*"
+                rb" rsp-self=(?:0x)?0*[1-9a-fA-F]",
+                auth,
+            )
+            if auth_response_result is None:
+                missing.append("RTL8852BS2 Authentication Response RX")
+
+            auth_end_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 authentication response "
+                rb"complete\r?\n",
+                auth,
+            )
+            if auth_end_result is None:
+                missing.append("RTL8852BS2 authentication completion")
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

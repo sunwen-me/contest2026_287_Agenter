@@ -1,6 +1,6 @@
 # Claude Handoff: K1 RTL8852BS2 Wireless Port
 
-更新时间：2026-08-29（Asia/Shanghai）
+更新时间：2026-08-30（Asia/Shanghai）
 
 ## 目标
 
@@ -39,6 +39,12 @@
 - **`wlan0` netdev 的扫描报告**：`SIOCSIWSCAN` 同步跑完 13 信道 sweep、`SIOCGIWSCAN` 读回，
   `wapi pscan wlan0` 从 userspace 打印出真实 BSSID ＋ 真实信道（run 7：4 个 BSS，ch8/ch8/ch1/ch1），
   25 项 `--require-*` 全链通过。**仅此而已：无 TX、不关联、无 RSSI、无 IP**
+- **主动扫描**：host 把 wildcard Probe Request 存进固件 packet-offload 表、信道表带
+  `tx_pkt`+`probe_req_pkt_id` 重新下发，收到真实 Probe Response（run 14 首达标）
+- **open-system 认证**：向选定 AP 发单播 Authentication Request，收到它的
+  Authentication Response `alg=0 seq=2 status=0`（run 20，`wireless_auth_diag`，
+  27 项 `--require-*` 全过）。发送时机借固件把射频停在扫描信道上的行为，
+  挂在 scan-offload dwell 里。**仅此而已：不关联、硬件不 ACK、无密钥、无数据通路**
 - H5 版本结果：HCI `0x0b/0x000b`，manufacturer `0x005d`，LMP subversion `0x8852`
 
 最新已通过的扫描/PHY/FW 日志（运行 12，13 信道被动扫描）：
@@ -57,6 +63,11 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 
 ## 尚未完成，禁止误报
 
+- **认证通了不等于关联通了。** run 20 收到的是 AP 的 Authentication Response，
+  `status=0` 是 AP 给的成功码；但本机 ADDR_CAM 里仍是 no-link role、单播地址匹配
+  关着、接收过滤放开，所以硬件**不会 ACK** 这一帧，AP 会重传几次然后把这次交换
+  超时掉。说「能和 AP 完成 open-system 认证交换的一个来回」是对的，
+  说「关联上了」「Wi-Fi 通了」是误报。
 - 没有关联、WPA、DHCP 或联网。`wireless_wlan0_scan_diag` 里那个**只报告扫描结果**的
   `wlan0` 已经在实板通过 25 项 `--require-*` 全链（run 7，见下），但它的范围就只有扫描：
   `SIOCSIWSCAN` 同步跑一次 13 信道被动 sweep、`SIOCGIWSCAN` 读回结果——**没有 TX、
@@ -185,15 +196,36 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
     是 `R_AX_RCR 0xCE00` 那个 32 位字的高半字、早就写了。**剩下唯一没审的是
     `sec_eng_init` / `sec_info_tbl_init`**（本地原厂缓存里没有正文），只影响加密，
     要到 WPA2 4-way 才需要。细节见 `docs/K1_WIRELESS_BRINGUP.md` 续十四。
-- **下一步优先级**：(1) 关联/认证：`k1_rtl8852bs_runtime_mgmt_tx_probe()`
-  （`k1_rtl8852bs_gpl.c:15682`）那条描述符已被证明能穿到 TMAC 并真辐射出去，
-  可以直接拿来发 Auth/Assoc——扫描结果 → 选 BSS → ADDR_CAM 写 BSSID →
-  Auth Request（open system）→ Auth Response → Assoc Request → Assoc Response；
-  已确认**不需要** JOININFO、CCTL/DCTL、`B_AX_PORT_FUNC_EN`。
+- **已完成（2026-08-30，原优先级 1 的前半 = 增量 3a）：认证（open system）已在板上打通。**
+  run 20，镜像 `wireless_auth_diag`，27 条 `--require-*` 全过、`RUN_EXIT=0`，
+  基线（原 26 条）无回归。AP `50:4f:3b:e2:e6:d2`（ch1）回了
+  `alg=0x0 seq=0x2 status=0x0 a2=504f3be2e6d2`——**它自己给出的成功码**。
+  关键机制：**固件会把射频停在扫描信道上**。
+  `k1_rtl8852bs_runtime_scanofld_next_channel_submit()`（`k1_rtl8852bs_gpl.c:9563`）
+  的自带注释写明 SCANOFLD 一直保持当前信道直到收到 NEXT_CH，而本移植的 NEXT_CH 由 RX
+  循环里的 250 ms dwell 截止时间发出，所以「进入信道通知 → 截止时间」之间射频确定停在
+  目标信道，可以在里面发帧并在同一信道收回复。这是原厂状态机自己的行为，
+  也是本移植目前唯一能在指定信道发送的办法（还没有
+  `rtw8852b_set_channel_{mac,bb,rf}`）。实现要点：
+  `mgmt_tx_build()` 加 `bool broadcast` 参数——单播管理帧必须清掉
+  `K1_RTL8852BS_MGMT_TXI_BMC`，否则硬件不等 ACK 也不重传；新增精简发送核心
+  `k1_rtl8852bs_runtime_mgmt_tx_frame()`（描述符与 CMD53 路径和已验证的
+  `mgmt_tx_probe()` 完全相同，只去掉仪表输出，因为控制台是轮询式的，
+  在 250 ms 窗口里打印十行会吃掉等回复的时间）；判据是 **A1 == 自身 MAC** 的
+  host 侧 memcmp，任何寄存器都无法伪造。
+  **但这不是关联**：ADDR_CAM 仍是 no-link role，硬件不 ACK，AP 会重传并超时。
+- **下一步优先级**：(1) 增量 3b：用 AP 的 BSSID/aid 更新 ADDR_CAM 与 role
+  （`struct k1_rtl8852bs_addr_cam_info_s` 里 `network_type`/`self_role`/`bssid`/`aid`
+  已经就位，目前只填了 `self_mac`），让硬件 ACK AP 的帧，然后
+  Assoc Request → Assoc Response。发送路径直接用
+  `k1_rtl8852bs_runtime_mgmt_tx_frame()`（`broadcast=false`），时机同样挂在
+  scan-offload 的 dwell 上；已确认**不需要** JOININFO、CCTL/DCTL、`B_AX_PORT_FUNC_EN`。
   (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
   发送正确性与 RSSI 精度要靠它；同一批还有 `set_enable_bb_rf(hal, 0)` 的 disable 半边、
   `halbb_dm_init()`/`halrf_dm_init()` 正文、五张 `init_rf_reg` store 表、halbb `phy_reg_gain`。
   (3) `sec_eng_init` / `sec_info_tbl_init`，WPA2 4-way 之前补。
+  (4) 真正的 STA 链路最终还是要把 `rtw8852b_set_channel_{mac,bb,rf}` 移植进来，
+  让信道控制不再依赖扫描卸载状态机。
 
 ## 当前最重要的技术结论
 

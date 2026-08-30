@@ -329,6 +329,7 @@ int k1_rtl8852bs_fwdl_runtime_scanofld_active_diagnostic(
   FAR const uint8_t *self_mac);
 int k1_rtl8852bs_runtime_scanofld_passive_scan(
   FAR struct k1_rtl8852bs_scan_result_s *result);
+int k1_rtl8852bs_fwdl_runtime_auth_diagnostic(FAR const uint8_t *self_mac);
 int k1_rtl8852bs_fwdl_preboot_diagnostic(void);
 int k1_rtl8852bs_fwdl_h2c_tx_diagnostic(void);
 int k1_rtl8852bs_fwdl_fw_header_packet_diagnostic(void);

@@ -1,0 +1,36 @@
+# RTL8852BS2 authentication: transmit an Authentication Request to a real
+# access point, receive its Authentication Response.
+#
+# The parent is the active-scan profile whose whole chain already passed on the
+# board, so one run of this image re-validates everything proven before -
+# firmware download, the runtime control plane, the no-link role and CAM, the
+# passive 2.4 GHz 1-13 sweep with real Beacon RX, the wlan0 netdev whose wapi
+# scan reports those access points, and the host and firmware transmit paths
+# that put a Probe Request in the air and got a Probe Response back - and then
+# adds the one new step.
+#
+# That step is the first frame this port addresses to a single peer. A passive
+# sweep picks the access point with the most received Beacons and takes the
+# channel it advertises; a second sweep then transmits an open-system
+# Authentication Request from inside its receive loop, at the moment the
+# firmware reports it entered that channel. Scan offload parks the radio there
+# until the host submits the next-channel command, so the dwell is a window in
+# which the radio is known to be tuned to the target and the answer can arrive
+# on the same channel. The descriptor drops the broadcast/multicast bit the
+# Probe Request needs, because a unicast management frame is acknowledged by
+# its recipient.
+#
+# The image fails unless an Authentication frame addressed to the eFuse self
+# MAC arrives. A1 is compared in host software, so no register setting can
+# make another station's frame count as an answer to this one.
+#
+# This does NOT associate. The address CAM still holds the no-link role, so
+# this host does not acknowledge the response and the access point will retry
+# it and time the exchange out. Receiving the response is the result; a link is
+# not claimed. Still RAM-only: no key, no data path, no IP address, no wlan0
+# behaviour change, and nothing written to eMMC, SPI flash, eFuse or the
+# U-Boot environment.
+
+#include "../wireless_scanofld_active_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_AUTH_DIAGNOSTIC=y
