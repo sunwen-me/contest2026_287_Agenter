@@ -1927,6 +1927,38 @@ def main() -> int:
             else:
                 resident = started[resident_begin_result.end():]
 
+            # The park step that runs before the window, and the window's own
+            # read-back of what it did.  Run 36 polled a whole window on
+            # channel 13 against an access point on channel 1, because the
+            # sweep that confirms the association walks 1 to 13 unparked and
+            # ends wherever it ends; the park step is what puts the radio back
+            # and this is what says it landed.  The completion marker is
+            # searched before the window's slice because the step runs before
+            # the window's first line.
+            resident_park_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 station resident park "
+                rb"complete\r?\n",
+                started,
+            )
+            if resident_park_result is None:
+                missing.append(
+                    "RTL8852BS2 radio parked on the associated channel")
+
+            # The two numbers are compared rather than matched: a regular
+            # expression cannot say "equal to the other capture", and the
+            # channel this has to equal is whatever the association ran on.
+            resident_parked_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window parked="
+                rb"(?:0x)?0*([0-9a-fA-F]+) bb-ch=(?:0x)?[0-9a-fA-F]+"
+                rb" target=(?:0x)?0*([0-9a-fA-F]+)",
+                resident,
+            )
+            if (resident_parked_result is None or
+                    int(resident_parked_result.group(1), 16) !=
+                    int(resident_parked_result.group(2), 16)):
+                missing.append(
+                    "RTL8852BS2 resident window on the associated channel")
+
             # A Beacon from the access point this run associated with, received
             # with no sweep running.  Beacons from other access points are
             # counted in the same line and deliberately not accepted here: they

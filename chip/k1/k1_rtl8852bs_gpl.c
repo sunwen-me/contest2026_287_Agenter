@@ -14524,6 +14524,15 @@ struct k1_rtl8852bs_scanofld_passive_match_s
    */
 
   uint16_t parked_dwells;
+
+  /* The poll iteration on which the channel walk was first judged finished,
+   * counted from one, or zero if it never was.  A sweep that times out needs
+   * the distinction: a walk that was never complete is a firmware or air
+   * problem, while a walk completed on poll N whose drain did not finish is a
+   * budget problem, and the two are indistinguishable from the masks alone.
+   */
+
+  uint16_t complete_poll;
   bool dwell_pending;
   bool first_bss_valid;
   bool first_ssid_present;
@@ -17597,6 +17606,83 @@ static void k1_rtl8852bs_runtime_fault_snapshot(FAR const char *stage,
     }
 }
 
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_scanofld_walk_done
+ *
+ * Description:
+ *   Whether firmware's own account of the channel list is complete: the
+ *   generic done acknowledgement for the start command, the scan-end
+ *   notification, and - on an unparked sweep - every channel entered and
+ *   every dwell retired either by this host or by the firmware itself.
+ *
+ *   A parked table names one channel in all thirteen entries, so the
+ *   per-channel masks can never hold more than that one bit and demanding all
+ *   thirteen would hang the sweep until its timeout.  What remains is still
+ *   firmware's own account of finishing the list.  The unparked sweep keeps
+ *   the stricter test unchanged.
+ *
+ ****************************************************************************/
+
+static bool k1_rtl8852bs_runtime_scanofld_walk_done(
+  FAR const struct k1_rtl8852bs_scanofld_passive_match_s *match)
+{
+  const uint16_t all =
+    (uint16_t)((1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) - 1u);
+
+  if (!match->done_ack.matched || !match->saw_scan_end)
+    {
+      return false;
+    }
+
+  if (g_k1_rtl8852bs_scanofld_park_channel != 0)
+    {
+      return true;
+    }
+
+  return match->entered_channels == all &&
+         (uint16_t)(match->advanced_channels |
+                    match->firmware_advanced_channels) == all;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_scanofld_complete_check
+ *
+ * Description:
+ *   Judge the test above once, and on the transition to complete record
+ *   firmware's return value and the poll it happened on.
+ *
+ *   This has to run on every poll rather than only when a C2H frame arrives.
+ *   The last channel's dwell is retired by this host from the dwell poll at
+ *   the head of the loop, so a sweep whose scan-end notification shares one
+ *   receive aggregate with the final channel-enter event reaches the C2H
+ *   dispatch with that channel's bit still clear, and nothing would ever look
+ *   again: no C2H follows a scan end.  Run 37 timed out exactly there, with
+ *   end=0x1 and a channel mask that was complete one poll later, while run 36
+ *   passed the same code because its two events landed in separate reads.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_scanofld_complete_check(
+  FAR struct k1_rtl8852bs_scanofld_passive_match_s *match,
+  unsigned int attempt, FAR bool *complete, FAR int *complete_ret,
+  FAR uint8_t *firmware_return)
+{
+  if (*complete || !k1_rtl8852bs_runtime_scanofld_walk_done(match))
+    {
+      return;
+    }
+
+  /* Firmware is done with the channel list.  Frames received during the last
+   * dwell can still be queued, so record the verdict and let the caller keep
+   * draining until the FIFO goes quiet.
+   */
+
+  *firmware_return = match->done_ack.firmware_return;
+  *complete_ret = match->done_ack.firmware_return == 0 ? OK : -EIO;
+  *complete = true;
+  match->complete_poll = (uint16_t)(attempt + 1u);
+}
+
 static int k1_rtl8852bs_runtime_scanofld_passive_wait(
   FAR uint8_t *firmware_return, bool require_bss,
   bool require_probe_response,
@@ -17607,7 +17693,7 @@ static int k1_rtl8852bs_runtime_scanofld_passive_wait(
   FAR uint8_t *buffer;
   size_t length;
   size_t offset;
-  unsigned int attempt;
+  unsigned int attempt = 0;
   unsigned int drain_polls = 0;
   unsigned int idle_polls = 0;
   bool complete = false;
@@ -17663,6 +17749,15 @@ static int k1_rtl8852bs_runtime_scanofld_passive_wait(
         {
           goto out;
         }
+
+      /* The dwell poll is what retires the last channel, so the walk can
+       * become complete here with no frame in sight.  Judging it before the
+       * receive read means an idle FIFO from this point on still ends the
+       * sweep through the drain below instead of burning the poll budget.
+       */
+
+      k1_rtl8852bs_runtime_scanofld_complete_check(
+        match, attempt, &complete, &complete_ret, firmware_return);
 
       ret = k1_rtl8852bs_runtime_rx_read(
         buffer, K1_RTL8852BS_SCAN_OFLD_RX_MAX, &length);
@@ -17763,36 +17858,6 @@ static int k1_rtl8852bs_runtime_scanofld_passive_wait(
                   goto out;
                 }
 
-              /* A parked table names one channel in all thirteen entries, so
-               * the per-channel masks can never hold more than that one bit
-               * and demanding all thirteen would hang the sweep until its
-               * timeout.  What remains is still firmware's own account of
-               * finishing the list: the generic done acknowledgement plus the
-               * scan-end notification.  The unparked sweep keeps the stricter
-               * test unchanged.
-               */
-
-              if (!complete && match->done_ack.matched &&
-                  match->saw_scan_end &&
-                  (g_k1_rtl8852bs_scanofld_park_channel != 0 ||
-                   (match->entered_channels ==
-                      (1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) -
-                      1u &&
-                    (match->advanced_channels |
-                     match->firmware_advanced_channels) ==
-                      (1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) -
-                      1u)))
-                {
-                  /* Firmware is done with the channel list.  Frames received
-                   * during the last dwell can still be queued, so record the
-                   * verdict and keep draining until the FIFO goes quiet.
-                   */
-
-                  *firmware_return = match->done_ack.firmware_return;
-                  complete_ret =
-                    match->done_ack.firmware_return == 0 ? OK : -EIO;
-                  complete = true;
-                }
             }
           else if (!frame.crc_error && !frame.icv_error &&
                    frame.packet_type == 0)
@@ -17803,6 +17868,9 @@ static int k1_rtl8852bs_runtime_scanofld_passive_wait(
 
           offset = frame.next_offset;
         }
+
+      k1_rtl8852bs_runtime_scanofld_complete_check(
+        match, attempt, &complete, &complete_ret, firmware_return);
 
       if (complete && ++drain_polls >= K1_RTL8852BS_SCAN_OFLD_DRAIN_POLL_COUNT)
         {
@@ -17880,6 +17948,10 @@ out:
   k1_early_puthex(match->firmware_advanced_channels);
   k1_early_puts(" end=");
   k1_early_puthex(match->saw_scan_end ? 1 : 0);
+  k1_early_puts(" complete-at=");
+  k1_early_puthex(match->complete_poll);
+  k1_early_puts(" polls=");
+  k1_early_puthex(attempt);
   k1_early_puts("\r\n");
 
   if (ret < 0)
@@ -17900,6 +17972,8 @@ out:
       k1_early_puthex(match->firmware_advanced_channels);
       k1_early_puts(" end=");
       k1_early_puthex(match->saw_scan_end ? 1 : 0);
+      k1_early_puts(" complete-at=");
+      k1_early_puthex(match->complete_poll);
       k1_early_puts(" last=ch");
       k1_early_puthex(match->last_channel);
       k1_early_puts(" reason=");
@@ -23072,8 +23146,21 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
  * pairs printed here name the layer to port next instead of leaving the whole
  * of set_channel to be written blind.
  *
- * Nothing here is programmed and nothing is persistent: three registers are
- * written, all of them receive filters, and all three are put back.
+ * Nothing in the window is programmed and nothing is persistent: three
+ * registers are written, all of them receive filters, and all three are put
+ * back.
+ *
+ * One step runs before the window and is not part of it.  Run 36 showed the
+ * premise that the radio is still on the access point's channel by then to be
+ * false -- the sweep that confirms the association walks 1 to 13 unparked and
+ * leaves the radio wherever it ends, which was channel 13 against an access
+ * point on channel 1 -- so the park step below asks the firmware for a sweep
+ * whose channel list names the target channel in all thirteen entries, which
+ * is the only mechanism this port has to move the radio at all.  That sweep
+ * ends before the window opens, and the window still runs with none in
+ * progress; it also refuses to run at all unless the radio reads back on the
+ * channel the association ran on, so a wrong channel is never again reported
+ * as an access point that said nothing.
  ****************************************************************************/
 
 #define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       3000u
@@ -23082,6 +23169,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_RESIDENT_PROBE_ATTEMPTS    4u
 #define K1_RTL8852BS_RESIDENT_FRAME_MAX         128u
 #define K1_RTL8852BS_RESIDENT_DEAUTH_BODY       26u
+#define K1_RTL8852BS_RESIDENT_OTHER_HEAD        16u
 
 /* The channel-defining registers of the three layers, as the vendor names
  * them.  cfg_mac_bw() owns the first two, halbb_ctrl_bw_ch_8852b() the
@@ -23138,6 +23226,27 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t data_frames_target;
   uint32_t deauth_target;
   uint32_t probes_sent;
+
+  /* What every frame that arrived actually was.  Run 36's window reported
+   * eleven frames with all of the counters above at zero, and no reading of
+   * that report explains them: a frame that is neither a Beacon nor a Probe
+   * Response nor from the associated access point was counted once by
+   * rx_frames and then described by nothing.  type_frames splits the arrivals
+   * by the two frame-control type bits, subtype_mask records one bit per
+   * management subtype that fell past the named cases, and unclassified is
+   * the count no other counter here claims -- so a window's frame total is
+   * always accounted for.  first_other keeps the head of the first such frame,
+   * because a count says how many and only the bytes say what.
+   */
+
+  uint32_t type_frames[4];
+  uint32_t mgmt_other;
+  uint32_t data_frames;
+  uint32_t self_frames;
+  uint32_t unclassified;
+  uint32_t subtype_mask;
+  uint8_t first_other[K1_RTL8852BS_RESIDENT_OTHER_HEAD];
+  uint8_t first_other_length;
   uint16_t deauth_reason;
   int probe_status;
 };
@@ -23347,6 +23456,184 @@ static bool k1_rtl8852bs_runtime_resident_channel_stable(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_parked_channel
+ *
+ * Description:
+ *   The channel a sample says the radio is actually listening on.  The
+ *   radio's 0x18 carries it in its low eight bits -- every sweep's read-back
+ *   shows 0x1c01 for channel 1 and 0x1c0d after a walk that ended on channel
+ *   13 -- and both paths have to agree before the value is used: a window that
+ *   ran with the two paths on different channels would be reporting about
+ *   neither, so a disagreement reads as zero, which no channel is.
+ *
+ *   The baseband's 0x0734 mirror is decoded separately, for the log only.  The
+ *   vendor writes it as halbb_ctrl_bw_ch_8852b() does, mask 0x0ff0000, from
+ *   halbb_ch_idx_encode() -- a function whose body is not in the vendor source
+ *   this port was written against -- and run 36 read 0x0d there with the radio
+ *   on channel 13, so on 2.4 GHz the encoded index is the channel.  That is an
+ *   observation about one band and not a decoding rule, which is why the test
+ *   below is the radio's and the baseband's value is only printed beside it.
+ *
+ ****************************************************************************/
+
+#define K1_RTL8852BS_RESIDENT_RF_CHANNEL_MASK   0xffu
+#define K1_RTL8852BS_RESIDENT_BB_CHANNEL_SHIFT  16u
+#define K1_RTL8852BS_RESIDENT_BB_CHANNEL_MASK   0xffu
+
+static uint8_t k1_rtl8852bs_runtime_resident_parked_channel(
+  FAR const struct k1_rtl8852bs_resident_channel_s *state)
+{
+  uint8_t path_a;
+  uint8_t path_b;
+
+  path_a = (uint8_t)(state->rf_channel[K1_RTL8852BS_RF_PATH_A] &
+                     K1_RTL8852BS_RESIDENT_RF_CHANNEL_MASK);
+  path_b = (uint8_t)(state->rf_channel[K1_RTL8852BS_RF_PATH_B] &
+                     K1_RTL8852BS_RESIDENT_RF_CHANNEL_MASK);
+  return path_a == path_b ? path_a : 0u;
+}
+
+static uint8_t k1_rtl8852bs_runtime_resident_bb_channel(
+  FAR const struct k1_rtl8852bs_resident_channel_s *state)
+{
+  return (uint8_t)((state->bb_channel >>
+                    K1_RTL8852BS_RESIDENT_BB_CHANNEL_SHIFT) &
+                   K1_RTL8852BS_RESIDENT_BB_CHANNEL_MASK);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_park
+ *
+ * Description:
+ *   Leave the radio listening on the channel the association ran on, using
+ *   the only mechanism this port has to move it: a scan-offload sweep whose
+ *   channel list names that one channel in all thirteen entries.
+ *
+ *   Run 36 is why this exists.  Its window did everything it was written to
+ *   do -- filter widened, FIFO polled for the whole three seconds, four
+ *   directed Probe Requests accepted by the hardware, every sampled register
+ *   identical on both sides -- and heard nothing, because the radio was on
+ *   channel 13 while the access point was on channel 1.  The step before it,
+ *   the sweep that confirms the association survived, walks 1 to 13 unparked
+ *   and ends where it ends; the association and the handshake had run in a
+ *   parked sweep before that and left 0x1c01 behind, and the confirming walk
+ *   overwrote it with 0x1c0d.  So the design premise "after the association
+ *   the radio is parked on the target's channel" was false, and it was false
+ *   for a reason this port controls.
+ *
+ *   The sweep is not part of the measurement.  It ends before the window
+ *   opens, and its own result is reported here rather than folded into the
+ *   window's: the beacons it heard from the target are what say the park
+ *   landed on a radio that can hear that access point, which is exactly the
+ *   thing a silent window afterwards would then have to explain.
+ *
+ *   A sample that already names the target channel runs no sweep at all.  A
+ *   future ordering that leaves the radio parked where it belongs therefore
+ *   costs nothing here, and this step disappears from the console by itself.
+ *
+ * Input Parameters:
+ *   result  - the caller's scan result, reused rather than a second one on the
+ *             stack; it holds a bounded BSS table and nothing this step keeps
+ *   bssid   - the access point this run associated with, for the beacon count
+ *   channel - the channel it was associated on
+ *
+ * Returned Value:
+ *   OK when the radio reads back on that channel, whether or not a sweep was
+ *   needed to get it there.  -ECHRNG when it does not, and the sweep's own
+ *   errno when the sweep itself failed.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_park(
+  FAR struct k1_rtl8852bs_scan_result_s *result,
+  FAR const uint8_t *bssid, uint8_t channel)
+{
+  struct k1_rtl8852bs_resident_channel_s state;
+  uint16_t beacons = 0;
+  uint8_t parked;
+  int sweep_ret = OK;
+  int ret;
+
+  if (result == NULL || bssid == NULL || channel == 0)
+    {
+      return -EINVAL;
+    }
+
+  ret = k1_rtl8852bs_runtime_resident_channel_read("park-before", &state);
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident park read error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      return ret;
+    }
+
+  parked = k1_rtl8852bs_runtime_resident_parked_channel(&state);
+  k1_early_puts("K1 Wi-Fi GPL: resident park before parked=");
+  k1_early_puthex(parked);
+  k1_early_puts(" bb-ch=");
+  k1_early_puthex(k1_rtl8852bs_runtime_resident_bb_channel(&state));
+  k1_early_puts(" target=");
+  k1_early_puthex(channel);
+  k1_early_puts(" sweep=");
+  k1_early_puthex(parked == channel ? 0u : 1u);
+  k1_early_puts("\r\n");
+
+  if (parked == channel)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station resident park "
+                    "complete\r\n");
+      return OK;
+    }
+
+  k1_rtl8852bs_scanofld_park_arm(channel);
+  sweep_ret = k1_rtl8852bs_runtime_scanofld_passive_scan(result);
+  k1_rtl8852bs_scanofld_park_disarm();
+  if (sweep_ret >= 0)
+    {
+      beacons = k1_rtl8852bs_runtime_scan_beacon_frames(result, bssid);
+    }
+
+  ret = k1_rtl8852bs_runtime_resident_channel_read("park-after", &state);
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident park read error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      return ret;
+    }
+
+  parked = k1_rtl8852bs_runtime_resident_parked_channel(&state);
+  k1_early_puts("K1 Wi-Fi GPL: resident park after parked=");
+  k1_early_puthex(parked);
+  k1_early_puts(" bb-ch=");
+  k1_early_puthex(k1_rtl8852bs_runtime_resident_bb_channel(&state));
+  k1_early_puts(" target=");
+  k1_early_puthex(channel);
+  k1_early_puts(" sweep-err=");
+  k1_early_puthex((uintreg_t)(sweep_ret < 0 ? -sweep_ret : 0));
+  k1_early_puts(" bss=");
+  k1_early_puthex(result->bss_count);
+  k1_early_puts(" bcn-target=");
+  k1_early_puthex(beacons);
+  k1_early_puts("\r\n");
+
+  if (parked != channel)
+    {
+      /* The sweep may have failed, and it may have succeeded and still left
+       * the radio elsewhere.  Either way the window cannot run, and the errno
+       * says which of the two happened.
+       */
+
+      return sweep_ret < 0 ? sweep_ret : -ECHRNG;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station resident park "
+                "complete\r\n");
+  return OK;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_probe_build
  *
  * Description:
@@ -23453,6 +23740,27 @@ static int k1_rtl8852bs_runtime_resident_probe_build(
  *
  ****************************************************************************/
 
+static void k1_rtl8852bs_runtime_resident_keep_other(
+  FAR const uint8_t *payload, size_t payload_length,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  size_t length = payload_length;
+
+  count->unclassified++;
+  if (count->first_other_length != 0 || payload_length == 0)
+    {
+      return;
+    }
+
+  if (length > sizeof(count->first_other))
+    {
+      length = sizeof(count->first_other);
+    }
+
+  memcpy(count->first_other, payload, length);
+  count->first_other_length = (uint8_t)length;
+}
+
 static void k1_rtl8852bs_runtime_resident_observe(
   FAR const uint8_t *payload, size_t payload_length,
   FAR const uint8_t *self_mac, FAR const uint8_t *bssid,
@@ -23460,6 +23768,7 @@ static void k1_rtl8852bs_runtime_resident_observe(
 {
   struct k1_rtl8852bs_mgmt_frame_s mgmt;
   uint8_t subtype;
+  uint8_t type;
   bool from_target;
   int ret;
 
@@ -23471,18 +23780,57 @@ static void k1_rtl8852bs_runtime_resident_observe(
       return;
     }
 
-  from_target = mgmt.bssid_valid && memcmp(mgmt.bssid, bssid, 6) == 0;
+  type = (uint8_t)((mgmt.frame_control >> 2) &
+                   K1_RTL8852BS_IEEE80211_TYPE_MASK);
   subtype = (uint8_t)((mgmt.frame_control >>
                        K1_RTL8852BS_IEEE80211_SUBTYPE_SHIFT) &
                       K1_RTL8852BS_IEEE80211_SUBTYPE_MASK);
+  count->type_frames[type]++;
+
+  /* A frame carrying this host's own address as transmitter is one this port
+   * put into the hardware and got handed back, which the sweep's receive loop
+   * has seen before.  It is counted apart so it can never be read as an
+   * access point answering.
+   */
+
+  if (mgmt.addr2_valid && memcmp(mgmt.addr2, self_mac, 6) == 0)
+    {
+      count->self_frames++;
+    }
+
+  /* Whether the frame came from the access point this run associated with.
+   * The management parser fills its BSSID field for a Beacon or a Probe
+   * Response only, so for every other frame the question has to be asked of
+   * the transmitter and of address 3, which is where a frame an access point
+   * sends carries its own address.  Without those two the data-frame counter
+   * could never leave zero, which is one of the things run 36's report could
+   * not account for.
+   */
+
+  from_target = (mgmt.bssid_valid && memcmp(mgmt.bssid, bssid, 6) == 0) ||
+                (mgmt.addr2_valid && memcmp(mgmt.addr2, bssid, 6) == 0) ||
+                (mgmt.addr3_valid && memcmp(mgmt.addr3, bssid, 6) == 0);
 
   if (!mgmt.is_management)
     {
-      if (from_target)
+      if (type == K1_RTL8852BS_IEEE80211_TYPE_DATA)
         {
-          count->data_frames_target++;
+          count->data_frames++;
+          if (from_target)
+            {
+              count->data_frames_target++;
+            }
+
+          return;
         }
 
+      /* Control frames, and anything the standard has added since, are named
+       * by the type breakdown and by nothing else, so they go to the
+       * unclassified account with their head kept.
+       */
+
+      k1_rtl8852bs_runtime_resident_keep_other(payload, payload_length,
+                                               count);
       return;
     }
 
@@ -23509,6 +23857,14 @@ static void k1_rtl8852bs_runtime_resident_observe(
       return;
     }
 
+  /* Every management subtype that gets this far is recorded in one word, one
+   * bit per subtype, so a window whose remainder was all Probe Requests from
+   * other stations reads differently from one whose remainder was an
+   * Authentication nobody expected.
+   */
+
+  count->subtype_mask |= (uint32_t)1u << subtype;
+
   /* A Deauthentication or Disassociation from the access point is the one
    * answer that explains a silent window without any of the registers having
    * moved: the association this window rides on would be over, and the reason
@@ -23526,7 +23882,12 @@ static void k1_rtl8852bs_runtime_resident_observe(
           count->deauth_reason = k1_rtl8852bs_read_le16(
             payload + K1_RTL8852BS_IEEE80211_HEADER_SIZE);
         }
+
+      return;
     }
+
+  count->mgmt_other++;
+  k1_rtl8852bs_runtime_resident_keep_other(payload, payload_length, count);
 }
 
 /****************************************************************************
@@ -23556,10 +23917,12 @@ static void k1_rtl8852bs_runtime_resident_observe(
  *
  * Returned Value:
  *   OK when a Beacon from the target and its Probe Response both arrived and
- *   every sampled register held still.  -ENODATA when no Beacon from the
- *   target arrived, -ETIMEDOUT when one did but no Probe Response followed,
- *   -EIO when a sampled register moved, and the failing errno of the receive
- *   path or the filter otherwise.
+ *   every sampled register held still.  -ECHRNG when the radio is not on the
+ *   channel the association ran on, which is checked before the window is
+ *   opened and is the one failure that says nothing at all about the receive
+ *   path.  -ENODATA when no Beacon from the target arrived, -ETIMEDOUT when
+ *   one did but no Probe Response followed, -EIO when a sampled register
+ *   moved, and the failing errno of the receive path or the filter otherwise.
  *
  ****************************************************************************/
 
@@ -23580,6 +23943,7 @@ static int k1_rtl8852bs_runtime_resident_window(
   size_t length;
   size_t offset;
   uint16_t sequence;
+  uint8_t parked;
   bool stable = false;
   bool exit_valid = false;
   int receive_ret = OK;
@@ -23624,6 +23988,32 @@ static int k1_rtl8852bs_runtime_resident_window(
       k1_early_puts("\r\n");
       kmm_free(buffer);
       return ret;
+    }
+
+  /* What channel the radio is on, before anything is measured on it.  Run 36
+   * polled a whole window on channel 13 while the access point was on channel
+   * 1 and reported the silence as -ENODATA, which is the errno for "the target
+   * said nothing" and was read as one -- so a window that is listening in the
+   * wrong place now says exactly that instead, with an errno of its own, and
+   * says it before spending the three seconds.
+   */
+
+  parked = k1_rtl8852bs_runtime_resident_parked_channel(&enter);
+  k1_early_puts("K1 Wi-Fi GPL: resident window parked=");
+  k1_early_puthex(parked);
+  k1_early_puts(" bb-ch=");
+  k1_early_puthex(k1_rtl8852bs_runtime_resident_bb_channel(&enter));
+  k1_early_puts(" target=");
+  k1_early_puthex(channel);
+  k1_early_puts("\r\n");
+
+  if (channel != 0 && parked != channel)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident window error=");
+      k1_early_puthex(ECHRNG);
+      k1_early_puts("\r\n");
+      kmm_free(buffer);
+      return -ECHRNG;
     }
 
   ret = k1_rtl8852bs_scan_rx_filter_enable(&filter);
@@ -23796,6 +24186,42 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puts(" filter=");
   k1_early_puthex((uintreg_t)(filter_ret < 0 ? -filter_ret : 0));
   k1_early_puts("\r\n");
+
+  /* The second line accounts for the frame total.  Every arrival is in the
+   * type breakdown, and everything the classifier could not name is in
+   * unclassified with the head of the first one printed after it, so a
+   * window's frames are never a number with nothing behind it.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window frames total=");
+  k1_early_puthex(count.rx_frames);
+  k1_early_puts(" mgmt=");
+  k1_early_puthex(count.type_frames[0]);
+  k1_early_puts(" ctrl=");
+  k1_early_puthex(count.type_frames[1]);
+  k1_early_puts(" data=");
+  k1_early_puthex(count.type_frames[2]);
+  k1_early_puts(" ext=");
+  k1_early_puthex(count.type_frames[3]);
+  k1_early_puts(" data-all=");
+  k1_early_puthex(count.data_frames);
+  k1_early_puts(" self-tx=");
+  k1_early_puthex(count.self_frames);
+  k1_early_puts(" mgmt-other=");
+  k1_early_puthex(count.mgmt_other);
+  k1_early_puts(" subtypes=");
+  k1_early_puthex(count.subtype_mask);
+  k1_early_puts(" unclassified=");
+  k1_early_puthex(count.unclassified);
+  k1_early_puts("\r\n");
+
+  if (count.first_other_length != 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident window unclassified head=");
+      k1_rtl8852bs_scanofld_log_bytes(count.first_other,
+                                      count.first_other_length);
+      k1_early_puts("\r\n");
+    }
 
   /* The verdict names the earliest thing that was wrong, so a run reads as
    * one cause rather than as a list.  A register that moved comes first
@@ -24391,8 +24817,18 @@ static int k1_rtl8852bs_runtime_station_diagnostic(
    * reported, and a window that heard nothing must not retract them.  It
    * prints its own verdict line and only prints its completion marker when it
    * passed, so the acceptance harness fails the run on the marker's absence.
+   *
+   * The park step comes first because of what run 36 measured: the confirming
+   * sweep above walks 1 to 13 with no park channel armed and ends on channel
+   * 13, so by the time the window ran the radio had been moved off the access
+   * point's channel by this very function.  The confirming sweep is left
+   * exactly as it is -- it is the evidence that the association survived a
+   * full sweep, and narrowing it to one channel would weaken that -- and the
+   * park step puts the radio back instead, with a parked sweep that ends
+   * before the window opens.  Both are their own step and each reports itself.
    */
 
+  (void)k1_rtl8852bs_runtime_resident_park(&result, bssid, channel);
   (void)k1_rtl8852bs_runtime_resident_window(self_mac, bssid, ssid,
                                              ssid_length, channel);
 #endif

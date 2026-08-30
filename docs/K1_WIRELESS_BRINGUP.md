@@ -5685,15 +5685,19 @@ TSF 在 `FUNC_EN` **之前**就已经是 AP 自己的计时器（run 34 的 `c43
 
 ### 增量 3h：不跑扫描的驻留收发窗口（先证伪「信道不是驻留的」）
 
-代码已实现、`--no-key` 与带钥匙两个镜像都构建干净，**板上证据待补（run 36）**。除了下面
-三条更正——它们的证据来自已经跑完的 run 35——本节其余内容都是写在上板之前的设计与判据，
-上板结果补在本节末尾。
+代码已实现，上板跑过两轮：**run 36 证伪了本节的一个设计假设**（关联跑完射频并不在目标
+信道上），**run 37 撞上 sweep 完成判定里的一个竞态**（它自己把关联和四次握手全过了，
+`mic=0x1 msg4=0x1`，但确认 sweep 报了 `-ETIMEDOUT`）。两个原因都已修，**run 38 待上板**。
+除了下面三条更正——它们的证据来自 run 35——本节的设计与判据都是写在上板之前的，
+两轮板上结果和它们引出的改动补在本节末尾。
 
 镜像 `wireless_wpa_diag`，新符号 `CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC=y`；
-带钥匙 ELF SHA-256 `95c7492042e675662fc0b78cc86873a8026c868d5aa45499787de7c21e7dc74f`
-（`text 775038 data 9768 bss 25296`），`--no-key`
-`323525a1fe661d45f266d068932e101e9e2de86ae674d30e824ebe5149e5afcc`
-（`text 775022 data 9768 bss 25296`）；告警仍然只有长期存在的那 6 条。
+run 38 用的带钥匙 ELF SHA-256
+`40117d228c8f568d34326bf3b5d5c6d068012891883c60142fdbade04aae7915`
+（`text 777324 data 9768 bss 25296`），`--no-key`
+`3e6ef1efe08ef24a99be0b300c15aca326f9f9c07c39078bfdf948e438e26d7f`
+（`text 777308 data 9768 bss 25296`）；告警仍然只有长期存在的那 6 条。
+（run 36 跑的是 `95c74920…`／`323525a1…`，run 37 跑的是 `b32aa5d4…`／`56e4d197…`。）
 
 #### 更正一：信道一直是驻留的
 
@@ -5801,21 +5805,33 @@ Deauth/Disassoc 及其 reason code、解析错误、超长帧。这样「窗口�
 #### 串口长什么样
 
 ```
+K1 Wi-Fi GPL: resident park before parked=0xd bb-ch=0xd target=0x1 sweep=0x1
+K1 Wi-Fi GPL: resident park after parked=0x1 bb-ch=0x1 target=0x1 sweep-err=0x0 \
+  bss=0x1 bcn-target=0xa
+K1 Wi-Fi GPL: RTL8852BS2 station resident park complete
 K1 Wi-Fi GPL: resident window enter channel=0x1 ssid-len=0x2 window-ms=0xbb8
 K1 Wi-Fi GPL: resident channel enter c010=… c628=… bb49c0=… bb49c4=… bb0734=… \
   bb0700=… bb2344=… bb4738=… bb4aa4=… rf18-a=… rf18-b=…
+K1 Wi-Fi GPL: resident window parked=0x1 bb-ch=0x1 target=0x1
 K1 Wi-Fi GPL: resident probe tx sn=… bytes=… status=0x0
 K1 Wi-Fi GPL: resident channel exit  c010=… （同上 11 项）
 K1 Wi-Fi GPL: resident window channel=… polls=… rx-reads=… frames=… beacons=… \
   bcn-target=… probes=… probe-status=… probe-rsp=… probe-rsp-self=… data-target=… \
   deauth=… reason=… parse-err=… oversize=… ch-stable=0x1 rx=0x0 filter=0x0
+K1 Wi-Fi GPL: resident window frames total=… mgmt=… ctrl=… data=… ext=… data-all=… \
+  self-tx=… mgmt-other=… subtypes=… unclassified=…
 K1 Wi-Fi GPL: RTL8852BS2 station resident window complete
 ```
 
+park 步骤发现射频已经在目标信道上时，`before` 那一行打 `sweep=0x0`，后面直接是
+`resident park complete`，不跑 sweep 也不写任何寄存器。
+
 失败时不是这一行，而是 `resident window error=<errno>`，判据阶梯按「最能解释的原因排前面」：
-退出快照读失败 → 它的 errno；有寄存器动了 → `-EIO`；接收路径出错 → 它的 errno；过滤器写回
-出错 → 它的 errno；目标一条 Beacon 都没有 → `-ENODATA`；有 Beacon 但没有发给本机的
-Probe Response → `-ETIMEDOUT`；否则 `OK`。
+进入快照解出来的驻留信道 ≠ 关联信道 → `-ECHRNG`（**在 3 秒窗口打开之前就判，run 36 之后
+加的**）；退出快照读失败 → 它的 errno；有寄存器动了 → `-EIO`；接收路径出错 → 它的 errno；
+过滤器写回出错 → 它的 errno；目标一条 Beacon 都没有 → `-ENODATA`；有 Beacon 但没有发给本机
+的 Probe Response → `-ETIMEDOUT`；否则 `OK`。park 步骤自己的失败也分开报：它那次 sweep 的
+errno，或者 sweep 跑完信道仍然不对时的 `-ECHRNG`。
 
 **失败不撤回已经报出去的关联和握手。** 调用点是 `(void)`，完成标记只在通过时才打，所以
 验收靠这一行的有无，而不靠这一步去否定上面那些已经有硬证据的结论。
@@ -5823,8 +5839,12 @@ Probe Response → `-ETIMEDOUT`；否则 `OK`。
 #### 判据
 
 runner 加了一个 flag，`--require-runtime-resident`，板上验收从 34 条变成 **35 条**
-`--require-*`。它从 `resident window enter channel=` 那一行往后切，然后要求五件事同时成立：
+`--require-*`。它从 `resident window enter channel=` 那一行往后切，然后要求七件事同时成立
+（后两条是 run 36 之后加的，flag 数不变）：
 
+0. `RTL8852BS2 station resident park complete`，并且 `resident park after` 与
+   `resident window parked=` 两行里 `parked=` 和 `target=` 数值相等——**判据里先有「在正确
+   的信道上」，再谈收到了什么**；
 1. ` bcn-target=` 非零——目标 AP 的 Beacon 在没有 sweep 的情况下进了本端的接收路径；
 2. `resident probe tx sn=… status=0x0`——定向 Probe Request 交给硬件成功；
 3. ` probe-rsp-self=` 非零——AP 的 Probe Response 回到了本机地址（发送真的出去了）；
@@ -5836,6 +5856,117 @@ runner 加了一个 flag，`--require-runtime-resident`，板上验收从 34 条
 `resident channel moved …` 或者 `-ENODATA`/`-ETIMEDOUT` 直接点名是哪一层出的问题，
 而不用再猜。
 
+#### 板上结果一：run 36 证伪了「关联跑完射频就停在目标信道上」
+
+run 36（`out/k1-serial/k1-wpa-20260830T221808Z.log`，35 条 flag 里缺 3 条）一路走到驻留
+窗口，窗口自己的读数把故障定位得没有歧义：
+
+```
+3167 resident window enter channel=0x1 ssid-len=0x2 window-ms=0xbb8
+3177 resident channel resident-enter … bb0734=0xd0000 … rf18-a=0x1c0d rf18-b=0x1c0d
+3197 resident channel resident-exit  … 13 项与进入时逐字节相同
+3199 resident window channel=0x1 polls=0xb30 rx-reads=0x29 frames=0xb beacons=0x0 \
+     bcn-target=0x0 probes=0x4 probe-status=0x0 probe-rsp=0x0 probe-rsp-self=0x0 \
+     data-target=0x0 deauth=0x0 reason=0x0 parse-err=0x0 oversize=0x0 \
+     ch-stable=0x1 rx=0x0 filter=0x0
+3200 resident window error=0x3d                  <- ENODATA
+```
+
+`ch-stable=0x1 rx=0x0 filter=0x0` 说明这一步自己什么都没做错：13 个寄存器一个没动，接收
+路径没报错，过滤器写回没报错；4 帧 Probe Request 也都交出去了（`probe-status=0x0`）。真正
+的读数是 `rf18-a/b=0x1c0d`——**射频在信道 13，关联在信道 1**。窗口在一个空信道上听了 3 秒，
+`-ENODATA` 就是它唯一能给的答案。
+
+被证伪的是「更正一」之后顺着写下来的那句默认假设：**park=1 的 sweep 之后本端要的信道就在
+RF 里**——这句本身对，但那不是驻留窗口之前的最后一次 sweep。装钥匙之前，同一个函数还要跑
+一次**不 park 的 1-13 确认 sweep**（它是「关联在整整一次全信道扫描之后还活着」这条证据），
+run 36 自己的回读把顺序摆得很清楚：
+
+```
+2942 scan RF readback before … ch-reg=0x1c01 ch=0x1   <- 握手那次 park=1 的 sweep 留下的
+3106 scan RF readback after  … ch-reg=0x1c0d ch=0xd   <- 确认 sweep 走完 1-13，停在 13
+3154 assoc confirm bss=0x4 beacons=0x10 aid=0x1
+3166 RTL8852BS2 station WPA2 keys installed
+3167 resident window enter channel=0x1                <- 窗口从这里开始
+```
+
+**证伪它的是这个函数自己的确认 sweep，不是外部条件。** 「更正一」那条规律（每次 sweep 的
+`before` 等于上一次的 `after`）在 run 36 里一次例外都没有，只是这次它指向的是信道 13。
+
+#### 因此加的三件事
+
+1. **窗口之前的 park 步骤。** 确认 sweep 保持不 park——它是关联存活的证据，收窄信道会削弱
+   它。改成在窗口之前单独加一步：读一次两条路径的 RF `0x18`，已经在目标信道上就直接返回
+   `RTL8852BS2 station resident park complete`，不在就 `park_arm(channel)` ＋ 一次
+   parked sweep ＋ `park_disarm()`，然后再读一次核对。这一步顺带报自己那次 sweep 收到的
+   目标 Beacon 数（`bcn-target=`），所以「射频听得见这个 AP」和「窗口什么都没听到」不会混
+   成一个结论。将来若把确认 sweep 挪到窗口之后，这一步会自己变成一次无操作的回读。
+2. **`-ECHRNG`（44）。** 窗口在打开 3 秒之前先比一次「解码出来的驻留信道」和「关联信道」，
+   不一致直接 `-ECHRNG` 退出，判据阶梯因此多一个状态：**信道问题再也不会被报成
+   `-ENODATA`**。RF `0x18` 低 8 位是信道号（`0x1c01`→1、`0x1c0d`→13），两条路径必须一致，
+   否则解码结果记 0。BB `0x0734` 的 [23:16] 只打印不参与判定：原厂
+   `halbb_8852b_api.c:1415` 用 `0x0ff0000` 掩码写 `halbb_ch_idx_encode()` 的结果，而这个
+   函数体不在缓存的原厂子集里，run 36 在信道 13 上读到 `0x0d` 是一次观测，不是解码规则。
+3. **帧分类。** run 36 的 `frames=0xb beacons=0x0 parse-err=0x0`（收到 11 帧、一个 Beacon
+   都不是、也没有解析错误）当时无法进一步追。现在按 FC 的 type 位分四类计数，另记「A2 是
+   本机」的自发帧、数据帧、管理帧里没被命名的子类型掩码、完全没分类的帧数，以及第一帧没分
+   类帧的前 16 字节。顺带修掉一个死计数器：`k1_rtl8852bs_runtime_mgmt_parse()` 只在管理帧
+   的分支之后才填 `bssid`/`bssid_valid`，所以数据帧的 `from_target` 永远为假、
+   `data-target=` 永远是 0；现在 `from_target` 也接受 `addr2`/`addr3` 命中 BSSID。
+
+#### 板上结果二：run 37 撞上 sweep 完成判定的一个竞态
+
+run 37（`out/k1-serial/k1-wpa-20260830T224144Z.log`）没走到驻留窗口，但它把上面所有步骤
+又跑了一遍**并且全过**，包括在另一个 BSSID 上完成的四次握手：
+
+```
+1643 auth target bssid=504f3be2e6d2 channel=0x1 beacons=0x6 ssid-len=0x2
+2761 assoc request tx channel=0x1 bytes=0x46 ssid-len=0x2 cap=0x431 rsn=0x1 sn=0x7 status=0x0
+2763 wpa msg2 tx bytes=0x99 sn=0x8 status=0x0
+2765 wpa msg4 tx bytes=0x83 sn=0x9 status=0x0
+2881 assoc exchange rsp=0x1 status=0x0 aid=0x1 auth-rsp=0x1 beacons=0x1d bss=0x3 \
+     wpa=0x1 msg1=0x1 msg2=0x1 msg3=0x1 mic=0x1 msg4=0x1 bssid=504f3be2e6d2
+```
+
+`mic=0x1` 是 AP 第三帧的完整性校验通过，也就是密码学那一整条链在 run 36 之外又独立成立了
+一次——而且这次的对端是**另一个 BSSID**：run 36 关联的是隐藏 SSID 的 `564f3be2e6d2`，
+run 37 关联的是同一 ESS 里带 RSN 元素的 `504f3be2e6d2`（两者与 `6413abdbf628` 都在 run 37
+的 BSS 表里）。目标是扫描表里第一个可用 BSS，所以两轮之间会变，而 park 步骤用的是关联那一
+步自己的信道，跟着变。
+
+失败在装钥匙之前的确认 sweep：
+
+```
+3105 passive scan walk enter-mask=0x1fff next=0x1ff9 fw-next=0x6 end=0x1
+3106 passive scan-offload wait error=0x6e C2H=0xf done-ack=0x1 scan-events=0xe \
+     enter-mask=0x1fff next=0x1ff9 fw-next=0x6 end=0x1 last=ch0xd reason=0x5
+3158 passive scan-offload error=0x6e firmware-return=0x0
+3159 station WPA2 error=0x6e                     <- ETIMEDOUT
+```
+
+**这一行的四个输入全部满足完成条件**：`enter-mask=0x1fff` 十三个信道全进过，`end=0x1` 见到
+scan-end，`done-ack=0x1`，`next | fw-next = 0x1ff9 | 0x6 = 0x1fff` 十三个 dwell 全退掉。
+run 36 的同一次 sweep 打的是逐字节相同的 walk 行，然后成功了。差别只在 C2H 的到达边界：
+
+```
+run 36  3062 C2H ch=0xd reason=0x3      3067 next-channel ch=0xd      3068 C2H ch=0xd reason=0x5
+run 37  3065 C2H ch=0xd reason=0x3      3066 C2H ch=0xd reason=0x5    3068 next-channel ch=0xd
+```
+
+完成判定原来**只写在 C2H 分派的分支里**。run 37 的最后一次 channel-enter 和 scan-end 落在
+同一个接收聚合里，所以判定是在信道 13 那一位还没置上时做的（`0xfff ≠ 0x1fff`）；退掉最后
+一个 dwell 的是循环头上的 dwell 轮询，发生在下一轮，而**scan-end 之后不会再有 C2H**，于是
+再也没有人回头看一眼，1000 个轮询预算烧完报 `-ETIMEDOUT`。run 36 只是两个事件恰好落在两次
+读里。这是本端 sweep 等待循环里一个一直存在的竞态，run 37 是第一次撞上。
+
+修法：把判定提出来变成 `k1_rtl8852bs_runtime_scanofld_walk_done()` ＋
+`k1_rtl8852bs_runtime_scanofld_complete_check()`，**每一轮轮询都判两次**——dwell 轮询之后
+（这时最后一个 dwell 刚被退掉，且此后 FIFO 空也能靠 drain 收尾，不会再烧预算）、帧处理循环
+之后（覆盖 C2H 事件）。判定内容一字未改，parked sweep 仍然只要 done-ack ＋ scan-end。
+另外 `match` 里记下第一次判定成立的轮询序号，`passive scan walk` 和超时行都打
+`complete-at=`／`polls=`：**「走完了但 drain 没做完」和「根本没走完」以后是两个可区分的
+读数**，而不是同一个 `-ETIMEDOUT`。
+
 #### 还没做的
 
 **这仍然不是一条通的链路。** 这一增量哪怕全过，也只是证明「不跑扫描时收发循环还活着」：
@@ -5846,7 +5977,8 @@ eMMC / SPI flash / eFuse / U-Boot 环境一个都没写。
 
 #### 下一步
 
-1. 上板跑 run 36，把本节的证据补齐（需要用户按 RST，`--boot-timeout 900`）。
+1. 上板跑 run 38（需要用户按 RST，`--boot-timeout 900`）：确认 sweep 的竞态修掉之后
+   走到 park 步骤和驻留窗口，把本节最后一块证据补齐。
 2. 发送描述符的安全字段（`sec_type` / `sec_cam_idx`）——密钥在 CAM 里、槽也有了、信道是
    驻留的、port 是使能的，缺的只是发送路径去引用安全 CAM index（增量 3i）。
 3. `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI）那一批，以及把

@@ -413,7 +413,7 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   **失败不中断关联**：`FUNC_EN` 一旦写下去，中途放弃会留下半配置的 port 并把这一轮要收集的
   握手证据一起丢掉；代价是 `RTL8852BS2 port init complete` 只在「序列跑完 ＋ TSF 在走」
   时才打，`--require-runtime-port-init` 认这一行加 `status=0x0 tsf=0x1` 的结果行。
-- **已实现、构建干净、待上板 run 36（增量 3h）：不跑扫描的驻留收发窗口。**
+- **已实现、上板跑过 run 36／run 37、修完待上板 run 38（增量 3h）：不跑扫描的驻留收发窗口。**
   Kconfig 符号 `K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC`（`depends on
   K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC`，只有 wpa profile 打开），跑在装钥匙之后。
   它先把 3e/3f/3g 那句「没有驻留信道」证伪（见上面「尚未完成，禁止误报」里那段更正），
@@ -428,6 +428,28 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `RTL8852BS2 station resident window complete` 只在通过时打，
   `--require-runtime-resident` 认那一行加 `bcn-target`/`probe-rsp-self` 非零、
   `ch-stable=0x1 rx=0x0 filter=0x0`。
+  **run 36（`k1-wpa-20260830T221808Z.log`）证伪了本增量的设计假设**：窗口自己什么都没做错
+  （`ch-stable=0x1 rx=0x0 filter=0x0`、4 帧 Probe Request 都交出去了），但
+  `rf18-a/b=0x1c0d`——射频在信道 13、关联在信道 1，`-ENODATA`(0x3d) 是在空信道上听了 3 秒。
+  原因是**这个函数自己**在装钥匙之前还要跑一次不 park 的 1-13 确认 sweep（`2942 before
+  ch=0x1` → `3106 after ch=0xd`）。修法：确认 sweep 保持不 park（它是关联存活的证据），
+  窗口之前加一步 park——已经在目标信道就只回读，不在就 `park_arm` ＋ 一次 parked sweep ＋
+  `park_disarm`，并报这次 sweep 的目标 Beacon 数；窗口进入时先比信道，不一致直接
+  `-ECHRNG`(44)，**信道问题不再被报成 `-ENODATA`**；同时给收到的每一帧分类（type 四类、
+  自发帧、管理子类型掩码、未分类帧数 ＋ 第一帧前 16 字节），并修掉
+  `mgmt_parse()` 不给非管理帧填 `bssid_valid` 导致 `data-target=` 永远为 0 的死计数器。
+  **run 37（`k1-wpa-20260830T224144Z.log`）没走到窗口**，但它独立地把认证／关联／四次握手
+  又跑通一次（`mic=0x1 msg4=0x1 aid=0x1`，对端是另一个 BSSID `504f3be2e6d2`），失败在确认
+  sweep 的 `-ETIMEDOUT`：完成判定原来只写在 C2H 分派分支里，而 run 37 的最后一次
+  channel-enter 和 scan-end 落在同一个接收聚合里，判定时信道 13 的 dwell 还没退掉
+  （`next|fw-next` 差一位），退掉它的 dwell 轮询发生在下一轮，**scan-end 之后不再有 C2H**，
+  于是没人回头看，1000 个轮询预算烧完。修法：判定提成
+  `k1_rtl8852bs_runtime_scanofld_walk_done()`／`..._complete_check()`，dwell 轮询之后和帧
+  处理之后各判一次，判定内容一字未改；`passive scan walk` 与超时行新增
+  `complete-at=`/`polls=`，「走完了但 drain 没做完」和「根本没走完」从此可区分。
+  这是所有 unparked sweep 共有的竞态，run 37 是第一次撞上。
+  runner 在同一个 flag 里多认两条：`RTL8852BS2 station resident park complete`，以及
+  `resident park after`／`resident window parked=` 两行的 `parked=` 与 `target=` 数值相等。
 - **下一步优先级**：(1) 发送描述符的安全字段（`sec_type`/`sec_cam_idx`）：这是第一次可能
   有「被 CCMP 保护的数据帧」。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
   信道本来就是驻留的（增量 3h 的更正一），所以挡在「密钥装好」和「能收发数据」之间的
