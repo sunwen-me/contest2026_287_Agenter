@@ -971,6 +971,63 @@ config K1_RTL8852BS2_RUNTIME_WPA_SSID
 		tools/build_k1_wpa.sh injects K1_WIFI_SSID the same way it injects the
 		passphrase.
 
+config K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC
+	bool "Hold the associated channel with no RTL8852BS2 sweep running"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
+	---help---
+		After the association step finishes, stay on the access point's channel
+		with no scan-offload sweep running: widen the receive filter the way a
+		sweep does, poll the receive FIFO for three seconds, transmit one
+		directed Probe Request into that window, and require both a Beacon from
+		the access point this run associated with and that access point's Probe
+		Response back.
+
+		Every frame this port has ever received or transmitted happened inside a
+		channel dwell, and the reason was assumed to be that only the firmware
+		tunes the radio. The RF snapshots say otherwise: the channel register
+		holds the parked channel between sweeps and each sweep begins on the
+		value the previous one ended with, so nothing retunes when a sweep ends.
+		What ends with a sweep is this port's own receive filter, which is put
+		back to the value the firmware left and no longer accepts the broadcast
+		frames a Beacon is one of. This option is the measurement that follows:
+		if the frames come back when the filter stays open, the channel was
+		never what a resident link was missing.
+
+		Nothing is tuned and nothing is programmed. The registers that decide
+		the channel and bandwidth in all three layers - the MAC's bandwidth and
+		band, the baseband's sub-carrier offset, bandwidth, channel index,
+		receive path and CCK block, and both radio paths' channel register with
+		its D-die mirror - are sampled before and after and compared field by
+		field, and the console names any that moved. The only registers written
+		are the three receive filters, and all three are restored.
+
+		A directed Probe Request is what makes it a transmit test as well as a
+		receive one. A Beacon proves the receiver is on the channel; only a
+		Probe Response carrying this host's own address proves a frame written
+		into the management queue outside any dwell was radiated and answered.
+		The request is repeated on a half-second gap while no answer has come,
+		each attempt with a fresh sequence number, so one lost frame is not the
+		whole result.
+
+		A silent window is as informative as a working one and is reported as
+		what it is: no Beacon from the target fails with ENODATA, a Beacon
+		without a Probe Response with ETIMEDOUT, and a sampled register that
+		moved with EIO. Beacons from other access points, data frames from the
+		target, and a Deauthentication or Disassociation from it with its reason
+		code are counted separately, so a window that heard nothing is
+		distinguishable from one whose association was already over.
+
+		This is still not a working link. A held channel is a precondition for a
+		data path, not a data path: the transmit descriptor's security fields
+		are not filled in, so nothing is encrypted or decrypted, no frame beyond
+		the unprotected management and EAPOL-Key frames is sent or received, no
+		network device changes behaviour and no IP address is configured. A
+		failure here is logged and does not abort the association step, which
+		has already reported its own result; the acceptance harness requires
+		this step's completion line, so a failure fails the run there. Nothing
+		is written to eMMC, SPI flash, eFuse or the U-Boot environment.
+
 config K1_RTL8852BS2_WLAN_NETDEV
 	bool "Register the RTL8852BS2 wlan0 scan network device"
 	default n

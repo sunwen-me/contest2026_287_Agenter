@@ -86,6 +86,26 @@
 # TSF-based wait mac_port_init() places between the function enable and the
 # beacon early time - is what says so from inside the sequence.
 #
+# After all of that, and for the first time in this port, the image stays on the
+# channel with no sweep running. Every frame any earlier run received or
+# transmitted happened inside a channel dwell, and the reason was assumed to be
+# that only the firmware tunes the radio; the RF snapshots of the association
+# runs say otherwise, because the channel register holds the parked channel
+# between sweeps and each sweep starts on the value the previous one ended with.
+# What ends with a sweep is this port's own receive filter, restored to a value
+# that no longer accepts the broadcast frames a Beacon is one of. So the window
+# widens that filter again, polls the receive FIFO for three seconds, transmits
+# one directed Probe Request into it, and requires a Beacon from the associated
+# access point and that access point's Probe Response back. It tunes nothing:
+# the channel and bandwidth registers of all three layers are sampled on both
+# sides and compared, the console names any that moved, and the only registers
+# written are the three receive filters, all of which are put back. A silent
+# window is reported as what it is - ENODATA for no Beacon, ETIMEDOUT for a
+# Beacon with no Probe Response, EIO for a register that moved - with beacons
+# from other access points, data frames from the target and any
+# Deauthentication with its reason code counted apart, and it does not retract
+# the association and handshake that were already reported.
+#
 # This is still not a working link. The keys are installed and acknowledged by
 # the firmware, and the port is enabled, which is all this claims: nothing is
 # encrypted or decrypted yet, because the transmit descriptor's security fields
@@ -97,4 +117,5 @@
 #include "../wireless_assoc_diag/defconfig"
 
 CONFIG_K1_RTL8852BS2_RUNTIME_PORT_INIT_DIAGNOSTIC=y
+CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC=y
 CONFIG_K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC=y

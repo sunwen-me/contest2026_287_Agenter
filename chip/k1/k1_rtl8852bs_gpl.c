@@ -23036,6 +23036,817 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
     }
 }
 
+#ifdef CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC
+
+/****************************************************************************
+ * RTL8852BS2 resident receive/transmit window
+ *
+ * Every frame this port has ever received or transmitted happened inside a
+ * scan-offload dwell.  That is not because the radio needs one: run 35's RF
+ * snapshots show the channel register keeps the parked channel between
+ * sweeps -- 0x1c01 for channel 1, 0x1c0d after a full 1-13 walk -- and each
+ * sweep's entry value is the previous sweep's exit value, so nothing tunes
+ * the radio away when a sweep ends.  What ends with a sweep is this host's
+ * own receive filter: k1_rtl8852bs_scan_rx_filter_restore() puts 0xce20 back
+ * to the value the firmware left, which drops the broadcast and multicast
+ * acceptance bits a Beacon needs, so the frames stop arriving because this
+ * port asked for them to.
+ *
+ * This window is the measurement that follows from that.  With no sweep
+ * running and no channel programming of its own, it widens the receive
+ * filter exactly the way a sweep does, polls the receive FIFO for a bounded
+ * time, counts what arrives from the access point this run associated with,
+ * transmits one directed Probe Request into the same window and waits for the
+ * Probe Response, and samples the channel-defining MAC, baseband and RF
+ * registers on both sides so a run says whether anything moved underneath it.
+ *
+ * The Probe Request is what makes it a transmit test as well.  A Beacon
+ * arriving proves the receiver is on the channel; only a Probe Response
+ * addressed to this host proves a frame this host wrote into the management
+ * queue outside any dwell was radiated on it and answered.
+ *
+ * Either outcome is evidence.  Beacons and a Probe Response mean the channel
+ * is this host's to stay on and the next thing missing is the transmit
+ * descriptor's security fields and a data path to use them.  Silence means
+ * something the firmware does per dwell is load-bearing, and the register
+ * pairs printed here name the layer to port next instead of leaving the whole
+ * of set_channel to be written blind.
+ *
+ * Nothing here is programmed and nothing is persistent: three registers are
+ * written, all of them receive filters, and all three are put back.
+ ****************************************************************************/
+
+#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       3000u
+#define K1_RTL8852BS_RESIDENT_PROBE_DELAY_MSEC  300u
+#define K1_RTL8852BS_RESIDENT_PROBE_GAP_MSEC    500u
+#define K1_RTL8852BS_RESIDENT_PROBE_ATTEMPTS    4u
+#define K1_RTL8852BS_RESIDENT_FRAME_MAX         128u
+#define K1_RTL8852BS_RESIDENT_DEAUTH_BODY       26u
+
+/* The channel-defining registers of the three layers, as the vendor names
+ * them.  cfg_mac_bw() owns the first two, halbb_ctrl_bw_ch_8852b() the
+ * baseband set, and halrf_ctrl_ch_8852b() the radio's 0x18.
+ */
+
+#define K1_RTL8852BS_WMAC_RFMOD                 0xc010u
+#define K1_RTL8852BS_TXRATE_CHK                 0xc628u
+#define K1_RTL8852BS_BB_SCO                     0x49c0u
+#define K1_RTL8852BS_BB_BANDWIDTH               0x49c4u
+#define K1_RTL8852BS_BB_CHANNEL_INDEX           0x0734u
+#define K1_RTL8852BS_BB_RECEIVE_PATH            0x0700u
+#define K1_RTL8852BS_BB_CCK_BLOCK               0x2344u
+#define K1_RTL8852BS_BB_SEGMENT_A               0x4738u
+#define K1_RTL8852BS_BB_SEGMENT_B               0x4aa4u
+
+/* One sample of everything that says what channel and bandwidth the hardware
+ * is on.  The radio half is read through the existing RF snapshot, which
+ * already covers both paths' 0x18 and its D-die mirror; only the MAC and
+ * baseband registers are read here.
+ */
+
+struct k1_rtl8852bs_resident_channel_s
+{
+  uint32_t bandwidth;
+  uint32_t rate_check;
+  uint32_t bb_sco;
+  uint32_t bb_bandwidth;
+  uint32_t bb_channel;
+  uint32_t bb_receive_path;
+  uint32_t bb_cck;
+  uint32_t bb_segment_a;
+  uint32_t bb_segment_b;
+  uint32_t rf_channel[K1_RTL8852BS_RF_PATHS];
+  uint32_t rf_ddie_channel[K1_RTL8852BS_RF_PATHS];
+};
+
+/* What the window observed.  The counters separate the two ways it can come
+ * up empty: a receive path that heard nothing at all, and one that heard
+ * other access points but not the one this run associated with.
+ */
+
+struct k1_rtl8852bs_resident_count_s
+{
+  uint32_t polls;
+  uint32_t rx_reads;
+  uint32_t rx_frames;
+  uint32_t rx_oversize;
+  uint32_t parse_errors;
+  uint32_t beacons;
+  uint32_t beacons_target;
+  uint32_t probe_responses;
+  uint32_t probe_responses_self;
+  uint32_t data_frames_target;
+  uint32_t deauth_target;
+  uint32_t probes_sent;
+  uint16_t deauth_reason;
+  int probe_status;
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_channel_read
+ *
+ * Description:
+ *   Sample every register that decides what channel and bandwidth the
+ *   hardware is on, and print it.  The radio half comes from the RF snapshot
+ *   the scan path already uses, so both paths' 0x18 and its D-die mirror are
+ *   covered by the same reader that produced the run-35 evidence; nothing is
+ *   written by any of it.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_channel_read(
+  FAR const char *phase,
+  FAR struct k1_rtl8852bs_resident_channel_s *state)
+{
+  struct k1_rtl8852bs_scan_rf_readback_s readback;
+  unsigned int path;
+  int ret;
+
+  if (phase == NULL || state == NULL)
+    {
+      return -EINVAL;
+    }
+
+  memset(state, 0, sizeof(*state));
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_WMAC_RFMOD, &state->bandwidth);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_TXRATE_CHK,
+                                &state->rate_check);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_SCO, &state->bb_sco);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_BANDWIDTH,
+                               &state->bb_bandwidth);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_CHANNEL_INDEX,
+                               &state->bb_channel);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_RECEIVE_PATH,
+                               &state->bb_receive_path);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_CCK_BLOCK, &state->bb_cck);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_SEGMENT_A,
+                               &state->bb_segment_a);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_SEGMENT_B,
+                               &state->bb_segment_b);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_scan_rf_readback_read(&readback);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_rtl8852bs_scan_rf_readback_log(phase, &readback);
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      state->rf_channel[path] = readback.channel[path];
+      state->rf_ddie_channel[path] = readback.ddie_channel[path];
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: resident channel ");
+  k1_early_puts(phase);
+  k1_early_puts(" c010=");
+  k1_early_puthex(state->bandwidth);
+  k1_early_puts(" c628=");
+  k1_early_puthex(state->rate_check);
+  k1_early_puts(" bb49c0=");
+  k1_early_puthex(state->bb_sco);
+  k1_early_puts(" bb49c4=");
+  k1_early_puthex(state->bb_bandwidth);
+  k1_early_puts(" bb0734=");
+  k1_early_puthex(state->bb_channel);
+  k1_early_puts(" bb0700=");
+  k1_early_puthex(state->bb_receive_path);
+  k1_early_puts(" bb2344=");
+  k1_early_puthex(state->bb_cck);
+  k1_early_puts(" bb4738=");
+  k1_early_puthex(state->bb_segment_a);
+  k1_early_puts(" bb4aa4=");
+  k1_early_puthex(state->bb_segment_b);
+  k1_early_puts(" rf18-a=");
+  k1_early_puthex(state->rf_channel[K1_RTL8852BS_RF_PATH_A]);
+  k1_early_puts(" rf18-b=");
+  k1_early_puthex(state->rf_channel[K1_RTL8852BS_RF_PATH_B]);
+  k1_early_puts("\r\n");
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_channel_stable
+ *
+ * Description:
+ *   Compare two samples and name every register that moved.  A window whose
+ *   frames stopped arriving while these all held still says the channel was
+ *   never the reason, and one whose registers moved names the layer that
+ *   moved them.  The comparison is over the whole register rather than over
+ *   the channel field alone, because a bandwidth or a receive-path change
+ *   would silence a receiver just as effectively as a retune.
+ *
+ ****************************************************************************/
+
+static bool k1_rtl8852bs_runtime_resident_channel_stable(
+  FAR const struct k1_rtl8852bs_resident_channel_s *enter,
+  FAR const struct k1_rtl8852bs_resident_channel_s *exit_state)
+{
+  static const char * const names[] =
+    {
+      "c010", "c628", "bb49c0", "bb49c4", "bb0734", "bb0700", "bb2344",
+      "bb4738", "bb4aa4", "rf18-a", "rf18-b", "rfddie-a", "rfddie-b"
+    };
+
+  uint32_t before[13];
+  uint32_t after[13];
+  unsigned int index;
+  bool stable = true;
+
+  before[0]  = enter->bandwidth;
+  before[1]  = enter->rate_check;
+  before[2]  = enter->bb_sco;
+  before[3]  = enter->bb_bandwidth;
+  before[4]  = enter->bb_channel;
+  before[5]  = enter->bb_receive_path;
+  before[6]  = enter->bb_cck;
+  before[7]  = enter->bb_segment_a;
+  before[8]  = enter->bb_segment_b;
+  before[9]  = enter->rf_channel[K1_RTL8852BS_RF_PATH_A];
+  before[10] = enter->rf_channel[K1_RTL8852BS_RF_PATH_B];
+  before[11] = enter->rf_ddie_channel[K1_RTL8852BS_RF_PATH_A];
+  before[12] = enter->rf_ddie_channel[K1_RTL8852BS_RF_PATH_B];
+
+  after[0]  = exit_state->bandwidth;
+  after[1]  = exit_state->rate_check;
+  after[2]  = exit_state->bb_sco;
+  after[3]  = exit_state->bb_bandwidth;
+  after[4]  = exit_state->bb_channel;
+  after[5]  = exit_state->bb_receive_path;
+  after[6]  = exit_state->bb_cck;
+  after[7]  = exit_state->bb_segment_a;
+  after[8]  = exit_state->bb_segment_b;
+  after[9]  = exit_state->rf_channel[K1_RTL8852BS_RF_PATH_A];
+  after[10] = exit_state->rf_channel[K1_RTL8852BS_RF_PATH_B];
+  after[11] = exit_state->rf_ddie_channel[K1_RTL8852BS_RF_PATH_A];
+  after[12] = exit_state->rf_ddie_channel[K1_RTL8852BS_RF_PATH_B];
+
+  for (index = 0; index < sizeof(names) / sizeof(names[0]); index++)
+    {
+      if (before[index] == after[index])
+        {
+          continue;
+        }
+
+      stable = false;
+      k1_early_puts("K1 Wi-Fi GPL: resident channel moved ");
+      k1_early_puts(names[index]);
+      k1_early_puts(" enter=");
+      k1_early_puthex(before[index]);
+      k1_early_puts(" exit=");
+      k1_early_puthex(after[index]);
+      k1_early_puts("\r\n");
+    }
+
+  return stable;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_probe_build
+ *
+ * Description:
+ *   Serialize one directed Probe Request for the host transmit path.  It
+ *   differs from the wildcard frame k1_rtl8852bs_runtime_probe_request_build()
+ *   hands to firmware packet offload in the two ways that matter here: the
+ *   destination and BSSID are the access point this run associated with rather
+ *   than the broadcast address, and the SSID element carries that access
+ *   point's own name rather than being the wildcard.  Both narrow what can
+ *   answer, which is what makes a Probe Response evidence about one radio on
+ *   one channel instead of about whichever access point was fastest.
+ *
+ *   The caller supplies the sequence number, as the Authentication and
+ *   Association requests do, and for the same reason: nothing in the transmit
+ *   descriptor numbers a management frame, and a receiver that caches recent
+ *   sequence numbers per transmitter acknowledges a repeat and then discards
+ *   it, which is indistinguishable from an access point that stopped
+ *   answering.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_probe_build(
+  FAR uint8_t *frame, size_t frame_length, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid, FAR const uint8_t *ssid, uint8_t ssid_length,
+  uint16_t sequence, FAR size_t *length)
+{
+  static const uint8_t supported_rates[] =
+    {
+      0x02u, 0x04u, 0x0bu, 0x16u, 0x0cu, 0x12u, 0x18u, 0x24u
+    };
+
+  static const uint8_t extended_rates[] =
+    {
+      0x30u, 0x48u, 0x60u, 0x6cu
+    };
+
+  size_t required = K1_RTL8852BS_IEEE80211_HEADER_SIZE + 2u + ssid_length +
+                    2u + sizeof(supported_rates) +
+                    2u + sizeof(extended_rates);
+  size_t offset;
+
+  if (frame == NULL || length == NULL || self_mac == NULL || bssid == NULL ||
+      !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(bssid) ||
+      ssid_length > K1_RTL8852BS_IEEE80211_SSID_MAX ||
+      (ssid_length > 0 && ssid == NULL) ||
+      sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK ||
+      frame_length < required)
+    {
+      return -EINVAL;
+    }
+
+  memset(frame, 0, frame_length);
+  frame[0] = (uint8_t)(K1_RTL8852BS_PROBE_REQUEST_FRAME_CONTROL & 0xffu);
+  frame[1] = (uint8_t)(K1_RTL8852BS_PROBE_REQUEST_FRAME_CONTROL >> 8);
+
+  /* Duration stays zero for the hardware to fill.  Address 1 is the access
+   * point, address 2 this host, address 3 the BSSID.
+   */
+
+  memcpy(frame + 4, bssid, 6);
+  memcpy(frame + 10, self_mac, 6);
+  memcpy(frame + 16, bssid, 6);
+  k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
+  offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+  frame[offset++] = K1_RTL8852BS_IEEE80211_SSID_IE;
+  frame[offset++] = ssid_length;
+  if (ssid_length > 0)
+    {
+      memcpy(frame + offset, ssid, ssid_length);
+      offset += ssid_length;
+    }
+
+  frame[offset++] = K1_RTL8852BS_IEEE80211_SUPPORTED_RATES_IE;
+  frame[offset++] = (uint8_t)sizeof(supported_rates);
+  memcpy(frame + offset, supported_rates, sizeof(supported_rates));
+  offset += sizeof(supported_rates);
+
+  frame[offset++] = K1_RTL8852BS_IEEE80211_EXTENDED_RATES_IE;
+  frame[offset++] = (uint8_t)sizeof(extended_rates);
+  memcpy(frame + offset, extended_rates, sizeof(extended_rates));
+  offset += sizeof(extended_rates);
+
+  *length = offset;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_observe
+ *
+ * Description:
+ *   Classify one 802.11 frame received inside the window.  Only frames from
+ *   the access point this run associated with are counted as its own: a
+ *   Beacon from a neighbour proves the receiver works and proves nothing
+ *   about the channel this host is supposed to be holding, so the two are
+ *   counted apart.
+ *
+ *   A Probe Response only counts as an answer to this host's transmit when
+ *   its first address is this host's own.  The window runs with the same
+ *   receive filter a sweep uses, so a response an access point sent to a
+ *   different station arrives here too, and counting one of those would
+ *   report a transmit that never happened.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_resident_observe(
+  FAR const uint8_t *payload, size_t payload_length,
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  struct k1_rtl8852bs_mgmt_frame_s mgmt;
+  uint8_t subtype;
+  bool from_target;
+  int ret;
+
+  count->rx_frames++;
+  ret = k1_rtl8852bs_runtime_mgmt_parse(payload, payload_length, &mgmt);
+  if (ret < 0)
+    {
+      count->parse_errors++;
+      return;
+    }
+
+  from_target = mgmt.bssid_valid && memcmp(mgmt.bssid, bssid, 6) == 0;
+  subtype = (uint8_t)((mgmt.frame_control >>
+                       K1_RTL8852BS_IEEE80211_SUBTYPE_SHIFT) &
+                      K1_RTL8852BS_IEEE80211_SUBTYPE_MASK);
+
+  if (!mgmt.is_management)
+    {
+      if (from_target)
+        {
+          count->data_frames_target++;
+        }
+
+      return;
+    }
+
+  if (mgmt.is_beacon)
+    {
+      count->beacons++;
+      if (from_target)
+        {
+          count->beacons_target++;
+        }
+
+      return;
+    }
+
+  if (mgmt.is_probe_response)
+    {
+      count->probe_responses++;
+      if (from_target && mgmt.addr1_valid &&
+          memcmp(mgmt.addr1, self_mac, 6) == 0)
+        {
+          count->probe_responses_self++;
+        }
+
+      return;
+    }
+
+  /* A Deauthentication or Disassociation from the access point is the one
+   * answer that explains a silent window without any of the registers having
+   * moved: the association this window rides on would be over, and the reason
+   * code says why.  It is read straight out of the frame body, which the
+   * management parser does not keep.
+   */
+
+  if (from_target &&
+      (subtype == K1_RTL8852BS_IEEE80211_SUBTYPE_DEAUTHENTICATION ||
+       subtype == K1_RTL8852BS_IEEE80211_SUBTYPE_DISASSOCIATION))
+    {
+      count->deauth_target++;
+      if (payload_length >= K1_RTL8852BS_RESIDENT_DEAUTH_BODY)
+        {
+          count->deauth_reason = k1_rtl8852bs_read_le16(
+            payload + K1_RTL8852BS_IEEE80211_HEADER_SIZE);
+        }
+    }
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_window
+ *
+ * Description:
+ *   Hold the associated channel with no sweep running: widen the receive
+ *   filter the way a sweep does, poll the receive FIFO for a bounded window,
+ *   transmit one directed Probe Request into it, and require both a Beacon
+ *   from the access point this run associated with and that access point's
+ *   Probe Response back.
+ *
+ *   Nothing here tunes anything.  The channel registers are sampled on both
+ *   sides and compared, and the three receive filters are the only registers
+ *   written; all three are put back before the function returns.  A window
+ *   that receives nothing while every sampled register held still is therefore
+ *   evidence about the receive path and not about the radio.
+ *
+ * Input Parameters:
+ *   self_mac    - the eFuse self MAC, as transmitter and as the address a
+ *                 Probe Response has to carry to count
+ *   bssid       - the access point this run associated with
+ *   ssid        - that access point's SSID, for the directed Probe Request's
+ *                 SSID element
+ *   ssid_length - its length, zero when the BSS suppresses its own name
+ *   channel     - the channel the association ran on, for the log only
+ *
+ * Returned Value:
+ *   OK when a Beacon from the target and its Probe Response both arrived and
+ *   every sampled register held still.  -ENODATA when no Beacon from the
+ *   target arrived, -ETIMEDOUT when one did but no Probe Response followed,
+ *   -EIO when a sampled register moved, and the failing errno of the receive
+ *   path or the filter otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_window(
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid,
+  FAR const uint8_t *ssid, uint8_t ssid_length, uint8_t channel)
+{
+  struct k1_rtl8852bs_scan_rx_filter_state_s filter;
+  struct k1_rtl8852bs_resident_channel_s enter;
+  struct k1_rtl8852bs_resident_channel_s exit_state;
+  struct k1_rtl8852bs_resident_count_s count;
+  struct k1_rtl8852bs_rx_frame_s frame;
+  uint8_t probe[K1_RTL8852BS_RESIDENT_FRAME_MAX];
+  FAR uint8_t *buffer;
+  clock_t deadline;
+  clock_t probe_deadline;
+  size_t probe_length;
+  size_t length;
+  size_t offset;
+  uint16_t sequence;
+  bool stable = false;
+  bool exit_valid = false;
+  int receive_ret = OK;
+  int exit_ret = OK;
+  int filter_ret = OK;
+  int verdict;
+  int ret;
+
+  if (self_mac == NULL || bssid == NULL ||
+      !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(bssid))
+    {
+      return -EINVAL;
+    }
+
+  memset(&count, 0, sizeof(count));
+  count.probe_status = -ENODATA;
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window enter channel=");
+  k1_early_puthex(channel);
+  k1_early_puts(" ssid-len=");
+  k1_early_puthex(ssid_length);
+  k1_early_puts(" window-ms=");
+  k1_early_puthex(K1_RTL8852BS_RESIDENT_WINDOW_MSEC);
+  k1_early_puts("\r\n");
+
+  buffer = kmm_malloc(K1_RTL8852BS_SCAN_OFLD_RX_MAX);
+  if (buffer == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  /* The entry sample is the baseline every later comparison is against, so a
+   * window that cannot take one has nothing to report and does not run.
+   */
+
+  ret = k1_rtl8852bs_runtime_resident_channel_read("resident-enter", &enter);
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident channel read error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      kmm_free(buffer);
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_scan_rx_filter_enable(&filter);
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident filter error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      kmm_free(buffer);
+      return ret;
+    }
+
+  /* The console is polled, and every command trace line inside the window is
+   * time the receive FIFO is not being drained in.  The transmit path prints
+   * its own two lines and they are wanted, so only the SDIO command trace is
+   * suppressed, exactly as the sweep does it.
+   */
+
+  k1_sdio_wifi_suppress_command_trace(true);
+  deadline = clock_systime_ticks() +
+             MSEC2TICK(K1_RTL8852BS_RESIDENT_WINDOW_MSEC);
+  probe_deadline = clock_systime_ticks() +
+                   MSEC2TICK(K1_RTL8852BS_RESIDENT_PROBE_DELAY_MSEC);
+
+  while ((sclock_t)(clock_systime_ticks() - deadline) < 0)
+    {
+      count.polls++;
+
+      /* The first Probe Request goes out a fraction of a second into the
+       * window, so the receive loop is already draining when the answer
+       * arrives, and it is repeated on a gap while no answer has come: one
+       * request per window would make a single lost frame the whole result.
+       * Every attempt takes a fresh sequence number.
+       */
+
+      if (count.probes_sent < K1_RTL8852BS_RESIDENT_PROBE_ATTEMPTS &&
+          count.probe_responses_self == 0 &&
+          (sclock_t)(clock_systime_ticks() - probe_deadline) >= 0)
+        {
+          sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+          ret = k1_rtl8852bs_runtime_resident_probe_build(
+            probe, sizeof(probe), self_mac, bssid, ssid, ssid_length,
+            sequence, &probe_length);
+          if (ret >= 0)
+            {
+              ret = k1_rtl8852bs_runtime_mgmt_tx_frame(probe, probe_length,
+                                                       sequence, false);
+            }
+
+          count.probes_sent++;
+          count.probe_status = ret;
+          probe_deadline = clock_systime_ticks() +
+                           MSEC2TICK(K1_RTL8852BS_RESIDENT_PROBE_GAP_MSEC);
+
+          k1_early_puts("K1 Wi-Fi GPL: resident probe tx sn=");
+          k1_early_puthex(sequence);
+          k1_early_puts(" bytes=");
+          k1_early_puthex((uintreg_t)probe_length);
+          k1_early_puts(" status=");
+          k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts("\r\n");
+        }
+
+      ret = k1_rtl8852bs_runtime_rx_read(
+        buffer, K1_RTL8852BS_SCAN_OFLD_RX_MAX, &length);
+      if (ret == -EAGAIN)
+        {
+          up_mdelay(K1_RTL8852BS_RUNTIME_DONE_ACK_POLL_MSEC);
+          continue;
+        }
+
+      if (ret == -ENOSPC)
+        {
+          /* The FIFO keeps an aggregate too large for this buffer, so the
+           * loss stays visible in the counter instead of ending the window.
+           */
+
+          count.rx_oversize++;
+          up_mdelay(K1_RTL8852BS_RUNTIME_DONE_ACK_POLL_MSEC);
+          continue;
+        }
+
+      if (ret < 0)
+        {
+          receive_ret = ret;
+          break;
+        }
+
+      count.rx_reads++;
+      offset = 0;
+      while (offset < length)
+        {
+          ret = k1_rtl8852bs_runtime_rx_parse(buffer, length, offset,
+                                              &frame);
+          if (ret < 0 || frame.next_offset <= offset)
+            {
+              receive_ret = ret < 0 ? ret : -EPROTO;
+              break;
+            }
+
+          if (!frame.crc_error && !frame.icv_error && frame.packet_type == 0)
+            {
+              k1_rtl8852bs_runtime_resident_observe(
+                buffer + frame.payload_offset, frame.payload_length,
+                self_mac, bssid, &count);
+            }
+
+          offset = frame.next_offset;
+        }
+
+      if (receive_ret < 0)
+        {
+          break;
+        }
+    }
+
+  k1_sdio_wifi_suppress_command_trace(false);
+
+  /* The exit sample is taken before the filter goes back, so it describes the
+   * hardware as the window ran it rather than as the restore leaves it.
+   */
+
+  exit_ret = k1_rtl8852bs_runtime_resident_channel_read("resident-exit",
+                                                        &exit_state);
+  exit_valid = exit_ret >= 0;
+  filter_ret = k1_rtl8852bs_scan_rx_filter_restore(&filter);
+  kmm_free(buffer);
+
+  if (exit_valid)
+    {
+      stable = k1_rtl8852bs_runtime_resident_channel_stable(&enter,
+                                                            &exit_state);
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window channel=");
+  k1_early_puthex(channel);
+  k1_early_puts(" polls=");
+  k1_early_puthex(count.polls);
+  k1_early_puts(" rx-reads=");
+  k1_early_puthex(count.rx_reads);
+  k1_early_puts(" frames=");
+  k1_early_puthex(count.rx_frames);
+  k1_early_puts(" beacons=");
+  k1_early_puthex(count.beacons);
+  k1_early_puts(" bcn-target=");
+  k1_early_puthex(count.beacons_target);
+  k1_early_puts(" probes=");
+  k1_early_puthex(count.probes_sent);
+  k1_early_puts(" probe-status=");
+  k1_early_puthex((uintreg_t)(count.probe_status < 0 ?
+                              -count.probe_status : 0));
+  k1_early_puts(" probe-rsp=");
+  k1_early_puthex(count.probe_responses);
+  k1_early_puts(" probe-rsp-self=");
+  k1_early_puthex(count.probe_responses_self);
+  k1_early_puts(" data-target=");
+  k1_early_puthex(count.data_frames_target);
+  k1_early_puts(" deauth=");
+  k1_early_puthex(count.deauth_target);
+  k1_early_puts(" reason=");
+  k1_early_puthex(count.deauth_reason);
+  k1_early_puts(" parse-err=");
+  k1_early_puthex(count.parse_errors);
+  k1_early_puts(" oversize=");
+  k1_early_puthex(count.rx_oversize);
+  k1_early_puts(" ch-stable=");
+  k1_early_puthex(stable ? 1 : 0);
+  k1_early_puts(" rx=");
+  k1_early_puthex((uintreg_t)(receive_ret < 0 ? -receive_ret : 0));
+  k1_early_puts(" filter=");
+  k1_early_puthex((uintreg_t)(filter_ret < 0 ? -filter_ret : 0));
+  k1_early_puts("\r\n");
+
+  /* The verdict names the earliest thing that was wrong, so a run reads as
+   * one cause rather than as a list.  A register that moved comes first
+   * because it would explain everything after it; then the receive path's own
+   * failure; then what the window was for.
+   */
+
+  if (!exit_valid)
+    {
+      verdict = exit_ret;
+    }
+  else if (!stable)
+    {
+      verdict = -EIO;
+    }
+  else if (receive_ret < 0)
+    {
+      verdict = receive_ret;
+    }
+  else if (filter_ret < 0)
+    {
+      verdict = filter_ret;
+    }
+  else if (count.beacons_target == 0)
+    {
+      verdict = -ENODATA;
+    }
+  else if (count.probe_responses_self == 0)
+    {
+      verdict = -ETIMEDOUT;
+    }
+  else
+    {
+      verdict = OK;
+    }
+
+  if (verdict < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident window error=");
+      k1_early_puthex((uintreg_t)-verdict);
+      k1_early_puts("\r\n");
+      return verdict;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station resident window "
+                "complete\r\n");
+  return OK;
+}
+
+#endif /* CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC */
+
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_station_diagnostic
  *
@@ -23568,6 +24379,23 @@ static int k1_rtl8852bs_runtime_station_diagnostic(
       k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station WPA2 keys "
                     "installed\r\n");
     }
+
+#ifdef CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC
+  /* Everything above happened inside a scan-offload sweep.  This is the same
+   * association, the same channel and the same access point with no sweep
+   * running, which is the first thing in this port that a data path would need
+   * and the last thing no run has ever shown.
+   *
+   * Its failure does not abort the step, on the same reasoning the port
+   * programming above uses: the association and the handshake are already
+   * reported, and a window that heard nothing must not retract them.  It
+   * prints its own verdict line and only prints its completion marker when it
+   * passed, so the acceptance harness fails the run on the marker's absence.
+   */
+
+  (void)k1_rtl8852bs_runtime_resident_window(self_mac, bssid, ssid,
+                                             ssid_length, channel);
+#endif
 
   return OK;
 

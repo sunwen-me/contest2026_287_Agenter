@@ -291,6 +291,13 @@ def parse_args() -> argparse.Namespace:
               "vendor's TSF-based delay asks"),
     )
     parser.add_argument(
+        "--require-runtime-resident", action="store_true",
+        help=("fail unless the associated channel is held with no sweep "
+              "running: a Beacon from the target and its Probe Response back "
+              "inside one bounded receive window, every sampled channel "
+              "register unchanged across it, and the receive filter restored"),
+    )
+    parser.add_argument(
         "--require-runtime-wpa-msg1", action="store_true",
         help=("fail unless a pairwise master key is derived from a configured "
               "passphrase and the access point sends a first EAPOL-Key frame "
@@ -1904,6 +1911,82 @@ def main() -> int:
             )
             if wpa_keys_end_result is None:
                 missing.append("RTL8852BS2 WPA2-PSK key installation")
+        if args.require_runtime_resident:
+            # The resident window's own lines, sliced from the line it prints
+            # on entry so nothing a sweep received can satisfy these checks.
+            # That line exists only inside the window, which runs after the
+            # association step has already reported its result.
+            resident_begin_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window enter channel="
+                rb"(?:0x)?0*[1-9a-fA-F][0-9a-fA-F]*",
+                started,
+            )
+            if resident_begin_result is None:
+                missing.append("RTL8852BS2 resident window start")
+                resident = started
+            else:
+                resident = started[resident_begin_result.end():]
+
+            # A Beacon from the access point this run associated with, received
+            # with no sweep running.  Beacons from other access points are
+            # counted in the same line and deliberately not accepted here: they
+            # would prove the receiver works without proving anything about the
+            # channel this host is supposed to be holding.
+            resident_beacon_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window channel=[^\r\n]*"
+                rb" bcn-target=(?:0x)?0*[1-9a-fA-F]",
+                resident,
+            )
+            if resident_beacon_result is None:
+                missing.append(
+                    "RTL8852BS2 Beacon from the associated access point with "
+                    "no sweep running")
+
+            # The transmit half.  The status of the Probe Request separates a
+            # frame the hardware accepted from one the builder or the queue
+            # refused, and only a Probe Response carrying this host's own
+            # address counts as its answer.
+            resident_probe_tx_result = re.search(
+                rb"K1 Wi-Fi GPL: resident probe tx sn=[^\r\n]*"
+                rb" status=0x0+(?![0-9a-fA-F])",
+                resident,
+            )
+            if resident_probe_tx_result is None:
+                missing.append(
+                    "RTL8852BS2 directed Probe Request transmit outside a "
+                    "dwell")
+
+            resident_probe_rsp_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window channel=[^\r\n]*"
+                rb" probe-rsp-self=(?:0x)?0*[1-9a-fA-F]",
+                resident,
+            )
+            if resident_probe_rsp_result is None:
+                missing.append(
+                    "RTL8852BS2 Probe Response to this host outside a dwell")
+
+            # What makes the two above evidence about the receive and transmit
+            # paths rather than about the radio: every sampled channel and
+            # bandwidth register held still, the receive loop hit no error, and
+            # the three receive filters were restored and read back.
+            resident_stable_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window channel=[^\r\n]*"
+                rb" ch-stable=0x0*1(?![0-9a-fA-F]) rx=0x0+(?![0-9a-fA-F])"
+                rb" filter=0x0+(?![0-9a-fA-F])",
+                resident,
+            )
+            if resident_stable_result is None:
+                missing.append(
+                    "RTL8852BS2 channel registers unchanged across the "
+                    "resident window")
+
+            resident_end_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 station resident window "
+                rb"complete\r?\n",
+                resident,
+            )
+            if resident_end_result is None:
+                missing.append("RTL8852BS2 resident window completion")
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

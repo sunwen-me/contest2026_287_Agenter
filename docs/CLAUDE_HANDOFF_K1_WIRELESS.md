@@ -172,10 +172,16 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   3d 里那一帧 Deauthentication（reason 15 = 握手超时）在 run 33/34 都不再出现，
   `deauth-self=0x0 deauth-reason=0xffff`。
   另外：port 0 从增量 3g（run 35）起是**被使能的**（`c400=0x1e81c`、`NET_TYPE`=2(INFRA)、
-  bit2 `PORT_FUNC_EN`=1），但**帧仍然从 scan-offload 停驻的 dwell 上发出去**，因为还没有
-  驻留信道（`rtw8852b_set_channel_{mac,bb,rf}` 未移植）。run 35 的 `eapol=0x4`
-  （和 run 34 一样）就是这个代价的直接读数：AP 重传了两次 Msg1，因为本端在两个 dwell
-  之间发不出 Msg2——使能 port 没有改变这一点。
+  bit2 `PORT_FUNC_EN`=1）。
+  **这里原先写着「帧仍然从 scan-offload 停驻的 dwell 上发出去，因为还没有驻留信道」，
+  那句话是错的**，增量 3h 的三条更正证伪了它：run 35 的 144 条 `scan RF readback` 显示
+  每次 sweep 的 `before` 都等于上一次 sweep 的 `after`，RF `0x18` 的 `ch` 字段就停在
+  最后一次 dwell 的信道上——**信道一直是驻留的**，`set_channel` 不是拿到它的前提。
+  sweep 结束时变的是本端自己的三个接收过滤器（`ce20` `0xf017000f`→`0xf0170001`、
+  `ce30` `0x55550055`→`0x0`，所有数据子类型都丢），所以 sweep 之外收不到 Beacon 也收不到
+  发给自己的单播数据帧，是本端自己关的。`eapol=0x4`（AP 重传两次 Msg1）的原因**目前不明**：
+  整个握手都在同一个 park=1 的 sweep 之内、`msg2 tx sn=0x8/0x9` 紧邻两行、中间没有 dwell
+  边界，所以「dwell 之间发不出去」不是它；新的解释没有证据，不要再写一个。
   说「完成了 WPA2-PSK 四次握手、密钥已被固件接受」是对的，
   说「Wi-Fi 通了」「能收发数据」「流量已加密」是误报。
 - **认证、join、关联、四次握手、装密钥、port 使能六步都过了，仍然不等于「Wi-Fi 通了」。** run 20/run 25 收到的是 AP 的
@@ -407,13 +413,30 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   **失败不中断关联**：`FUNC_EN` 一旦写下去，中途放弃会留下半配置的 port 并把这一轮要收集的
   握手证据一起丢掉；代价是 `RTL8852BS2 port init complete` 只在「序列跑完 ＋ TSF 在走」
   时才打，`--require-runtime-port-init` 认这一行加 `status=0x0 tsf=0x1` 的结果行。
-- **下一步优先级**：(1) `rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1 ＋ 发送描述符的
-  安全字段（`sec_type`/`sec_cam_idx`）：这两件凑齐才第一次可能有「被 CCMP 保护的数据帧」。
-  密钥已经在硬件里（增量 3f）、port 也已经使能（增量 3g），现在挡在「密钥装好」和
-  「能收发数据」之间只剩两条——描述符不引用安全 CAM index，硬件就不会去加密；
-  以及仍然是在停驻的扫描 dwell 上发帧（run 35 的 `eapol=0x4` 就是 AP 因此重传了两次
-  Msg1，使能 port 并没有改变它）。3b/3c/3d 欠的 `JOININFO` 顺序已在 3g 还清
-  （认证前 `disconn=0x1`、关联时 `disconn=0x0`）。
+- **已实现、构建干净、待上板 run 36（增量 3h）：不跑扫描的驻留收发窗口。**
+  Kconfig 符号 `K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC`（`depends on
+  K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC`，只有 wpa profile 打开），跑在装钥匙之后。
+  它先把 3e/3f/3g 那句「没有驻留信道」证伪（见上面「尚未完成，禁止误报」里那段更正），
+  然后在**没有任何 sweep 在跑**的时候证明收发循环还活着：进出各采一次 13 个「定义信道」的
+  寄存器（MAC `c010`/`c628`、BB `49c0`/`49c4`/`0734`/`0700`/`2344`/`4738`/`4aa4`、
+  RF `0x18` 两条路径 ＋ D-die 镜像），逐项比，动了就点名并返回 `-EIO`；
+  **唯一被写的是三个接收过滤器，而且全部原值写回**，不 tune 任何东西。窗口 3000 ms，
+  轮询 RX FIFO，进入 300 ms 后发一帧定向 Probe Request（每 500 ms 重发、最多 4 次），
+  判据是「目标 BSSID 的 Beacon ＋ A1 是本机的 Probe Response」，邻居的帧一条都不算。
+  报错阶梯 `-EIO`（寄存器动了）/`-ENODATA`（没 Beacon）/`-ETIMEDOUT`（有 Beacon 没回应）。
+  **失败不撤回已经报出去的关联和握手**：调用点是 `(void)`，完成标记
+  `RTL8852BS2 station resident window complete` 只在通过时打，
+  `--require-runtime-resident` 认那一行加 `bcn-target`/`probe-rsp-self` 非零、
+  `ch-stable=0x1 rx=0x0 filter=0x0`。
+- **下一步优先级**：(1) 发送描述符的安全字段（`sec_type`/`sec_cam_idx`）：这是第一次可能
+  有「被 CCMP 保护的数据帧」。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
+  信道本来就是驻留的（增量 3h 的更正一），所以挡在「密钥装好」和「能收发数据」之间的
+  只剩这一条——描述符不引用安全 CAM index，硬件就不会去加密。
+  **这一条原先写的是「`rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1」排第一，理由是
+  「仍然在停驻的扫描 dwell 上发帧」；那个理由被 3h 证伪了**，`set_channel` 因此降级成
+  「以后要切信道时才需要」，不再是数据面的前提。3b/3c/3d 欠的 `JOININFO` 顺序已在 3g
+  还清（认证前 `disconn=0x1`、关联时 `disconn=0x0`）。增量 3h 自己（不跑扫描的驻留收发
+  窗口）代码已实现、构建干净，**待上板 run 36**。
   (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
   发送正确性与 RSSI 精度要靠它；同一批还有 `set_enable_bb_rf(hal, 0)` 的 disable 半边、
   `halbb_dm_init()`/`halrf_dm_init()` 正文、五张 `init_rf_reg` store 表、halbb `phy_reg_gain`。
@@ -534,18 +557,19 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是数据面：`rtw8852b_set_channel_{mac,bb,rf}` 驻留信道 1 ＋ 发送描述符的
-安全字段**——密钥已经在硬件里、port 也已经使能了，但没有任何一条发送路径去引用它的安全
-CAM index，所以仍然一帧 CCMP 都没有；而且发帧仍然发生在停驻的扫描 dwell 上（run 35 的
-`eapol=0x4` 就是 AP 因此重传了两次 Msg1，使能 port 没有改变它）。做法与欠账见
-「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e/3f/3g 镜像：
+**当前实际下一步是数据面：发送描述符的安全字段**——密钥已经在硬件里、port 也已经使能、
+信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），但没有任何一条发送路径去引用
+安全 CAM index，所以仍然一帧 CCMP 都没有。中间夹着增量 3h 本身：不跑扫描的驻留收发窗口，
+代码已实现、两个镜像都构建干净，**待上板 run 36**（`--require-runtime-resident`）。
+做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e/3f/3g/3h 镜像：
 
 ```bash
 tools/build_k1_wpa.sh             # profile board/k1/muse_pi_pro/configs/wireless_wpa_diag
 ```
 
-板上验收是 34 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
-＋ `--require-runtime-port-init`），run 35 一条没失败、以
+板上验收现在是 35 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
+＋ `--require-runtime-port-init` ＋ 增量 3h 新增的 `--require-runtime-resident`；
+run 35 跑的是其中 34 条，那时还没有最后这条），run 35 一条没失败、以
 `PASS: K1 wireless RAM image reached NSH` 收尾，日志
 `out/k1-serial/k1-wpa-20260830T194339Z.log`（run 34 是其中 33 条，日志
 `out/k1-serial/k1-wpa-20260830T174332Z.log`；run 33 是 31 条，日志

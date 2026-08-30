@@ -5682,3 +5682,172 @@ TSF 在 `FUNC_EN` **之前**就已经是 AP 自己的计时器（run 34 的 `c43
    缺的只是发送路径去引用它，这是第一次有机会发出一帧被 CCMP 保护的数据帧（增量 3i）。
 3. `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI）那一批，
    以及把认证／关联响应的前 32 字节原样打到串口这条一直没补的证据。
+
+### 增量 3h：不跑扫描的驻留收发窗口（先证伪「信道不是驻留的」）
+
+代码已实现、`--no-key` 与带钥匙两个镜像都构建干净，**板上证据待补（run 36）**。除了下面
+三条更正——它们的证据来自已经跑完的 run 35——本节其余内容都是写在上板之前的设计与判据，
+上板结果补在本节末尾。
+
+镜像 `wireless_wpa_diag`，新符号 `CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC=y`；
+带钥匙 ELF SHA-256 `95c7492042e675662fc0b78cc86873a8026c868d5aa45499787de7c21e7dc74f`
+（`text 775038 data 9768 bss 25296`），`--no-key`
+`323525a1fe661d45f266d068932e101e9e2de86ae674d30e824ebe5149e5afcc`
+（`text 775022 data 9768 bss 25296`）；告警仍然只有长期存在的那 6 条。
+
+#### 更正一：信道一直是驻留的
+
+3e/3f/3g 都写过「本端仍然在 parked 的扫描 dwell 里发帧而不是驻留在一个工作信道上」，并且
+因为这句话把 `rtw8852b_set_channel_{mac,bb,rf}` 排成下一步的第一位。被替换的原句是：
+
+- 3e「还没做的」：「`mac_port_init()` 仍未移植，仍然是在 parked 的扫描 dwell 里发帧而不是
+  驻留在一个工作信道上」
+- 3f「这轮 AP 把 Msg1 发了三遍」：「原因是本端仍然在 parked 的扫描 dwell 里发帧，两个
+  dwell 之间发不出去，AP 的重传定时器先响了……这正是『没有驻留信道』要付的利息」
+- 3g「这一步证明了什么、没证明什么」：「也没有证明本端驻留在了信道 1……帧仍然从停驻的扫描
+  dwell 上发出去」
+
+run 35 自己的 RF 回读证伪了第一句。那一轮打了 144 条 `scan RF readback`，每次 sweep 前
+（`before`）后（`after`）各一次、两条路径 ＋ D-die 镜像都读，连起来是一条链：
+
+```
+522  pre-si-reset ch-reg=0x1001 ch=0x1   <- 固件 bring-up 留下的，本端还没扫过
+532  before       ch-reg=0x1001 ch=0x1
+715  after        ch-reg=0x1c0d ch=0xd   <- 1-13 全扫，停在 13
+1058 before       ch-reg=0x1c0d ch=0xd   <- 下一次 sweep 开始时还是 13
+1774 after        ch-reg=0x1c01 ch=0x1   <- park=1 的 sweep，停在 1
+1845 before       ch-reg=0x1c01 ch=0x1
+```
+
+**每一次 sweep 的 `before` 都等于上一次 sweep 的 `after`，一次例外都没有。** sweep 结束时
+没有任何东西把信道退回去，`ch` 字段就停在最后一次 dwell 的信道上；高位那几位只在第一次
+sweep 时从 `0x1000` 变成 `0x1c00`，之后 143 条回读一直是 `0x1c00`。
+
+也就是说「信道是固件顺手停在那儿的」这个说法本身没错，但结论反了：**它停在那儿正是驻留**，
+本端要的信道 1 在 park=1 的 sweep 之后就在 RF 里，用不着先移植 `set_channel` 才有。
+
+#### 更正二：sweep 之外收不到东西，是本端自己关的
+
+sweep 结束时真正变的是本端自己的三个接收过滤器。同一份 run 35 日志：
+
+```
+515 scan RX filter before ce20=0xf0170001 ce28=0x55555555 ce30=0x00000000
+516 scan RX filter scan   ce20=0xf017000f ce28=0x55555555 ce30=0x55550055
+760 scan RX filter after  ce20=0xf0170001 ce28=0x55555555 ce30=0x00000000
+```
+
+`ce20`（`R_AX_RX_FLTR_OPT`）低位那 `0xe` 是 A1 匹配、广播、多播三位；`ce30`（数据帧子类型
+过滤）在 dwell 之外是 `0x0`——**所有数据子类型都丢**。所以 sweep 之外这台主机既收不到
+Beacon（广播帧），也收不到发给自己的单播数据帧（EAPOL Msg1 就是一帧 QoS Data）：不是射频
+不在信道上，是 `k1_rtl8852bs_scan_rx_filter_restore()` 把过滤器关回去了。`ce30=0x0` 这个
+初值增量 3e 记过一笔（「卡住四次握手的不是密码学，是接收侧的一个复位值」），只是当时只把它
+当成 dwell **之内**要打开的东西，没把「dwell 之外它又被关回去」和「dwell 之间收不到」
+连起来。
+
+#### 更正三：AP 重传两次 Msg1 的原因仍然不明，「dwell 之间发不出去」不是它
+
+3f/3g 把 `eapol=0x4` 解释成「本端在两个 dwell 之间发不出 Msg2」。run 35 的日志排下来不
+支持这个解释：整个握手发生在**同一个 park=1 的 sweep 之内**，那个 sweep 反复对信道 1 重新
+`next-channel`，`ce20`/`ce30` 全程是打开的值；而且 `wpa msg2 tx sn=0x8` 和 `sn=0x9` 是
+紧邻的两行，中间没有任何 dwell 边界。两份 Msg1 更像是本端一次 FIFO 轮询里排队取出来的
+（AP 在本端把 FIFO 抽干之前就重传了），那是接收轮询延迟，不是发送被挡住。
+
+**这条只撤回错的解释，不换一个新解释。** 真实原因（接收轮询延迟／Msg2 没到 AP／AP 自己的
+重传策略）本轮不猜，`eapol=0x4` 仍然是一个未解释的读数。
+
+#### 这个增量因此改做什么
+
+原计划的 3h 是移植 `rtw8852b_set_channel_{mac,bb,rf}`：几百条寄存器写，为了拿到一个本端
+已经有了的东西。既然信道已经驻留，真正没被证明的就剩一件——**没有任何 sweep 在跑的时候，
+本端自己的收发循环还能不能工作。** 3h 因此改成一个有界的驻留收发窗口，跑在关联／握手／
+装钥匙之后，`wireless_wpa_diag` 的最后一步。符号只有 wpa profile 打开，但调用点放在
+`if (wpa) { … }` 之外，所以 assoc-only profile 打开它也能跑（`depends on
+K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC`）。
+
+#### 它写什么、不写什么
+
+**只写三个接收过滤器，而且全部写回。** 复用现成的
+`k1_rtl8852bs_scan_rx_filter_enable()` 把 `ce20`/`ce28`(mgmt)/`ce30`(data) 打开，窗口结束
+后 `..._restore()` 原值写回。**一个信道寄存器都不动**：没有 `set_channel`、没有 H2C、
+没有 sweep，所以窗口里发生的任何事都只能是收发路径的性质，不可能是「刚才那几百条写把它
+救活了」。
+
+进出各采一次「定义信道」的 13 个值，逐项比：
+
+| 层 | 寄存器 | 是什么 |
+| --- | --- | --- |
+| MAC | `c010` | `R_AX_WMAC_RFMOD`，带宽 |
+| MAC | `c628` | `R_AX_TXRATE_CHK` 的 `B_AX_BAND_MODE` BIT(4) |
+| BB | `49c0` / `49c4` | SCO / 带宽 |
+| BB | `0734` | [27:16] 信道号 |
+| BB | `0700` / `2344` / `4738` / `4aa4` | 接收路径 / CCK block / segment A / segment B |
+| RF | `0x18` ×2 ＋ D-die 镜像 ×2 | 两条路径的信道寄存器（走现成的只读回读函数） |
+
+任何一项动了，就把字段名、进入值、退出值打成一行 `resident channel moved <name>
+enter=… exit=…`，并让这一步返回 `-EIO`——「窗口静默」和「有人把信道挪了」因此不会混成
+同一个结论。
+
+窗口 3000 ms：轮询 SDIO RX FIFO（`k1_rtl8852bs_runtime_rx_read()` 的 `-EAGAIN`/`-ENOSPC`
+语义照旧），进入 300 ms 后发一帧**定向** Probe Request（A1=A3=BSSID、A2=本机、SSID 元素
+带目标自己的名字、速率表和野卡版一致），没等到回应就每 500 ms 重发，最多 4 次，每次换
+sequence number。**这一帧是把窗口从「能收」变成「能收也能发」的那件事**：Probe Response
+只会回给发过 Probe Request 的地址，收到它就同时证明了两个方向。
+
+计数分开记，邻居的帧一条都不算进判据：目标 BSSID 的 Beacon / 别人的 Beacon、
+Probe Response / 「A1 是本机」的 Probe Response、目标发来的数据帧、目标发来的
+Deauth/Disassoc 及其 reason code、解析错误、超长帧。这样「窗口静默」和「关联早就被 AP
+拆了」是两个可区分的结果。
+
+#### 串口长什么样
+
+```
+K1 Wi-Fi GPL: resident window enter channel=0x1 ssid-len=0x2 window-ms=0xbb8
+K1 Wi-Fi GPL: resident channel enter c010=… c628=… bb49c0=… bb49c4=… bb0734=… \
+  bb0700=… bb2344=… bb4738=… bb4aa4=… rf18-a=… rf18-b=…
+K1 Wi-Fi GPL: resident probe tx sn=… bytes=… status=0x0
+K1 Wi-Fi GPL: resident channel exit  c010=… （同上 11 项）
+K1 Wi-Fi GPL: resident window channel=… polls=… rx-reads=… frames=… beacons=… \
+  bcn-target=… probes=… probe-status=… probe-rsp=… probe-rsp-self=… data-target=… \
+  deauth=… reason=… parse-err=… oversize=… ch-stable=0x1 rx=0x0 filter=0x0
+K1 Wi-Fi GPL: RTL8852BS2 station resident window complete
+```
+
+失败时不是这一行，而是 `resident window error=<errno>`，判据阶梯按「最能解释的原因排前面」：
+退出快照读失败 → 它的 errno；有寄存器动了 → `-EIO`；接收路径出错 → 它的 errno；过滤器写回
+出错 → 它的 errno；目标一条 Beacon 都没有 → `-ENODATA`；有 Beacon 但没有发给本机的
+Probe Response → `-ETIMEDOUT`；否则 `OK`。
+
+**失败不撤回已经报出去的关联和握手。** 调用点是 `(void)`，完成标记只在通过时才打，所以
+验收靠这一行的有无，而不靠这一步去否定上面那些已经有硬证据的结论。
+
+#### 判据
+
+runner 加了一个 flag，`--require-runtime-resident`，板上验收从 34 条变成 **35 条**
+`--require-*`。它从 `resident window enter channel=` 那一行往后切，然后要求五件事同时成立：
+
+1. ` bcn-target=` 非零——目标 AP 的 Beacon 在没有 sweep 的情况下进了本端的接收路径；
+2. `resident probe tx sn=… status=0x0`——定向 Probe Request 交给硬件成功；
+3. ` probe-rsp-self=` 非零——AP 的 Probe Response 回到了本机地址（发送真的出去了）；
+4. ` ch-stable=0x1 rx=0x0 filter=0x0`——13 个信道寄存器一个没动，接收路径和过滤器写回都
+   没报错；
+5. `RTL8852BS2 station resident window complete`。
+
+两种结果都推进：过了，下一个拦路虎就明确是发送描述符的安全字段和数据面；不过，
+`resident channel moved …` 或者 `-ENODATA`/`-ETIMEDOUT` 直接点名是哪一层出的问题，
+而不用再猜。
+
+#### 还没做的
+
+**这仍然不是一条通的链路。** 这一增量哪怕全过，也只是证明「不跑扫描时收发循环还活着」：
+发送描述符的安全字段仍然没填，仍然没有一帧被 CCMP 保护过，`wlan0` 的行为一个字节没变，
+没有 DHCP、没有联网。密钥的三层处理照旧（profile 留空、构建脚本从 `~/.config/k1-wifi-psk.env`
+读、`out/k1-wpa` 不发布），这一步新增的打印里没有任何由密钥派生的值。仍然是 RAM-only：
+eMMC / SPI flash / eFuse / U-Boot 环境一个都没写。
+
+#### 下一步
+
+1. 上板跑 run 36，把本节的证据补齐（需要用户按 RST，`--boot-timeout 900`）。
+2. 发送描述符的安全字段（`sec_type` / `sec_cam_idx`）——密钥在 CAM 里、槽也有了、信道是
+   驻留的、port 是使能的，缺的只是发送路径去引用安全 CAM index（增量 3i）。
+3. `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI）那一批，以及把
+   认证／关联响应的前 32 字节原样打到串口这条一直没补的证据。
