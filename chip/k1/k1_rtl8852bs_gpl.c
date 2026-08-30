@@ -1545,9 +1545,13 @@ extern void k1_early_puthex(uintreg_t value);
   (K1_RTL8852BS_IEEE80211_HEADER_SIZE + K1_RTL8852BS_AUTH_BODY_SIZE)
 
 /* The capability-information bits this port has anything to say about, IEEE
- * 802.11 clause 9.4.1.4.  Privacy is the one that decides whether a BSS can
- * be associated with at all by a station that builds no RSN element yet; the
- * other two describe the transmitter's own PHY.
+ * 802.11 clause 9.4.1.4.  Privacy is the one that describes the BSS rather
+ * than the transmitter: a station echoes it in its Association Request when
+ * the BSS requires data confidentiality, and pairs it with an RSN element
+ * naming the suites it will use.  This port builds that element from what the
+ * BSS advertised, so a Privacy BSS can be asked to associate; nothing here
+ * derives or installs a key, so the link that follows cannot carry data.
+ * The other two bits describe the transmitter's own PHY.
  */
 
 #define K1_RTL8852BS_IEEE80211_CAPABILITY_ESS            0x0001u
@@ -1570,6 +1574,24 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_IEEE80211_RSN_AKM_PSK               2u
 #define K1_RTL8852BS_IEEE80211_RSN_GROUP_UNKNOWN         0xffu
 
+/* The same element built rather than decoded, for the Association Request this
+ * port sends to a Privacy BSS.  The body is the twenty bytes of clause
+ * 9.4.2.24 with one suite in each list: version 1, the group cipher the BSS
+ * itself advertised, CCMP as the only pairwise cipher, the pre-shared key
+ * suite as the only key management suite, and RSN capabilities zero -- no PMKID
+ * list and no group management cipher, both of which are optional and neither
+ * of which this port has anything to put in.  The group cipher is echoed from
+ * the BSS instead of being fixed at CCMP because a mixed-mode BSS legitimately
+ * advertises a weaker group cipher than its pairwise one, and clause 12.6.3
+ * has the access point refuse a request whose group cipher does not match its
+ * own.  No key material exists anywhere in this element.
+ */
+
+#define K1_RTL8852BS_IEEE80211_RSN_CAPABILITIES          0u
+#define K1_RTL8852BS_IEEE80211_RSN_BODY_SIZE             20u
+#define K1_RTL8852BS_ASSOC_RSN_IE_SIZE                     \
+  (2u + K1_RTL8852BS_IEEE80211_RSN_BODY_SIZE)
+
 /* One Association Request, IEEE 802.11 clause 9.3.3.6, and the Association
  * Response that answers it, clause 9.3.3.7.  The frame control is a
  * management frame of subtype 0 with every flag clear.  Like the
@@ -1584,9 +1606,11 @@ extern void k1_early_puthex(uintreg_t value);
  * the part's PHY rather than of this port's software, a 2.4 GHz 802.11ax radio
  * has them, and a station that claimed less would make the access point turn
  * protection on for every other station in the BSS -- a change to somebody
- * else's BSS that a diagnostic has no business making.  Privacy stays clear:
- * this host offers no cipher, which is also why only an access point that
- * advertises no Privacy can be asked to associate it.
+ * else's BSS that a diagnostic has no business making.  Privacy is not fixed:
+ * it is set when the target advertises it, and then an RSN element goes into
+ * the request as well, because a station that asks a Privacy BSS to associate
+ * it without naming a cipher suite is refused by clause 12.6.3 before its
+ * frame path is ever exercised.
  *
  * The listen interval is one beacon: this station never sleeps, so it is the
  * only honest value.
@@ -1605,7 +1629,15 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_ASSOC_LISTEN_INTERVAL               1u
 #define K1_RTL8852BS_ASSOC_BODY_SIZE                     4u
 #define K1_RTL8852BS_ASSOC_RESPONSE_BODY_SIZE            6u
-#define K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE              96u
+
+/* The largest Association Request this builder can produce: the 24-byte header,
+ * the 4-byte body, a 34-byte SSID element, the 10-byte and 6-byte rate
+ * elements and the 22-byte RSN element come to 100 bytes, so the buffer is the
+ * next power of two above that.  It was 96 while no RSN element was built,
+ * which is one byte less than a full-length SSID and an RSN element need.
+ */
+
+#define K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE              128u
 
 /* The largest management frame the host transmit path has to carry.  It is
  * the Association Request rather than the Probe Request, because the
@@ -5659,12 +5691,30 @@ static void k1_rtl8852bs_runtime_auth_disarm(void)
  * the answer to it is observed.
  */
 
+/* What the target BSS requires of a station's Association Request, read out of
+ * its Beacon and carried into the transmit path.  privacy is the capability bit
+ * exactly as the BSS advertised it, rsn says an RSN element is to be built, and
+ * group_cipher is the suite selector the BSS named for its group cipher, echoed
+ * back because clause 12.6.3 has the access point compare it against its own.
+ * A BSS with privacy set and rsn clear is one this port cannot ask at all; that
+ * combination never reaches the transmit path because the target selection
+ * skips it.
+ */
+
+struct k1_rtl8852bs_assoc_security_s
+{
+  bool privacy;
+  bool rsn;
+  uint8_t group_cipher;
+};
+
 struct k1_rtl8852bs_assoc_action_s
 {
   uint8_t bssid[6];
   uint8_t ssid[32];
   uint8_t ssid_length;
   uint8_t channel;
+  struct k1_rtl8852bs_assoc_security_s security;
   uint16_t capability;
   bool armed;
   bool transmitted;
@@ -5698,12 +5748,16 @@ static struct k1_rtl8852bs_assoc_action_s g_k1_rtl8852bs_assoc_action;
  *   both of those are results worth having rather than something to paper
  *   over.
  *
+ *   The security summary is a parameter for the same reason: it too is read
+ *   from the sweep result the later sweep overwrites.  A NULL summary means an
+ *   open BSS, which is what every caller before this one meant.
+ *
  ****************************************************************************/
 
-static void k1_rtl8852bs_runtime_assoc_arm(FAR const uint8_t *bssid,
-                                           uint8_t channel,
-                                           FAR const uint8_t *ssid,
-                                           uint8_t ssid_length)
+static void k1_rtl8852bs_runtime_assoc_arm(
+  FAR const uint8_t *bssid, uint8_t channel, FAR const uint8_t *ssid,
+  uint8_t ssid_length,
+  FAR const struct k1_rtl8852bs_assoc_security_s *security)
 {
   memset(&g_k1_rtl8852bs_assoc_action, 0,
          sizeof(g_k1_rtl8852bs_assoc_action));
@@ -5719,6 +5773,11 @@ static void k1_rtl8852bs_runtime_assoc_arm(FAR const uint8_t *bssid,
     {
       memcpy(g_k1_rtl8852bs_assoc_action.ssid, ssid, ssid_length);
       g_k1_rtl8852bs_assoc_action.ssid_length = ssid_length;
+    }
+
+  if (security != NULL)
+    {
+      g_k1_rtl8852bs_assoc_action.security = *security;
     }
 
   g_k1_rtl8852bs_assoc_action.channel = channel;
@@ -10011,9 +10070,19 @@ static void k1_rtl8852bs_runtime_auth_transmit(void)
  *   it actually heard rather than inventing a name for a BSS that suppresses
  *   its own.
  *
- *   No RSN element is built.  This host offers no cipher, so it may only ask
- *   an access point that advertises no Privacy to associate it, and the
- *   diagnostic refuses a Privacy-enabled target before reaching this point.
+ *   An RSN element is built when the target advertises one, and the Privacy
+ *   capability bit is set with it.  The element names one pairwise cipher
+ *   (CCMP), one key management suite (PSK) and the group cipher the target
+ *   itself advertised; it carries no key material, and none is derived here.
+ *   Sending it is what makes a Privacy access point answer at all: clause
+ *   12.6.3 has it refuse a request that names no suite, before anything about
+ *   this port's frame path is exercised.  The element goes after the two rate
+ *   sets, which is where the element order of clause 9.3.3.6 puts it.
+ *
+ *   An access point that advertises Privacy without an RSN element cannot be
+ *   asked by this port at all; the target selection skips such a BSS, and this
+ *   builder refuses the combination rather than sending a request that claims
+ *   confidentiality it cannot name.
  *
  * Input Parameters:
  *   frame        - Receives the frame.
@@ -10022,6 +10091,9 @@ static void k1_rtl8852bs_runtime_auth_transmit(void)
  *   bssid        - The access point.  It is both the destination and the BSSID.
  *   ssid         - The SSID element contents, as the BSS advertised them.
  *   ssid_length  - Its length, which may legitimately be zero.
+ *   security     - What the target requires: its Privacy bit, whether an RSN
+ *                  element is to be built, and its group cipher suite.  NULL
+ *                  means an open BSS.
  *   sequence     - The twelve-bit sequence number for this frame.
  *   length       - Receives the number of bytes written.
  *
@@ -10033,6 +10105,7 @@ static void k1_rtl8852bs_runtime_auth_transmit(void)
 static int k1_rtl8852bs_runtime_assoc_request_build(
   FAR uint8_t *frame, size_t frame_length, FAR const uint8_t *self_mac,
   FAR const uint8_t *bssid, FAR const uint8_t *ssid, uint8_t ssid_length,
+  FAR const struct k1_rtl8852bs_assoc_security_s *security,
   uint16_t sequence, FAR size_t *length)
 {
   /* The same two rate sets the Probe Request advertises: 1, 2, 5.5, 11, 6, 9,
@@ -10052,8 +10125,34 @@ static int k1_rtl8852bs_runtime_assoc_request_build(
       0x30u, 0x48u, 0x60u, 0x6cu
     };
 
+  /* The IEEE 802.11 OUI every standard cipher and key management selector is
+   * built from, clause 9.4.2.24.
+   */
+
+  static const uint8_t rsn_oui[] =
+    {
+      0x00u, 0x0fu, 0xacu
+    };
+
+  bool privacy = security != NULL && security->privacy;
+  bool rsn = security != NULL && security->rsn;
+  uint8_t group_cipher = security != NULL ?
+                         security->group_cipher :
+                         K1_RTL8852BS_IEEE80211_RSN_GROUP_UNKNOWN;
+  uint16_t capability = K1_RTL8852BS_ASSOC_CAPABILITY;
   size_t required;
   size_t offset;
+
+  /* Privacy without a suite to name, a suite to name without Privacy, or a
+   * group cipher this port could not decode, is a request that cannot be
+   * built honestly.
+   */
+
+  if (privacy != rsn ||
+      (rsn && group_cipher == K1_RTL8852BS_IEEE80211_RSN_GROUP_UNKNOWN))
+    {
+      return -EOPNOTSUPP;
+    }
 
   if (frame == NULL || length == NULL || self_mac == NULL || bssid == NULL ||
       !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
@@ -10067,7 +10166,8 @@ static int k1_rtl8852bs_runtime_assoc_request_build(
 
   required = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
              K1_RTL8852BS_ASSOC_BODY_SIZE + 2u + ssid_length +
-             2u + sizeof(supported_rates) + 2u + sizeof(extended_rates);
+             2u + sizeof(supported_rates) + 2u + sizeof(extended_rates) +
+             (rsn ? K1_RTL8852BS_ASSOC_RSN_IE_SIZE : 0u);
   if (frame_length < required)
     {
       return -EINVAL;
@@ -10088,7 +10188,12 @@ static int k1_rtl8852bs_runtime_assoc_request_build(
   k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
   offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
 
-  k1_rtl8852bs_write_le16(frame + offset, K1_RTL8852BS_ASSOC_CAPABILITY);
+  if (privacy)
+    {
+      capability |= K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY;
+    }
+
+  k1_rtl8852bs_write_le16(frame + offset, capability);
   k1_rtl8852bs_write_le16(frame + offset + 2,
                           K1_RTL8852BS_ASSOC_LISTEN_INTERVAL);
   offset += K1_RTL8852BS_ASSOC_BODY_SIZE;
@@ -10110,6 +10215,36 @@ static int k1_rtl8852bs_runtime_assoc_request_build(
   frame[offset++] = (uint8_t)sizeof(extended_rates);
   memcpy(frame + offset, extended_rates, sizeof(extended_rates));
   offset += sizeof(extended_rates);
+
+  if (rsn)
+    {
+      frame[offset++] = K1_RTL8852BS_IEEE80211_RSN_IE;
+      frame[offset++] = K1_RTL8852BS_IEEE80211_RSN_BODY_SIZE;
+      k1_rtl8852bs_write_le16(frame + offset,
+                              K1_RTL8852BS_IEEE80211_RSN_VERSION);
+      offset += 2u;
+
+      memcpy(frame + offset, rsn_oui, sizeof(rsn_oui));
+      frame[offset + sizeof(rsn_oui)] = group_cipher;
+      offset += K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+
+      k1_rtl8852bs_write_le16(frame + offset, 1u);
+      offset += 2u;
+      memcpy(frame + offset, rsn_oui, sizeof(rsn_oui));
+      frame[offset + sizeof(rsn_oui)] =
+        K1_RTL8852BS_IEEE80211_RSN_CIPHER_CCMP;
+      offset += K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+
+      k1_rtl8852bs_write_le16(frame + offset, 1u);
+      offset += 2u;
+      memcpy(frame + offset, rsn_oui, sizeof(rsn_oui));
+      frame[offset + sizeof(rsn_oui)] = K1_RTL8852BS_IEEE80211_RSN_AKM_PSK;
+      offset += K1_RTL8852BS_IEEE80211_RSN_SUITE_SIZE;
+
+      k1_rtl8852bs_write_le16(frame + offset,
+                              K1_RTL8852BS_IEEE80211_RSN_CAPABILITIES);
+      offset += 2u;
+    }
 
   *length = offset;
   return OK;
@@ -10153,11 +10288,17 @@ static void k1_rtl8852bs_runtime_assoc_transmit(void)
   sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
   g_k1_rtl8852bs_assoc_action.request_sequence = sequence;
   g_k1_rtl8852bs_assoc_action.capability = K1_RTL8852BS_ASSOC_CAPABILITY;
+  if (g_k1_rtl8852bs_assoc_action.security.privacy)
+    {
+      g_k1_rtl8852bs_assoc_action.capability |=
+        K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY;
+    }
 
   ret = k1_rtl8852bs_runtime_assoc_request_build(
     frame, sizeof(frame), g_k1_rtl8852bs_scan_self_mac,
     g_k1_rtl8852bs_assoc_action.bssid, g_k1_rtl8852bs_assoc_action.ssid,
-    g_k1_rtl8852bs_assoc_action.ssid_length, sequence, &frame_length);
+    g_k1_rtl8852bs_assoc_action.ssid_length,
+    &g_k1_rtl8852bs_assoc_action.security, sequence, &frame_length);
   if (ret >= 0)
     {
       ret = k1_rtl8852bs_runtime_mgmt_tx_frame(frame, frame_length, sequence,
@@ -10177,6 +10318,12 @@ static void k1_rtl8852bs_runtime_assoc_transmit(void)
   k1_early_puthex((uintreg_t)frame_length);
   k1_early_puts(" ssid-len=");
   k1_early_puthex(g_k1_rtl8852bs_assoc_action.ssid_length);
+  k1_early_puts(" cap=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.capability);
+  k1_early_puts(" rsn=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.security.rsn ? 1u : 0u);
+  k1_early_puts(" rsn-group=");
+  k1_early_puthex(g_k1_rtl8852bs_assoc_action.security.group_cipher);
   k1_early_puts(" sn=");
   k1_early_puthex(sequence);
   k1_early_puts(" status=");
@@ -18619,33 +18766,119 @@ static void k1_rtl8852bs_runtime_assoc_report(FAR const char *label)
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_security_from_bss
+ *
+ * Description:
+ *   Summarize what one BSS requires of an Association Request.  The summary is
+ *   copied out of the sweep result because every later sweep overwrites it, and
+ *   it is what decides whether an RSN element is built and which group cipher
+ *   goes into it.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_assoc_security_from_bss(
+  FAR const struct k1_rtl8852bs_scan_bss_s *bss,
+  FAR struct k1_rtl8852bs_assoc_security_s *security)
+{
+  if (security == NULL)
+    {
+      return;
+    }
+
+  memset(security, 0, sizeof(*security));
+  security->group_cipher = K1_RTL8852BS_IEEE80211_RSN_GROUP_UNKNOWN;
+  if (bss == NULL)
+    {
+      return;
+    }
+
+  security->privacy = (bss->capability &
+                       K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY) != 0;
+
+  /* The element is built only for a BSS that both requires confidentiality and
+   * advertises suites this port can name.  An open BSS that carries an RSN
+   * element anyway gets no element back: a station that claimed a cipher the
+   * BSS does not require would be describing a link it cannot set up.
+   */
+
+  if (security->privacy && bss->rsn_present && bss->rsn_pairwise_ccmp &&
+      bss->rsn_akm_psk &&
+      bss->rsn_group_cipher != K1_RTL8852BS_IEEE80211_RSN_GROUP_UNKNOWN)
+    {
+      security->rsn = true;
+      security->group_cipher = bss->rsn_group_cipher;
+    }
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_assoc_askable
+ *
+ * Description:
+ *   Whether this port is able to put an Association Request to one BSS at all.
+ *   A BSS that requires confidentiality is askable when it advertises an RSN
+ *   element naming CCMP among its pairwise ciphers, the pre-shared key suite
+ *   among its key management suites, and a group cipher this port decoded,
+ *   because that is the one combination the request builder can name.  A BSS
+ *   that requires confidentiality some other way -- TKIP only, a vendor suite,
+ *   SAE only -- is not askable, and that is a limitation of this port rather
+ *   than a property of the access point.
+ *
+ ****************************************************************************/
+
+static bool k1_rtl8852bs_runtime_assoc_askable(
+  FAR const struct k1_rtl8852bs_scan_bss_s *bss)
+{
+  struct k1_rtl8852bs_assoc_security_s security;
+
+  if (bss == NULL || bss->channel == 0)
+    {
+      return false;
+    }
+
+  k1_rtl8852bs_runtime_assoc_security_from_bss(bss, &security);
+  return security.privacy == security.rsn;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_assoc_target_select
  *
  * Description:
- *   Choose the access point the association step aims at.  Two things
- *   disqualify a candidate, and both are properties of this port rather than
- *   of the access point.
+ *   Choose the access point the association step aims at.  One thing
+ *   disqualifies a candidate outright: it requires confidentiality in a way
+ *   this port cannot name in an Association Request, which is every case
+ *   except an RSN element with CCMP among the pairwise ciphers and the
+ *   pre-shared key suite among the key management suites.  That is a
+ *   limitation of this port, and a BSS in that state is skipped rather than
+ *   asked, because the refusal it would return says nothing about this port's
+ *   frame path.
  *
- *   The first is Privacy.  An access point that sets the Privacy bit requires
- *   a cipher suite in the Association Request and a key exchange afterwards,
- *   and this component has no security engine initialized and no key of any
- *   kind, so asking one to associate would produce a refusal that says nothing
- *   about this port's frame path.  Such an access point is skipped rather than
- *   attempted.
+ *   Everything else is a preference, in this order:
  *
- *   The second is that the access point has to answer this host's
- *   Authentication Request, because IEEE 802.11 clause 11.3 lets an
- *   Association Request through only from state 2.  An access point already
- *   proven to answer in this run is therefore preferred, exactly as the join
- *   step prefers it and for the same reason: the question this step asks is
- *   what the Association Request does, and it can only be read against a peer
- *   whose authentication behaviour is already known.
+ *   1. A BSS that advertises its own SSID.  IEEE 802.11 clause 11.3.5.3 has
+ *      the access point compare the SSID element in the request against its
+ *      own, and a BSS that suppresses its SSID gives a station nothing to put
+ *      there, so it discards the request in silence.  Run 30 is the evidence:
+ *      three Association Requests to a hidden open BSS and three more with a
+ *      sibling's SSID drew no Association Response at all, while the same
+ *      access point had answered every Authentication Request -- which carries
+ *      no SSID element to compare.
+ *   2. An open BSS over an RSN one.  Both can be asked, but only the open one
+ *      leads to a link this port could carry data on: an RSN access point that
+ *      grants the association immediately starts a four-way handshake this
+ *      component has no key material to answer, and drops the station when it
+ *      times out.  The Association Response is still the result being asked
+ *      for, and it is real either way.
+ *   3. The access point already proven to answer this host's Authentication
+ *      Request in this run, because clause 11.3 lets an Association Request
+ *      through only from state 2, and an answer already observed is the
+ *      cheapest evidence that state 2 is reachable.
+ *   4. The BSS heard in the most beacons, as a tie-break: it is the strongest
+ *      signal among otherwise equal candidates.
  *
  * Input Parameters:
  *   result - a completed sweep
  *   proven - set to true when the returned entry is the access point that
- *            already answered an Authentication Request, false when it is this
- *            function's own choice among the open ones
+ *            already answered an Authentication Request, false otherwise
  *
  * Returned Value:
  *   The selected entry, or NULL when the sweep saw no access point this port
@@ -18658,6 +18891,8 @@ k1_rtl8852bs_runtime_assoc_target_select(
   FAR const struct k1_rtl8852bs_scan_result_s *result, FAR bool *proven)
 {
   FAR const struct k1_rtl8852bs_scan_bss_s *best = NULL;
+  unsigned int best_rank = 0;
+  bool best_proven = false;
   unsigned int index;
 
   if (proven != NULL)
@@ -18674,29 +18909,49 @@ k1_rtl8852bs_runtime_assoc_target_select(
        index < K1_RTL8852BS_SCAN_BSS_MAX; index++)
     {
       FAR const struct k1_rtl8852bs_scan_bss_s *bss = &result->bss[index];
+      unsigned int rank = 0;
+      bool proven_match;
 
-      if (bss->channel == 0 ||
-          (bss->capability & K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY) != 0)
+      if (!k1_rtl8852bs_runtime_assoc_askable(bss))
         {
           continue;
         }
 
-      if (g_k1_rtl8852bs_auth_proven.valid &&
-          memcmp(bss->bssid, g_k1_rtl8852bs_auth_proven.bssid,
-                 sizeof(g_k1_rtl8852bs_auth_proven.bssid)) == 0)
-        {
-          if (proven != NULL)
-            {
-              *proven = true;
-            }
+      /* The three preferences, weighted so that each outranks every
+       * combination of the ones below it.
+       */
 
-          return bss;
+      if (bss->ssid_present && bss->ssid_length > 0)
+        {
+          rank += 4;
         }
 
-      if (best == NULL || bss->beacon_frames > best->beacon_frames)
+      if ((bss->capability &
+           K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY) == 0)
+        {
+          rank += 2;
+        }
+
+      proven_match = g_k1_rtl8852bs_auth_proven.valid &&
+                     memcmp(bss->bssid, g_k1_rtl8852bs_auth_proven.bssid,
+                            sizeof(g_k1_rtl8852bs_auth_proven.bssid)) == 0;
+      if (proven_match)
+        {
+          rank += 1;
+        }
+
+      if (best == NULL || rank > best_rank ||
+          (rank == best_rank && bss->beacon_frames > best->beacon_frames))
         {
           best = bss;
+          best_rank = rank;
+          best_proven = proven_match;
         }
+    }
+
+  if (proven != NULL)
+    {
+      *proven = best_proven;
     }
 
   return best;
@@ -18801,6 +19056,9 @@ struct k1_rtl8852bs_assoc_attempt_s
  *   channel      - the channel it advertises
  *   ssid         - the SSID to put in the Association Request
  *   ssid_length  - its length, which may be zero
+ *   security     - what the target requires of the request: its Privacy bit,
+ *                  whether an RSN element is to be built, and the group cipher
+ *                  to echo in it
  *   result       - sweep result buffer, overwritten by this attempt
  *   attempt      - filled in with what this attempt observed
  *
@@ -18810,6 +19068,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
   FAR const char *label, FAR const char *auth_label,
   FAR const char *ssid_source, FAR const uint8_t *bssid, uint8_t channel,
   FAR const uint8_t *ssid, uint8_t ssid_length,
+  FAR const struct k1_rtl8852bs_assoc_security_s *security,
   FAR struct k1_rtl8852bs_scan_result_s *result,
   FAR struct k1_rtl8852bs_assoc_attempt_s *attempt)
 {
@@ -18832,6 +19091,10 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
   k1_early_puthex(ssid_length);
   k1_early_puts(" channel=");
   k1_early_puthex(channel);
+  k1_early_puts(" privacy=");
+  k1_early_puthex(security != NULL && security->privacy ? 1u : 0u);
+  k1_early_puts(" rsn=");
+  k1_early_puthex(security != NULL && security->rsn ? 1u : 0u);
   k1_early_puts(" bssid=");
   k1_rtl8852bs_scanofld_log_bytes(bssid, 6);
   k1_early_puts("\r\n");
@@ -18839,7 +19102,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
   before_valid = k1_rtl8852bs_runtime_tx_state_sample(&before) == OK;
 
   k1_rtl8852bs_runtime_auth_arm(bssid, channel);
-  k1_rtl8852bs_runtime_assoc_arm(bssid, channel, ssid, ssid_length);
+  k1_rtl8852bs_runtime_assoc_arm(bssid, channel, ssid, ssid_length, security);
   attempt->sweep_ret = k1_rtl8852bs_runtime_scanofld_passive_scan(result);
   k1_rtl8852bs_runtime_auth_disarm();
   k1_rtl8852bs_runtime_assoc_disarm();
@@ -18946,6 +19209,7 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
   FAR const struct k1_rtl8852bs_scan_bss_s *target;
   struct k1_rtl8852bs_assoc_attempt_s advertised;
   struct k1_rtl8852bs_assoc_attempt_s sibling;
+  struct k1_rtl8852bs_assoc_security_s security;
   FAR const struct k1_rtl8852bs_assoc_attempt_s *decided;
   uint8_t bssid[6];
   uint8_t ssid[K1_RTL8852BS_IEEE80211_SSID_MAX];
@@ -18992,6 +19256,7 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
 
   memcpy(bssid, target->bssid, sizeof(bssid));
   channel = target->channel;
+  k1_rtl8852bs_runtime_assoc_security_from_bss(target, &security);
   ssid_length = target->ssid_present ? target->ssid_length : 0u;
   if (ssid_length > sizeof(ssid))
     {
@@ -19019,6 +19284,14 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
   k1_early_puthex(ssid_length);
   k1_early_puts(" rsn=");
   k1_early_puthex(target->rsn_present ? 1u : 0u);
+  k1_early_puts(" rsn-group=");
+  k1_early_puthex(target->rsn_group_cipher);
+  k1_early_puts(" rsn-ccmp=");
+  k1_early_puthex(target->rsn_pairwise_ccmp ? 1u : 0u);
+  k1_early_puts(" rsn-psk=");
+  k1_early_puthex(target->rsn_akm_psk ? 1u : 0u);
+  k1_early_puts(" rsn-tx=");
+  k1_early_puthex(security.rsn ? 1u : 0u);
   k1_early_puts(" proven=");
   k1_early_puthex(proven ? 1u : 0u);
   k1_early_puts("\r\n");
@@ -19039,7 +19312,7 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
   k1_rtl8852bs_runtime_assoc_attempt("assoc advertised",
                                      "assoc advertised auth", "advertised",
                                      bssid, channel, ssid, ssid_length,
-                                     &result, &advertised);
+                                     &security, &result, &advertised);
   decided = &advertised;
 
   /* The sibling SSID is only worth trying when the target named itself in no
@@ -19056,7 +19329,7 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
       k1_rtl8852bs_runtime_assoc_attempt("assoc sibling", "assoc sibling auth",
                                          "sibling", bssid, channel,
                                          sibling_ssid, sibling_length,
-                                         &result, &sibling);
+                                         &security, &result, &sibling);
 
       /* The sibling becomes the reported attempt when it got further than the
        * advertised one.  Association is the whole point, so an associated

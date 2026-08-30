@@ -1553,14 +1553,24 @@ def main() -> int:
             # Everything is judged from the lines the association step prints,
             # sliced from its own target line so none of the earlier steps'
             # reports can satisfy these checks.  The target line also has to
-            # say privacy=0x0: this port offers no cipher suite, so an
-            # association claimed against a Privacy access point would mean the
-            # target selection had been bypassed rather than that the exchange
-            # worked.
+            # describe a BSS this port is allowed to ask, which is one of
+            # exactly two shapes: an open BSS, which gets no RSN element
+            # (privacy=0x0 rsn-tx=0x0), or a BSS that requires confidentiality
+            # and advertises suites the request builder can name, which gets one
+            # (privacy=0x1 rsn-ccmp=0x1 rsn-psk=0x1 rsn-tx=0x1).  Privacy
+            # without a transmitted RSN element, or an element sent to a BSS
+            # that did not ask for one, would mean the target selection had been
+            # bypassed rather than that the exchange worked -- the frame would
+            # be refused by IEEE 802.11 clause 12.6.3 before this port's frame
+            # path mattered.  rsn-tx is what the builder actually put in the
+            # request, so no beacon field can stand in for it.
             assoc_target_result = None
             for candidate in re.finditer(
                     rb"K1 Wi-Fi GPL: assoc target bssid=([0-9a-f]{12}) "
-                    rb"channel=(?:0x)?0*[1-9a-fA-F][^\r\n]* privacy=0x0+"
+                    rb"channel=(?:0x)?0*[1-9a-fA-F][^\r\n]*"
+                    rb"(?: privacy=0x0+ [^\r\n]*rsn-tx=0x0+"
+                    rb"| privacy=0x0*1 [^\r\n]*rsn-ccmp=0x0*1"
+                    rb" rsn-psk=0x0*1 rsn-tx=0x0*1)"
                     rb"(?![0-9a-fA-F])",
                     started):
                 if candidate.group(1).strip(b"0"):
@@ -1569,7 +1579,7 @@ def main() -> int:
 
             if assoc_target_result is None:
                 missing.append(
-                    "RTL8852BS2 association target BSS without Privacy")
+                    "RTL8852BS2 association target BSS this port may ask")
                 assoc = started
             else:
                 assoc = started[assoc_target_result.end():]
