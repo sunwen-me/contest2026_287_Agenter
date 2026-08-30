@@ -5162,3 +5162,100 @@ AKM PSK、RSN capabilities 0），目标改成已经被证明会回认证请求�
 Association Response 之后才是 `sec_eng_init`/`sec_info_tbl_init` 和四次握手。3b 欠的
 上游顺序（`JOININFO` 在认证前 `dis_conn=true`、关联时才翻 `dis_conn=false` 并把 port
 设成 INFRA、调 `mac_port_init()`）在 3d 一起还。
+
+### 增量 3d：Association Request 带 SSID ＋ RSN element，AP 授予 AID（关联完成）
+
+提交 `b2d9e6f`，板上 run 31，日志 `out/k1-serial/k1-assoc-20260830T125240Z.log`，
+镜像仍是 `wireless_assoc_diag`，ELF SHA-256
+`2fe2282ddb4113892d8ac983d3e75c42f495cb368caf45e9fe4fe9b7a07b199e`。
+**本 runner 的 30 项 `--require-*` 全部通过，退出码 0**，包括 3c 没过的那三项。
+
+#### 改了什么（只有两件事，都在请求内容和目标选择上）
+
+1. **请求里补上该 BSS 自己的 SSID 和一条 RSN element。** 元素按 clause 9.3.3.6 排在两张
+   速率表之后：id 48、长度 20，body = version LE16 1、组密码 `00 0f ac <group>`、
+   成对密码计数 LE16 1 ＋ `00 0f ac 04`、AKM 计数 LE16 1 ＋ `00 0f ac 02`、
+   RSN capabilities LE16 0。**没有任何密钥材料**——element 声明的是要求，不是密钥。
+   capability 里按目标的 Privacy 位置 1（`0x421` → `0x431`）。
+   `K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE` 96 → 128（24 头 + 4 body + 34 SSID +
+   10 rates + 6 ext rates + 22 RSN = 100）。
+2. **目标选择从「跳过一切 Privacy BSS」改成打分排序。** 公布 SSID(+4) > 不加密(+2) >
+   已被证明会回认证请求(+1)，Beacon 数破平。本端说不清其要求的 Privacy BSS
+   （只有 TKIP 成对密码、厂商私有 suite、只有 SAE）仍然跳过并返回 `-EOPNOTSUPP`；
+   `k1_rtl8852bs_runtime_assoc_askable()` 在两侧都要求 `privacy == rsn`。
+
+组密码必须**回抄** BSS 公布的值，不能固定写 CCMP：混合模式 BSS 会合法地公布一个比成对
+密码更弱的组密码，AP 会拿请求里的组密码和自己的比。run 31 的目标是 `rsn-group=0x4`
+（CCMP），而同一次普查里 `789682af9f60` 就是 `rsn-group=0x2`（TKIP）。
+
+#### 上板之前先在主机上逐字节验过
+
+把 `k1_rtl8852bs_runtime_assoc_request_build()` 连它需要的宏抽到一个一次性的 gcc 程序里
+（`FAR`/`OK`/`k1_rtl8852bs_write_le16`/`k1_rtl8852bs_addr_cam_mac_valid` 打桩），
+20 条断言全过后才花一次上板：开放 BSS ＋ 空 SSID = 46 字节且 capability 不带 Privacy；
+SSID `SB` ＋ RSN = **70 字节**、capability `0x0431`、元素字节
+`30 14 01 00 00 0f ac 04 01 00 00 0f ac 04 01 00 00 0f ac 02 00 00`；
+混合模式回抄 `rsn-group=2` 而成对密码仍是 4；32 字节 SSID ＋ RSN = 100 字节正好装得下；
+四条拒绝路径（Privacy 无 RSN、RSN 无 Privacy、组密码没解出来、99 字节缓冲区）各返回
+`-EOPNOTSUPP`/`-EINVAL`。板上实测 `bytes=0x46` 与主机预期完全一致。
+
+#### 板上证据
+
+```
+assoc target bssid=504f3be2e6d2 channel=0x1 beacons=0xd cap=0x431 privacy=0x1
+  ssid-len=0x2 rsn=0x1 rsn-group=0x4 rsn-ccmp=0x1 rsn-psk=0x1 rsn-tx=0x1 proven=0x1
+assoc advertised begin ssid-source=advertised ssid-len=0x2 channel=0x1 privacy=0x1 rsn=0x1
+auth request tx  channel=0x1 bytes=0x1e sn=0x6 status=0x0
+assoc request tx channel=0x1 bytes=0x46 ssid-len=0x2 cap=0x431 rsn=0x1 rsn-group=0x4
+  sn=0x7 status=0x0
+assoc advertised auth req=0x1 req-sn=0x6 tx-status=0x0 frames=0x1 rsp-self=0x1
+  rsp-target=0x1 alg=0x0 seq=0x2 status=0x0 a2=504f3be2e6d2
+assoc advertised      req=0x1 req-sn=0x7 req-bytes=0x46 tx-status=0x0 frames=0x1
+  rsp-self=0x1 rsp-target=0x1 rsp-cap=0x431 status=0x0 aid=0x1 a2=504f3be2e6d2
+assoc exchange rsp=0x1 status=0x0 aid=0x1 auth-rsp=0x1 beacons=0x18 bss=0x2 sweep=0x0
+assoc info done-ack return=0x0
+assoc CAM  done-ack return=0x0
+assoc confirm bss=0x6 beacons=0xb aid=0x1
+RTL8852BS2 station association complete
+```
+
+`rsp-self` 是 host 侧把 A1 和 eFuse 自身 MAC 逐字节比出来的，`status`/`aid` 是从 body
+读的（AID 按 clause 9.4.1.8 掩掉高两位保留位），所以这一行只可能来自一帧真的、发给本机的
+Association Response。同一次 sweep 的管理帧子类型直方图独立佐证：
+subtype 11（Authentication）=1、subtype 1（Association Response）=1，
+subtype 8（Beacon）=0x31。**一次请求就被回答**，而 run 30 是六次全沉默——
+发送路径两轮完全一样，差别只在请求内容。
+
+#### 两条能直接复用的结论
+
+- **Association Request 沉默，先查请求内容，不要先动 MAC/PHY。** 两处硬要求：
+  clause 11.3.5.3 要带该 BSS 自己的 SSID（认证请求不带 SSID，所以隐藏 SSID 的 BSS 会
+  「认证能过、关联静默」）；clause 12.6.3 对带 Privacy 的 BSS 要求给出密码套件，
+  否则请求在本移植任何一行代码被检验之前就已经被拒。
+- **关联成功不改变 port 的硬件状态。** run 31 结束时 `c400=0x1e01b`：bit2
+  `PORT_FUNC_EN`=0、`NET_TYPE`=0（NO_LINK）。整个认证/关联是在 scan-offload 停驻的
+  dwell 上由软件收发管理帧完成的，`mac_port_init()` 仍然没移植。
+
+#### AP 随后把我们踢了，这是预期行为
+
+确认 sweep 里目标 BSS 的 `mgmt-other=0x1`、子类型直方图 index 12 = 1，
+**即 AP 发了一帧 Deauthentication**。本端没有 PMK/PTK、也没有 `sec_eng_init`，
+四次握手一帧都答不上来，AP 超时后踢掉这个 station 完全正确。
+（本端没有按 A1 过滤 deauth，所以「这一帧是发给本机的」是强推断而非证明；
+要变成证明，需要给 deauth 也加一条 A1 == self 的计数。）
+
+#### 下一步
+
+增量 3e：`sec_eng_init` / `sec_info_tbl_init` ＋ WPA2 四次握手——这是现在唯一挡在
+「关联成功」和「能收发数据」之间的东西。同一批把 3b/3c/3d 欠的原厂顺序还掉
+（`JOININFO` 在认证前 `dis_conn=true`、关联时才翻 `dis_conn=false` 并把 port 设成 INFRA、
+调 `mac_port_init()`），并把 `mac_port_init()` 的 band0/port0 子集补上：对 STA 就是
+`R_AX_PORT_CFG_P0`(0xC400) 先 `FUNC_SW=0`、`TXBCN_RPT_EN`/`RXBCN_RPT_EN` 清零、
+`NET_TYPE`(bit11:10)=2(INFRA)、`TBTT_PROHIB_EN`(bit13) ＋ `BRK_SETUP`(bit16)=1、
+`RX_BSSID_FIT_EN`(bit4)=1、`TSF_UDT_EN`(bit3)=1、`BCNTX_EN`(bit12)=0，再配
+`BCN_INTV`/`BSS_CLR`/`TBTT_AGG=1`/`HIQ_WIN`/`HIQ_DTIM`/hiq `pkt_drop`/
+`BCN_HOLD_TIME=400`/`BCN_MASK_AREA=0`，**最后**才 `PORT_FUNC_EN`(bit2)=1，
+延时 10 µs 再写 `BCN_ERLY=160`/`BCN_SETUP_TIME=4`/`TBTT_ERLY=5`
+（原厂 `mport.c:2010-2305`、常量在 `mport.h:23-31`）。
+另外值得顺手补的证据：把认证/关联响应的前 32 字节原样打到串口——run 31 的响应帧字节
+被 armed 期间的输出抑制吃掉了，判据只能依赖解析后的字段。

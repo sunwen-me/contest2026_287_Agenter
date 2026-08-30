@@ -59,7 +59,27 @@
   本 runner 的 30 条 `--require-*` 过 27 条，提交 `7c1cbe4`）。run 27 那种「同一个二进制
   一轮成一轮不成」的抖动由此消失。**关联仍然没成**：Association Request 确实发出去了
   （两个 BSS 各 3 次、46/48 字节），但一帧 Association Response 都没收到，
-  `station association error=0x3d`；原因见下一节
+  `station association error=0x3d`；原因和修法见下一条（增量 3d）
+- **真正的 802.11 关联完成（增量 3d）**：把 Association Request 补上该 BSS 自己的 SSID
+  和一条 RSN element（id 48、长度 20：version 1、组密码回抄 BSS 公布的值、成对密码 CCMP、
+  AKM PSK、RSN capabilities 0，**不含任何密钥材料**），并把目标从「只挑不带 Privacy 的
+  BSS」改成打分挑「本端能说清其要求的 BSS」，run 31 一次就成了：
+  `assoc target bssid=504f3be2e6d2 … cap=0x431 privacy=0x1 ssid-len=0x2 rsn=0x1
+  rsn-group=0x4 rsn-ccmp=0x1 rsn-psk=0x1 rsn-tx=0x1 proven=0x1`、
+  `assoc request tx … bytes=0x46 cap=0x431 rsn=0x1 rsn-group=0x4 sn=0x7 status=0x0`
+  （70 字节，正是主机侧逐字节自测预期的长度），然后
+  **`assoc advertised req=0x1 req-bytes=0x46 tx-status=0x0 frames=0x1 rsp-self=0x1
+  rsp-target=0x1 rsp-cap=0x431 status=0x0 aid=0x1 a2=504f3be2e6d2`** —— AP 回了一帧
+  Association Response，A1 等于本机 eFuse MAC、A2 等于目标 BSSID、状态码 0（成功）、
+  授予 AID 1。同一次 sweep 的管理帧子类型直方图独立佐证：subtype 11（Authentication）=1、
+  subtype 1（Association Response）=1。随后 `assoc info done-ack return=0x0`、
+  `assoc CAM done-ack return=0x0`（两条 join 命令带着 AID 重发并被固件确认）、
+  `assoc confirm bss=0x6 beacons=0xb aid=0x1`、`RTL8852BS2 station association complete`；
+  本 runner 的 30 条 `--require-*` **全部通过**，退出码 0。日志
+  `out/k1-serial/k1-assoc-20260830T125240Z.log`，提交 `b2d9e6f`，ELF SHA-256
+  `2fe2282ddb4113892d8ac983d3e75c42f495cb368caf45e9fe4fe9b7a07b199e`。
+  与 run 30 的唯一差别就是请求内容：run 30 对隐藏 SSID 的开放 VAP 发了 6 次都没人理，
+  run 31 对同一台 AP 的 WPA2-PSK VAP 只发 1 次就拿到了 AID。
 - H5 版本结果：HCI `0x0b/0x000b`，manufacturer `0x005d`，LMP subversion `0x8852`
 
 最新已通过的扫描/PHY/FW 日志（运行 12，13 信道被动扫描）：
@@ -78,30 +98,30 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 
 ## 尚未完成，禁止误报
 
-- **关联没有完成，`station join complete` 不是关联。** run 30 首次把 join 的三条命令
-  链路全部跑通并打出 `RTL8852BS2 station join complete`，随后向两个 BSS 各发了 3 次
-  Association Request（带新序列号、46/48 字节、`frames=0x0`），**一帧 Association
-  Response 都没有**，`station association error=0x3d`(ENODATA)、`bring-up failed: -61`。
-  说「join 全链通了、管理帧交换可重复了」是对的，说「关联上了」是误报。
-  根因目前判定是**射频环境 ＋ 请求内容**，不是发送路径：run 30 的 BSS 普查里，
-  所有公布 SSID 的 BSS 都带 Privacy ＋ RSN（基本都是 CCMP+PSK），而唯一两个不带
-  Privacy 的（`564f3be2e6d2`、`a639b3663b34`，cap=0x421、rsn=0）**不公布 SSID**；
-  Association Request 按 IEEE 802.11 11.3.5.3 必须带该 BSS 自己的 SSID，
-  隐藏 SSID 的 BSS 只会静默丢弃（认证请求不带 SSID，所以认证能过、关联不能）。
-  另外 `50:4f:…` 与 `56:4f:…` 只差本地管理位，是同一台物理 AP 的两个 VAP，
-  所以「两个 AP 都不理我们」实际是一台 AP 的同一种行为。可行路线见
-  「建议 Claude 的下一步」的增量 3d。
-- **认证通了、join 命令被固件接受了，都不等于关联通了。** run 20/run 25 收到的是 AP 的
-  Authentication Response，`status=0` 是 AP 给的成功码；增量 3b 之后固件和 ADDR_CAM
-  也确实知道本机属于这个 BSS。但从来没有一帧 Association Response（增量 3c 已经把
-  Association Request 发上去了，见上条）、没有 AID、没有密钥、
-  port 0 仍是 `PORT_FUNC_EN=0`/`NET_TYPE=0`/TSF 冻结（`mac_port_init()` 未移植）。
-  说「能和 AP 完成 open-system 认证交换的一个来回，并让固件接受 join 状态」是对的，
-  说「关联上了」「Wi-Fi 通了」是误报。
+- **关联完成了，但链路还不能用：没有密钥、没有四次握手、没有数据面。** run 31 拿到的
+  AID 是真的，但 RSN element 只是「声明要求」，本端没有 PMK/PTK，也没有移植
+  `sec_eng_init`/`sec_info_tbl_init`，所以 AP 发起的四次握手一帧都答不上来。
+  证据就在同一次运行的确认 sweep 里：目标 BSS 的 `mgmt-other=0x1`、管理帧子类型直方图
+  index 12 = 1，**即 AP 发了一帧 Deauthentication**（本端没有按 A1 过滤 deauth，
+  所以「这一帧是发给本机的」只是强推断，不是证明）。也就是说 AP 承认了这次关联，
+  然后因为握手超时把这个 station 踢掉——这正是预期行为，不是回归。
+  另外 port 0 到关联结束仍然是 `c400=0x1e01b`：**bit2 `PORT_FUNC_EN`=0、
+  `NET_TYPE`=0（NO_LINK）**，整个认证/关联是在 scan-offload 停驻的 dwell 上由软件收发
+  管理帧完成的，硬件层面这个 port 根本没被使能，`mac_port_init()` 仍未移植。
+  说「完成了 802.11 关联、AP 授予了 AID」是对的，说「Wi-Fi 通了」「能收发数据」是误报。
+- **认证、join、关联三步都过了，仍然不等于「Wi-Fi 通了」。** run 20/run 25 收到的是 AP 的
+  Authentication Response（`status=0`）；增量 3b 之后固件和 ADDR_CAM 知道本机属于这个 BSS；
+  增量 3d 又拿到了 Association Response 和 AID 1。缺的是这三步之后的东西：密钥（四次握手，
+  需要 `sec_eng_init`/`sec_info_tbl_init`）、一个真正被使能的 port（`mac_port_init()`）、
+  一个静态工作信道（`rtw8852b_set_channel_{mac,bb,rf}`，现在还是从停驻的扫描 dwell 上发包）、
+  以及 BB/RF 的 DM 校准（DACK/RCK/IQK/DPK/TSSI）。
+  说「能和 AP 完成 open-system 认证 ＋ 关联并拿到 AID」是对的，
+  说「关联上了就等于联网了」是误报。
   （原来这里写的「硬件不会 ACK 这一帧，AP 会重传几次然后超时」是没有证据的推测，
   已删除：run 25 里每一次被回答的交换 `TX PPDU.lcck` 恰好 +2、run 24 里每一次没被回答
   的只 +1，多出来的那一个 PPDU 只能是本机发的。详见 `K1_WIRELESS_BRINGUP.md` 增量 3b。）
-- 没有关联、WPA、DHCP 或联网。`wireless_wlan0_scan_diag` 里那个**只报告扫描结果**的
+- **`wlan0` 这个网络接口自己仍然不做关联、WPA、DHCP 或联网。**（增量 3d 的关联发生在
+  `wireless_assoc_diag` 的诊断路径里，不在 `wlan0` 的 ioctl 后面。）`wireless_wlan0_scan_diag` 里那个**只报告扫描结果**的
   `wlan0` 已经在实板通过 25 项 `--require-*` 全链（run 7，见下），但它的范围就只有扫描：
   `SIOCSIWSCAN` 同步跑一次 13 信道被动 sweep、`SIOCGIWSCAN` 读回结果——**没有 TX、
   没有数据 RX 路径、不关联、不认证、无密钥、无 RSSI（不伪造 `IWEVQUAL`）、无 IP**。
@@ -275,25 +295,32 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   115200 8N1 下约 550 ms，而一个 dwell 只有 180 ms）。外加 done-ack RX 缓冲 512 → 8192，
   这是 run 29 `-ENOSPC` 的根因。效果：`prejoin-rsp=0x1 joininfo-rsp=0x1 cam-rsp=0x1`
   ＋ `RTL8852BS2 station join complete`。**仍然不是关联**，见「尚未完成，禁止误报」第一条。
-- **下一步优先级**：(1) 增量 3d：让 Association Request 能被回答。3c 已经把请求发上去了
-  （capability、listen interval、SSID、supported/extended rates，`broadcast=false` 走
-  `k1_rtl8852bs_runtime_mgmt_tx_frame()`，挂在 parked dwell 上），缺的是目标和内容：
-  目标改成已经被证明会回认证请求的 WPA2-PSK AP `504f3be2e6d2`（SSID `SB`、cap=0x431、
-  RSN CCMP+PSK、`proven=0x1`）；请求里带该 BSS 自己的 SSID，加一条匹配的 RSN element
-  （element 48，version 1、组密码 CCMP、成对密码 CCMP、AKM PSK、RSN capabilities 0，
-  20 字节 body / 22 字节 IE，**不含任何密钥材料**——需要先把 Beacon 里的 RSN IE 存进
-  `struct k1_rtl8852bs_scan_bss_s`）；capability 按目标的 Privacy 位置 1；
-  `K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE` 从 96 提到 128（24+4+34+10+6+22 = 100 已超 96）；
-  验收脚本里 `privacy=0x0` 那条锚点改成「目标公布 RSN 且是 CCMP+PSK」，不要删掉。
-  然后解 subtype=1 的 `status`/`aid`，拿到 AID 后重发
-  一次 ADDR_CAM，`status` 非零要照实报告。同一批要把 3b/3c 欠的原厂顺序补回来：`JOININFO`
-  `dis_conn=true` 在认证之前，`dis_conn=false` + INFRA port + `mac_port_init()`
-  只在关联时；`mac_port_init()` 的 band0/port0 子集（NO_LINK/INFRA，不做
-  MBSSID/AP/DBCC）输入已经收集齐（`mport.c:2010-2305` 与 `mport.h` 的 DEF 常量）。
-  (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
+- **已完成（2026-08-30，增量 3d）：802.11 关联在板上完成，AP 授予 AID 1。**
+  run 31，镜像 `wireless_assoc_diag`，本 runner 的 30 条 `--require-*` 全过、退出码 0，
+  提交 `b2d9e6f`。改动就两件事：(a) Association Request 里补上目标 BSS 的 SSID 和一条
+  RSN element（组密码回抄 BSS 的公布值，因为混合模式 AP 的组密码可以弱于成对密码，
+  而 AP 会拿请求里的组密码和自己的比）；(b) 目标选择从「跳过一切 Privacy BSS」改成
+  打分排序：公布 SSID(+4) > 开放(+2) > 已被证明会回认证(+1)，Beacon 数破平；
+  本端说不清其要求的 Privacy BSS（只有 TKIP 成对密码、厂商私有 suite、只有 SAE）
+  仍然跳过并返回 `-EOPNOTSUPP`。`K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE` 96 → 128。
+  **关联之后的链路仍然不通**，见「尚未完成，禁止误报」第一条。
+- **下一步优先级**：(1) `sec_eng_init` / `sec_info_tbl_init` ＋ WPA2 四次握手：
+  这是现在唯一挡在「关联成功」和「能收发数据」之间的东西——run 31 已经证明 AP 会授予 AID、
+  也会在握手超时后发 Deauthentication。同一批要把 3b/3c/3d 欠的原厂顺序补回来：
+  `JOININFO` `dis_conn=true` 在认证之前，`dis_conn=false` + INFRA port +
+  `mac_port_init()` 只在关联时。
+  (2) `mac_port_init()` 的 band0/port0 子集（NO_LINK/INFRA，不做 MBSSID/AP/DBCC）。
+  输入已收集齐（`mport.c:2010-2305`、`mport.h` 的 DEF 常量）；对 STA 而言就是把
+  `R_AX_PORT_CFG_P0`(0xC400) 按顺序写成：先 `FUNC_SW=0`，`TXBCN_RPT_EN`(bit0)/
+  `RXBCN_RPT_EN`(bit1) 清零，`NET_TYPE`(bit11:10)=2(INFRA)，`TBTT_PROHIB_EN`(bit13)＋
+  `BRK_SETUP`(bit16)=1，`RX_BSSID_FIT_EN`(bit4)=1，`TSF_UDT_EN`(bit3)=1，
+  `BCNTX_EN`(bit12)=0，再配 `BCN_INTV`/`BSS_CLR`/`TBTT_AGG=1`/`HIQ_WIN`/`HIQ_DTIM`/
+  hiq pkt_drop/`BCN_HOLD_TIME=400`/`BCN_MASK_AREA=0`，**最后**才 `PORT_FUNC_EN`(bit2)=1，
+  延时 10 µs 再写 `BCN_ERLY=160`/`BCN_SETUP_TIME=4`/`TBTT_ERLY=5`。
+  run 31 结束时实测 `c400=0x1e01b`，bit2 与 `NET_TYPE` 都还是 0。
+  (3) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
   发送正确性与 RSSI 精度要靠它；同一批还有 `set_enable_bb_rf(hal, 0)` 的 disable 半边、
   `halbb_dm_init()`/`halrf_dm_init()` 正文、五张 `init_rf_reg` store 表、halbb `phy_reg_gain`。
-  (3) `sec_eng_init` / `sec_info_tbl_init`，WPA2 4-way 之前补。
   (4) 真正的 STA 链路最终还是要把 `rtw8852b_set_channel_{mac,bb,rf}` 移植进来，
   让信道控制不再依赖扫描卸载状态机。
 
@@ -312,6 +339,15 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
+- **Association Request 沉默的原因几乎总在请求内容里，不在发送路径里。** run 30 发了 6 次
+  没有一帧回应，run 31 只发 1 次就拿到 AID，两者的发送路径完全一样。两处必须满足：
+  IEEE 802.11 11.3.5.3 要求请求带该 BSS 自己的 SSID（认证请求不带 SSID，
+  所以隐藏 SSID 的 BSS 会「认证能过、关联静默」）；clause 12.6.3 要求对带 Privacy 的 BSS
+  必须给出密码套件，否则请求在本移植的任何一行代码被检验之前就已经被拒。
+  推论：调试关联先打印/校验请求字节，不要先去动 MAC 或 PHY。
+- **RSN element 的组密码必须回抄 BSS 公布的值，不能固定写 CCMP。** 混合模式 BSS 会合法地
+  公布一个比成对密码更弱的组密码，而 AP 会把请求里的组密码和自己的比。run 31 的目标
+  `rsn-group=0x4`（CCMP），但同一次普查里 `789682af9f60` 就是 `rsn-group=0x2`（TKIP）。
 - **host 自建的管理帧必须带真序列号。** 帧里的序列控制字段就是上空气的那个；描述符里
   能让硬件代填的 `AX_TXD_HW_SSN_SEL`/`AX_TXD_EN_HWSEQ_MODE` 在本移植里都是 0。所有请求
   共用一个号码 = 触发 802.11 clause 10.3.2.14 重复检测，AP 会 ACK 然后丢掉，症状是
@@ -399,17 +435,18 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 上面这段「第一块砖是 TX」已经完成：Probe Request 真发出去并收到 Probe Response
 （run 14）、open-system 认证收到 AP 的成功回复（run 20 / 增量 3a）、station join 的两条
 命令被固件接受（run 25 / 增量 3b）、join 全链 ＋ 可重复的管理帧交换（run 30 / 增量 3c）。
-**当前实际下一步是增量 3d：让 Association Request 能被回答**，做法与欠账见
-「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3c 镜像：
+**当前实际下一步是增量 3e：WPA2 四次握手（`sec_eng_init`/`sec_info_tbl_init`）**，
+因为增量 3d 已经在 run 31 拿到 AID 1、并观察到 AP 在握手超时后发 Deauthentication。
+做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3d 镜像：
 
 ```bash
 tools/build_k1_assoc.sh           # profile board/k1/muse_pi_pro/configs/wireless_assoc_diag
 ```
 
 板上验收在既有 28 条 `--require-*` 之后追加 `--require-runtime-assoc-response` 与
-`--require-runtime-assoc`（共 30 条），运行日志
-`out/k1-serial/k1-assoc-20260830T120636Z.log`；run 30 过 27 条，没过的三条正是
-Association Response、关联本身、以及依赖它们的 bring-up 成功。
+`--require-runtime-assoc`（共 30 条）。run 31（提交 `b2d9e6f`）**30 条全过、退出码 0**，
+日志 `out/k1-serial/k1-assoc-20260830T125240Z.log`；上一轮 run 30 过 27 条，
+没过的三条正是 Association Response、关联本身、以及依赖它们的 bring-up 成功。
 
 TX 正确性依赖的初始化缺口
 （`rtw_hal_bb_dm_init`/`rtw_hal_rf_dm_init` 那一批）见本节前面的清单
