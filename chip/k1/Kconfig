@@ -783,12 +783,12 @@ config K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
 		Response is decoded, while the radio is still parked on the target's
 		channel.
 
-		Only an access point that advertises no Privacy is asked. This component
-		has no security engine initialized and holds no key, so it can offer no
-		cipher suite, and a Privacy access point would refuse the request for
-		that reason alone. Such an access point is skipped rather than attempted,
-		and a run with nothing else in range fails with EOPNOTSUPP, which
-		describes this port and not the radio environment.
+		An access point that advertises Privacy is asked only when its RSN
+		element offers CCMP among the pairwise ciphers and the pre-shared key
+		suite among the key management suites, because that pair is the only one
+		this port can name in an Association Request. Anything else is skipped
+		rather than attempted, and a run with nothing else in range fails with
+		EOPNOTSUPP, which describes this port and not the radio environment.
 
 		Up to two attempts are made and the difference between them is the SSID.
 		The first uses what the target advertised, zero length included, because
@@ -809,11 +809,89 @@ config K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
 		An answered exchange is the result, whatever status code it carried; the
 		completion line is printed only for status 0 with a non-zero identifier,
 		and a refusal is reported as a refusal. An identifier is not a working
-		link: no key is installed, no four-way handshake is run, no data frame is
-		sent or received, no network device changes behaviour, no IP address is
-		configured, and the port's TSF is still frozen because mac_port_init() is
-		not ported yet. Nothing is written to eMMC, SPI flash, eFuse or the
-		U-Boot environment.
+		link: no key is installed, no data frame is sent or received, no network
+		device changes behaviour, no IP address is configured, and the port's TSF
+		is still frozen because mac_port_init() is not ported yet. This option
+		runs no four-way handshake; K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC is the
+		one that does. Nothing is written to eMMC, SPI flash, eFuse or the U-Boot
+		environment.
+
+config K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC
+	bool "Require the RTL8852BS2 WPA2-PSK four-way handshake"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
+	---help---
+		Continue the association of K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC into
+		the WPA2-PSK four-way handshake of IEEE 802.11 clause 12.7.6, and require
+		the access point's third EAPOL-Key message to carry an integrity code
+		this host verifies. This replaces the association step rather than adding
+		a third one: the access point sends its first EAPOL-Key frame within
+		milliseconds of granting the association, so the only place it can be
+		answered is the receive loop of the sweep the association happened in.
+
+		A verified integrity code on the third message is the strongest evidence
+		short of encrypted traffic. The access point can only compute it from a
+		pairwise transient key derived from the same pairwise master key, over
+		the same frame bytes, in the same order, so one verification confirms the
+		passphrase, the PBKDF2 derivation, the pairwise key expansion, the nonce
+		and address ordering, and every byte of the EAPOL-Key frame this host
+		transmitted, all at once.
+
+		The handshake needs no security engine and installs no key: all four
+		EAPOL-Key frames are unprotected. The group key that arrives wrapped
+		inside the third message is not unwrapped, because AES key unwrap is not
+		ported; the third message's integrity code covers the wrapped bytes as
+		they arrived, so it verifies without decrypting anything.
+
+		A key descriptor version this port cannot compute is refused rather than
+		answered with a wrong integrity code, and the step then fails with
+		EOPNOTSUPP. No passphrase configured fails with ENOKEY, an access point
+		that sent no first message or stopped answering fails with ETIMEDOUT, and
+		a third message whose integrity code does not verify fails with EBADMSG,
+		which is what a wrong passphrase looks like.
+
+		No key material is printed: not the passphrase, not the pairwise master
+		key, and none of the transient key or its three sub-keys. What the
+		console carries is which frame arrived, which one went out, and whether
+		the integrity code verified. Nothing is written to eMMC, SPI flash, eFuse
+		or the U-Boot environment.
+
+config K1_RTL8852BS2_RUNTIME_WPA_PASSPHRASE
+	string "RTL8852BS2 WPA2-PSK passphrase"
+	default ""
+	---help---
+		The WPA2-PSK passphrase of the access point the handshake aims at, 8 to
+		63 characters. Empty by default and empty in every committed defconfig:
+		this is a credential and belongs in nobody's repository.
+
+		Supply it at configure time instead, from outside the source tree.
+		tools/build_k1_wpa.sh reads K1_WIFI_PASSPHRASE from the environment or
+		from ~/.config/k1-wifi-psk.env and writes a generated defconfig outside
+		the repository that includes the committed profile and appends this line,
+		so a tree that is committed or published never carries the value.
+
+		It is used once, before any sweep, to derive the pairwise master key with
+		PBKDF2-SHA1 over 4096 iterations salted with the SSID, and is not stored
+		or printed anywhere afterwards.
+
+config K1_RTL8852BS2_RUNTIME_WPA_SSID
+	string "RTL8852BS2 WPA2-PSK network name"
+	default ""
+	---help---
+		The SSID of the one network the handshake may aim at. Empty means any RSN
+		access point in range that advertises its own name, which is only useful
+		where exactly one is.
+
+		Naming it matters because a pairwise master key is the passphrase salted
+		with the SSID: it belongs to one network and to no other. Aiming at a
+		different RSN access point would produce an integrity code that does not
+		verify, and that is indistinguishable in the log from a key derivation
+		this port got wrong, which is the very thing the step exists to test.
+
+		An SSID is broadcast in every Beacon and is not a secret, but it does
+		identify somebody's network, so the committed profile leaves it empty and
+		tools/build_k1_wpa.sh injects K1_WIFI_SSID the same way it injects the
+		passphrase.
 
 config K1_RTL8852BS2_WLAN_NETDEV
 	bool "Register the RTL8852BS2 wlan0 scan network device"

@@ -998,6 +998,28 @@ int k1_wireless_initialize(void)
                * state 2 from that answer.
                */
 
+#        ifdef CONFIG_K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC
+
+              /* The handshake replaces the association step rather than
+               * following it, because it is the same exchange carried further:
+               * the access point sends its first EAPOL-Key frame within
+               * milliseconds of granting the association, so the only place it
+               * can be answered is the receive loop of the sweep the
+               * association happened in.  Running the association step first
+               * and the handshake after would spend a whole extra sweep to
+               * arrive too late for the frame it exists to answer.
+               */
+
+              if (probe_ret >= 0)
+                {
+                  probe_ret =
+                    k1_rtl8852bs_fwdl_runtime_wpa_diagnostic(wifi_mac);
+                  if (probe_ret < 0)
+                    {
+                      ret = probe_ret;
+                    }
+                }
+#        else
               if (probe_ret >= 0)
                 {
                   probe_ret =
@@ -1007,6 +1029,7 @@ int k1_wireless_initialize(void)
                       ret = probe_ret;
                     }
                 }
+#        endif
 #      endif
 #    endif
 #  endif

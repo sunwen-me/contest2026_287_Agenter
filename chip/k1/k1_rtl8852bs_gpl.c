@@ -474,6 +474,8 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RCR                     0xce00u
 #define K1_RTL8852BS_PLCP_HDR_FLTR           0xce04u
 #define K1_RTL8852BS_MGNT_FLTR               0xce28u
+#define K1_RTL8852BS_CTRL_FLTR               0xce2cu
+#define K1_RTL8852BS_DATA_FLTR               0xce30u
 #define K1_RTL8852BS_RX_FLTR_OPT             0xce20u
 #define K1_RTL8852BS_ADDR_CAM_CTRL            0xce34u
 #define K1_RTL8852BS_RESPBA_CAM_CTRL         0xce3cu
@@ -1127,6 +1129,8 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_SCAN_RX_FLTR_OPT_MASK   0x000000beu
 #define K1_RTL8852BS_SCAN_RX_FLTR_OPT_VALUE  0x0000000eu
 #define K1_RTL8852BS_SCAN_MGNT_FLTR_TO_HOST  0x55555555u
+#define K1_RTL8852BS_SCAN_DATA_FLTR_TO_HOST  0x55555555u
+#define K1_RTL8852BS_SCAN_DATA_FLTR_CHECK    0x00030003u
 #define K1_RTL8852BS_PPDU_STAT_RPT_EN        0x00000001u
 #define K1_RTL8852BS_ADDR_CAM_RANGE           (0x7fu << 16)
 #define K1_RTL8852BS_ADDR_CAM_CLEAR           (1u << 8)
@@ -1177,6 +1181,8 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_PROBE_RESPONSE 5u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_BEACON   8u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_AUTHENTICATION 11u
+#define K1_RTL8852BS_IEEE80211_SUBTYPE_DISASSOCIATION 10u
+#define K1_RTL8852BS_IEEE80211_SUBTYPE_DEAUTHENTICATION 12u
 #define K1_RTL8852BS_IEEE80211_HEADER_SIZE      24u
 #define K1_RTL8852BS_IEEE80211_BEACON_FIXED_SIZE 12u
 #define K1_RTL8852BS_IEEE80211_SSID_IE          0u
@@ -1422,7 +1428,14 @@ extern void k1_early_puthex(uintreg_t value);
  * reading after the firmware reports scan end.
  */
 
-#define K1_RTL8852BS_SCAN_OFLD_RX_MAX              8192u
+/* Forwarding data frames to the host during a dwell means the aggregates
+ * this path reads now carry full-length data payloads from every station on
+ * the channel, not just management frames.  An aggregate larger than this
+ * buffer is skipped and counted rather than read, so the room is worth more
+ * than the 8 KiB it replaces; the board has 128 MiB.
+ */
+
+#define K1_RTL8852BS_SCAN_OFLD_RX_MAX              16384u
 #define K1_RTL8852BS_SCAN_OFLD_BSS_MAX             24u
 #define K1_RTL8852BS_SCAN_OFLD_DRAIN_POLL_COUNT    256u
 #define K1_RTL8852BS_SCAN_OFLD_DRAIN_IDLE_POLLS    32u
@@ -1639,16 +1652,25 @@ extern void k1_early_puthex(uintreg_t value);
 
 #define K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE              128u
 
-/* The largest management frame the host transmit path has to carry.  It is
- * the Association Request rather than the Probe Request, because the
- * Association Request adds the capability information and the listen
- * interval in front of the same elements.  The transmit buffer is sized from
- * this so that a long SSID is rejected by the hardware or by the frame
- * builder, never silently by the buffer.
+/* The largest frame the band-0 management transmit path has to carry.  Two
+ * frames compete for it and only one of them is a management frame.  The
+ * Association Request comes to 100 bytes -- it is the longest management frame
+ * this port builds, because it adds the capability information and the listen
+ * interval in front of the same elements the Probe Request carries.  The other
+ * is the second EAPOL-Key frame of the four-way handshake, which is a data
+ * frame: a 24-byte header, an 8-byte LLC/SNAP header, a 4-byte 802.1X header,
+ * the 95-byte key frame and the 22-byte RSN element, 153 bytes in all.  It
+ * rides the management queue rather than a data queue because every
+ * scan-offload channel entry sets PAUSE_TX_DATA for its dwell, and the
+ * handshake has to happen inside a dwell; the queue a frame was submitted on
+ * is invisible to the access point that receives it.
+ *
+ * The buffer is sized from the larger of the two and rounded up, so that a
+ * long SSID or an unexpectedly long key frame is rejected by the frame builder
+ * or by the hardware, never silently by the buffer.
  */
 
-#define K1_RTL8852BS_MGMT_TX_FRAME_MAX                   \
-  K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE
+#define K1_RTL8852BS_MGMT_TX_FRAME_MAX                   192u
 #define K1_RTL8852BS_ASSOC_STATUS_SUCCESS                0u
 #define K1_RTL8852BS_ASSOC_AID_MASK                      0x3fffu
 #define K1_RTL8852BS_ASSOC_RESPONSE_MIN_SIZE               \
@@ -3295,6 +3317,682 @@ static void k1_rtl8852bs_write_le32(FAR uint8_t *buffer, uint32_t value)
   buffer[1] = (uint8_t)(value >> 8);
   buffer[2] = (uint8_t)(value >> 16);
   buffer[3] = (uint8_t)(value >> 24);
+}
+
+/****************************************************************************
+ * SHA-1, HMAC-SHA1, PBKDF2 and the IEEE 802.11 pseudo-random function.
+ *
+ * WPA2-PSK needs exactly these four and nothing else: the pairwise master key
+ * is PBKDF2-SHA1 over the passphrase and the SSID, the pairwise transient key
+ * is the standard's own PRF over that master key and the two nonces, and every
+ * EAPOL-Key frame after the first carries an HMAC-SHA1-128 message integrity
+ * code.  They are implemented here rather than pulled in from a crypto library
+ * because this component runs from board bring-up, before any of them is
+ * initialised, and because a self-contained implementation can be checked on
+ * the host against ground truth generated by a second implementation.
+ *
+ * Nothing in this section ever prints key material.  The passphrase, the
+ * master key, the transient key and its three sub-keys are only ever consumed
+ * by the functions below; the console lines report which step succeeded, and
+ * the two nonces, which travel over the air in the clear anyway.
+ ****************************************************************************/
+
+#define K1_RTL8852BS_SHA1_DIGEST_SIZE  20u
+#define K1_RTL8852BS_SHA1_BLOCK_SIZE   64u
+#define K1_RTL8852BS_HMAC_MAX_CHUNKS   6u
+
+struct k1_rtl8852bs_sha1_s
+{
+  uint32_t state[5];
+  uint32_t length;
+  uint8_t block[K1_RTL8852BS_SHA1_BLOCK_SIZE];
+  uint8_t fill;
+};
+
+static uint32_t k1_rtl8852bs_sha1_rol(uint32_t value, unsigned int bits)
+{
+  return (value << bits) | (value >> (32u - bits));
+}
+
+static void k1_rtl8852bs_sha1_compress(FAR uint32_t *state,
+                                       FAR const uint8_t *block)
+{
+  static const uint32_t constants[4] =
+  {
+    0x5a827999u, 0x6ed9eba1u, 0x8f1bbcdcu, 0xca62c1d6u
+  };
+
+  uint32_t schedule[80];
+  uint32_t a;
+  uint32_t b;
+  uint32_t c;
+  uint32_t d;
+  uint32_t e;
+  uint32_t mix;
+  uint32_t constant;
+  uint32_t temp;
+  unsigned int index;
+
+  for (index = 0; index < 16; index++)
+    {
+      schedule[index] = (uint32_t)block[index * 4] << 24 |
+                        (uint32_t)block[index * 4 + 1] << 16 |
+                        (uint32_t)block[index * 4 + 2] << 8 |
+                        (uint32_t)block[index * 4 + 3];
+    }
+
+  for (index = 16; index < 80; index++)
+    {
+      schedule[index] = k1_rtl8852bs_sha1_rol(
+        schedule[index - 3] ^ schedule[index - 8] ^
+        schedule[index - 14] ^ schedule[index - 16], 1);
+    }
+
+  a = state[0];
+  b = state[1];
+  c = state[2];
+  d = state[3];
+  e = state[4];
+
+  for (index = 0; index < 80; index++)
+    {
+      if (index < 20)
+        {
+          mix = (b & c) | (~b & d);
+          constant = constants[0];
+        }
+      else if (index < 40)
+        {
+          mix = b ^ c ^ d;
+          constant = constants[1];
+        }
+      else if (index < 60)
+        {
+          mix = (b & c) | (b & d) | (c & d);
+          constant = constants[2];
+        }
+      else
+        {
+          mix = b ^ c ^ d;
+          constant = constants[3];
+        }
+
+      temp = k1_rtl8852bs_sha1_rol(a, 5) + mix + e + constant +
+             schedule[index];
+      e = d;
+      d = c;
+      c = k1_rtl8852bs_sha1_rol(b, 30);
+      b = a;
+      a = temp;
+    }
+
+  state[0] += a;
+  state[1] += b;
+  state[2] += c;
+  state[3] += d;
+  state[4] += e;
+}
+
+static void k1_rtl8852bs_sha1_init(FAR struct k1_rtl8852bs_sha1_s *context)
+{
+  context->state[0] = 0x67452301u;
+  context->state[1] = 0xefcdab89u;
+  context->state[2] = 0x98badcfeu;
+  context->state[3] = 0x10325476u;
+  context->state[4] = 0xc3d2e1f0u;
+  context->length = 0;
+  context->fill = 0;
+}
+
+static void k1_rtl8852bs_sha1_update(FAR struct k1_rtl8852bs_sha1_s *context,
+                                     FAR const uint8_t *data, size_t length)
+{
+  size_t offset = 0;
+
+  context->length += (uint32_t)length;
+  while (offset < length)
+    {
+      size_t room = K1_RTL8852BS_SHA1_BLOCK_SIZE - context->fill;
+      size_t take = length - offset < room ? length - offset : room;
+
+      memcpy(context->block + context->fill, data + offset, take);
+      context->fill = (uint8_t)(context->fill + take);
+      offset += take;
+
+      if (context->fill == K1_RTL8852BS_SHA1_BLOCK_SIZE)
+        {
+          k1_rtl8852bs_sha1_compress(context->state, context->block);
+          context->fill = 0;
+        }
+    }
+}
+
+static void k1_rtl8852bs_sha1_final(FAR struct k1_rtl8852bs_sha1_s *context,
+                                    FAR uint8_t *digest)
+{
+  uint64_t bits = (uint64_t)context->length * 8u;
+  uint8_t padding = 0x80;
+  uint8_t trailer[8];
+  unsigned int index;
+
+  k1_rtl8852bs_sha1_update(context, &padding, 1);
+  padding = 0;
+  while (context->fill != K1_RTL8852BS_SHA1_BLOCK_SIZE - 8u)
+    {
+      k1_rtl8852bs_sha1_update(context, &padding, 1);
+    }
+
+  for (index = 0; index < 8; index++)
+    {
+      trailer[index] = (uint8_t)(bits >> (56u - index * 8u));
+    }
+
+  k1_rtl8852bs_sha1_update(context, trailer, sizeof(trailer));
+  for (index = 0; index < 5; index++)
+    {
+      digest[index * 4] = (uint8_t)(context->state[index] >> 24);
+      digest[index * 4 + 1] = (uint8_t)(context->state[index] >> 16);
+      digest[index * 4 + 2] = (uint8_t)(context->state[index] >> 8);
+      digest[index * 4 + 3] = (uint8_t)context->state[index];
+    }
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_hmac_sha1
+ *
+ * Description:
+ *   RFC 2104 HMAC-SHA1 over a vector of message chunks.  The vector form is
+ *   what the callers actually need: the PRF hashes a label, a separator byte,
+ *   the two addresses, the two nonces and a counter, and the EAPOL message
+ *   integrity code hashes a frame whose own message integrity field has to
+ *   read as zero without the frame being modified.
+ ****************************************************************************/
+
+static void k1_rtl8852bs_hmac_sha1(FAR const uint8_t *key, size_t key_length,
+                                   FAR const uint8_t * const *chunks,
+                                   FAR const size_t *lengths,
+                                   unsigned int count, FAR uint8_t *mac)
+{
+  struct k1_rtl8852bs_sha1_s context;
+  uint8_t pad[K1_RTL8852BS_SHA1_BLOCK_SIZE];
+  uint8_t shortened[K1_RTL8852BS_SHA1_DIGEST_SIZE];
+  uint8_t inner[K1_RTL8852BS_SHA1_DIGEST_SIZE];
+  unsigned int index;
+
+  if (key_length > K1_RTL8852BS_SHA1_BLOCK_SIZE)
+    {
+      k1_rtl8852bs_sha1_init(&context);
+      k1_rtl8852bs_sha1_update(&context, key, key_length);
+      k1_rtl8852bs_sha1_final(&context, shortened);
+      key = shortened;
+      key_length = sizeof(shortened);
+    }
+
+  memset(pad, 0x36, sizeof(pad));
+  for (index = 0; index < key_length; index++)
+    {
+      pad[index] = (uint8_t)(pad[index] ^ key[index]);
+    }
+
+  k1_rtl8852bs_sha1_init(&context);
+  k1_rtl8852bs_sha1_update(&context, pad, sizeof(pad));
+  for (index = 0; index < count; index++)
+    {
+      if (lengths[index] > 0)
+        {
+          k1_rtl8852bs_sha1_update(&context, chunks[index], lengths[index]);
+        }
+    }
+
+  k1_rtl8852bs_sha1_final(&context, inner);
+
+  memset(pad, 0x5c, sizeof(pad));
+  for (index = 0; index < key_length; index++)
+    {
+      pad[index] = (uint8_t)(pad[index] ^ key[index]);
+    }
+
+  k1_rtl8852bs_sha1_init(&context);
+  k1_rtl8852bs_sha1_update(&context, pad, sizeof(pad));
+  k1_rtl8852bs_sha1_update(&context, inner, sizeof(inner));
+  k1_rtl8852bs_sha1_final(&context, mac);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_pbkdf2_sha1
+ *
+ * Description:
+ *   RFC 2898 PBKDF2 with HMAC-SHA1 as the underlying function.  IEEE 802.11
+ *   clause J.4 defines the WPA2 pre-shared key as exactly this with the
+ *   passphrase as the password, the SSID as the salt, 4096 iterations and a
+ *   256-bit output, so the only caller passes those.
+ *
+ *   4096 iterations of two blocks is 8192 HMAC-SHA1 operations, which is why
+ *   this is called once before the sweep starts and never from the receive
+ *   loop: a dwell is 250 ms and cannot afford it.
+ ****************************************************************************/
+
+static void k1_rtl8852bs_pbkdf2_sha1(FAR const char *passphrase,
+                                     FAR const uint8_t *salt,
+                                     size_t salt_length,
+                                     unsigned int iterations,
+                                     FAR uint8_t *out, size_t out_length)
+{
+  FAR const uint8_t *chunks[2];
+  size_t lengths[2];
+  uint8_t counter[4];
+  uint8_t digest[K1_RTL8852BS_SHA1_DIGEST_SIZE];
+  uint8_t block[K1_RTL8852BS_SHA1_DIGEST_SIZE];
+  size_t key_length = strlen(passphrase);
+  size_t offset = 0;
+  uint32_t index = 1;
+  unsigned int round;
+  unsigned int byte;
+
+  while (offset < out_length)
+    {
+      size_t take = out_length - offset;
+
+      counter[0] = (uint8_t)(index >> 24);
+      counter[1] = (uint8_t)(index >> 16);
+      counter[2] = (uint8_t)(index >> 8);
+      counter[3] = (uint8_t)index;
+
+      chunks[0] = salt;
+      lengths[0] = salt_length;
+      chunks[1] = counter;
+      lengths[1] = sizeof(counter);
+      k1_rtl8852bs_hmac_sha1((FAR const uint8_t *)passphrase, key_length,
+                             chunks, lengths, 2, digest);
+      memcpy(block, digest, sizeof(block));
+
+      for (round = 1; round < iterations; round++)
+        {
+          chunks[0] = digest;
+          lengths[0] = sizeof(digest);
+          k1_rtl8852bs_hmac_sha1((FAR const uint8_t *)passphrase, key_length,
+                                 chunks, lengths, 1, digest);
+          for (byte = 0; byte < sizeof(block); byte++)
+            {
+              block[byte] = (uint8_t)(block[byte] ^ digest[byte]);
+            }
+        }
+
+      if (take > sizeof(block))
+        {
+          take = sizeof(block);
+        }
+
+      memcpy(out + offset, block, take);
+      offset += take;
+      index++;
+    }
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_wpa_prf
+ *
+ * Description:
+ *   The IEEE 802.11 clause 12.7.1.2 pseudo-random function: HMAC-SHA1 over
+ *   the label, a zero separator, the data and a single-byte counter, repeated
+ *   until enough output exists.  A 384-bit output over the master key, the two
+ *   addresses and the two nonces is the pairwise transient key.
+ ****************************************************************************/
+
+static void k1_rtl8852bs_wpa_prf(FAR const uint8_t *key, size_t key_length,
+                                 FAR const char *label,
+                                 FAR const uint8_t *data, size_t data_length,
+                                 FAR uint8_t *out, size_t out_length)
+{
+  FAR const uint8_t *chunks[4];
+  size_t lengths[4];
+  uint8_t digest[K1_RTL8852BS_SHA1_DIGEST_SIZE];
+  uint8_t separator = 0;
+  uint8_t counter = 0;
+  size_t offset = 0;
+
+  while (offset < out_length)
+    {
+      size_t take = out_length - offset;
+
+      chunks[0] = (FAR const uint8_t *)label;
+      lengths[0] = strlen(label);
+      chunks[1] = &separator;
+      lengths[1] = 1;
+      chunks[2] = data;
+      lengths[2] = data_length;
+      chunks[3] = &counter;
+      lengths[3] = 1;
+      k1_rtl8852bs_hmac_sha1(key, key_length, chunks, lengths, 4, digest);
+
+      if (take > sizeof(digest))
+        {
+          take = sizeof(digest);
+        }
+
+      memcpy(out + offset, digest, take);
+      offset += take;
+      counter++;
+    }
+}
+
+/****************************************************************************
+ * The EAPOL-Key frame, IEEE 802.11 clause 12.7.2, and the two of the four
+ * handshake messages a station sends.
+ *
+ * Byte offsets are counted from the first byte of the key frame, which is the
+ * descriptor type, so they are the offsets the standard's own figure uses.
+ * The 802.1X header - version, packet type and body length - sits in front of
+ * it and is included in the message integrity code, which is why the two are
+ * always built and hashed as one buffer.
+ ****************************************************************************/
+
+#define K1_RTL8852BS_EAPOL_VERSION                  1u
+#define K1_RTL8852BS_EAPOL_TYPE_KEY                 3u
+#define K1_RTL8852BS_EAPOL_HEADER_SIZE              4u
+#define K1_RTL8852BS_EAPOL_DESCRIPTOR_RSN           2u
+#define K1_RTL8852BS_EAPOL_DESCRIPTOR_WPA           254u
+#define K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE           95u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_OFFSET          1u
+#define K1_RTL8852BS_EAPOL_KEY_LENGTH_OFFSET        3u
+#define K1_RTL8852BS_EAPOL_KEY_REPLAY_OFFSET        5u
+#define K1_RTL8852BS_EAPOL_KEY_REPLAY_SIZE          8u
+#define K1_RTL8852BS_EAPOL_KEY_NONCE_OFFSET         13u
+#define K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE           32u
+#define K1_RTL8852BS_EAPOL_KEY_IV_OFFSET            45u
+#define K1_RTL8852BS_EAPOL_KEY_RSC_OFFSET           61u
+#define K1_RTL8852BS_EAPOL_KEY_MIC_OFFSET           77u
+#define K1_RTL8852BS_EAPOL_KEY_MIC_SIZE             16u
+#define K1_RTL8852BS_EAPOL_KEY_DATA_LENGTH_OFFSET   93u
+
+/* Key Information, IEEE 802.11 table 12-8.  The low three bits are the key
+ * descriptor version: 2 is HMAC-SHA1-128 for the message integrity code and
+ * AES key wrap for the key data, which is what CCMP with the PSK
+ * authentication suite selects.  Version 3 replaces both with AES-128-CMAC
+ * and AES-SIV, so a version this component cannot compute is refused rather
+ * than answered with a wrong integrity code.
+ */
+
+#define K1_RTL8852BS_EAPOL_KEY_INFO_VERSION_MASK    0x0007u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_VERSION_SHA1    2u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_PAIRWISE        0x0008u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_INSTALL         0x0040u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_ACK             0x0080u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_MIC             0x0100u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_SECURE          0x0200u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_ERROR           0x0400u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_REQUEST         0x0800u
+#define K1_RTL8852BS_EAPOL_KEY_INFO_ENCRYPTED       0x1000u
+
+/* The pairwise transient key is 384 bits for CCMP: a 128-bit key confirmation
+ * key that authenticates the EAPOL frames, a 128-bit key encryption key that
+ * wraps the group key inside message three, and the 128-bit temporal key the
+ * hardware would encrypt data with once a security engine exists to hold it.
+ */
+
+#define K1_RTL8852BS_WPA_PMK_SIZE                   32u
+#define K1_RTL8852BS_WPA_PTK_SIZE                   48u
+#define K1_RTL8852BS_WPA_KCK_OFFSET                 0u
+#define K1_RTL8852BS_WPA_KCK_SIZE                   16u
+#define K1_RTL8852BS_WPA_KEK_OFFSET                 16u
+#define K1_RTL8852BS_WPA_KEK_SIZE                   16u
+#define K1_RTL8852BS_WPA_TK_OFFSET                  32u
+#define K1_RTL8852BS_WPA_TK_SIZE                    16u
+#define K1_RTL8852BS_WPA_PBKDF2_ITERATIONS          4096u
+#define K1_RTL8852BS_WPA_PRF_LABEL                  "Pairwise key expansion"
+
+/* The passphrase and the network name reach this file only as Kconfig strings,
+ * and only ever empty in a committed defconfig.  A configuration that has never
+ * seen the handshake option at all does not define them, so they default to
+ * empty here too: an empty passphrase is refused with -ENOKEY at the one place
+ * it is read, which keeps every other profile building.
+ */
+
+#ifndef CONFIG_K1_RTL8852BS2_RUNTIME_WPA_PASSPHRASE
+#  define CONFIG_K1_RTL8852BS2_RUNTIME_WPA_PASSPHRASE ""
+#endif
+
+#ifndef CONFIG_K1_RTL8852BS2_RUNTIME_WPA_SSID
+#  define CONFIG_K1_RTL8852BS2_RUNTIME_WPA_SSID ""
+#endif
+
+/* A station's EAPOL frame is a ToDS data frame: A1 is the BSSID, A2 is this
+ * host and A3 is the destination, which for a frame the access point itself
+ * consumes is the access point.  Frame control is type 2 subtype 0 with the
+ * ToDS bit set and nothing else; the frame is not protected, because the
+ * handshake is what produces the keys that would protect it.
+ */
+
+#define K1_RTL8852BS_EAPOL_FRAME_CONTROL            0x0108u
+#define K1_RTL8852BS_EAPOL_LLC_SIZE                 8u
+#define K1_RTL8852BS_EAPOL_FRAME_MAX                                       \
+  (K1_RTL8852BS_IEEE80211_HEADER_SIZE + K1_RTL8852BS_EAPOL_LLC_SIZE +       \
+   K1_RTL8852BS_EAPOL_HEADER_SIZE + K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE +     \
+   K1_RTL8852BS_ASSOC_RSN_IE_SIZE)
+
+#if K1_RTL8852BS_EAPOL_FRAME_MAX > K1_RTL8852BS_MGMT_TX_FRAME_MAX
+#  error "the band-0 management transmit buffer cannot carry an EAPOL-Key frame"
+#endif
+
+static void k1_rtl8852bs_write_be16(FAR uint8_t *buffer, uint16_t value)
+{
+  buffer[0] = (uint8_t)(value >> 8);
+  buffer[1] = (uint8_t)value;
+}
+
+static uint16_t k1_rtl8852bs_read_be16(FAR const uint8_t *buffer)
+{
+  return (uint16_t)((uint16_t)buffer[0] << 8 | (uint16_t)buffer[1]);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_wpa_ptk_derive
+ *
+ * Description:
+ *   IEEE 802.11 clause 12.7.1.3: the pairwise transient key is the PRF over
+ *   the master key, the two MAC addresses in numeric order and the two nonces
+ *   in numeric order.  Ordering both pairs is what lets the two ends derive
+ *   the same key without agreeing who is first.
+ ****************************************************************************/
+
+static void k1_rtl8852bs_wpa_ptk_derive(FAR const uint8_t *pmk,
+                                        FAR const uint8_t *authenticator,
+                                        FAR const uint8_t *supplicant,
+                                        FAR const uint8_t *anonce,
+                                        FAR const uint8_t *snonce,
+                                        FAR uint8_t *ptk)
+{
+  uint8_t data[12 + 2 * K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE];
+  FAR const uint8_t *low;
+  FAR const uint8_t *high;
+
+  low = memcmp(authenticator, supplicant, 6) < 0 ? authenticator : supplicant;
+  high = low == authenticator ? supplicant : authenticator;
+  memcpy(data, low, 6);
+  memcpy(data + 6, high, 6);
+
+  low = memcmp(anonce, snonce, K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE) < 0 ?
+        anonce : snonce;
+  high = low == anonce ? snonce : anonce;
+  memcpy(data + 12, low, K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE);
+  memcpy(data + 12 + K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE, high,
+         K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE);
+
+  k1_rtl8852bs_wpa_prf(pmk, K1_RTL8852BS_WPA_PMK_SIZE,
+                       K1_RTL8852BS_WPA_PRF_LABEL, data, sizeof(data),
+                       ptk, K1_RTL8852BS_WPA_PTK_SIZE);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_wpa_key_mic
+ *
+ * Description:
+ *   The message integrity code of one EAPOL-Key frame: HMAC-SHA1 over the
+ *   802.1X header and the whole key frame with the integrity field read as
+ *   zero, truncated to its first 128 bits.  The field is not modified in the
+ *   caller's buffer; the hash is fed the frame in three pieces around it, so
+ *   the same function verifies a received frame and signs a built one.
+ ****************************************************************************/
+
+static void k1_rtl8852bs_wpa_key_mic(FAR const uint8_t *kck,
+                                     FAR const uint8_t *eapol,
+                                     size_t eapol_length, FAR uint8_t *mic)
+{
+  static const uint8_t zeros[K1_RTL8852BS_EAPOL_KEY_MIC_SIZE] =
+  {
+    0
+  };
+
+  FAR const uint8_t *chunks[3];
+  size_t lengths[3];
+  size_t prefix = K1_RTL8852BS_EAPOL_HEADER_SIZE +
+                  K1_RTL8852BS_EAPOL_KEY_MIC_OFFSET;
+  uint8_t digest[K1_RTL8852BS_SHA1_DIGEST_SIZE];
+
+  chunks[0] = eapol;
+  lengths[0] = prefix;
+  chunks[1] = zeros;
+  lengths[1] = sizeof(zeros);
+  chunks[2] = eapol + prefix + K1_RTL8852BS_EAPOL_KEY_MIC_SIZE;
+  lengths[2] = eapol_length - prefix - K1_RTL8852BS_EAPOL_KEY_MIC_SIZE;
+  k1_rtl8852bs_hmac_sha1(kck, K1_RTL8852BS_WPA_KCK_SIZE, chunks, lengths, 3,
+                         digest);
+  memcpy(mic, digest, K1_RTL8852BS_EAPOL_KEY_MIC_SIZE);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_wpa_key_frame_build
+ *
+ * Description:
+ *   Build one complete EAPOL-Key frame a station sends: the 802.11 ToDS data
+ *   header, the LLC/SNAP header that carries the 802.1X ethertype, the 802.1X
+ *   header and the key frame, with the message integrity code computed over
+ *   the last two once everything else is in place.
+ *
+ *   Both messages this host sends go through here.  Message two differs from
+ *   message four in three fields only - the Secure bit, the nonce and the key
+ *   data - so a single builder means the frame layout is written once and the
+ *   integrity code is computed the same way for both.
+ *
+ * Input Parameters:
+ *   frame            - Output buffer for the whole 802.11 frame.
+ *   size             - Its size.
+ *   self_mac         - This host's address, the transmitter and the supplicant.
+ *   bssid            - The access point, which is A1, A3 and the destination.
+ *   descriptor_type  - Echoed from the access point's own key frame.
+ *   key_info         - Key Information for the message being built.
+ *   key_length       - The Key Length field.  Zero for both messages an RSN
+ *                      station sends; the field only carries a cipher key
+ *                      length in the older WPA descriptor.
+ *   replay           - The eight-byte replay counter, echoed from the message
+ *                      being answered, which is what makes the answer match.
+ *   nonce            - The key nonce, or NULL for the zero nonce message four
+ *                      carries.
+ *   key_data         - Key data, or NULL when there is none.
+ *   key_data_length  - Its length.
+ *   kck              - The key confirmation key the integrity code uses.
+ *   sequence         - The 802.11 sequence number for the data frame.
+ *   length           - Receives the built frame length.
+ *
+ * Returned Value:
+ *   OK, or -EINVAL when an argument is missing or the buffer is too small.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_wpa_key_frame_build(
+  FAR uint8_t *frame, size_t size, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid, uint8_t descriptor_type, uint16_t key_info,
+  uint16_t key_length, FAR const uint8_t *replay, FAR const uint8_t *nonce,
+  FAR const uint8_t *key_data, uint8_t key_data_length,
+  FAR const uint8_t *kck, uint16_t sequence, FAR size_t *length)
+{
+  static const uint8_t llc_snap[K1_RTL8852BS_EAPOL_LLC_SIZE] =
+  {
+    0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e
+  };
+
+  FAR uint8_t *eapol;
+  size_t eapol_length;
+  size_t required;
+  size_t offset;
+
+  if (frame == NULL || self_mac == NULL || bssid == NULL || replay == NULL ||
+      kck == NULL || length == NULL ||
+      (key_data == NULL && key_data_length > 0) ||
+      sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK)
+    {
+      return -EINVAL;
+    }
+
+  eapol_length = K1_RTL8852BS_EAPOL_HEADER_SIZE +
+                 K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE + key_data_length;
+  required = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+             K1_RTL8852BS_EAPOL_LLC_SIZE + eapol_length;
+  if (size < required)
+    {
+      return -EINVAL;
+    }
+
+  memset(frame, 0, size);
+  frame[0] = (uint8_t)(K1_RTL8852BS_EAPOL_FRAME_CONTROL & 0xffu);
+  frame[1] = (uint8_t)(K1_RTL8852BS_EAPOL_FRAME_CONTROL >> 8);
+
+  /* Duration stays zero for the hardware to fill.  A ToDS data frame puts the
+   * BSSID in address 1, the source in address 2 and the destination in address
+   * 3; the destination of a frame the access point itself consumes is the
+   * access point.
+   */
+
+  memcpy(frame + 4, bssid, 6);
+  memcpy(frame + 10, self_mac, 6);
+  memcpy(frame + 16, bssid, 6);
+  k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
+  offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+  memcpy(frame + offset, llc_snap, sizeof(llc_snap));
+  offset += sizeof(llc_snap);
+
+  eapol = frame + offset;
+  eapol[0] = K1_RTL8852BS_EAPOL_VERSION;
+  eapol[1] = K1_RTL8852BS_EAPOL_TYPE_KEY;
+  k1_rtl8852bs_write_be16(eapol + 2,
+                          (uint16_t)(K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE +
+                                     key_data_length));
+
+  eapol[K1_RTL8852BS_EAPOL_HEADER_SIZE] = descriptor_type;
+  k1_rtl8852bs_write_be16(eapol + K1_RTL8852BS_EAPOL_HEADER_SIZE +
+                          K1_RTL8852BS_EAPOL_KEY_INFO_OFFSET, key_info);
+  k1_rtl8852bs_write_be16(eapol + K1_RTL8852BS_EAPOL_HEADER_SIZE +
+                          K1_RTL8852BS_EAPOL_KEY_LENGTH_OFFSET, key_length);
+  memcpy(eapol + K1_RTL8852BS_EAPOL_HEADER_SIZE +
+         K1_RTL8852BS_EAPOL_KEY_REPLAY_OFFSET, replay,
+         K1_RTL8852BS_EAPOL_KEY_REPLAY_SIZE);
+  if (nonce != NULL)
+    {
+      memcpy(eapol + K1_RTL8852BS_EAPOL_HEADER_SIZE +
+             K1_RTL8852BS_EAPOL_KEY_NONCE_OFFSET, nonce,
+             K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE);
+    }
+
+  k1_rtl8852bs_write_be16(eapol + K1_RTL8852BS_EAPOL_HEADER_SIZE +
+                          K1_RTL8852BS_EAPOL_KEY_DATA_LENGTH_OFFSET,
+                          key_data_length);
+  if (key_data_length > 0)
+    {
+      memcpy(eapol + K1_RTL8852BS_EAPOL_HEADER_SIZE +
+             K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE, key_data, key_data_length);
+    }
+
+  /* The integrity code is computed last, over everything above from the 802.1X
+   * version byte on, with its own field read as zero.
+   */
+
+  k1_rtl8852bs_wpa_key_mic(kck, eapol, eapol_length,
+                           eapol + K1_RTL8852BS_EAPOL_HEADER_SIZE +
+                           K1_RTL8852BS_EAPOL_KEY_MIC_OFFSET);
+
+  *length = required;
+  return OK;
 }
 
 static int k1_rtl8852bs_post_power_read16(uint32_t address,
@@ -5792,6 +6490,142 @@ static void k1_rtl8852bs_runtime_assoc_disarm(void)
   k1_rtl8852bs_scanofld_park_disarm();
 }
 
+/* The WPA2-PSK four-way handshake, IEEE 802.11 clause 12.7.6, and the account
+ * of how far it got.  It is module state for the same reason the two
+ * management exchanges are: every frame of it has to be handed to the hardware
+ * from inside the scan-offload receive loop, which is the only place that
+ * knows the radio is parked on the access point's channel.
+ *
+ * It is armed together with the authentication and association exchanges,
+ * because the access point sends message one within milliseconds of its
+ * Association Response and this host has to answer inside the same parked
+ * sweep.  A handshake started from a later sweep would arrive three seconds
+ * after the association, by which time the access point has usually given up
+ * and deauthenticated.
+ *
+ * The pairwise master key is derived before the sweep starts, never inside it:
+ * PBKDF2 with 4096 iterations is on the order of sixteen thousand SHA-1
+ * compressions, and a receive loop that spent that long on one frame would
+ * miss the rest of the dwell.
+ *
+ * No field here is ever printed.  The master key, the transient key and its
+ * three sub-keys stay inside this structure and inside the functions that
+ * consume them; what the console gets is which message arrived, which one went
+ * out, and whether the integrity code on message three verified -- which is
+ * the whole result and reveals nothing.  The two nonces travel over the air in
+ * the clear, so their presence is reported as a flag rather than as bytes for
+ * consistency with everything else here, not because they are secret.
+ */
+
+struct k1_rtl8852bs_wpa_action_s
+{
+  bool armed;
+  uint8_t bssid[6];
+  uint8_t channel;
+
+  /* The master key and the RSN element that has to be echoed in message two.
+   * The element is copied out of the Association Request this port actually
+   * transmitted rather than rebuilt, because clause 12.7.2 has the access
+   * point compare the two byte for byte and refuse a mismatch; copying makes
+   * them identical by construction.
+   */
+
+  bool pmk_valid;
+  uint8_t pmk[K1_RTL8852BS_WPA_PMK_SIZE];
+  uint8_t rsn_ie[K1_RTL8852BS_ASSOC_RSN_IE_SIZE];
+  uint8_t rsn_ie_length;
+
+  /* What arrived.  eapol_frames counts every EAPOL frame this sweep saw,
+   * frames_to_self only those the access point addressed to this host, and the
+   * two malformed counters separate a frame this port could not parse from one
+   * it parsed and refused.
+   */
+
+  uint16_t eapol_frames;
+  uint16_t frames_to_self;
+  uint16_t malformed;
+  uint16_t version_refused;
+  uint16_t replay_rejected;
+
+  bool msg1_valid;
+  uint16_t msg1_key_info;
+  uint8_t descriptor_type;
+  uint8_t anonce[K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE];
+  uint8_t replay[K1_RTL8852BS_EAPOL_KEY_REPLAY_SIZE];
+
+  bool ptk_valid;
+  uint8_t snonce[K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE];
+  uint8_t ptk[K1_RTL8852BS_WPA_PTK_SIZE];
+
+  bool msg2_sent;
+  int msg2_status;
+  uint16_t msg2_bytes;
+  uint16_t msg2_sequence;
+
+  bool msg3_valid;
+  bool msg3_mic_valid;
+  uint16_t msg3_key_info;
+  uint16_t msg3_key_data_length;
+  uint16_t msg3_mic_failures;
+
+  bool msg4_sent;
+  int msg4_status;
+  uint16_t msg4_bytes;
+  uint16_t msg4_sequence;
+  bool complete;
+};
+
+static struct k1_rtl8852bs_wpa_action_s g_k1_rtl8852bs_wpa_action;
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_wpa_arm
+ *
+ * Description:
+ *   Arm the four-way handshake for one association attempt.  The master key is
+ *   a parameter because deriving it costs milliseconds this must not spend
+ *   inside a dwell, and because the passphrase it comes from has no business
+ *   travelling any further into this component than the one function that
+ *   derives it.
+ *
+ *   The RSN element is a parameter for a different reason: it is the element
+ *   the Association Request carried, and it is captured by the transmit path
+ *   that built it rather than rebuilt here.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_wpa_arm(FAR const uint8_t *bssid,
+                                         uint8_t channel,
+                                         FAR const uint8_t *pmk)
+{
+  memset(&g_k1_rtl8852bs_wpa_action, 0, sizeof(g_k1_rtl8852bs_wpa_action));
+  if (bssid == NULL || pmk == NULL)
+    {
+      return;
+    }
+
+  memcpy(g_k1_rtl8852bs_wpa_action.bssid, bssid,
+         sizeof(g_k1_rtl8852bs_wpa_action.bssid));
+  memcpy(g_k1_rtl8852bs_wpa_action.pmk, pmk,
+         sizeof(g_k1_rtl8852bs_wpa_action.pmk));
+  g_k1_rtl8852bs_wpa_action.pmk_valid = true;
+  g_k1_rtl8852bs_wpa_action.channel = channel;
+  g_k1_rtl8852bs_wpa_action.msg2_status = -ENODATA;
+  g_k1_rtl8852bs_wpa_action.msg4_status = -ENODATA;
+  g_k1_rtl8852bs_wpa_action.armed = true;
+}
+
+static void k1_rtl8852bs_runtime_wpa_disarm(void)
+{
+  /* The park channel belongs to the association attempt this handshake rides
+   * inside, so it is released there; only the arming flag is cleared here.
+   * The key material is deliberately left in place until the next arm zeroes
+   * it, because the report that follows the sweep has to be able to say
+   * whether a transient key was ever derived.
+   */
+
+  g_k1_rtl8852bs_wpa_action.armed = false;
+}
+
 /* True while either management exchange is armed.  The early console is
  * polled at 115200 baud, so a sixty-line register snapshot costs more than a
  * second, which is over four channel dwells.  Run 26 spent that second inside
@@ -5805,7 +6639,8 @@ static void k1_rtl8852bs_runtime_assoc_disarm(void)
 static bool k1_rtl8852bs_scanofld_exchange_armed(void)
 {
   return g_k1_rtl8852bs_auth_action.armed ||
-         g_k1_rtl8852bs_assoc_action.armed;
+         g_k1_rtl8852bs_assoc_action.armed ||
+         g_k1_rtl8852bs_wpa_action.armed;
 }
 
 /****************************************************************************
@@ -10299,6 +11134,28 @@ static void k1_rtl8852bs_runtime_assoc_transmit(void)
     g_k1_rtl8852bs_assoc_action.bssid, g_k1_rtl8852bs_assoc_action.ssid,
     g_k1_rtl8852bs_assoc_action.ssid_length,
     &g_k1_rtl8852bs_assoc_action.security, sequence, &frame_length);
+  /* The RSN element this request carries is captured for the four-way
+   * handshake before the frame is handed to the hardware.  IEEE 802.11 clause
+   * 12.7.2 has the access point compare the element in the second EAPOL-Key
+   * frame against the one it received here and abandon the handshake when they
+   * differ, so the handshake copies the bytes that actually went out rather
+   * than rebuilding the element from the same inputs.  The builder writes the
+   * element last, which is what makes the tail of the frame the element.
+   */
+
+  if (ret >= 0 && g_k1_rtl8852bs_wpa_action.armed &&
+      g_k1_rtl8852bs_assoc_action.security.rsn &&
+      frame_length > K1_RTL8852BS_ASSOC_RSN_IE_SIZE &&
+      frame[frame_length - K1_RTL8852BS_ASSOC_RSN_IE_SIZE] ==
+        K1_RTL8852BS_IEEE80211_RSN_IE)
+    {
+      memcpy(g_k1_rtl8852bs_wpa_action.rsn_ie,
+             frame + frame_length - K1_RTL8852BS_ASSOC_RSN_IE_SIZE,
+             K1_RTL8852BS_ASSOC_RSN_IE_SIZE);
+      g_k1_rtl8852bs_wpa_action.rsn_ie_length =
+        K1_RTL8852BS_ASSOC_RSN_IE_SIZE;
+    }
+
   if (ret >= 0)
     {
       ret = k1_rtl8852bs_runtime_mgmt_tx_frame(frame, frame_length, sequence,
@@ -10714,6 +11571,8 @@ struct k1_rtl8852bs_scan_rx_filter_state_s
   uint32_t plcp_header_filter;
   uint32_t rx_filter_option;
   uint32_t management_filter;
+  uint32_t control_filter;
+  uint32_t data_filter;
   bool active;
 };
 
@@ -10725,6 +11584,8 @@ static void k1_rtl8852bs_scan_rx_filter_log(
   uint32_t plcp_header_filter = 0;
   uint32_t rx_filter_option = 0;
   uint32_t management_filter = 0;
+  uint32_t control_filter = 0;
+  uint32_t data_filter = 0;
 
   if (state != NULL)
     {
@@ -10732,6 +11593,8 @@ static void k1_rtl8852bs_scan_rx_filter_log(
       plcp_header_filter = state->plcp_header_filter;
       rx_filter_option = state->rx_filter_option;
       management_filter = state->management_filter;
+      control_filter = state->control_filter;
+      data_filter = state->data_filter;
     }
 
   k1_early_puts("K1 Wi-Fi GPL: scan RX filter ");
@@ -10744,6 +11607,10 @@ static void k1_rtl8852bs_scan_rx_filter_log(
   k1_early_puthex(rx_filter_option);
   k1_early_puts(" ce28=");
   k1_early_puthex(management_filter);
+  k1_early_puts(" ce2c=");
+  k1_early_puthex(control_filter);
+  k1_early_puts(" ce30=");
+  k1_early_puthex(data_filter);
   k1_early_puts("\r\n");
 }
 
@@ -10777,8 +11644,22 @@ static int k1_rtl8852bs_scan_rx_filter_read(
       return ret;
     }
 
-  return k1_rtl8852bs_mac_read32(K1_RTL8852BS_MGNT_FLTR,
-                                 &state->management_filter);
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_MGNT_FLTR,
+                                &state->management_filter);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_CTRL_FLTR,
+                                &state->control_filter);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  return k1_rtl8852bs_mac_read32(K1_RTL8852BS_DATA_FLTR,
+                                 &state->data_filter);
 }
 
 static int k1_rtl8852bs_scan_rx_filter_restore(
@@ -10807,6 +11688,13 @@ static int k1_rtl8852bs_scan_rx_filter_restore(
       first_error = ret;
     }
 
+  ret = k1_rtl8852bs_mac_write32(K1_RTL8852BS_DATA_FLTR,
+                                 state->data_filter);
+  if (ret < 0 && first_error == OK)
+    {
+      first_error = ret;
+    }
+
   ret = k1_rtl8852bs_scan_rx_filter_read(&current);
   if (ret < 0)
     {
@@ -10823,7 +11711,8 @@ static int k1_rtl8852bs_scan_rx_filter_restore(
     {
       k1_rtl8852bs_scan_rx_filter_log("after", &current);
       if (current.rx_filter_option != state->rx_filter_option ||
-          current.management_filter != state->management_filter)
+          current.management_filter != state->management_filter ||
+          current.data_filter != state->data_filter)
         {
           first_error = -EIO;
         }
@@ -10859,6 +11748,34 @@ static int k1_rtl8852bs_scan_rx_filter_enable(
    * CAM matching and disables beacon CAM checks.  The host RX path also
    * needs every management subtype forwarded from RMAC to the SDIO host.
    * These are the minimal band-0 changes made by the vendor scan path.
+   *
+   * The data-frame type filter is programmed for the same reason, and it is
+   * not part of the vendor scan path: rx_fltr_init() inside cmac_init()
+   * forwards management, control and data frames to the host once at MAC
+   * initialisation, and this component only reproduces a static subset of
+   * cmac_init() that leaves all three type filters alone.  A four-way
+   * handshake receives EAPOL-Key message 1 as a unicast QoS data frame, so
+   * an RMAC that forwards data frames to the WLAN CPU or drops them would
+   * report msg1=0x0 for a reason that has nothing to do with the key
+   * derivation.  Both registers are read before the dwell and written back
+   * afterwards, so the observed value is on the console either way.
+   *
+   * Run 32 read this register before writing it and found 0x00000000: every
+   * data subtype was being dropped by RMAC, so no data frame had ever
+   * reached this host, and the four-way handshake could not have worked
+   * whatever the key derivation did.  The same run read the register back
+   * after the write as 0x55550055 rather than 0x55555555, so the write is
+   * only honoured for subtypes 0-3 and 8-15; subtypes 4-7 -- Null, CF-Ack,
+   * CF-Poll, CF-Ack+CF-Poll, none of which carry a body -- stay at drop.
+   * The read-back is therefore checked over the two subtypes that can carry
+   * an EAPOL frame, Data and QoS Data, instead of over the whole register.
+   * Run 32 failed on that exact comparison, which is why it is a mask now.
+   *
+   * The control-frame filter is deliberately only logged, never written.
+   * Acknowledgements and block-ack traffic are answered by hardware, the
+   * host needs none of it, and forwarding every control frame on a busy
+   * channel into the SDIO receive path would cost throughput the diagnostic
+   * has no use for.
    */
 
   current_rx_filter_option = state->rx_filter_option;
@@ -10879,6 +11796,13 @@ static int k1_rtl8852bs_scan_rx_filter_enable(
       goto error;
     }
 
+  ret = k1_rtl8852bs_mac_write32(K1_RTL8852BS_DATA_FLTR,
+                                 K1_RTL8852BS_SCAN_DATA_FLTR_TO_HOST);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
   ret = k1_rtl8852bs_scan_rx_filter_read(&current);
   if (ret < 0)
     {
@@ -10888,7 +11812,10 @@ static int k1_rtl8852bs_scan_rx_filter_enable(
   k1_rtl8852bs_scan_rx_filter_log("scan", &current);
   if ((current.rx_filter_option & K1_RTL8852BS_SCAN_RX_FLTR_OPT_MASK) !=
       K1_RTL8852BS_SCAN_RX_FLTR_OPT_VALUE ||
-      current.management_filter != K1_RTL8852BS_SCAN_MGNT_FLTR_TO_HOST)
+      current.management_filter != K1_RTL8852BS_SCAN_MGNT_FLTR_TO_HOST ||
+      (current.data_filter & K1_RTL8852BS_SCAN_DATA_FLTR_CHECK) !=
+      (K1_RTL8852BS_SCAN_DATA_FLTR_TO_HOST &
+       K1_RTL8852BS_SCAN_DATA_FLTR_CHECK))
     {
       ret = -EIO;
       goto error;
@@ -12563,6 +13490,23 @@ struct k1_rtl8852bs_scanofld_passive_match_s
    */
 
   uint32_t unicast_to_others;
+
+  /* Data frames whose A1 is this host's own address, and the deauthentication
+   * or disassociation frames addressed to this host with the reason code the
+   * first of them carried.  Both exist because run 31 could not tell the
+   * difference between an access point that never sent this host anything and
+   * one that sent something and then threw it out: the sweep summary counted
+   * data frames only in total, over an air full of other stations' traffic, and
+   * did not look at management subtypes 10 and 12 at all.  A four-way
+   * handshake makes both questions the whole result -- message one is a data
+   * frame addressed to this host, and a wrong passphrase ends as a
+   * deauthentication with reason code 15, "4-Way Handshake timeout".
+   */
+
+  uint32_t data_frames_to_self;
+  uint32_t deauth_to_self;
+  uint16_t deauth_reason;
+  bool deauth_valid;
   uint32_t scan_report_events;
   uint32_t scan_report_rx_count;
   uint32_t scan_report_channels;
@@ -12836,6 +13780,417 @@ static void k1_rtl8852bs_scanofld_traffic_record(
     }
 }
 
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_eapol_locate
+ *
+ * Description:
+ *   Find the 802.1X packet inside one received data frame.  An EAPOL frame
+ *   from an access point to a station is a from-DS data frame whose payload
+ *   starts with the LLC/SNAP header of RFC 1042 carrying EtherType 0x888e; a
+ *   QoS data frame puts two more bytes of QoS control in front of that, which
+ *   is why the subtype decides the offset rather than a constant.
+ *
+ *   The 802.1X body length is checked against what the frame actually carries
+ *   and the smaller of the two is returned, because the integrity code covers
+ *   the declared length and an access point that padded the frame -- which the
+ *   hardware may also do to reach a minimum length -- would otherwise make
+ *   every code fail to verify.
+ *
+ * Returned Value:
+ *   OK with eapol and eapol_length set when the frame carries an EAPOL-Key
+ *   packet, -ENOMSG when it is not an EAPOL frame at all, and -EBADMSG when it
+ *   is one but is too short or truncated.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_eapol_locate(
+  FAR const uint8_t *payload, size_t payload_length, uint16_t frame_control,
+  FAR const uint8_t **eapol, FAR size_t *eapol_length)
+{
+  static const uint8_t llc_snap[K1_RTL8852BS_EAPOL_LLC_SIZE] =
+  {
+    0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8e
+  };
+
+  size_t offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+  size_t available;
+  size_t declared;
+  uint8_t subtype;
+
+  if (((frame_control >> 2) & K1_RTL8852BS_IEEE80211_TYPE_MASK) !=
+      K1_RTL8852BS_IEEE80211_TYPE_DATA)
+    {
+      return -ENOMSG;
+    }
+
+  /* From-DS and not to-DS: a frame the access point sent into the BSS.  A
+   * frame with both bits set is a four-address bridged frame this port never
+   * receives, and one with neither is an ad-hoc frame.
+   */
+
+  if ((frame_control & 0x0200u) == 0 || (frame_control & 0x0100u) != 0)
+    {
+      return -ENOMSG;
+    }
+
+  subtype = (uint8_t)((frame_control >>
+                       K1_RTL8852BS_IEEE80211_SUBTYPE_SHIFT) &
+                      K1_RTL8852BS_IEEE80211_SUBTYPE_MASK);
+  if ((subtype & 0x08u) != 0)
+    {
+      offset += 2u;
+    }
+
+  if (payload_length < offset + K1_RTL8852BS_EAPOL_LLC_SIZE ||
+      memcmp(payload + offset, llc_snap, sizeof(llc_snap)) != 0)
+    {
+      return -ENOMSG;
+    }
+
+  offset += K1_RTL8852BS_EAPOL_LLC_SIZE;
+  available = payload_length - offset;
+  if (available < K1_RTL8852BS_EAPOL_HEADER_SIZE +
+                  K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE ||
+      payload[offset + 1] != K1_RTL8852BS_EAPOL_TYPE_KEY)
+    {
+      return -EBADMSG;
+    }
+
+  declared = K1_RTL8852BS_EAPOL_HEADER_SIZE +
+             k1_rtl8852bs_read_be16(payload + offset + 2);
+  if (declared < K1_RTL8852BS_EAPOL_HEADER_SIZE +
+                 K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE)
+    {
+      return -EBADMSG;
+    }
+
+  *eapol = payload + offset;
+  *eapol_length = declared < available ? declared : available;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_wpa_snonce_derive
+ *
+ * Description:
+ *   Produce this station's nonce for one handshake.
+ *
+ *   This is not independent randomness and is not presented as any.  Nothing
+ *   in this port has an entropy source: there is no seeded random device this
+ *   early in board bring-up, the part's own random generator is not ported, and
+ *   the MAC's timing counter is still frozen because mac_port_init() is not
+ *   ported either.  What is available is the system tick at the moment the
+ *   access point's message one arrived, that message's own nonce, and this
+ *   host's address, run through the standard's PRF keyed with the pairwise
+ *   master key.
+ *
+ *   That gives a value an observer who does not know the passphrase cannot
+ *   predict, which is what the nonce is for, and a value that differs between
+ *   two handshakes as long as the tick differs.  It does not give a value that
+ *   would be safe if the same tick and the same access point nonce ever
+ *   recurred, and it is written here rather than hidden so that whoever ports
+ *   a real generator can delete it.  The access point does not check nonce
+ *   quality -- clause 12.7.6.3 has it only compare the nonce it gets back in
+ *   message two against the one it will use in its own key derivation.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_wpa_snonce_derive(void)
+{
+  uint8_t seed[6 + K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE + 8];
+  uint64_t ticks = (uint64_t)clock_systime_ticks();
+  unsigned int index;
+
+  memcpy(seed, g_k1_rtl8852bs_scan_self_mac, 6);
+  memcpy(seed + 6, g_k1_rtl8852bs_wpa_action.anonce,
+         K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE);
+  for (index = 0; index < 8; index++)
+    {
+      seed[6 + K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE + index] =
+        (uint8_t)(ticks >> (index * 8));
+    }
+
+  k1_rtl8852bs_wpa_prf(g_k1_rtl8852bs_wpa_action.pmk,
+                       sizeof(g_k1_rtl8852bs_wpa_action.pmk),
+                       "K1 RTL8852BS supplicant nonce", seed, sizeof(seed),
+                       g_k1_rtl8852bs_wpa_action.snonce,
+                       sizeof(g_k1_rtl8852bs_wpa_action.snonce));
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_wpa_key_transmit
+ *
+ * Description:
+ *   Build and transmit one of the two EAPOL-Key frames a station sends, from
+ *   inside the receive loop that just decoded the frame it answers.
+ *
+ *   Message two carries this station's nonce and the RSN element the
+ *   Association Request carried; message four carries neither, sets the Secure
+ *   bit, and is the acknowledgement that ends the handshake.  Both carry an
+ *   integrity code under the key confirmation key and echo the replay counter
+ *   of the message they answer, which is what lets the access point pair them.
+ *
+ *   The frame goes out on the band-0 management queue.  It is a data frame, but
+ *   every scan-offload channel entry suspends the data queues for the duration
+ *   of its dwell and the handshake has to complete inside a dwell; which queue
+ *   a frame was submitted on is not something the access point can see.
+ *
+ * Input Parameters:
+ *   final  - true for message four, false for message two
+ *   replay - the replay counter to echo, from the message being answered
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_wpa_key_transmit(
+  bool final, FAR const uint8_t *replay)
+{
+  uint8_t frame[K1_RTL8852BS_EAPOL_FRAME_MAX];
+  size_t frame_length = 0;
+  uint16_t key_info;
+  uint16_t sequence;
+  int ret;
+
+  key_info = K1_RTL8852BS_EAPOL_KEY_INFO_VERSION_SHA1 |
+             K1_RTL8852BS_EAPOL_KEY_INFO_PAIRWISE |
+             K1_RTL8852BS_EAPOL_KEY_INFO_MIC;
+  if (final)
+    {
+      key_info |= K1_RTL8852BS_EAPOL_KEY_INFO_SECURE;
+    }
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+  if (!g_k1_rtl8852bs_scan_self_mac_valid ||
+      (!final && g_k1_rtl8852bs_wpa_action.rsn_ie_length == 0))
+    {
+      /* No RSN element was captured from the Association Request, so the only
+       * message two this port could build is one clause 12.7.2 has the access
+       * point abandon the handshake over.  Refusing is the honest answer.
+       */
+
+      ret = -EINVAL;
+    }
+  else
+    {
+      ret = k1_rtl8852bs_runtime_wpa_key_frame_build(
+        frame, sizeof(frame), g_k1_rtl8852bs_scan_self_mac,
+        g_k1_rtl8852bs_wpa_action.bssid,
+        g_k1_rtl8852bs_wpa_action.descriptor_type, key_info, 0, replay,
+        final ? NULL : g_k1_rtl8852bs_wpa_action.snonce,
+        final ? NULL : g_k1_rtl8852bs_wpa_action.rsn_ie,
+        final ? 0u : g_k1_rtl8852bs_wpa_action.rsn_ie_length,
+        g_k1_rtl8852bs_wpa_action.ptk + K1_RTL8852BS_WPA_KCK_OFFSET, sequence,
+        &frame_length);
+      if (ret >= 0)
+        {
+          ret = k1_rtl8852bs_runtime_mgmt_tx_frame(frame, frame_length,
+                                                   sequence, false);
+        }
+    }
+
+  if (final)
+    {
+      g_k1_rtl8852bs_wpa_action.msg4_sent = true;
+      g_k1_rtl8852bs_wpa_action.msg4_status = ret;
+      g_k1_rtl8852bs_wpa_action.msg4_bytes = (uint16_t)frame_length;
+      g_k1_rtl8852bs_wpa_action.msg4_sequence = sequence;
+      g_k1_rtl8852bs_wpa_action.complete = ret >= 0;
+    }
+  else
+    {
+      g_k1_rtl8852bs_wpa_action.msg2_sent = true;
+      g_k1_rtl8852bs_wpa_action.msg2_status = ret;
+      g_k1_rtl8852bs_wpa_action.msg2_bytes = (uint16_t)frame_length;
+      g_k1_rtl8852bs_wpa_action.msg2_sequence = sequence;
+    }
+
+  /* One short line per transmit.  The console is polled and this runs inside
+   * the dwell the answer has to arrive in, so nothing longer belongs here.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: wpa msg");
+  k1_early_puts(final ? "4" : "2");
+  k1_early_puts(" tx bytes=");
+  k1_early_puthex((uintreg_t)frame_length);
+  k1_early_puts(" sn=");
+  k1_early_puthex(sequence);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_wpa_observe
+ *
+ * Description:
+ *   Run this station's half of the four-way handshake over one received data
+ *   frame.  IEEE 802.11 clause 12.7.6: the access point sends message one with
+ *   its nonce and no integrity code, this station answers with message two
+ *   carrying its own nonce, its RSN element and the first integrity code the
+ *   access point can check; the access point's message three proves it derived
+ *   the same key, and message four acknowledges it.
+ *
+ *   Only the two messages the access point sends are handled here, and only
+ *   from the access point this handshake was armed against to this host's own
+ *   address: the sweep runs with unicast address matching off, so an EAPOL
+ *   frame belonging to another station's handshake arrives here as well and
+ *   would otherwise be answered with an integrity code computed under the
+ *   wrong key.
+ *
+ *   Message three is not decrypted.  Its key data carries the group key
+ *   wrapped under the key encryption key, and unwrapping it needs an AES
+ *   implementation this port does not have and a security engine that could
+ *   hold the result.  The integrity code covers the wrapped bytes as they
+ *   arrived, so it verifies without unwrapping anything, and a verified code is
+ *   the proof this exchange exists to produce: the access point could only have
+ *   computed it from a pairwise key derived from the same master key, so it is
+ *   the passphrase, the derivation and this port's frame bytes all confirmed at
+ *   once.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_wpa_observe(
+  FAR const uint8_t *payload, size_t payload_length,
+  FAR const struct k1_rtl8852bs_mgmt_frame_s *mgmt)
+{
+  FAR const uint8_t *eapol;
+  FAR const uint8_t *key;
+  size_t eapol_length;
+  uint16_t key_info;
+  uint8_t mic[K1_RTL8852BS_EAPOL_KEY_MIC_SIZE];
+  int ret;
+
+  if (!g_k1_rtl8852bs_wpa_action.armed ||
+      !g_k1_rtl8852bs_wpa_action.pmk_valid)
+    {
+      return;
+    }
+
+  ret = k1_rtl8852bs_runtime_eapol_locate(payload, payload_length,
+                                          mgmt->frame_control, &eapol,
+                                          &eapol_length);
+  if (ret == -ENOMSG)
+    {
+      return;
+    }
+
+  g_k1_rtl8852bs_wpa_action.eapol_frames++;
+  if (ret < 0)
+    {
+      g_k1_rtl8852bs_wpa_action.malformed++;
+      return;
+    }
+
+  if (!mgmt->addr1_valid || !mgmt->addr2_valid ||
+      !k1_rtl8852bs_scanofld_is_self_mac(mgmt->addr1) ||
+      memcmp(mgmt->addr2, g_k1_rtl8852bs_wpa_action.bssid,
+             sizeof(g_k1_rtl8852bs_wpa_action.bssid)) != 0)
+    {
+      return;
+    }
+
+  g_k1_rtl8852bs_wpa_action.frames_to_self++;
+  key = eapol + K1_RTL8852BS_EAPOL_HEADER_SIZE;
+  key_info = k1_rtl8852bs_read_be16(key +
+                                    K1_RTL8852BS_EAPOL_KEY_INFO_OFFSET);
+
+  /* A frame without the pairwise bit is a group-key handshake message.  This
+   * port holds no group key, so there is nothing it could answer with.
+   */
+
+  if ((key_info & K1_RTL8852BS_EAPOL_KEY_INFO_PAIRWISE) == 0)
+    {
+      return;
+    }
+
+  /* The key descriptor version decides which integrity code the access point
+   * will check, and version 3 -- AES-128-CMAC with AES-SIV key wrap -- is one
+   * this port cannot compute.  Answering it with an HMAC-SHA1 code would be a
+   * wrong answer rather than no answer, so it is refused and counted.
+   */
+
+  if ((key_info & K1_RTL8852BS_EAPOL_KEY_INFO_VERSION_MASK) !=
+      K1_RTL8852BS_EAPOL_KEY_INFO_VERSION_SHA1)
+    {
+      g_k1_rtl8852bs_wpa_action.version_refused++;
+      return;
+    }
+
+  if ((key_info & K1_RTL8852BS_EAPOL_KEY_INFO_MIC) == 0)
+    {
+      /* Message one.  A retransmission carrying the same nonce is answered
+       * again with the same message two -- the access point resends it exactly
+       * when it did not get one -- but the station nonce is derived once per
+       * access point nonce, because clause 12.7.6.3 has the access point
+       * derive its key from the nonce it received and a second nonce would
+       * make the key it computed disagree with the one computed here.
+       */
+
+      if (!g_k1_rtl8852bs_wpa_action.ptk_valid ||
+          memcmp(g_k1_rtl8852bs_wpa_action.anonce,
+                 key + K1_RTL8852BS_EAPOL_KEY_NONCE_OFFSET,
+                 K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE) != 0)
+        {
+          memcpy(g_k1_rtl8852bs_wpa_action.anonce,
+                 key + K1_RTL8852BS_EAPOL_KEY_NONCE_OFFSET,
+                 K1_RTL8852BS_EAPOL_KEY_NONCE_SIZE);
+          k1_rtl8852bs_runtime_wpa_snonce_derive();
+          k1_rtl8852bs_wpa_ptk_derive(g_k1_rtl8852bs_wpa_action.pmk,
+                                      g_k1_rtl8852bs_wpa_action.bssid,
+                                      g_k1_rtl8852bs_scan_self_mac,
+                                      g_k1_rtl8852bs_wpa_action.anonce,
+                                      g_k1_rtl8852bs_wpa_action.snonce,
+                                      g_k1_rtl8852bs_wpa_action.ptk);
+          g_k1_rtl8852bs_wpa_action.ptk_valid = true;
+        }
+
+      memcpy(g_k1_rtl8852bs_wpa_action.replay,
+             key + K1_RTL8852BS_EAPOL_KEY_REPLAY_OFFSET,
+             K1_RTL8852BS_EAPOL_KEY_REPLAY_SIZE);
+      g_k1_rtl8852bs_wpa_action.descriptor_type = key[0];
+      g_k1_rtl8852bs_wpa_action.msg1_key_info = key_info;
+      g_k1_rtl8852bs_wpa_action.msg1_valid = true;
+
+      k1_rtl8852bs_runtime_wpa_key_transmit(
+        false, key + K1_RTL8852BS_EAPOL_KEY_REPLAY_OFFSET);
+      return;
+    }
+
+  /* Message three.  Nothing can be answered before a transient key exists,
+   * which is another way of saying message one has to have arrived first; an
+   * access point that only ever sends message three is a state this port
+   * records rather than guesses at.
+   */
+
+  g_k1_rtl8852bs_wpa_action.msg3_key_info = key_info;
+  g_k1_rtl8852bs_wpa_action.msg3_key_data_length =
+    k1_rtl8852bs_read_be16(key + K1_RTL8852BS_EAPOL_KEY_DATA_LENGTH_OFFSET);
+  g_k1_rtl8852bs_wpa_action.msg3_valid = true;
+  if (!g_k1_rtl8852bs_wpa_action.ptk_valid)
+    {
+      return;
+    }
+
+  k1_rtl8852bs_wpa_key_mic(g_k1_rtl8852bs_wpa_action.ptk +
+                           K1_RTL8852BS_WPA_KCK_OFFSET, eapol, eapol_length,
+                           mic);
+  if (memcmp(mic, key + K1_RTL8852BS_EAPOL_KEY_MIC_OFFSET, sizeof(mic)) != 0)
+    {
+      /* The access point derived a different pairwise key, which for a correct
+       * derivation means a different pairwise master key, which means the
+       * configured passphrase is not this network's.  It is counted rather
+       * than printed as a failure here because the sweep still has to be left
+       * for whatever else arrives, and the report after it says so.
+       */
+
+      g_k1_rtl8852bs_wpa_action.msg3_mic_failures++;
+      return;
+    }
+
+  g_k1_rtl8852bs_wpa_action.msg3_mic_valid = true;
+  k1_rtl8852bs_runtime_wpa_key_transmit(
+    true, key + K1_RTL8852BS_EAPOL_KEY_REPLAY_OFFSET);
+}
+
 static void k1_rtl8852bs_scanofld_observe_wifi(
   FAR const uint8_t *payload, size_t payload_length,
   FAR struct k1_rtl8852bs_scanofld_passive_match_s *match)
@@ -12928,6 +14283,19 @@ static void k1_rtl8852bs_scanofld_observe_wifi(
       if (frame_type == K1_RTL8852BS_IEEE80211_TYPE_DATA)
         {
           match->data_frames_seen++;
+          if (mgmt.addr1_valid &&
+              k1_rtl8852bs_scanofld_is_self_mac(mgmt.addr1))
+            {
+              match->data_frames_to_self++;
+            }
+
+          /* The four-way handshake runs from here.  Its first message is an
+           * ordinary data frame from the access point, so this branch -- which
+           * until now only counted -- is the only place in the receive path it
+           * can be seen, and answering it has to happen inside this dwell.
+           */
+
+          k1_rtl8852bs_runtime_wpa_observe(payload, payload_length, &mgmt);
         }
       else
         {
@@ -12941,6 +14309,29 @@ static void k1_rtl8852bs_scanofld_observe_wifi(
 
   match->management_frames++;
   match->mgmt_subtypes[frame_subtype]++;
+
+  /* A deauthentication or disassociation addressed to this host is the access
+   * point undoing what an earlier step in this run achieved, and its reason
+   * code says why.  Reason 15 is a four-way handshake that timed out, which is
+   * what a wrong passphrase looks like from the access point's side; reason 2
+   * is an invalid pairwise key.  Counting these is what lets a run distinguish
+   * an access point that ignored this host from one that answered it and then
+   * threw it out, which the sweep summary could not do before.
+   */
+
+  if ((frame_subtype == K1_RTL8852BS_IEEE80211_SUBTYPE_DEAUTHENTICATION ||
+       frame_subtype == K1_RTL8852BS_IEEE80211_SUBTYPE_DISASSOCIATION) &&
+      mgmt.addr1_valid && k1_rtl8852bs_scanofld_is_self_mac(mgmt.addr1))
+    {
+      match->deauth_to_self++;
+      if (!match->deauth_valid &&
+          payload_length >= K1_RTL8852BS_IEEE80211_HEADER_SIZE + 2u)
+        {
+          match->deauth_valid = true;
+          match->deauth_reason = k1_rtl8852bs_read_le16(
+            payload + K1_RTL8852BS_IEEE80211_HEADER_SIZE);
+        }
+    }
   if (dwell_index >= 0)
     {
       match->dwell_management[dwell_index]++;
@@ -13347,6 +14738,12 @@ static void k1_rtl8852bs_scanofld_log_bss_table(
   k1_early_puthex(match->rx_parse_errors);
   k1_early_puts(" data=");
   k1_early_puthex(match->data_frames_seen);
+  k1_early_puts(" data-self=");
+  k1_early_puthex(match->data_frames_to_self);
+  k1_early_puts(" deauth-self=");
+  k1_early_puthex(match->deauth_to_self);
+  k1_early_puts(" deauth-reason=");
+  k1_early_puthex(match->deauth_valid ? match->deauth_reason : 0xffffu);
   k1_early_puts(" ctrl=");
   k1_early_puthex(match->control_frames);
   k1_early_puts(" rx-total=");
@@ -13862,6 +15259,9 @@ static void k1_rtl8852bs_runtime_scanofld_export_result(
   result->advanced_channels = match->advanced_channels;
   result->dropped_count = match->bss_dropped;
   result->scan_end = match->saw_scan_end;
+  result->data_frames_to_self = (uint16_t)match->data_frames_to_self;
+  result->deauth_to_self = (uint16_t)match->deauth_to_self;
+  result->deauth_reason = match->deauth_valid ? match->deauth_reason : 0xffffu;
 
   for (index = 0; index < match->bss_count &&
        index < K1_RTL8852BS_SCAN_OFLD_BSS_MAX; index++)
@@ -18766,6 +20166,130 @@ static void k1_rtl8852bs_runtime_assoc_report(FAR const char *label)
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_wpa_report
+ *
+ * Description:
+ *   Print the one line that separates the ways the four-way handshake can end:
+ *   never started because the access point sent nothing, started and answered
+ *   but with an integrity code that did not verify, or completed.  It runs
+ *   after the sweep, so it may be as long as it needs to be.
+ *
+ *   No key material appears in it.  The pairwise master key, the transient key
+ *   and its three sub-keys are never printed, in this line or anywhere else;
+ *   what is printed is which message arrived, which one went out, and whether
+ *   the integrity code verified, which is the entire result.  The first four
+ *   bytes of the access point's nonce are printed because they are the access
+ *   point's own value sent in the clear, and because a nonce of all zeroes
+ *   would otherwise be indistinguishable from a correct one.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_wpa_report(FAR const char *label)
+{
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" eapol=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.eapol_frames);
+  k1_early_puts(" eapol-self=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.frames_to_self);
+  k1_early_puts(" malformed=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.malformed);
+  k1_early_puts(" ver-refused=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.version_refused);
+  k1_early_puts(" rsn-ie=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.rsn_ie_length);
+  k1_early_puts(" msg1=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg1_valid ? 1u : 0u);
+  k1_early_puts(" msg1-info=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg1_key_info);
+  k1_early_puts(" anonce=");
+  k1_rtl8852bs_scanofld_log_bytes(g_k1_rtl8852bs_wpa_action.anonce, 4);
+  k1_early_puts(" ptk=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.ptk_valid ? 1u : 0u);
+  k1_early_puts(" msg2=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg2_sent ? 1u : 0u);
+  k1_early_puts(" msg2-bytes=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg2_bytes);
+  k1_early_puts(" msg2-status=");
+  k1_early_puthex((uintreg_t)(g_k1_rtl8852bs_wpa_action.msg2_status < 0 ?
+                              -g_k1_rtl8852bs_wpa_action.msg2_status : 0));
+  k1_early_puts(" msg3=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg3_valid ? 1u : 0u);
+  k1_early_puts(" msg3-info=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg3_key_info);
+  k1_early_puts(" msg3-keydata=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg3_key_data_length);
+  k1_early_puts(" mic=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg3_mic_valid ? 1u : 0u);
+  k1_early_puts(" mic-fail=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg3_mic_failures);
+  k1_early_puts(" msg4=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg4_sent ? 1u : 0u);
+  k1_early_puts(" msg4-status=");
+  k1_early_puthex((uintreg_t)(g_k1_rtl8852bs_wpa_action.msg4_status < 0 ?
+                              -g_k1_rtl8852bs_wpa_action.msg4_status : 0));
+  k1_early_puts(" complete=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.complete ? 1u : 0u);
+  k1_early_puts("\r\n");
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_wpa_pmk_derive
+ *
+ * Description:
+ *   Derive the pairwise master key for one BSS from the configured passphrase.
+ *   IEEE 802.11 annex J.4: the key is PBKDF2-SHA1 over the passphrase with the
+ *   SSID as salt and 4096 iterations, which is the whole of what WPA2-PSK means
+ *   by a pre-shared key.
+ *
+ *   This is called once per run, before any sweep starts.  It costs on the
+ *   order of sixteen thousand SHA-1 compressions and a receive loop that spent
+ *   that long inside a 250 ms dwell would miss the rest of it.
+ *
+ *   The passphrase reaches this function from a Kconfig string and goes no
+ *   further: it is not stored in module state, not copied into the handshake
+ *   state, and never printed.  Neither is the key it produces.  The committed
+ *   defconfig leaves the string empty, so a tree with no passphrase configured
+ *   builds and reports -ENOKEY rather than attempting a handshake it cannot
+ *   complete.
+ *
+ * Returned Value:
+ *   OK with pmk filled in, -ENOKEY when no passphrase is configured, or
+ *   -EINVAL when the passphrase or the SSID is not a length WPA2-PSK allows.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_wpa_pmk_derive(FAR const uint8_t *ssid,
+                                               uint8_t ssid_length,
+                                               FAR uint8_t *pmk)
+{
+  FAR const char *passphrase = CONFIG_K1_RTL8852BS2_RUNTIME_WPA_PASSPHRASE;
+  size_t length = strlen(passphrase);
+
+  if (length == 0)
+    {
+      return -ENOKEY;
+    }
+
+  /* Clause J.4 allows 8 to 63 printable characters.  A 64-character string
+   * would be a hexadecimal master key rather than a passphrase, which is a
+   * different input this port does not accept.
+   */
+
+  if (length < 8 || length > 63 || ssid_length == 0 ||
+      ssid_length > K1_RTL8852BS_IEEE80211_SSID_MAX || ssid == NULL ||
+      pmk == NULL)
+    {
+      return -EINVAL;
+    }
+
+  k1_rtl8852bs_pbkdf2_sha1(passphrase, ssid, ssid_length,
+                           K1_RTL8852BS_WPA_PBKDF2_ITERATIONS, pmk,
+                           K1_RTL8852BS_WPA_PMK_SIZE);
+  return OK;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_assoc_security_from_bss
  *
  * Description:
@@ -18862,12 +20386,23 @@ static bool k1_rtl8852bs_runtime_assoc_askable(
  *      sibling's SSID drew no Association Response at all, while the same
  *      access point had answered every Authentication Request -- which carries
  *      no SSID element to compare.
- *   2. An open BSS over an RSN one.  Both can be asked, but only the open one
- *      leads to a link this port could carry data on: an RSN access point that
- *      grants the association immediately starts a four-way handshake this
- *      component has no key material to answer, and drops the station when it
- *      times out.  The Association Response is still the result being asked
- *      for, and it is real either way.
+ *   2. An open BSS over an RSN one, when no passphrase is being used.  Both can
+ *      be asked, but without key material only the open one leads to a link
+ *      this port could carry data on: an RSN access point that grants the
+ *      association immediately starts a four-way handshake, and drops the
+ *      station when it times out.  The Association Response is still the result
+ *      being asked for, and it is real either way.
+ *
+ *      With a passphrase this preference inverts and hardens.  An open BSS is
+ *      then disqualified rather than preferred, because a handshake is the
+ *      thing being tested and an open access point runs none; and when an SSID
+ *      is configured alongside the passphrase, only that exact SSID is asked.
+ *      A pairwise master key is derived from the passphrase salted with the
+ *      SSID, so it belongs to one network and to no other: asking a different
+ *      RSN access point would produce a wrong integrity code, and a wrong
+ *      integrity code from a wrong key is indistinguishable in the log from a
+ *      wrong key derivation, which is exactly the evidence this step exists to
+ *      produce.  Aiming at one named network keeps that distinction.
  *   3. The access point already proven to answer this host's Authentication
  *      Request in this run, because clause 11.3 lets an Association Request
  *      through only from state 2, and an answer already observed is the
@@ -18877,6 +20412,9 @@ static bool k1_rtl8852bs_runtime_assoc_askable(
  *
  * Input Parameters:
  *   result - a completed sweep
+ *   wpa    - true when a four-way handshake is to be run against the target,
+ *            which restricts the candidates to the RSN access points a
+ *            configured passphrase can actually belong to
  *   proven - set to true when the returned entry is the access point that
  *            already answered an Authentication Request, false otherwise
  *
@@ -18888,8 +20426,11 @@ static bool k1_rtl8852bs_runtime_assoc_askable(
 
 static FAR const struct k1_rtl8852bs_scan_bss_s *
 k1_rtl8852bs_runtime_assoc_target_select(
-  FAR const struct k1_rtl8852bs_scan_result_s *result, FAR bool *proven)
+  FAR const struct k1_rtl8852bs_scan_result_s *result, bool wpa,
+  FAR bool *proven)
 {
+  FAR const char *wanted = CONFIG_K1_RTL8852BS2_RUNTIME_WPA_SSID;
+  size_t wanted_length = strlen(wanted);
   FAR const struct k1_rtl8852bs_scan_bss_s *best = NULL;
   unsigned int best_rank = 0;
   bool best_proven = false;
@@ -18917,6 +20458,27 @@ k1_rtl8852bs_runtime_assoc_target_select(
           continue;
         }
 
+      /* Disqualifications that only apply when a handshake is to be run: an
+       * access point with no RSN element runs none, and an access point whose
+       * SSID is not the configured one holds a different pre-shared key.
+       */
+
+      if (wpa)
+        {
+          if (!bss->rsn_present || !bss->ssid_present ||
+              bss->ssid_length == 0)
+            {
+              continue;
+            }
+
+          if (wanted_length > 0 &&
+              (bss->ssid_length != wanted_length ||
+               memcmp(bss->ssid, wanted, wanted_length) != 0))
+            {
+              continue;
+            }
+        }
+
       /* The three preferences, weighted so that each outranks every
        * combination of the ones below it.
        */
@@ -18926,8 +20488,8 @@ k1_rtl8852bs_runtime_assoc_target_select(
           rank += 4;
         }
 
-      if ((bss->capability &
-           K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY) == 0)
+      if (!wpa && (bss->capability &
+                   K1_RTL8852BS_IEEE80211_CAPABILITY_PRIVACY) == 0)
         {
           rank += 2;
         }
@@ -19031,6 +20593,25 @@ struct k1_rtl8852bs_assoc_attempt_s
   uint16_t status;
   uint16_t aid;
   int sweep_ret;
+
+  /* What the four-way handshake reached inside this attempt's sweep, when one
+   * was armed.  msg3_mic_valid is the load-bearing one: an access point can
+   * only produce an integrity code this host verifies from a pairwise key it
+   * derived from the same pairwise master key, so a verified code is the
+   * configured passphrase, the key derivation and this port's frame bytes all
+   * confirmed at once.  complete adds that the acknowledgement went out.
+   */
+
+  bool wpa_armed;
+  bool msg1_seen;
+  bool msg2_sent;
+  bool msg3_seen;
+  bool msg3_mic_valid;
+  bool complete;
+  uint16_t version_refused;
+  uint16_t deauth_to_self;
+  uint16_t deauth_reason;
+  uint16_t data_frames_to_self;
 };
 
 /****************************************************************************
@@ -19059,6 +20640,14 @@ struct k1_rtl8852bs_assoc_attempt_s
  *   security     - what the target requires of the request: its Privacy bit,
  *                  whether an RSN element is to be built, and the group cipher
  *                  to echo in it
+ *   pmk          - the pairwise master key for this BSS, which arms the
+ *                  four-way handshake inside the same sweep, or NULL to run
+ *                  the attempt as association only.  The handshake is a
+ *                  continuation of this exchange and not a step of its own:
+ *                  the access point sends its first EAPOL-Key frame within
+ *                  milliseconds of granting the association, so the only place
+ *                  it can be answered is the receive loop of the sweep that
+ *                  the association happened in
  *   result       - sweep result buffer, overwritten by this attempt
  *   attempt      - filled in with what this attempt observed
  *
@@ -19069,6 +20658,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
   FAR const char *ssid_source, FAR const uint8_t *bssid, uint8_t channel,
   FAR const uint8_t *ssid, uint8_t ssid_length,
   FAR const struct k1_rtl8852bs_assoc_security_s *security,
+  FAR const uint8_t *pmk,
   FAR struct k1_rtl8852bs_scan_result_s *result,
   FAR struct k1_rtl8852bs_assoc_attempt_s *attempt)
 {
@@ -19095,6 +20685,8 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
   k1_early_puthex(security != NULL && security->privacy ? 1u : 0u);
   k1_early_puts(" rsn=");
   k1_early_puthex(security != NULL && security->rsn ? 1u : 0u);
+  k1_early_puts(" wpa=");
+  k1_early_puthex(pmk != NULL ? 1u : 0u);
   k1_early_puts(" bssid=");
   k1_rtl8852bs_scanofld_log_bytes(bssid, 6);
   k1_early_puts("\r\n");
@@ -19103,9 +20695,21 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 
   k1_rtl8852bs_runtime_auth_arm(bssid, channel);
   k1_rtl8852bs_runtime_assoc_arm(bssid, channel, ssid, ssid_length, security);
+
+  /* Arming the handshake last matters: k1_rtl8852bs_runtime_wpa_arm() zeroes
+   * the handshake state including the copy of the transmitted RSN element, and
+   * that copy is taken by the association transmit path while the sweep runs.
+   */
+
+  if (pmk != NULL)
+    {
+      k1_rtl8852bs_runtime_wpa_arm(bssid, channel, pmk);
+    }
+
   attempt->sweep_ret = k1_rtl8852bs_runtime_scanofld_passive_scan(result);
   k1_rtl8852bs_runtime_auth_disarm();
   k1_rtl8852bs_runtime_assoc_disarm();
+  k1_rtl8852bs_runtime_wpa_disarm();
 
   if (k1_rtl8852bs_runtime_tx_state_sample(&after) == OK)
     {
@@ -19116,6 +20720,11 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
   k1_rtl8852bs_runtime_auth_report(auth_label);
   k1_rtl8852bs_runtime_assoc_report(label);
 
+  if (pmk != NULL)
+    {
+      k1_rtl8852bs_runtime_wpa_report(label);
+    }
+
   attempt->bss_count = result->bss_count;
   attempt->beacon_frames = k1_rtl8852bs_runtime_scan_beacon_frames(result,
                                                                   bssid);
@@ -19123,10 +20732,31 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
   attempt->response = g_k1_rtl8852bs_assoc_action.response_valid;
   attempt->status = g_k1_rtl8852bs_assoc_action.response_status;
   attempt->aid = g_k1_rtl8852bs_assoc_action.response_aid;
+
+  attempt->deauth_to_self = result->deauth_to_self;
+  attempt->deauth_reason = result->deauth_reason;
+  attempt->data_frames_to_self = result->data_frames_to_self;
+
+  /* The handshake state is module-wide and survives an attempt that armed no
+   * handshake, so it is only read into an attempt that armed one.  Otherwise a
+   * second attempt would inherit the first one's verified integrity code and
+   * claim a handshake it never ran.
+   */
+
+  if (pmk != NULL)
+    {
+      attempt->wpa_armed = true;
+      attempt->msg1_seen = g_k1_rtl8852bs_wpa_action.msg1_valid;
+      attempt->msg2_sent = g_k1_rtl8852bs_wpa_action.msg2_sent;
+      attempt->msg3_seen = g_k1_rtl8852bs_wpa_action.msg3_valid;
+      attempt->msg3_mic_valid = g_k1_rtl8852bs_wpa_action.msg3_mic_valid;
+      attempt->complete = g_k1_rtl8852bs_wpa_action.complete;
+      attempt->version_refused = g_k1_rtl8852bs_wpa_action.version_refused;
+    }
 }
 
 /****************************************************************************
- * Name: k1_rtl8852bs_fwdl_runtime_assoc_diagnostic
+ * Name: k1_rtl8852bs_runtime_station_diagnostic
  *
  * Description:
  *   Ask one real access point to associate this host, and require its
@@ -19143,14 +20773,24 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
  *   frames are therefore armed before the sweep starts and the sweep's own
  *   receive drain is what observes both answers.
  *
- *   Only an access point that advertises no Privacy is asked.  This component
- *   has no security engine initialized and holds no key, so it can offer no
- *   cipher suite; an Association Request without an RSN element to a Privacy
- *   access point is refused for that reason alone and would say nothing about
- *   this port.  Such an access point is skipped by the target selection rather
- *   than attempted, and a run with nothing else in range fails with
- *   -EOPNOTSUPP, which is an honest description of this port and not of the
- *   radio environment.
+ *   An access point that advertises Privacy is asked only when its RSN element
+ *   offers CCMP among the pairwise ciphers and the pre-shared key suite among
+ *   the key management suites, because that is the only pair this port can name
+ *   in an Association Request.  Anything else is skipped by the target
+ *   selection rather than attempted -- the refusal it would return says nothing
+ *   about this port's frame path -- and a run with nothing else in range fails
+ *   with -EOPNOTSUPP, which is an honest description of this port and not of
+ *   the radio environment.
+ *
+ *   With wpa set, the same exchange continues into the WPA2-PSK four-way
+ *   handshake of clause 12.7.6 inside the same sweep, and the target selection
+ *   narrows to the RSN access points the configured passphrase can belong to.
+ *   The pairwise master key is derived once before any sweep starts, because it
+ *   costs some sixteen thousand SHA-1 compressions and a receive loop that
+ *   spent that long inside a 250 ms dwell would miss the rest of it.  Its salt
+ *   is the SSID, so a key is only derived for an access point that advertised
+ *   one: the handshake is skipped, with a line saying so, on a BSS whose name
+ *   this host had to guess.
  *
  *   Up to two attempts are made, and the difference between them is the SSID.
  *   The first uses what the target advertised, zero length included: a BSS that
@@ -19176,34 +20816,54 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
  *   filtering receive traffic, and a run that reported an association while
  *   quietly having stopped receiving would be worse than a failure.
  *
- *   What this does NOT do: no key of any kind is installed, no four-way
- *   handshake is run, no data frame is sent or received, no network device
- *   changes behaviour, no IP address is configured, and the port's TSF is still
- *   frozen and not synchronised to the access point's beacons, because
- *   mac_port_init() is not ported yet.  An association identifier granted by an
- *   access point is not a working link.  Nothing is written to eMMC, SPI flash,
- *   eFuse or the U-Boot environment.
+ *   What this does NOT do: no key is installed in the hardware, so nothing is
+ *   encrypted or decrypted and no data frame beyond the unprotected EAPOL-Key
+ *   frames is sent or received; the group key that arrives wrapped inside the
+ *   third handshake message is not unwrapped, because AES key unwrap is not
+ *   ported; no network device changes behaviour; no IP address is configured;
+ *   and the port's TSF is still frozen and not synchronised to the access
+ *   point's beacons, because mac_port_init() is not ported yet.  Neither an
+ *   association identifier nor a completed handshake is a working link.
+ *   Nothing is written to eMMC, SPI flash, eFuse or the U-Boot environment.
+ *
+ *   No key material is printed by any part of this: not the passphrase, not the
+ *   pairwise master key, and none of the transient key or its three sub-keys.
+ *   What the console carries is which frame arrived, which one went out, and
+ *   whether the integrity code verified.
  *
  * Input Parameters:
  *   self_mac - The eFuse self MAC.  It has to be the address the role and the
  *              address CAM were configured with, because a response is only
  *              counted as an answer to this host when its A1 matches.
+ *   wpa      - true to continue the association into a four-way handshake and
+ *              require its third message's integrity code to verify.
  *
  * Returned Value:
- *   OK when an Association Response addressed to this host arrived, whatever
- *   status code it carried, because the answered exchange is the milestone this
- *   step is named for; the console line "RTL8852BS2 station association
- *   complete" is printed only for status 0 with a non-zero association
- *   identifier.  Otherwise a negated errno: -ENODATA when the request went
- *   unanswered, -EHOSTUNREACH when the sweep found no access point at all,
- *   -EOPNOTSUPP when every access point in range requires a cipher this port
- *   cannot offer, -EPROTO when the association identifier update cost this host
- *   the target's beacons, and -EIO when the firmware rejected one of the two
- *   re-sent commands.
+ *   Without wpa: OK when an Association Response addressed to this host
+ *   arrived, whatever status code it carried, because the answered exchange is
+ *   the milestone this step is named for; the console line "RTL8852BS2 station
+ *   association complete" is printed only for status 0 with a non-zero
+ *   association identifier.  Otherwise a negated errno: -ENODATA when the
+ *   request went unanswered, -EHOSTUNREACH when the sweep found no access point
+ *   at all, -EOPNOTSUPP when every access point in range requires a cipher this
+ *   port cannot offer, -EPROTO when the association identifier update cost this
+ *   host the target's beacons, and -EIO when the firmware rejected one of the
+ *   two re-sent commands.
+ *
+ *   With wpa: every failure above still fails, an association that was refused
+ *   fails with -ECONNREFUSED because a refused station is never sent a first
+ *   EAPOL-Key frame, and OK additionally requires the third message's integrity
+ *   code to have verified.  A handshake that fell short reports where: -ENOKEY
+ *   when no passphrase is configured, -EOPNOTSUPP when the access point asked
+ *   for a key descriptor version this port cannot compute, -ETIMEDOUT when the
+ *   access point sent no first message or did not answer the second, and
+ *   -EBADMSG when the third message arrived but its integrity code did not
+ *   verify -- which is what a wrong passphrase looks like.
  *
  ****************************************************************************/
 
-int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
+static int k1_rtl8852bs_runtime_station_diagnostic(
+  FAR const uint8_t *self_mac, bool wpa)
 {
   struct k1_rtl8852bs_scan_result_s result;
   FAR const struct k1_rtl8852bs_scan_bss_s *target;
@@ -19214,6 +20874,8 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
   uint8_t bssid[6];
   uint8_t ssid[K1_RTL8852BS_IEEE80211_SSID_MAX];
   uint8_t sibling_ssid[K1_RTL8852BS_IEEE80211_SSID_MAX];
+  uint8_t pmk[K1_RTL8852BS_WPA_PMK_SIZE];
+  FAR const uint8_t *handshake_pmk = NULL;
   uint8_t ssid_length;
   uint8_t sibling_length = 0;
   uint8_t channel;
@@ -19237,7 +20899,7 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
       goto error;
     }
 
-  target = k1_rtl8852bs_runtime_assoc_target_select(&result, &proven);
+  target = k1_rtl8852bs_runtime_assoc_target_select(&result, wpa, &proven);
   if (target == NULL)
     {
       /* Separate the two ways there can be nothing to aim at: a sweep that
@@ -19267,6 +20929,44 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
   if (ssid_length > 0)
     {
       memcpy(ssid, target->ssid, ssid_length);
+    }
+
+  /* Derive the pairwise master key here, before any sweep: the target's SSID
+   * is its salt and is now known, and the derivation is far too slow to run
+   * from inside a receive loop.  A target that advertised no SSID cannot have
+   * a key derived for it at all, and the handshake is skipped rather than
+   * attempted with a key salted by a guess.
+   */
+
+  memset(pmk, 0, sizeof(pmk));
+  if (wpa)
+    {
+      ret = ssid_length > 0 ?
+            k1_rtl8852bs_runtime_wpa_pmk_derive(ssid, ssid_length, pmk) :
+            -ENOENT;
+
+      k1_early_puts("K1 Wi-Fi GPL: wpa pmk ssid-len=");
+      k1_early_puthex(ssid_length);
+      k1_early_puts(" status=");
+      k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+      k1_early_puts("\r\n");
+
+      if (ret == -ENOKEY || ret == -EINVAL)
+        {
+          /* No passphrase configured, or one no length WPA2-PSK allows.  That
+           * is a build-time omission and not a result about the radio, so it
+           * is reported as itself rather than run as a handshake that cannot
+           * possibly complete.
+           */
+
+          ret = ret == -EINVAL ? -EINVAL : -ENOKEY;
+          goto error;
+        }
+
+      if (ret == OK)
+        {
+          handshake_pmk = pmk;
+        }
     }
 
   k1_early_puts("K1 Wi-Fi GPL: assoc target bssid=");
@@ -19312,7 +21012,8 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
   k1_rtl8852bs_runtime_assoc_attempt("assoc advertised",
                                      "assoc advertised auth", "advertised",
                                      bssid, channel, ssid, ssid_length,
-                                     &security, &result, &advertised);
+                                     &security, handshake_pmk, &result,
+                                     &advertised);
   decided = &advertised;
 
   /* The sibling SSID is only worth trying when the target named itself in no
@@ -19329,7 +21030,7 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
       k1_rtl8852bs_runtime_assoc_attempt("assoc sibling", "assoc sibling auth",
                                          "sibling", bssid, channel,
                                          sibling_ssid, sibling_length,
-                                         &security, &result, &sibling);
+                                         &security, NULL, &result, &sibling);
 
       /* The sibling becomes the reported attempt when it got further than the
        * advertised one.  Association is the whole point, so an associated
@@ -19393,6 +21094,25 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
   k1_early_puts(" sweep=");
   k1_early_puthex((uintreg_t)(decided->sweep_ret < 0 ?
                               -decided->sweep_ret : 0));
+  k1_early_puts(" data-self=");
+  k1_early_puthex(decided->data_frames_to_self);
+  k1_early_puts(" deauth-self=");
+  k1_early_puthex(decided->deauth_to_self);
+  k1_early_puts(" deauth-reason=");
+  k1_early_puthex(decided->deauth_to_self != 0 ?
+                  decided->deauth_reason : 0xffffu);
+  k1_early_puts(" wpa=");
+  k1_early_puthex(decided->wpa_armed ? 1u : 0u);
+  k1_early_puts(" msg1=");
+  k1_early_puthex(decided->msg1_seen ? 1u : 0u);
+  k1_early_puts(" msg2=");
+  k1_early_puthex(decided->msg2_sent ? 1u : 0u);
+  k1_early_puts(" msg3=");
+  k1_early_puthex(decided->msg3_seen ? 1u : 0u);
+  k1_early_puts(" mic=");
+  k1_early_puthex(decided->msg3_mic_valid ? 1u : 0u);
+  k1_early_puts(" msg4=");
+  k1_early_puthex(decided->complete ? 1u : 0u);
   k1_early_puts(" bssid=");
   k1_rtl8852bs_scanofld_log_bytes(bssid, sizeof(bssid));
   k1_early_puts("\r\n");
@@ -19423,6 +21143,18 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
       k1_early_puts(" aid=");
       k1_early_puthex(decided->aid);
       k1_early_puts("\r\n");
+
+      /* A refused station is never sent a first EAPOL-Key frame, so for the
+       * handshake step this is a failure and not the milestone it is for the
+       * association step.
+       */
+
+      if (wpa)
+        {
+          ret = -ECONNREFUSED;
+          goto error;
+        }
+
       return OK;
     }
 
@@ -19470,13 +21202,102 @@ int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
     }
 
   k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station association complete\r\n");
+
+  if (wpa)
+    {
+      /* Name where a handshake stopped, in the order the four messages happen,
+       * so the log distinguishes an access point that started no handshake from
+       * one that answered with a key descriptor version this port cannot
+       * compute, from one that stopped answering, from one whose integrity code
+       * did not verify -- the last being what a wrong passphrase looks like.
+       */
+
+      if (!decided->wpa_armed)
+        {
+          ret = -ENOENT;
+        }
+      else if (decided->version_refused != 0)
+        {
+          ret = -EOPNOTSUPP;
+        }
+      else if (!decided->msg1_seen || !decided->msg3_seen)
+        {
+          ret = -ETIMEDOUT;
+        }
+      else if (!decided->msg3_mic_valid)
+        {
+          ret = -EBADMSG;
+        }
+      else if (!decided->complete)
+        {
+          ret = -EIO;
+        }
+      else
+        {
+          ret = OK;
+        }
+
+      if (ret < 0)
+        {
+          goto error;
+        }
+
+      memset(pmk, 0, sizeof(pmk));
+      k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station WPA2 four-way "
+                    "handshake complete\r\n");
+    }
+
   return OK;
 
 error:
-  k1_early_puts("K1 Wi-Fi GPL: station association error=");
+  memset(pmk, 0, sizeof(pmk));
+  k1_early_puts(wpa ? "K1 Wi-Fi GPL: station WPA2 error=" :
+                      "K1 Wi-Fi GPL: station association error=");
   k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
   k1_early_puts("\r\n");
   return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_fwdl_runtime_assoc_diagnostic
+ *
+ * Description:
+ *   Association only: authenticate, associate, and take the association
+ *   identifier into the address CAM.  See
+ *   k1_rtl8852bs_runtime_station_diagnostic() for what this does and does not
+ *   prove.
+ *
+ ****************************************************************************/
+
+int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac)
+{
+  return k1_rtl8852bs_runtime_station_diagnostic(self_mac, false);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_fwdl_runtime_wpa_diagnostic
+ *
+ * Description:
+ *   The same association, continued into the WPA2-PSK four-way handshake of
+ *   IEEE 802.11 clause 12.7.6 inside the same sweep, and required to reach a
+ *   third message whose integrity code verifies.  This is one step and not two
+ *   because the access point sends its first EAPOL-Key frame within
+ *   milliseconds of granting the association: the only place it can be answered
+ *   is the receive loop of the sweep the association happened in.
+ *
+ *   A verified integrity code on the third message is the strongest evidence
+ *   this port can produce short of encrypted traffic.  The access point can
+ *   only compute it from a pairwise transient key derived from the same
+ *   pairwise master key, over the same frame bytes, in the same order -- so one
+ *   verification confirms the configured passphrase, the PBKDF2 derivation, the
+ *   pairwise key expansion, the nonce and address ordering, and every byte of
+ *   the EAPOL-Key frame this host transmitted, all at once.
+ *
+ ****************************************************************************/
+
+int k1_rtl8852bs_fwdl_runtime_wpa_diagnostic(FAR const uint8_t *self_mac)
+{
+  return k1_rtl8852bs_runtime_station_diagnostic(self_mac, true);
 }
 
 int k1_rtl8852bs_fwdl_preboot_diagnostic(void)

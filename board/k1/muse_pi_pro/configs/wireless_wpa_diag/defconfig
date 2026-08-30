@@ -1,0 +1,69 @@
+# RTL8852BS2 WPA2-PSK: carry the association of the parent profile into the
+# four-way handshake of IEEE 802.11 clause 12.7.6, and require the access
+# point's third EAPOL-Key message to carry an integrity code this host
+# verifies.
+#
+# The parent is the association profile whose whole chain already passed on the
+# board, so one run of this image re-validates everything proven before -
+# firmware download, the runtime control plane, the no-link role and CAM, the
+# passive 2.4 GHz 1-13 sweep with real Beacon RX, the wlan0 netdev whose wapi
+# scan reports those access points, the Probe Request/Response exchange, the
+# directed Authentication Request/Response, the JOININFO + ADDR_CAM_UPDATE, and
+# the Association Request that came back with an association identifier - and
+# then adds the four frames of the handshake.
+#
+# The handshake replaces the association step rather than following it. An
+# access point sends its first EAPOL-Key frame within milliseconds of granting
+# the association, so the only place it can be answered is the receive loop of
+# the sweep the association happened in; a separate step would spend a whole
+# extra sweep to arrive too late for the frame it exists to answer.
+#
+# What this host computes: the pairwise master key as PBKDF2-SHA1 over the
+# passphrase salted with the SSID for 4096 iterations, once before any sweep
+# because it costs some sixteen thousand SHA-1 compressions; the pairwise
+# transient key as PRF-384 over that key with the two addresses and the two
+# nonces each in sorted order; and the integrity code of every EAPOL-Key frame
+# as HMAC-SHA1-128 under the key confirmation key with the code's own field read
+# as zero. All of it is this port's own code - SHA-1, HMAC, PBKDF2 and the PRF
+# included - and all of it was verified on the host against the published
+# IEEE 802.11i test vectors and an independent implementation before this
+# profile existed.
+#
+# What proves it: the integrity code on the access point's third message. The
+# access point can only compute that from a pairwise key derived from the same
+# pairwise master key, over the same bytes, in the same order, so one
+# verification confirms the passphrase, the derivation, the key expansion, the
+# nonce and address ordering, and every byte of the second message this host
+# transmitted, all at once. The second message's RSN element is the very bytes
+# of the Association Request's, as clause 12.7.2 requires.
+#
+# No security engine is needed and none is initialized: all four EAPOL-Key
+# frames are unprotected. The group key that arrives wrapped inside the third
+# message is not unwrapped, because AES key unwrap is not ported; the integrity
+# code covers the wrapped bytes as they arrived, so it verifies without
+# decrypting anything.
+#
+# The passphrase is not here. CONFIG_K1_RTL8852BS2_RUNTIME_WPA_PASSPHRASE and
+# CONFIG_K1_RTL8852BS2_RUNTIME_WPA_SSID are left empty by this profile on
+# purpose - a credential belongs in nobody's repository - and this image is
+# built through tools/build_k1_wpa.sh, which reads K1_WIFI_PASSPHRASE and
+# K1_WIFI_SSID from outside the source tree and appends them to a generated
+# defconfig that lives outside it as well. Built as it stands, the step reports
+# ENOKEY and runs no handshake, which is the honest result for an image with no
+# key.
+#
+# Nothing is printed that would leak one either: not the passphrase, not the
+# pairwise master key, and none of the transient key or its three sub-keys. The
+# console carries which frame arrived, which one went out, and whether the
+# integrity code verified.
+#
+# This is still not a working link. No key is installed in the hardware, so
+# nothing is encrypted or decrypted and no data frame beyond the unprotected
+# EAPOL-Key frames is sent or received, no wlan0 behaviour changes, no IP
+# address is configured, and the port's TSF is still frozen because
+# mac_port_init() is not ported yet. Still RAM-only: nothing written to eMMC,
+# SPI flash, eFuse or the U-Boot environment.
+
+#include "../wireless_assoc_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC=y

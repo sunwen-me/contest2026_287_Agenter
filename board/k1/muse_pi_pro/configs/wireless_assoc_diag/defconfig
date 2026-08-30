@@ -11,12 +11,13 @@
 # and then adds the one new frame.
 #
 # That frame is the Association Request. It carries the capability information
-# an 802.11ax part honestly has (ESS, short preamble, short slot time, Privacy
-# clear), a listen interval of one beacon, the SSID and the same two rate
-# elements the Probe Request advertises. There is no RSN element, because this
-# host has no security engine initialized and holds no key, so the step only
-# ever aims at an access point that advertises no Privacy and reports
-# EOPNOTSUPP when there is none in range.
+# an 802.11ax part honestly has (ESS, short preamble, short slot time, and the
+# Privacy bit echoing the target's), a listen interval of one beacon, the SSID,
+# the same two rate elements the Probe Request advertises and, for a target that
+# advertises Privacy, an RSN element naming CCMP as the pairwise and group
+# cipher and the pre-shared key suite. That one suite is all this port can name,
+# so an access point requiring anything else is skipped rather than asked, and a
+# run with nothing else in range reports EOPNOTSUPP.
 #
 # Authentication and association go out inside one sweep. IEEE 802.11 clause
 # 11.3 accepts an Association Request only while the access point still holds
@@ -37,11 +38,12 @@
 # the vendor order (JOININFO, then ADDR_CAM_UPDATE), followed by a confirming
 # sweep that must still receive the target's Beacons.
 #
-# This is not a link. No key is installed, no four-way handshake is run, no
-# data frame is sent or received, no wlan0 behaviour changes, no IP address is
-# configured, and the port's TSF is still frozen because mac_port_init() is not
-# ported yet. Still RAM-only: nothing written to eMMC, SPI flash, eFuse or the
-# U-Boot environment.
+# This is not a link. No key is installed, no data frame is sent or received,
+# no wlan0 behaviour changes, no IP address is configured, and the port's TSF is
+# still frozen because mac_port_init() is not ported yet. This profile runs no
+# four-way handshake; wireless_wpa_diag is the profile that does. Still
+# RAM-only: nothing written to eMMC, SPI flash, eFuse or the U-Boot
+# environment.
 
 #include "../wireless_join_diag/defconfig"
 

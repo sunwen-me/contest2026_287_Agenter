@@ -145,6 +145,17 @@ struct k1_rtl8852bs_scan_result_s
   uint8_t data_only_count;
   uint8_t dropped_count;
   bool scan_end;
+
+  /* Two counts the sweep keeps that are about this host rather than about the
+   * access points it heard: data frames whose A1 was this host's own address,
+   * and deauthentication or disassociation frames addressed to this host with
+   * the reason code of the first of them.  deauth_reason is only meaningful
+   * when deauth_to_self is non-zero.
+   */
+
+  uint16_t data_frames_to_self;
+  uint16_t deauth_to_self;
+  uint16_t deauth_reason;
 };
 
 /* A C2H packet begins with the common 8-byte Realtek firmware-command
@@ -352,6 +363,7 @@ int k1_rtl8852bs_runtime_scanofld_passive_scan(
 int k1_rtl8852bs_fwdl_runtime_auth_diagnostic(FAR const uint8_t *self_mac);
 int k1_rtl8852bs_fwdl_runtime_join_diagnostic(FAR const uint8_t *self_mac);
 int k1_rtl8852bs_fwdl_runtime_assoc_diagnostic(FAR const uint8_t *self_mac);
+int k1_rtl8852bs_fwdl_runtime_wpa_diagnostic(FAR const uint8_t *self_mac);
 int k1_rtl8852bs_fwdl_preboot_diagnostic(void);
 int k1_rtl8852bs_fwdl_h2c_tx_diagnostic(void);
 int k1_rtl8852bs_fwdl_fw_header_packet_diagnostic(void);

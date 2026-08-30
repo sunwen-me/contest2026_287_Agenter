@@ -283,6 +283,25 @@ def parse_args() -> argparse.Namespace:
               "still receives the target's Beacons"),
     )
     parser.add_argument(
+        "--require-runtime-wpa-msg1", action="store_true",
+        help=("fail unless a pairwise master key is derived from a configured "
+              "passphrase and the access point sends a first EAPOL-Key frame "
+              "addressed to the eFuse self MAC that this host answers with a "
+              "second message"),
+    )
+    parser.add_argument(
+        "--require-runtime-wpa-mic", action="store_true",
+        help=("fail unless the access point's third EAPOL-Key message arrives "
+              "and its HMAC-SHA1-128 integrity code verifies against the "
+              "pairwise transient key this host derived, which no register "
+              "setting can produce and only the same pre-shared key can"),
+    )
+    parser.add_argument(
+        "--require-runtime-wpa", action="store_true",
+        help=("fail unless that verified third message is acknowledged with a "
+              "fourth and the WPA2-PSK four-way handshake completes"),
+    )
+    parser.add_argument(
         "--require-wlan0-scan", action="store_true",
         help=("fail unless wlan0 registers and a wapi passive scan returns at "
               "least one Beacon/Probe-Response BSS through SIOCGIWSCAN"),
@@ -1652,6 +1671,91 @@ def main() -> int:
             )
             if assoc_end_result is None:
                 missing.append("RTL8852BS2 station association completion")
+        if (args.require_runtime_wpa_msg1 or args.require_runtime_wpa_mic
+                or args.require_runtime_wpa):
+            # Everything is judged from the handshake's own lines, sliced from
+            # the line that reports a pairwise master key was derived, so no
+            # earlier step can satisfy these checks and an image built with no
+            # passphrase cannot either: that line carries status=0x0 only when
+            # PBKDF2 ran over a configured passphrase and the target's own SSID.
+            wpa_pmk_result = re.search(
+                rb"K1 Wi-Fi GPL: wpa pmk ssid-len=(?:0x)?0*[1-9a-fA-F]"
+                rb"[0-9a-fA-F]* status=0x0+(?![0-9a-fA-F])",
+                started,
+            )
+            if wpa_pmk_result is None:
+                missing.append(
+                    "RTL8852BS2 WPA2-PSK pairwise master key from a "
+                    "configured passphrase")
+                wpa = started
+            else:
+                wpa = started[wpa_pmk_result.end():]
+
+            # The exchange line of the decided attempt carries the handshake
+            # outcome, and every field in it is set by host software that
+            # compared the frame's own addresses against the eFuse self MAC.
+            wpa_exchange_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc exchange rsp=(?:0x)?0*[1-9a-fA-F]"
+                rb"[^\r\n]* wpa=0x0*1 msg1=0x0*1 msg2=0x0*1 msg3=(0x[0-9a-f]+)"
+                rb" mic=(0x[0-9a-f]+) msg4=(0x[0-9a-f]+)",
+                wpa,
+            )
+            if wpa_exchange_result is None:
+                missing.append(
+                    "RTL8852BS2 EAPOL-Key message 1 RX and message 2 transmit")
+
+            # The second message is proof of nothing on its own -- this host
+            # composes it -- but its transmit status separates a frame the
+            # hardware accepted from one the builder refused.
+            wpa_msg2_result = re.search(
+                rb"K1 Wi-Fi GPL: wpa msg2 tx bytes=(?:0x)?0*[1-9a-fA-F]"
+                rb"[^\r\n]* status=0x0+(?![0-9a-fA-F])",
+                wpa,
+            )
+            if wpa_msg2_result is None:
+                missing.append("RTL8852BS2 EAPOL-Key message 2 transmit")
+        if args.require_runtime_wpa_mic or args.require_runtime_wpa:
+            # The load-bearing check of the whole increment.  mic=0x1 is set
+            # only when this host recomputed HMAC-SHA1-128 over the received
+            # frame under the key confirmation key it derived itself and the
+            # result equalled the access point's, which the access point could
+            # only have produced from the same pre-shared key.
+            wpa_mic_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc exchange rsp=(?:0x)?0*[1-9a-fA-F]"
+                rb"[^\r\n]* msg3=0x0*1 mic=0x0*1",
+                wpa,
+            )
+            if wpa_mic_result is None:
+                missing.append(
+                    "RTL8852BS2 EAPOL-Key message 3 integrity code verified")
+
+            # A run that verified a code and also counted a failure is not a
+            # clean verification and is not accepted as one.
+            wpa_failure_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc advertised eapol=[^\r\n]* "
+                rb"mic-fail=0x0+(?![0-9a-fA-F])",
+                wpa,
+            )
+            if wpa_failure_result is None:
+                missing.append(
+                    "RTL8852BS2 handshake with no integrity code failure")
+        if args.require_runtime_wpa:
+            wpa_msg4_result = re.search(
+                rb"K1 Wi-Fi GPL: wpa msg4 tx bytes=(?:0x)?0*[1-9a-fA-F]"
+                rb"[^\r\n]* status=0x0+(?![0-9a-fA-F])",
+                wpa,
+            )
+            if wpa_msg4_result is None:
+                missing.append("RTL8852BS2 EAPOL-Key message 4 transmit")
+
+            wpa_end_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 station WPA2 four-way handshake "
+                rb"complete\r?\n",
+                wpa,
+            )
+            if wpa_end_result is None:
+                missing.append(
+                    "RTL8852BS2 WPA2-PSK four-way handshake completion")
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "
