@@ -5037,3 +5037,128 @@ no-link 时发生的，同样 +2。计数器只数 PPDU 不给帧类型，所以
   的 MPDU/DMA 计数、`ctn-txen`、`ptcl-common`、`macid-sleep`、`macid-pause`、
   `cmac-drop`、`dmac-drop`、`loopback`、`cca-abort`）与 `TX PPDU`，旧日志里的旧前缀不要
   再当成缺失。
+
+### 增量 3c：把一次管理帧交换做成可重复的（parked 信道 + 有界重传），以及关联为什么还没成
+
+提交 `7c1cbe4`。开关 `CONFIG_K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC`（依赖
+`..._RUNTIME_JOIN_DIAGNOSTIC`）、profile
+`board/k1/muse_pi_pro/configs/wireless_assoc_diag/`、构建脚本
+`tools/build_k1_assoc.sh`、harness 判据 `--require-runtime-assoc-response` 与
+`--require-runtime-assoc`。板上 run 30
+（`out/k1-serial/k1-assoc-20260830T120636Z.log`）本 runner 的 30 项 `--require-*`
+过了 27 项。**关联没有成**：没过的三项就是 Association Response、关联本身、以及依赖
+它们的 bring-up 成功。这一节先说它为什么没成，再说这一增量真正解决掉的是什么。
+
+#### 关联没成的原因：周围没有一个「既广播 SSID 又不加密」的 BSS
+
+run 30 发了 6 个 Association Request（对开放 BSS 3 个，用它 sibling BSSID 广播的
+SSID 再发 3 个），`frames=0x0`——AP 一帧都没回。同一轮的 sweep 普查给出了原因：
+
+| BSSID | cap | Privacy | RSN | SSID |
+| --- | --- | --- | --- | --- |
+| `504f3be2e6d2` | `0x431` | 有 | 20 字节，CCMP+PSK | `SB` |
+| `564f3be2e6d2` | `0x421` | 无 | 无 | 长度 0（隐藏） |
+| `a639b3663b34` | `0x421` | 无 | 无 | 长度 0（隐藏） |
+| `487d2ee005ea` | `0x031` | 有 | 20 字节 | `TP-LINK_05EA` |
+| 其余 20 余个 | `0x_31`/`0x_11` | 有 | 20/24 字节 | 有 |
+
+**扫到的每一个广播 SSID 的 BSS 都开了 Privacy 并带 RSN；不开 Privacy 的两个都不广播
+SSID。** 关联诊断按「privacy=0x0」挑目标，于是挑中隐藏 SSID 的 `564f3be2e6d2`——它是
+旁边那台 AP 的一个隐藏 VAP。Association Request 必须带**这个 BSS 自己的 SSID**
+（IEEE 802.11 11.3.5.3），本机不知道它，于是：
+
+- 「advertised」那次带长度 0 的 SSID element：AP 无法匹配，静默丢弃；
+- 「sibling」那次带 `SB`（是 `504f3be2e6d2` 的 SSID，不是它的）：不匹配，同样丢弃。
+
+认证不受影响，两次尝试各自都拿到了 `rsp-self=0x1 status=0x0`——**Authentication
+Request 不带 SSID**，所以它能成、关联不能成，这两件事并不矛盾，也不是发送侧的问题。
+
+结论很直接：这个射频环境里能走到关联的只有 WPA2-PSK 的 AP（`504f3be2e6d2`，而且它已经
+被证明会回本机的认证请求）。要拿到真的 Association Response，请求里必须带上和它 beacon
+里一致的 RSN element（CCMP 成对、CCMP 组、PSK AKM），这就是增量 3d 的第一件事；四次
+握手和装密钥还在它后面。
+
+#### 这一增量真正解决的：一次交换以前是抛硬币
+
+run 27（`out/k1-serial/k1-assoc-20260830T113232Z.log`）以 `station join error=0x3d`
+失败：join 步骤第三次 sweep 的那**一个** Authentication Request 没被回答
+（`cam-rsp=0x0 frames=0x0`），而同一台 AP 回答了它前面两次 sweep。一次 180 ms dwell 里
+只许发一个请求、只等这一个 dwell，这就是抛硬币。四个改动把它变成可重复的：
+
+1. **parked 信道表**。交换 armed 期间，13 条 scan-offload 信道表项**全部**填目标信道，
+   射频就留在能听到回答的那个信道上，而不是发完就走。park 跟着 arm/disarm 走，别的
+   sweep 一行都不受影响。日志里是 `passive scan channel-list parked channel=0x1
+   entries=0xd`，普查 sweep 仍然打 `channels=1-13`。
+2. **parked sweep 要按表项数重新装填 dwell**。原来的门控是「每个信道只装一次 dwell」的
+   位掩码，parked 表反复进同一个信道，于是整轮只装了一次，退休之后再没有 dwell 到期、
+   再没有 next-channel 命令发出去，固件就一直等——run 28 的 `-110`
+   （`enter-mask=0x1 next=0x1 end=0x0 scan-events=0x2`）就是这个。现在 parked 表按 13
+   条表项各装一次 dwell，固件走完表并报 SCAN_END，run 29 起 parked sweep 的
+   `end=0x1` 正常了。
+3. **有界重传**。认证和关联各最多 3 个请求，每个取新的序列号（避免 3b 查明的
+   IEEE 802.11 10.3.2.14 重复检测），发送时机是 parked 信道的每一次 enter 通知，条件是
+   「还没收到回答」。run 30 里 `sn=0x7,0x8,0x9` 和 `sn=0xd,0xe,0xf` 就是两组三次重传。
+4. **armed 期间不许打轮询串口**。中途那次 TX 见证快照实测 65 行 6378 字节，115200 8N1
+   下约 550 ms，而 dwell 只有 180 ms，而且它正好花在刚发过请求的那个 dwell 里
+   （run 26）。现在它只打一行 `tx witness mid-sweep snapshot suppressed exchange=0x1`，
+   逐帧解码转储同样在 armed 期间关掉。
+
+效果：run 30 的 join 步骤三次 sweep **全部**被回答（`prejoin-rsp=0x1 joininfo-rsp=0x1
+cam-rsp=0x1`），打出了 `RTL8852BS2 station join complete`；两次关联尝试也各自先拿到了
+自己的 Authentication Response。
+
+#### 对 3b 那条更正的再更正：这个固件不会自己换信道
+
+3b 的文档写过「`mac_ax_scanofld_chinfo` 的 `period` 是停留时长，所以固件会自己离开，host
+的 NEXT_CH 只能把 dwell 缩短」。字段定义没错，但**这个固件的实际行为不是这样**：
+
+- 至今每一轮 sweep 的每一次 enter 通知，前面紧挨着的都是本机发的 next-channel 命令；
+  `fw-next` 在所有运行里始终是 `0x0`。
+- run 28 停发命令之后，本机在同一个信道上又等了好几秒——表项里配的 `period` 是 250 ms，
+  表还剩 11 条没走——固件既没有 LEAVE 也没有新的 ENTER。
+
+所以：**host 是 sweep 唯一的节拍器**。这和 180 ms 的 host dwell 短于 250 ms 的
+`period` 是自洽的（本机总是先抢到），但「固件会自己走」这一条在这个端口上从未被观测到，
+凡是依赖它的推理都不成立——parked sweep 停在原地不动就是直接后果。
+
+#### done-ack 等待需要 8 KiB 的 RX 缓冲，512 字节不够
+
+run 29（`out/k1-serial/k1-assoc-20260830T120235Z.log`）在 parked sweep 修好之后立刻换了
+一个失败：认证步骤通过了（`RTL8852BS2 authentication response complete`），join 步骤在
+JOININFO 的 done-ack 上死掉，`runtime single done-ack wait … error=0x1c`（`-ENOSPC`）。
+
+根因是 parked sweep 的一个副作用：sweep 结束后射频**留在**目标 AP 正在发 beacon 的信道
+上，SDIO RX FIFO 里待取的聚合帧于是经常不止一帧。`k1_rtl8852bs_runtime_rx_read()` 对
+「请求长度 > 缓冲区」的处理是**不消费、返回 `-ENOSPC`**（这是对的，FIFO 必须整块读），
+于是 done-ack 等待第一次读就失败，之后每一次读都失败同一个长度。
+
+`K1_RTL8852BS_RUNTIME_DONE_ACK_RX_MAX` 从 512 改成 8192，和 sweep 自己的读缓冲一样大
+（sweep 至今 `oversize=0x0`，从没报过超限），并且把 `-ENOSPC` 时设备宣告的长度一起打进
+错误行（`length=`），以后要再调大就有数据可依。
+
+#### run 27 → 30 的账
+
+| run | 结果 | 根因 |
+| --- | --- | --- |
+| 27 | `-61`，join `error=0x3d` | 一次 sweep 只发一个请求，第三次 sweep 没被回答 |
+| 28 | `-110`，认证步骤超时 | parked 表只装了一次 dwell，host 停发命令、固件干等；**认证其实成功了**（`rsp-self=0x1 status=0x0`），是 sweep 的超时把它盖掉了 |
+| 29 | `-28`，join `error=0x1c` | done-ack 512 字节缓冲遇上 parked 之后的多帧聚合，`-ENOSPC` |
+| 30 | `-61`，关联 `error=0x3d` | 环境里没有「广播 SSID 且不加密」的 BSS，Association Request 无法带对 SSID |
+
+run 28 那件事值得单独记：修好之前它的 `-110` 让人以为认证没成，其实 `auth req=0x1 …
+rsp-self=0x1 rsp-target=0x1 alg=0x0 seq=0x2 status=0x0 a2=504f3be2e6d2` 就在同一份日志
+里。**一次成功的交换被一个还没结束的 sweep 的返回值盖掉**，这类错误比失败本身更难看见，
+所以 3d 之前先把它写下来。当时还怀疑过是新加的重传没有触发；反汇编
+（`riscv-none-elf-objdump` 看 `k1_rtl8852bs_runtime_scanofld_passive_match`）确认两个
+`jal` 调用点都在、守卫条件逐条对得上，而重传的守卫要求「还没收到回答」——回答已经在第一
+个 dwell 里到了，所以它**本就不该**触发。
+
+#### 下一步
+
+增量 3d：给 Association Request 加 RSN element（version 1、组密码 CCMP、成对密码 CCMP、
+AKM PSK、RSN capabilities 0），目标改成已经被证明会回认证请求的 WPA2-PSK AP
+`504f3be2e6d2`；`K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE`（现在 96）要跟着放大，harness 的
+`privacy=0x0` 判据要改成「目标带 CCMP+PSK 的 RSN」而不是删掉。拿到带 AID 的
+Association Response 之后才是 `sec_eng_init`/`sec_info_tbl_init` 和四次握手。3b 欠的
+上游顺序（`JOININFO` 在认证前 `dis_conn=true`、关联时才翻 `dis_conn=false` 并把 port
+设成 INFRA、调 `mac_port_init()`）在 3d 一起还。

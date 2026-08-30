@@ -51,6 +51,15 @@
   两条之间、两条之后都仍然被 AP 回答、sweep 也仍然在收 Beacon（run 25，
   `wireless_join_diag`，28 项 `--require-*` 全过，提交 `20c3191`）。
   **仍然不是关联**：无 Association Request、无 AID、无密钥、TSF 未同步
+- **可重复的管理帧交换 ＋ station join 全链（增量 3c）**：交换 armed 期间把 13 条
+  scan-offload 信道表项全部填成目标信道（parked），按表项数逐条重新装填 host dwell，
+  认证/关联各最多 3 次带新序列号的重传，armed 期间关掉一切轮询串口输出。效果是 join
+  步骤的**三次 sweep 全部**被回答（`prejoin-rsp=0x1 joininfo-rsp=0x1 cam-rsp=0x1`），
+  首次打出 `RTL8852BS2 station join complete`（run 30，`wireless_assoc_diag`，
+  本 runner 的 30 条 `--require-*` 过 27 条，提交 `7c1cbe4`）。run 27 那种「同一个二进制
+  一轮成一轮不成」的抖动由此消失。**关联仍然没成**：Association Request 确实发出去了
+  （两个 BSS 各 3 次、46/48 字节），但一帧 Association Response 都没收到，
+  `station association error=0x3d`；原因见下一节
 - H5 版本结果：HCI `0x0b/0x000b`，manufacturer `0x005d`，LMP subversion `0x8852`
 
 最新已通过的扫描/PHY/FW 日志（运行 12，13 信道被动扫描）：
@@ -69,9 +78,23 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 
 ## 尚未完成，禁止误报
 
+- **关联没有完成，`station join complete` 不是关联。** run 30 首次把 join 的三条命令
+  链路全部跑通并打出 `RTL8852BS2 station join complete`，随后向两个 BSS 各发了 3 次
+  Association Request（带新序列号、46/48 字节、`frames=0x0`），**一帧 Association
+  Response 都没有**，`station association error=0x3d`(ENODATA)、`bring-up failed: -61`。
+  说「join 全链通了、管理帧交换可重复了」是对的，说「关联上了」是误报。
+  根因目前判定是**射频环境 ＋ 请求内容**，不是发送路径：run 30 的 BSS 普查里，
+  所有公布 SSID 的 BSS 都带 Privacy ＋ RSN（基本都是 CCMP+PSK），而唯一两个不带
+  Privacy 的（`564f3be2e6d2`、`a639b3663b34`，cap=0x421、rsn=0）**不公布 SSID**；
+  Association Request 按 IEEE 802.11 11.3.5.3 必须带该 BSS 自己的 SSID，
+  隐藏 SSID 的 BSS 只会静默丢弃（认证请求不带 SSID，所以认证能过、关联不能）。
+  另外 `50:4f:…` 与 `56:4f:…` 只差本地管理位，是同一台物理 AP 的两个 VAP，
+  所以「两个 AP 都不理我们」实际是一台 AP 的同一种行为。可行路线见
+  「建议 Claude 的下一步」的增量 3d。
 - **认证通了、join 命令被固件接受了，都不等于关联通了。** run 20/run 25 收到的是 AP 的
   Authentication Response，`status=0` 是 AP 给的成功码；增量 3b 之后固件和 ADDR_CAM
-  也确实知道本机属于这个 BSS。但没有 Association Request、没有 AID、没有密钥、
+  也确实知道本机属于这个 BSS。但从来没有一帧 Association Response（增量 3c 已经把
+  Association Request 发上去了，见上条）、没有 AID、没有密钥、
   port 0 仍是 `PORT_FUNC_EN=0`/`NET_TYPE=0`/TSF 冻结（`mac_port_init()` 未移植）。
   说「能和 AP 完成 open-system 认证交换的一个来回，并让固件接受 join 状态」是对的，
   说「关联上了」「Wi-Fi 通了」是误报。
@@ -242,12 +265,28 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   「只回第一次然后沉默」。现在有一个 12 位本机计数器，同时写进帧和 WD BODY dword3。
   **仍然不是关联**：没有 Association Request/AID/密钥，port 0 仍
   `PORT_FUNC_EN=0`/`NET_TYPE=0`/TSF 冻结。
-- **下一步优先级**：(1) 增量 3c：关联。Assoc Request（capability、listen interval、
-  SSID、supported rates，加从 Beacon 里回抄的 RSN IE——需要先把 RSN IE 存进
-  `struct k1_rtl8852bs_scan_bss_s`），解 subtype=1 的 `status`/`aid`，拿到 AID 后重发
-  一次 ADDR_CAM，`status` 非零要照实报告。发送路径直接用
-  `k1_rtl8852bs_runtime_mgmt_tx_frame()`（`broadcast=false`），时机同样挂在
-  scan-offload 的 dwell 上。同一批要把 3b 欠的原厂顺序补回来：`JOININFO`
+- **已完成（2026-08-30，增量 3c）：管理帧交换变成可重复的，join 全链在同一次运行里跑完。**
+  run 30，镜像 `wireless_assoc_diag`，本 runner 的 30 条 `--require-*` 过 27 条，
+  提交 `7c1cbe4`。四个改动：(a) 交换 armed 期间把 13 条信道表项全部填成目标信道（parked）；
+  (b) parked sweep 按表项数逐条重新装填 host dwell——原来「每信道一个 bit」的测试对
+  parked 列表只会装填一次，整轮 sweep 因此卡死（run 28 的 `-ETIMEDOUT` 正是如此，
+  而那一轮认证其实已经成功）；(c) 认证/关联各最多 3 次带新序列号的重传；
+  (d) armed 期间关掉一切轮询串口输出（实测一次 witness 快照 65 行 / 6378 字节，
+  115200 8N1 下约 550 ms，而一个 dwell 只有 180 ms）。外加 done-ack RX 缓冲 512 → 8192，
+  这是 run 29 `-ENOSPC` 的根因。效果：`prejoin-rsp=0x1 joininfo-rsp=0x1 cam-rsp=0x1`
+  ＋ `RTL8852BS2 station join complete`。**仍然不是关联**，见「尚未完成，禁止误报」第一条。
+- **下一步优先级**：(1) 增量 3d：让 Association Request 能被回答。3c 已经把请求发上去了
+  （capability、listen interval、SSID、supported/extended rates，`broadcast=false` 走
+  `k1_rtl8852bs_runtime_mgmt_tx_frame()`，挂在 parked dwell 上），缺的是目标和内容：
+  目标改成已经被证明会回认证请求的 WPA2-PSK AP `504f3be2e6d2`（SSID `SB`、cap=0x431、
+  RSN CCMP+PSK、`proven=0x1`）；请求里带该 BSS 自己的 SSID，加一条匹配的 RSN element
+  （element 48，version 1、组密码 CCMP、成对密码 CCMP、AKM PSK、RSN capabilities 0，
+  20 字节 body / 22 字节 IE，**不含任何密钥材料**——需要先把 Beacon 里的 RSN IE 存进
+  `struct k1_rtl8852bs_scan_bss_s`）；capability 按目标的 Privacy 位置 1；
+  `K1_RTL8852BS_ASSOC_REQUEST_MAX_SIZE` 从 96 提到 128（24+4+34+10+6+22 = 100 已超 96）；
+  验收脚本里 `privacy=0x0` 那条锚点改成「目标公布 RSN 且是 CCMP+PSK」，不要删掉。
+  然后解 subtype=1 的 `status`/`aid`，拿到 AID 后重发
+  一次 ADDR_CAM，`status` 非零要照实报告。同一批要把 3b/3c 欠的原厂顺序补回来：`JOININFO`
   `dis_conn=true` 在认证之前，`dis_conn=false` + INFRA port + `mac_port_init()`
   只在关联时；`mac_port_init()` 的 band0/port0 子集（NO_LINK/INFRA，不做
   MBSSID/AP/DBCC）输入已经收集齐（`mport.c:2010-2305` 与 `mport.h` 的 DEF 常量）。
@@ -283,6 +322,24 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   pkt) after sending probe req"（`mac_def.h:7398`）。
 - **`done_ack_wait()` 会抽 RX FIFO**，所以任何 H2C 提交都不能放在扫描 RX 循环里，只能放
   在两轮 sweep 之间；`k1_rtl8852bs_runtime_mgmt_tx_frame()` 可以从 RX 循环里调。
+- **这一版 scan-offload 固件从不自己换信道。** 每一次 sweep 的每一个 enter 通知都跟在本
+  host 的 next-channel 命令之后，`fw-next=0x0`、`firmware_advanced_channels` 一直是空的，
+  `mac_ax_scanofld_chinfo.period` 描述的固件侧自动推进在本移植上从未被观察到
+  （180 ms 的 host dwell 总是先到）。**host 是 sweep 唯一的节拍器**：host 一停下发，
+  固件就停在当前信道上无限等下去——run 28 的 `-ETIMEDOUT` 就是这么来的，而那一轮
+  认证其实已经成功（同一份日志里有 `rsp-self=0x1 status=0x0 a2=504f3be2e6d2`）。
+  提交 `d0cc279` 的说明里有一条相反的推测，以本条为准。
+- **成功的交换会被没结束的 sweep 掩盖。** 报错的 errno 来自 sweep 的等待循环，不代表
+  空口上那一步失败了；判定认证/关联成功与否只看 `rsp-self`/`status`/`frames` 这些
+  逐帧计数器，不要看外层 `wait error=`。
+- **parked 信道有副作用**：parked sweep 结束后射频停在目标信道上，后面做 H2C 时 SDIO
+  RX FIFO 仍在被那个 AP 的 Beacon/数据帧填满，所以 done-ack 的 RX 缓冲要按聚合帧尺寸
+  给（本组件 512 → 8192）。`rx_read()` 对太小的缓冲返回 `-ENOSPC` 且**不消费** FIFO
+  （`if (request_length > buffer_size) { *transfer_length = request_length; return -ENOSPC; }`），
+  公布的长度一直挂着，于是第一次失败之后每一次都以同样方式失败（run 29 的 `-28`）。
+- **Association Request 必须带该 BSS 自己的 SSID**（IEEE 802.11 11.3.5.3），
+  Authentication Request 不带。所以对隐藏 SSID 的 BSS 会出现「认证有回复、关联全静默」，
+  这不是发送路径的问题。
 - **TX 仪表日志前缀是 `TX state` 与 `TX PPDU`**（旧日志里的旧前缀已改名，不要当成缺失）。
 
 不要继续花时间调整已经排除的因素：
@@ -341,15 +398,20 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 
 上面这段「第一块砖是 TX」已经完成：Probe Request 真发出去并收到 Probe Response
 （run 14）、open-system 认证收到 AP 的成功回复（run 20 / 增量 3a）、station join 的两条
-命令被固件接受（run 25 / 增量 3b）。**当前实际下一步是增量 3c：关联**，做法与欠账见
-「已在实体板验证」末尾那条优先级 (1)。复现 3b 镜像：
+命令被固件接受（run 25 / 增量 3b）、join 全链 ＋ 可重复的管理帧交换（run 30 / 增量 3c）。
+**当前实际下一步是增量 3d：让 Association Request 能被回答**，做法与欠账见
+「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3c 镜像：
 
 ```bash
-tools/build_k1_join.sh            # profile board/k1/muse_pi_pro/configs/wireless_join_diag
+tools/build_k1_assoc.sh           # profile board/k1/muse_pi_pro/configs/wireless_assoc_diag
 ```
 
-板上验收在既有 27 条 `--require-*` 之后追加 `--require-runtime-join`（共 28 条），
-运行日志 `out/k1-serial/k1-join-20260830T101829Z.log`。TX 正确性依赖的初始化缺口
+板上验收在既有 28 条 `--require-*` 之后追加 `--require-runtime-assoc-response` 与
+`--require-runtime-assoc`（共 30 条），运行日志
+`out/k1-serial/k1-assoc-20260830T120636Z.log`；run 30 过 27 条，没过的三条正是
+Association Response、关联本身、以及依赖它们的 bring-up 成功。
+
+TX 正确性依赖的初始化缺口
 （`rtw_hal_bb_dm_init`/`rtw_hal_rf_dm_init` 那一批）见本节前面的清单
 （`set_enable_bb_rf(hal, 0)` disable 半边、`halbb_dm_init()`、`halrf_dm_init()` 正文、
 五张 `init_rf_reg` store 表、halbb `phy_reg_gain`），不要在补齐之前把发不出去归因于 MAC 层。
