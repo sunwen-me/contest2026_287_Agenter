@@ -249,12 +249,28 @@ struct k1_rtl8852bs_join_info_s
   bool he_station;
 };
 
+/* The number of key slots one address CAM entry holds.  The hardware field is
+ * seven slots wide whatever the security mode; which of them a given key type
+ * may occupy is what the mode decides.
+ */
+
+#define K1_RTL8852BS_ADDR_CAM_SEC_SLOTS 7
+
 /* Inputs for an RTL8852B MAC/ADDR_CAM_UPDATE/ADDRCAM_INFO create payload.
  * This bounded builder supports a non-multicast band-0 no-link station,
- * infrastructure station, or AP role without security/WOL state.  A no-link
- * station requires a genuine self MAC and zero target/BSSID values; other
- * roles require genuine non-zero unicast addresses.  It never submits the
- * resulting payload.
+ * infrastructure station, or AP role without wake-on-wireless state.  A
+ * no-link station requires a genuine self MAC and zero target/BSSID values;
+ * other roles require genuine non-zero unicast addresses.  It never submits
+ * the resulting payload.
+ *
+ * The four security fields are the key slots of the entry.  sec_ent_mode
+ * decides which slot ranges a key type may use -- mode 2, the one a CCMP
+ * network uses, gives the pairwise key slots 0 to 1, the group key slots 2 to
+ * 4 and the management key slots 5 to 6.  A slot is live when its bit is set
+ * in sec_ent_valid, and then sec_ent[slot] is the security CAM index holding
+ * the key material and sec_ent_keyid[slot] the key identifier the air carries.
+ * All zero, the shape every role this port created before it installed a key,
+ * is an entry with no keys.
  */
 
 struct k1_rtl8852bs_addr_cam_info_s
@@ -277,8 +293,45 @@ struct k1_rtl8852bs_addr_cam_info_s
   uint8_t self_mac[6];
   uint8_t target_mac[6];
   uint8_t bssid[6];
+  uint8_t sec_ent_mode;
+  uint8_t sec_ent_valid;
+  uint8_t sec_ent_keyid[K1_RTL8852BS_ADDR_CAM_SEC_SLOTS];
+  uint8_t sec_ent[K1_RTL8852BS_ADDR_CAM_SEC_SLOTS];
   bool trigger;
   bool lsig_txop;
+};
+
+/* How wide one security CAM entry is, and how much of it one write covers.
+ * An entry is thirty-two bytes and the command writes it in one go from
+ * offset zero, which is what the vendor's only caller does; the sixteen key
+ * bytes are the whole of what a CCMP key needs, and the rest of the entry is
+ * the initialisation vector space the hardware keeps for itself.
+ */
+
+#define K1_RTL8852BS_SEC_CAM_ENTRY_SIZE 0x20
+#define K1_RTL8852BS_SEC_CAM_KEY_SIZE   16
+
+/* Inputs for an RTL8852B MAC/SEC_CAM_INFO payload: one security CAM entry,
+ * addressed by index, holding one key.
+ *
+ * type is the cipher, in the encoding the hardware uses rather than the one
+ * the air does -- 6 is CCMP-128, which is the only cipher this port installs.
+ * ext_key says the key is the second half of a 256-bit one and spp_mode
+ * selects signalling and payload protection; both are zero for CCMP-128.  The
+ * key bytes go on the wire in the order they are given, which is the order
+ * the four-way handshake produced them in.  The builder never submits the
+ * payload it fills.
+ */
+
+struct k1_rtl8852bs_sec_cam_info_s
+{
+  uint8_t index;
+  uint8_t offset;
+  uint8_t length;
+  uint8_t type;
+  bool ext_key;
+  bool spp_mode;
+  uint8_t key[K1_RTL8852BS_SEC_CAM_KEY_SIZE];
 };
 
 typedef int (*k1_rtl8852bs_c2h_handler_t)(
@@ -347,6 +400,9 @@ int k1_rtl8852bs_runtime_join_info_build(
 int k1_rtl8852bs_fwdl_runtime_control_plane_diagnostic(void);
 int k1_rtl8852bs_runtime_addr_cam_build(
   FAR const struct k1_rtl8852bs_addr_cam_info_s *info,
+  FAR uint8_t *content, size_t content_length);
+int k1_rtl8852bs_runtime_sec_cam_build(
+  FAR const struct k1_rtl8852bs_sec_cam_info_s *info,
   FAR uint8_t *content, size_t content_length);
 int k1_rtl8852bs_fwdl_runtime_addr_cam_diagnostic(void);
 int k1_rtl8852bs_fwdl_runtime_role_cam_done_ack_diagnostic(

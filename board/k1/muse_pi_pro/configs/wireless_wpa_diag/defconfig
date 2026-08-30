@@ -1,7 +1,7 @@
 # RTL8852BS2 WPA2-PSK: carry the association of the parent profile into the
-# four-way handshake of IEEE 802.11 clause 12.7.6, and require the access
-# point's third EAPOL-Key message to carry an integrity code this host
-# verifies.
+# four-way handshake of IEEE 802.11 clause 12.7.6, require the access point's
+# third EAPOL-Key message to carry an integrity code this host verifies, and
+# install the two keys that handshake produced into the hardware.
 #
 # The parent is the association profile whose whole chain already passed on the
 # board, so one run of this image re-validates everything proven before -
@@ -37,11 +37,18 @@
 # transmitted, all at once. The second message's RSN element is the very bytes
 # of the Association Request's, as clause 12.7.2 requires.
 #
-# No security engine is needed and none is initialized: all four EAPOL-Key
-# frames are unprotected. The group key that arrives wrapped inside the third
-# message is not unwrapped, because AES key unwrap is not ported; the integrity
-# code covers the wrapped bytes as they arrived, so it verifies without
-# decrypting anything.
+# The four EAPOL-Key frames are themselves unprotected, so the handshake needs
+# no security engine in order to happen. The keys it produces do, and this
+# image brings that engine up before anything is transmitted: the three cipher
+# clocks, the six direction enables, integrity-code and message-integrity
+# append, and partial transmit mode off. The group key arrives wrapped inside
+# the third message and is opened with the AES key unwrap of RFC 3394 under the
+# key encryption half of the transient key - only after the integrity code has
+# verified, which is what rules out a wrong passphrase before anything is
+# decrypted at all. Both keys then go into the hardware the way the vendor's
+# mac_sta_add_key() does it: the address CAM entry is re-sent with the key's
+# slot filled in, then the security CAM entry holding the key is written, for
+# the pairwise key first and the group key second.
 #
 # The passphrase is not here. CONFIG_K1_RTL8852BS2_RUNTIME_WPA_PASSPHRASE and
 # CONFIG_K1_RTL8852BS2_RUNTIME_WPA_SSID are left empty by this profile on
@@ -57,8 +64,10 @@
 # console carries which frame arrived, which one went out, and whether the
 # integrity code verified.
 #
-# This is still not a working link. No key is installed in the hardware, so
-# nothing is encrypted or decrypted and no data frame beyond the unprotected
+# This is still not a working link. The keys are installed and acknowledged by
+# the firmware, which is all this claims: nothing is encrypted or decrypted
+# yet, because the transmit descriptor's security fields are not filled in and
+# there is no data path to fill them for. No data frame beyond the unprotected
 # EAPOL-Key frames is sent or received, no wlan0 behaviour changes, no IP
 # address is configured, and the port's TSF is still frozen because
 # mac_port_init() is not ported yet. Still RAM-only: nothing written to eMMC,

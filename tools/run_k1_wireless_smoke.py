@@ -302,6 +302,13 @@ def parse_args() -> argparse.Namespace:
               "fourth and the WPA2-PSK four-way handshake completes"),
     )
     parser.add_argument(
+        "--require-runtime-wpa-keys", action="store_true",
+        help=("fail unless the security engine comes up, the group key inside "
+              "the verified third message is unwrapped, and the firmware "
+              "acknowledges all four commands that install the pairwise and "
+              "group keys into the address CAM and the security CAM"),
+    )
+    parser.add_argument(
         "--require-wlan0-scan", action="store_true",
         help=("fail unless wlan0 registers and a wapi passive scan returns at "
               "least one Beacon/Probe-Response BSS through SIOCGIWSCAN"),
@@ -1672,7 +1679,7 @@ def main() -> int:
             if assoc_end_result is None:
                 missing.append("RTL8852BS2 station association completion")
         if (args.require_runtime_wpa_msg1 or args.require_runtime_wpa_mic
-                or args.require_runtime_wpa):
+                or args.require_runtime_wpa or args.require_runtime_wpa_keys):
             # Everything is judged from the handshake's own lines, sliced from
             # the line that reports a pairwise master key was derived, so no
             # earlier step can satisfy these checks and an image built with no
@@ -1714,7 +1721,8 @@ def main() -> int:
             )
             if wpa_msg2_result is None:
                 missing.append("RTL8852BS2 EAPOL-Key message 2 transmit")
-        if args.require_runtime_wpa_mic or args.require_runtime_wpa:
+        if (args.require_runtime_wpa_mic or args.require_runtime_wpa
+                or args.require_runtime_wpa_keys):
             # The load-bearing check of the whole increment.  mic=0x1 is set
             # only when this host recomputed HMAC-SHA1-128 over the received
             # frame under the key confirmation key it derived itself and the
@@ -1739,7 +1747,7 @@ def main() -> int:
             if wpa_failure_result is None:
                 missing.append(
                     "RTL8852BS2 handshake with no integrity code failure")
-        if args.require_runtime_wpa:
+        if args.require_runtime_wpa or args.require_runtime_wpa_keys:
             wpa_msg4_result = re.search(
                 rb"K1 Wi-Fi GPL: wpa msg4 tx bytes=(?:0x)?0*[1-9a-fA-F]"
                 rb"[^\r\n]* status=0x0+(?![0-9a-fA-F])",
@@ -1756,6 +1764,71 @@ def main() -> int:
             if wpa_end_result is None:
                 missing.append(
                     "RTL8852BS2 WPA2-PSK four-way handshake completion")
+        if args.require_runtime_wpa_keys:
+            # The security engine is judged from its own readback: the routine
+            # reports status=0x0 only after reading both registers back and
+            # finding the cipher clocks, the six direction enables and the
+            # ICV/MIC append set with partial transmit mode clear.
+            sec_eng_result = re.search(
+                rb"K1 Wi-Fi GPL: sec-eng init status=0x0+(?![0-9a-fA-F])",
+                started,
+            )
+            if sec_eng_result is None:
+                missing.append("RTL8852BS2 security engine bring-up")
+
+            # The group key is evidence in its own right: RFC 3394 puts eight
+            # 0xa6 bytes in front of the plaintext and the unwrap refuses
+            # anything else, so unwrap=0x0 means the access point wrapped with
+            # the same key encryption key this host derived.  A recovered key
+            # also has to be a length a CCMP-128 entry holds.
+            wpa_gtk_result = re.search(
+                rb"K1 Wi-Fi GPL: assoc advertised eapol=[^\r\n]* unwrap=0x0+"
+                rb" kde=0x0+ gtk=0x0*1 gtk-len=0x0*10 ",
+                wpa,
+            )
+            if wpa_gtk_result is None:
+                missing.append(
+                    "RTL8852BS2 group key unwrapped from the third message")
+
+            # Each of the four commands separately, because each can be refused
+            # on its own: the slot the key occupies and the entry that holds it,
+            # for the pairwise key and then the group key.
+            for label, description in (
+                (b"TK CAM", "pairwise key address CAM slot"),
+                (b"TK SEC", "pairwise key security CAM entry"),
+                (b"GTK CAM", "group key address CAM slot"),
+                (b"GTK SEC", "group key security CAM entry"),
+            ):
+                command_result = re.search(
+                    rb"K1 Wi-Fi GPL: " + label
+                    + rb" done-ack return=0x0+(?![0-9a-fA-F])",
+                    wpa,
+                )
+                if command_result is None:
+                    missing.append(
+                        "RTL8852BS2 firmware acknowledgement of the "
+                        + description)
+
+            # The report line is the host's own view of the same four commands
+            # plus the addressing they used: security entry mode 2, the pairwise
+            # slot 0 and the group slot 2 live, entry 0 and entry 1.
+            wpa_keys_result = re.search(
+                rb"K1 Wi-Fi GPL: station keys sec-mode=0x0*2 sec-valid=0x0*5"
+                rb" tk-ent=0x0+ tk-keyid=0x0+ tk-cam=0x0+ tk-sec=0x0+"
+                rb" tk=0x0*1 gtk-ent=0x0*1 gtk-keyid=0x[0-9a-fA-F]+"
+                rb" gtk-cam=0x0+ gtk-sec=0x0+ gtk=0x0*1",
+                wpa,
+            )
+            if wpa_keys_result is None:
+                missing.append(
+                    "RTL8852BS2 pairwise and group key CAM installation")
+
+            wpa_keys_end_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 station WPA2 keys installed\r?\n",
+                wpa,
+            )
+            if wpa_keys_end_result is None:
+                missing.append("RTL8852BS2 WPA2-PSK key installation")
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

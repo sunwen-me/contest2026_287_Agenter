@@ -822,9 +822,10 @@ config K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC
 	depends on K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC
 	---help---
 		Continue the association of K1_RTL8852BS2_RUNTIME_ASSOC_DIAGNOSTIC into
-		the WPA2-PSK four-way handshake of IEEE 802.11 clause 12.7.6, and require
+		the WPA2-PSK four-way handshake of IEEE 802.11 clause 12.7.6, require
 		the access point's third EAPOL-Key message to carry an integrity code
-		this host verifies. This replaces the association step rather than adding
+		this host verifies, and install the two keys that handshake produced into
+		the hardware. This replaces the association step rather than adding
 		a third one: the access point sends its first EAPOL-Key frame within
 		milliseconds of granting the association, so the only place it can be
 		answered is the receive loop of the sweep the association happened in.
@@ -837,24 +838,41 @@ config K1_RTL8852BS2_RUNTIME_WPA_DIAGNOSTIC
 		and address ordering, and every byte of the EAPOL-Key frame this host
 		transmitted, all at once.
 
-		The handshake needs no security engine and installs no key: all four
-		EAPOL-Key frames are unprotected. The group key that arrives wrapped
-		inside the third message is not unwrapped, because AES key unwrap is not
-		ported; the third message's integrity code covers the wrapped bytes as
-		they arrived, so it verifies without decrypting anything.
+		The four EAPOL-Key frames are themselves unprotected, so the handshake
+		needs no security engine in order to happen. The keys it produces do, so
+		the engine is brought up before anything is transmitted: the three cipher
+		clocks, the six direction enables, integrity-code and message-integrity
+		append, and partial transmit mode off. The group key arrives wrapped
+		inside the third message and is opened with the AES key unwrap of
+		RFC 3394 under the key encryption half of the transient key, only after
+		the integrity code has verified, so a wrong passphrase is already ruled
+		out before anything is decrypted. Both keys then go into the hardware in
+		the vendor's own order: the address CAM entry is re-sent with the key's
+		slot filled in, then the security CAM entry holding the key is written,
+		for the pairwise key first and the group key second.
+
+		Installed and acknowledged is all this claims. Nothing is encrypted or
+		decrypted with either key, because the transmit descriptor's security
+		fields are not filled in and there is no data path to fill them for.
 
 		A key descriptor version this port cannot compute is refused rather than
 		answered with a wrong integrity code, and the step then fails with
 		EOPNOTSUPP. No passphrase configured fails with ENOKEY, an access point
 		that sent no first message or stopped answering fails with ETIMEDOUT, and
 		a third message whose integrity code does not verify fails with EBADMSG,
-		which is what a wrong passphrase looks like.
+		which is what a wrong passphrase looks like. After a complete handshake,
+		a group key the third message never carried fails with ENOENT, one whose
+		length a CCMP-128 security CAM entry cannot hold fails with EOPNOTSUPP,
+		and a command the firmware refused fails with the errno of that command.
+		The console names each of the four commands separately, so a refused CAM
+		slot is distinguishable from a refused key entry.
 
 		No key material is printed: not the passphrase, not the pairwise master
-		key, and none of the transient key or its three sub-keys. What the
-		console carries is which frame arrived, which one went out, and whether
-		the integrity code verified. Nothing is written to eMMC, SPI flash, eFuse
-		or the U-Boot environment.
+		key, none of the transient key or its three sub-keys, and not the group
+		key. What the console carries is which frame arrived, which one went out,
+		whether the integrity code verified, and the CAM addressing the keys were
+		installed at. Nothing is written to eMMC, SPI flash, eFuse or the U-Boot
+		environment.
 
 config K1_RTL8852BS2_RUNTIME_WPA_PASSPHRASE
 	string "RTL8852BS2 WPA2-PSK passphrase"

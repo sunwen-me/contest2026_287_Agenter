@@ -434,6 +434,28 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_SS_CTRL_POLL_COUNT      2000u
 #define K1_RTL8852BS_SS_CTRL_POLL_USEC       1u
 
+/* R_AX_SEC_ENG_CTRL, R_AX_SEC_MPDU_PROC and what sec_eng_init() sets on them.
+ * The security engine is the DMAC block that encrypts a transmitted MPDU and
+ * decrypts a received one with the key the security CAM holds for the frame's
+ * address CAM entry.  Nothing in this port has ever written these two
+ * registers, so a key installed into that CAM would be read by a block whose
+ * cipher clocks and per-direction enables are still at their reset values.
+ *
+ * The vendor sequence is one read-modify-write each.  The control register
+ * gains the three cipher clock enables (counter-mode CMAC, WAPI, WEP/TKIP)
+ * and the six direction enables (unicast and broadcast management decrypt,
+ * multicast decrypt, broadcast decrypt, receive decrypt, transmit encrypt),
+ * and loses the partial transmit mode that only the software cipher path
+ * uses.  The MPDU processor register is asked to append the integrity check
+ * value and the message integrity code the cipher produces.
+ */
+
+#define K1_RTL8852BS_SEC_ENG_CTRL            0x9d00u
+#define K1_RTL8852BS_SEC_ENG_CTRL_SET        0x073fu
+#define K1_RTL8852BS_SEC_ENG_TX_PARTIAL_MODE (1u << 11)
+#define K1_RTL8852BS_SEC_MPDU_PROC           0x9d04u
+#define K1_RTL8852BS_SEC_MPDU_PROC_SET       0x0003u
+
 /* Static post-firmware fields from mac_trx_init() in trxcfg.c.  The full
  * vendor routine also requires scheduler, address-CAM, security, role, and
  * firmware policy state that is not present in this staged NuttX port.
@@ -1372,6 +1394,67 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_ADDR_CAM_CATEGORY          1u
 #define K1_RTL8852BS_ADDR_CAM_CLASS             6u
 #define K1_RTL8852BS_ADDR_CAM_FUNCTION          0u
+
+/* MAC/SEC_CAM_INFO, the command that writes one security CAM entry.  Its
+ * content is ten dwords: the entry index, the byte offset inside the entry and
+ * the number of bytes to write, then the cipher and its two mode flags, then
+ * sixteen key bytes in transmit order, then four dwords the vendor leaves
+ * untouched.  The vendor fills the first six from a local array and transmits
+ * whatever the stack held in the rest; this port sends the same ten dwords
+ * with that tail zeroed, because sending uninitialised memory to the firmware
+ * is not a behaviour worth reproducing.
+ */
+
+#define K1_RTL8852BS_SEC_CAM_CATEGORY           1u
+#define K1_RTL8852BS_SEC_CAM_CLASS              0xau
+#define K1_RTL8852BS_SEC_CAM_FUNCTION           1u
+#define K1_RTL8852BS_SEC_CAM_CONTENT_SIZE       40u
+#define K1_RTL8852BS_SEC_CAM_KEY_CONTENT_OFFSET 8u
+#define K1_RTL8852BS_SEC_CAM_OFFSET_SHIFT       8u
+#define K1_RTL8852BS_SEC_CAM_LENGTH_SHIFT       16u
+#define K1_RTL8852BS_SEC_CAM_TYPE_MAX           0xfu
+#define K1_RTL8852BS_SEC_CAM_EXT_KEY            (1u << 4)
+#define K1_RTL8852BS_SEC_CAM_SPP_MODE           (1u << 5)
+
+/* The cipher values are mac_ax_enc_alg: 0 none, 1 WEP-40, 2 WEP-104, 3 TKIP,
+ * 4 WAPI, 5 GCM-SMS4, 6 CCMP-128, 7 CCMP-256, 8 GCMP-128, 9 GCMP-256, 0xa
+ * BIP-CCMP-128.  Only CCMP-128 is installed here, because it is the only
+ * cipher the RSN element this port transmits offers.
+ */
+
+#define K1_RTL8852BS_SEC_CAM_ENC_CCMP128        6u
+
+/* Where the two keys of one WPA2 association go.
+ *
+ * sec_ent_mode 2 is the mode a CCMP unicast plus CCMP multicast network
+ * selects.  In that mode the vendor's decide_key_index() places a pairwise key
+ * in slot 0 and a group key in slot 2, and check_key_index() rejects anything
+ * outside slots 0 to 1 for a pairwise key and 2 to 4 for a group key.
+ *
+ * The security CAM indices are what the vendor's allocator would hand out: it
+ * walks entries from a rotating start that begins at zero, so the first key
+ * installed after reset takes entry 0 and the second entry 1.  This port has
+ * one role and installs exactly two keys, so the two indices are fixed here
+ * rather than allocated.
+ */
+
+#define K1_RTL8852BS_SEC_ENT_MODE_CCMP          2u
+#define K1_RTL8852BS_SEC_SLOT_PAIRWISE          0u
+#define K1_RTL8852BS_SEC_SLOT_GROUP             2u
+#define K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE     0u
+#define K1_RTL8852BS_SEC_CAM_INDEX_GROUP        1u
+
+/* The four commands that install those two keys, in the order the vendor's
+ * mac_sta_add_key() sends them: for each key the address CAM entry is re-sent
+ * with that key's slot filled in, and only then does the key itself go into
+ * the security CAM.  Each asks for a done acknowledgement, so each needs a
+ * sequence number no earlier command in this run has used.
+ */
+
+#define K1_RTL8852BS_KEY_TK_CAM_H2C_SEQUENCE    14u
+#define K1_RTL8852BS_KEY_TK_SEC_H2C_SEQUENCE    15u
+#define K1_RTL8852BS_KEY_GTK_CAM_H2C_SEQUENCE   16u
+#define K1_RTL8852BS_KEY_GTK_SEC_H2C_SEQUENCE   17u
 #define K1_RTL8852BS_MACID_PAUSE_SLEEP_CATEGORY 1u
 #define K1_RTL8852BS_MACID_PAUSE_SLEEP_CLASS    9u
 #define K1_RTL8852BS_MACID_PAUSE_SLEEP_FUNCTION 0x28u
@@ -3630,6 +3713,474 @@ static void k1_rtl8852bs_pbkdf2_sha1(FAR const char *passphrase,
 }
 
 /****************************************************************************
+ * AES-128 inverse cipher, RFC 3394 key unwrap and EAPOL key data parsing
+ *
+ * Message three of the four-way handshake carries the group key, and clause
+ * 12.7.2 wraps the whole Key Data field with the key encryption key -- the
+ * second quarter of the transient key -- using the NIST key wrap of RFC 3394.
+ * Unwrapping it needs the AES inverse cipher and nothing else: the wrap is
+ * six passes of AES decryption over the blocks in reverse order, and its
+ * integrity check is the constant initial value the last pass has to produce.
+ * A wrong key encryption key therefore fails loudly rather than yielding a
+ * plausible group key, which is the property that makes this safe to trust.
+ *
+ * Only the inverse cipher is implemented.  Wrapping is the access point's
+ * side of the exchange, and the pairwise key never travels over the air, so
+ * the forward cipher has no caller here.  Frame encryption is the hardware's
+ * job once the keys are in the security CAM.
+ ****************************************************************************/
+
+#define K1_RTL8852BS_AES_BLOCK_SIZE           16u
+#define K1_RTL8852BS_AES128_KEY_SIZE          16u
+#define K1_RTL8852BS_AES128_ROUNDS            10
+#define K1_RTL8852BS_AES128_SCHEDULE_SIZE     176u
+#define K1_RTL8852BS_KEY_UNWRAP_IV            0xa6u
+#define K1_RTL8852BS_KEY_UNWRAP_ROUNDS        6
+#define K1_RTL8852BS_KEY_UNWRAP_MIN           24u
+
+/* The forward S-box is needed by the key schedule, the inverse S-box by the
+ * cipher itself.  Both are the tables of FIPS 197 figures 7 and 14.
+ */
+
+static const uint8_t g_k1_rtl8852bs_aes_sbox[256] =
+{
+  0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5,
+  0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+  0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0,
+  0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+  0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc,
+  0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+  0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a,
+  0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+  0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0,
+  0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+  0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b,
+  0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+  0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85,
+  0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+  0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5,
+  0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+  0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17,
+  0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+  0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88,
+  0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+  0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c,
+  0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+  0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9,
+  0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+  0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6,
+  0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+  0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e,
+  0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+  0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94,
+  0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+  0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68,
+  0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+};
+
+static const uint8_t g_k1_rtl8852bs_aes_inverse_sbox[256] =
+{
+  0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38,
+  0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+  0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87,
+  0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+  0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d,
+  0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+  0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2,
+  0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+  0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16,
+  0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+  0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda,
+  0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+  0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a,
+  0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+  0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02,
+  0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+  0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea,
+  0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+  0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85,
+  0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+  0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89,
+  0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+  0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20,
+  0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+  0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31,
+  0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+  0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d,
+  0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+  0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0,
+  0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+  0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26,
+  0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+};
+
+struct k1_rtl8852bs_aes128_s
+{
+  uint8_t schedule[K1_RTL8852BS_AES128_SCHEDULE_SIZE];
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_aes_xtime
+ *
+ * Description:
+ *   Multiply by x in GF(2^8), the one primitive the whole cipher is built
+ *   from: a left shift reduced by the AES polynomial when it overflows.
+ *
+ ****************************************************************************/
+
+static uint8_t k1_rtl8852bs_aes_xtime(uint8_t value)
+{
+  return (uint8_t)((uint8_t)(value << 1) ^
+                   ((value & 0x80u) != 0u ? 0x1bu : 0x00u));
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_aes_multiply
+ *
+ * Description:
+ *   Multiply two field elements by the shift-and-add ladder.  The inverse
+ *   mix-columns step needs the four constants 9, 11, 13 and 14, which is more
+ *   than xtime alone covers and fewer than a table is worth.
+ *
+ ****************************************************************************/
+
+static uint8_t k1_rtl8852bs_aes_multiply(uint8_t left, uint8_t right)
+{
+  uint8_t result = 0;
+
+  while (right != 0u)
+    {
+      if ((right & 1u) != 0u)
+        {
+          result ^= left;
+        }
+
+      left = k1_rtl8852bs_aes_xtime(left);
+      right = (uint8_t)(right >> 1);
+    }
+
+  return result;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_aes128_schedule
+ *
+ * Description:
+ *   Expand a 128-bit key into the eleven round keys of FIPS 197 section 5.2.
+ *   The inverse cipher below uses them in reverse order without modifying
+ *   them, which is the straightforward inverse rather than the equivalent one
+ *   and needs no second schedule.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_aes128_schedule(FAR struct k1_rtl8852bs_aes128_s *aes,
+                                         FAR const uint8_t *key)
+{
+  uint8_t constant = 1u;
+  unsigned int index;
+
+  memcpy(aes->schedule, key, K1_RTL8852BS_AES128_KEY_SIZE);
+  for (index = K1_RTL8852BS_AES128_KEY_SIZE;
+       index < K1_RTL8852BS_AES128_SCHEDULE_SIZE; index += 4u)
+    {
+      uint8_t word[4];
+
+      memcpy(word, aes->schedule + index - 4u, sizeof(word));
+      if (index % K1_RTL8852BS_AES128_KEY_SIZE == 0u)
+        {
+          uint8_t first = word[0];
+
+          word[0] = (uint8_t)(g_k1_rtl8852bs_aes_sbox[word[1]] ^ constant);
+          word[1] = g_k1_rtl8852bs_aes_sbox[word[2]];
+          word[2] = g_k1_rtl8852bs_aes_sbox[word[3]];
+          word[3] = g_k1_rtl8852bs_aes_sbox[first];
+          constant = k1_rtl8852bs_aes_xtime(constant);
+        }
+
+      aes->schedule[index] =
+        (uint8_t)(aes->schedule[index - K1_RTL8852BS_AES128_KEY_SIZE] ^
+                  word[0]);
+      aes->schedule[index + 1u] =
+        (uint8_t)(aes->schedule[index + 1u - K1_RTL8852BS_AES128_KEY_SIZE] ^
+                  word[1]);
+      aes->schedule[index + 2u] =
+        (uint8_t)(aes->schedule[index + 2u - K1_RTL8852BS_AES128_KEY_SIZE] ^
+                  word[2]);
+      aes->schedule[index + 3u] =
+        (uint8_t)(aes->schedule[index + 3u - K1_RTL8852BS_AES128_KEY_SIZE] ^
+                  word[3]);
+    }
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_aes128_decrypt_block
+ *
+ * Description:
+ *   The inverse cipher of FIPS 197 section 5.3 on one sixteen byte block.
+ *   State byte r + 4c is row r of column c, so the inverse row shift reads
+ *   column (c - r) mod 4 and the inverse column mix works on four
+ *   consecutive bytes.  Input and output may be the same buffer.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_aes128_decrypt_block(
+  FAR const struct k1_rtl8852bs_aes128_s *aes,
+  FAR const uint8_t *input, FAR uint8_t *output)
+{
+  uint8_t state[K1_RTL8852BS_AES_BLOCK_SIZE];
+  uint8_t stage[K1_RTL8852BS_AES_BLOCK_SIZE];
+  unsigned int index;
+  unsigned int column;
+  int round;
+
+  for (index = 0; index < K1_RTL8852BS_AES_BLOCK_SIZE; index++)
+    {
+      state[index] = (uint8_t)(input[index] ^
+                               aes->schedule[K1_RTL8852BS_AES128_ROUNDS *
+                                             K1_RTL8852BS_AES_BLOCK_SIZE +
+                                             index]);
+    }
+
+  for (round = K1_RTL8852BS_AES128_ROUNDS - 1; round >= 0; round--)
+    {
+      for (index = 0; index < K1_RTL8852BS_AES_BLOCK_SIZE; index++)
+        {
+          unsigned int row = index % 4u;
+          unsigned int source = row + 4u * (((index / 4u) + 4u - row) % 4u);
+
+          stage[index] =
+            (uint8_t)(g_k1_rtl8852bs_aes_inverse_sbox[state[source]] ^
+                      aes->schedule[(unsigned int)round *
+                                    K1_RTL8852BS_AES_BLOCK_SIZE + index]);
+        }
+
+      if (round == 0)
+        {
+          memcpy(state, stage, sizeof(state));
+          break;
+        }
+
+      for (column = 0; column < 4u; column++)
+        {
+          uint8_t a0 = stage[4u * column];
+          uint8_t a1 = stage[4u * column + 1u];
+          uint8_t a2 = stage[4u * column + 2u];
+          uint8_t a3 = stage[4u * column + 3u];
+
+          state[4u * column] =
+            (uint8_t)(k1_rtl8852bs_aes_multiply(a0, 14u) ^
+                      k1_rtl8852bs_aes_multiply(a1, 11u) ^
+                      k1_rtl8852bs_aes_multiply(a2, 13u) ^
+                      k1_rtl8852bs_aes_multiply(a3, 9u));
+          state[4u * column + 1u] =
+            (uint8_t)(k1_rtl8852bs_aes_multiply(a0, 9u) ^
+                      k1_rtl8852bs_aes_multiply(a1, 14u) ^
+                      k1_rtl8852bs_aes_multiply(a2, 11u) ^
+                      k1_rtl8852bs_aes_multiply(a3, 13u));
+          state[4u * column + 2u] =
+            (uint8_t)(k1_rtl8852bs_aes_multiply(a0, 13u) ^
+                      k1_rtl8852bs_aes_multiply(a1, 9u) ^
+                      k1_rtl8852bs_aes_multiply(a2, 14u) ^
+                      k1_rtl8852bs_aes_multiply(a3, 11u));
+          state[4u * column + 3u] =
+            (uint8_t)(k1_rtl8852bs_aes_multiply(a0, 11u) ^
+                      k1_rtl8852bs_aes_multiply(a1, 13u) ^
+                      k1_rtl8852bs_aes_multiply(a2, 9u) ^
+                      k1_rtl8852bs_aes_multiply(a3, 14u));
+        }
+    }
+
+  memcpy(output, state, sizeof(state));
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_aes_key_unwrap
+ *
+ * Description:
+ *   The RFC 3394 key unwrap.  The input is one eight byte integrity value
+ *   followed by n eight byte blocks; six passes over those blocks in reverse
+ *   order recover the plaintext, and the integrity value has to come out as
+ *   eight copies of 0xa6 or the key encryption key was wrong.
+ *
+ *   The counter the specification exclusive-ors into the integrity value is
+ *   64 bits wide.  Here n is at most sixteen and the pass index at most five,
+ *   so it never exceeds a hundred; the four high bytes are unconditionally
+ *   zero and only the low four are folded in.
+ *
+ * Returned Value:
+ *   OK with the plaintext length, -EINVAL for a malformed request, or
+ *   -EBADMSG when the integrity value does not verify.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_aes_key_unwrap(FAR const uint8_t *kek,
+                                       FAR const uint8_t *input,
+                                       size_t input_length,
+                                       FAR uint8_t *output,
+                                       size_t output_capacity,
+                                       FAR size_t *output_length)
+{
+  struct k1_rtl8852bs_aes128_s aes;
+  uint8_t block[K1_RTL8852BS_AES_BLOCK_SIZE];
+  uint8_t integrity[8];
+  size_t blocks;
+  size_t index;
+  int pass;
+
+  if (kek == NULL || input == NULL || output == NULL ||
+      output_length == NULL || input_length < K1_RTL8852BS_KEY_UNWRAP_MIN ||
+      (input_length % 8u) != 0u || output_capacity < input_length - 8u)
+    {
+      return -EINVAL;
+    }
+
+  blocks = input_length / 8u - 1u;
+  memcpy(integrity, input, sizeof(integrity));
+  memcpy(output, input + 8, blocks * 8u);
+  k1_rtl8852bs_aes128_schedule(&aes, kek);
+
+  for (pass = K1_RTL8852BS_KEY_UNWRAP_ROUNDS - 1; pass >= 0; pass--)
+    {
+      for (index = blocks; index >= 1u; index--)
+        {
+          uint32_t counter = (uint32_t)(blocks * (size_t)pass + index);
+
+          memcpy(block, integrity, sizeof(integrity));
+          block[7] ^= (uint8_t)(counter & 0xffu);
+          block[6] ^= (uint8_t)((counter >> 8) & 0xffu);
+          block[5] ^= (uint8_t)((counter >> 16) & 0xffu);
+          block[4] ^= (uint8_t)((counter >> 24) & 0xffu);
+          memcpy(block + 8, output + (index - 1u) * 8u, 8);
+
+          k1_rtl8852bs_aes128_decrypt_block(&aes, block, block);
+          memcpy(integrity, block, sizeof(integrity));
+          memcpy(output + (index - 1u) * 8u, block + 8, 8);
+        }
+    }
+
+  for (index = 0; index < sizeof(integrity); index++)
+    {
+      if (integrity[index] != K1_RTL8852BS_KEY_UNWRAP_IV)
+        {
+          return -EBADMSG;
+        }
+    }
+
+  *output_length = blocks * 8u;
+  return OK;
+}
+
+/****************************************************************************
+ * Group key extraction from the unwrapped Key Data field
+ *
+ * The plaintext is a list of information elements: the RSN element the access
+ * point echoes, one or more key data elements, and 0xdd padding to the next
+ * multiple of eight.  A key data element is element 0xdd with the 00-0F-AC
+ * organisation identifier and a one byte data type, and data type 1 is the
+ * group key: a byte holding the key identifier in bits 1:0 and the transmit
+ * flag in bit 2, one reserved byte, then the key itself.
+ ****************************************************************************/
+
+#define K1_RTL8852BS_KDE_ELEMENT_VENDOR       0xddu
+#define K1_RTL8852BS_KDE_HEADER_SIZE          6u
+#define K1_RTL8852BS_KDE_DATA_TYPE_GTK        1u
+#define K1_RTL8852BS_KDE_GTK_OVERHEAD         6u
+#define K1_RTL8852BS_KDE_GTK_KEY_ID_MASK      0x03u
+#define K1_RTL8852BS_KDE_GTK_TRANSMIT         0x04u
+#define K1_RTL8852BS_GTK_SIZE_MAX             32u
+
+struct k1_rtl8852bs_gtk_s
+{
+  bool valid;
+  bool transmit;
+  uint8_t key_id;
+  uint8_t length;
+  uint8_t key[K1_RTL8852BS_GTK_SIZE_MAX];
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_wpa_key_data_parse
+ *
+ * Description:
+ *   Walk the unwrapped Key Data field and copy out the group key.
+ *
+ * Returned Value:
+ *   OK when a group key was found, -ENOENT when the field was well formed and
+ *   carried none, -EBADMSG when an element ran past the end of the field or
+ *   carried an empty group key, and -EINVAL for a bad request or a group key
+ *   longer than this port can hold.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_wpa_key_data_parse(FAR const uint8_t *data,
+                                           size_t length,
+                                           FAR struct k1_rtl8852bs_gtk_s *gtk)
+{
+  size_t offset = 0;
+
+  if (data == NULL || gtk == NULL)
+    {
+      return -EINVAL;
+    }
+
+  memset(gtk, 0, sizeof(*gtk));
+  while (offset + 2u <= length)
+    {
+      uint8_t element = data[offset];
+      uint8_t element_length = data[offset + 1u];
+
+      /* An element with a zero length that is not a real element ends the
+       * list: this is the padding of clause 12.7.2, and everything after it
+       * has to be zero.  Any other zero-length element is simply skipped.
+       */
+
+      if (element == K1_RTL8852BS_KDE_ELEMENT_VENDOR && element_length == 0u)
+        {
+          break;
+        }
+
+      if (offset + 2u + (size_t)element_length > length)
+        {
+          return -EBADMSG;
+        }
+
+      if (element == K1_RTL8852BS_KDE_ELEMENT_VENDOR &&
+          element_length >= K1_RTL8852BS_KDE_GTK_OVERHEAD &&
+          data[offset + 2u] == 0x00u && data[offset + 3u] == 0x0fu &&
+          data[offset + 4u] == 0xacu &&
+          data[offset + 5u] == K1_RTL8852BS_KDE_DATA_TYPE_GTK && !gtk->valid)
+        {
+          uint8_t key_length =
+            (uint8_t)(element_length - K1_RTL8852BS_KDE_GTK_OVERHEAD);
+
+          if (key_length == 0u)
+            {
+              return -EBADMSG;
+            }
+
+          if (key_length > K1_RTL8852BS_GTK_SIZE_MAX)
+            {
+              return -EINVAL;
+            }
+
+          gtk->key_id = (uint8_t)(data[offset + K1_RTL8852BS_KDE_HEADER_SIZE] &
+                                  K1_RTL8852BS_KDE_GTK_KEY_ID_MASK);
+          gtk->transmit =
+            (data[offset + K1_RTL8852BS_KDE_HEADER_SIZE] &
+             K1_RTL8852BS_KDE_GTK_TRANSMIT) != 0u;
+          gtk->length = key_length;
+          memcpy(gtk->key, data + offset + K1_RTL8852BS_KDE_HEADER_SIZE + 2u,
+                 key_length);
+          gtk->valid = true;
+        }
+
+      offset += 2u + (size_t)element_length;
+    }
+
+  return gtk->valid ? OK : -ENOENT;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_wpa_prf
  *
  * Description:
@@ -3740,6 +4291,16 @@ static void k1_rtl8852bs_wpa_prf(FAR const uint8_t *key, size_t key_length,
 #define K1_RTL8852BS_WPA_TK_SIZE                    16u
 #define K1_RTL8852BS_WPA_PBKDF2_ITERATIONS          4096u
 #define K1_RTL8852BS_WPA_PRF_LABEL                  "Pairwise key expansion"
+
+/* How much unwrapped Key Data one message three may carry.  A WPA2 access
+ * point sends the RSN element and one group key descriptor, which is
+ * forty-six bytes before the wrap pads them to a multiple of eight; the
+ * allowance is well past that so an access point that adds descriptors of its
+ * own is still parsed rather than refused.  The unwrap itself refuses
+ * anything longer, because it will not write past the buffer it is given.
+ */
+
+#define K1_RTL8852BS_WPA_KEY_DATA_MAX               128u
 
 /* The passphrase and the network name reach this file only as Kconfig strings,
  * and only ever empty in a committed defconfig.  A configuration that has never
@@ -5811,6 +6372,7 @@ int k1_rtl8852bs_runtime_addr_cam_build(
   uint8_t bssid_mask;
   uint8_t self_hash;
   uint8_t target_hash;
+  unsigned int slot;
   uint32_t word;
 
   if (info == NULL || content == NULL ||
@@ -5827,10 +6389,30 @@ int k1_rtl8852bs_runtime_addr_cam_build(
       info->bss_color > 0x3fu || info->beacon_hit_condition > 3u ||
       info->hit_rule > 3u || info->tsf_sync > 7u ||
       info->target_indicator > 7u || info->frame_target_indicator > 7u ||
-      info->aid > 0x0fffu ||
+      info->aid > 0x0fffu || info->sec_ent_mode > 3u ||
+      info->sec_ent_valid > 0x7fu ||
       !k1_rtl8852bs_addr_cam_mac_valid(info->self_mac))
     {
       return -EINVAL;
+    }
+
+  for (slot = 0; slot < K1_RTL8852BS_ADDR_CAM_SEC_SLOTS; slot++)
+    {
+      if (info->sec_ent_keyid[slot] > 3u)
+        {
+          return -EINVAL;
+        }
+
+      /* A slot that is not live has to be empty.  The check exists because a
+       * stale index left in an invalid slot is invisible on the wire and
+       * would become live the moment some later caller set the bit.
+       */
+
+      if ((info->sec_ent_valid & (1u << slot)) == 0u &&
+          (info->sec_ent[slot] != 0u || info->sec_ent_keyid[slot] != 0u))
+        {
+          return -EINVAL;
+        }
     }
 
   if (info->network_type == 0u &&
@@ -5908,7 +6490,27 @@ int k1_rtl8852bs_runtime_addr_cam_build(
          ((uint32_t)info->target_indicator << 24) |
          ((uint32_t)info->frame_target_indicator << 27);
   k1_rtl8852bs_write_le32(content + 32, word);
-  k1_rtl8852bs_write_le32(content + 36, info->aid);
+
+  word = (uint32_t)info->aid |
+         ((uint32_t)info->sec_ent_mode << 16);
+  for (slot = 0; slot < K1_RTL8852BS_ADDR_CAM_SEC_SLOTS; slot++)
+    {
+      word |= (uint32_t)info->sec_ent_keyid[slot] << (18u + 2u * slot);
+    }
+
+  k1_rtl8852bs_write_le32(content + 36, word);
+
+  word = (uint32_t)info->sec_ent_valid |
+         ((uint32_t)info->sec_ent[0] << 8) |
+         ((uint32_t)info->sec_ent[1] << 16) |
+         ((uint32_t)info->sec_ent[2] << 24);
+  k1_rtl8852bs_write_le32(content + 40, word);
+
+  word = (uint32_t)info->sec_ent[3] |
+         ((uint32_t)info->sec_ent[4] << 8) |
+         ((uint32_t)info->sec_ent[5] << 16) |
+         ((uint32_t)info->sec_ent[6] << 24);
+  k1_rtl8852bs_write_le32(content + 44, word);
 
   word = (uint32_t)info->bssid_cam_index |
          ((uint32_t)K1_RTL8852BS_BSSID_CAM_LENGTH << 16);
@@ -5925,12 +6527,84 @@ int k1_rtl8852bs_runtime_addr_cam_build(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_sec_cam_build
+ *
+ * Description:
+ *   Serialize one RTL8852B MAC/SEC_CAM_INFO payload, the fill_sec_cam_info()
+ *   half of the vendor's key install.  Ten dwords: the entry index, the byte
+ *   offset inside the entry and the number of bytes to write in the first, the
+ *   cipher and its two mode flags in the second, and the sixteen key bytes in
+ *   the four that follow.  The last four dwords are the part the vendor never
+ *   writes, and they are zeroed here.
+ *
+ *   The key bytes are copied in the order they are given, with no byte
+ *   swapping.  The vendor assigns them into its dword array through a byte
+ *   pointer, so wire bytes eight to twenty-three carry the key exactly as the
+ *   four-way handshake produced it.
+ *
+ *   The index field is one byte wide and is not bounded further here: how many
+ *   entries the part has is not something this port can check, and the two
+ *   entries it uses are 0 and 1.
+ *
+ *   It never submits the payload it fills.
+ *
+ * Returned Value:
+ *   OK with content filled in, or -EINVAL for a buffer of the wrong size or a
+ *   request that does not fit the fields.
+ *
+ ****************************************************************************/
+
+int k1_rtl8852bs_runtime_sec_cam_build(
+  FAR const struct k1_rtl8852bs_sec_cam_info_s *info,
+  FAR uint8_t *content, size_t content_length)
+{
+  uint32_t word;
+
+  if (info == NULL || content == NULL ||
+      content_length != K1_RTL8852BS_SEC_CAM_CONTENT_SIZE ||
+      info->type > K1_RTL8852BS_SEC_CAM_TYPE_MAX || info->length == 0 ||
+      (unsigned int)info->offset + (unsigned int)info->length >
+      K1_RTL8852BS_SEC_CAM_ENTRY_SIZE)
+    {
+      return -EINVAL;
+    }
+
+  memset(content, 0, K1_RTL8852BS_SEC_CAM_CONTENT_SIZE);
+  word = (uint32_t)info->index |
+         ((uint32_t)info->offset << K1_RTL8852BS_SEC_CAM_OFFSET_SHIFT) |
+         ((uint32_t)info->length << K1_RTL8852BS_SEC_CAM_LENGTH_SHIFT);
+  k1_rtl8852bs_write_le32(content, word);
+
+  word = (uint32_t)info->type;
+  if (info->ext_key)
+    {
+      word |= K1_RTL8852BS_SEC_CAM_EXT_KEY;
+    }
+
+  if (info->spp_mode)
+    {
+      word |= K1_RTL8852BS_SEC_CAM_SPP_MODE;
+    }
+
+  k1_rtl8852bs_write_le32(content + sizeof(uint32_t), word);
+  memcpy(content + K1_RTL8852BS_SEC_CAM_KEY_CONTENT_OFFSET, info->key,
+         K1_RTL8852BS_SEC_CAM_KEY_SIZE);
+  return OK;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_fwdl_runtime_addr_cam_diagnostic
  *
  * Description:
  *   Verify the upstream address/BSSID CAM serialization with a non-live RAM
  *   test vector.  The bytes never reach the RTL8852BS2, so they cannot
  *   create an address-CAM entry or change RF behavior on the board.
+ *
+ *   The security half of the key install is checked here too, for the same
+ *   reason and in the same way: the address CAM entry once its key slots are
+ *   filled in, and the security CAM payload that follows it.  No key material
+ *   is involved - the sixteen bytes are a counting pattern - and nothing is
+ *   submitted.
  ****************************************************************************/
 
 int k1_rtl8852bs_fwdl_runtime_addr_cam_diagnostic(void)
@@ -5966,8 +6640,22 @@ int k1_rtl8852bs_fwdl_runtime_addr_cam_diagnostic(void)
     .self_mac = {0x02u, 0x11u, 0x22u, 0x33u, 0x44u, 0x55u}
   };
 
+  struct k1_rtl8852bs_sec_cam_info_s sec =
+  {
+    .index = 0x11u,
+    .offset = 0u,
+    .length = K1_RTL8852BS_SEC_CAM_ENTRY_SIZE,
+    .type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+    .key =
+      {
+        0x10u, 0x11u, 0x12u, 0x13u, 0x14u, 0x15u, 0x16u, 0x17u,
+        0x18u, 0x19u, 0x1au, 0x1bu, 0x1cu, 0x1du, 0x1eu, 0x1fu
+      }
+  };
+
   uint8_t content[K1_RTL8852BS_ADDR_CAM_SIZE];
   uint8_t no_link_content[K1_RTL8852BS_ADDR_CAM_SIZE];
+  uint8_t sec_content[K1_RTL8852BS_SEC_CAM_CONTENT_SIZE];
   int ret;
 
   ret = k1_rtl8852bs_runtime_addr_cam_build(&info, content, sizeof(content));
@@ -6025,11 +6713,154 @@ int k1_rtl8852bs_fwdl_runtime_addr_cam_diagnostic(void)
       return -EIO;
     }
 
+  /* The security fields, in the shape the key install re-sends the entry in:
+   * mode 2, the pairwise key live in slot 0 with security CAM entry 0 and key
+   * identifier 0, the group key live in slot 2 with entry 1 and key identifier
+   * 2.  The three dwords those fields share with the association identifier
+   * have to come out exactly where the vendor's shifts put them, and the two
+   * words the first build checked must not move.
+   */
+
+  info.self_mac[0] &= (uint8_t)~1u;
+  info.sec_ent_mode = K1_RTL8852BS_SEC_ENT_MODE_CCMP;
+  info.sec_ent_valid = (uint8_t)((1u << K1_RTL8852BS_SEC_SLOT_PAIRWISE) |
+                                 (1u << K1_RTL8852BS_SEC_SLOT_GROUP));
+  info.sec_ent[K1_RTL8852BS_SEC_SLOT_PAIRWISE] =
+    K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE;
+  info.sec_ent[K1_RTL8852BS_SEC_SLOT_GROUP] =
+    K1_RTL8852BS_SEC_CAM_INDEX_GROUP;
+  info.sec_ent_keyid[K1_RTL8852BS_SEC_SLOT_GROUP] = 2u;
+
+  ret = k1_rtl8852bs_runtime_addr_cam_build(&info, content, sizeof(content));
+  if (ret < 0 || k1_rtl8852bs_read_le32(content + 8) != 0x11133f5du ||
+      k1_rtl8852bs_read_le32(content + 36) != 0x008205aau ||
+      k1_rtl8852bs_read_le32(content + 40) != 0x01000005u ||
+      k1_rtl8852bs_read_le32(content + 44) != 0)
+    {
+      return ret < 0 ? ret : -EIO;
+    }
+
+  /* A mode outside the two-bit field, a key identifier outside its own two
+   * bits, and an index left behind in a slot the valid mask does not claim.
+   */
+
+  info.sec_ent_mode = 4u;
+  if (k1_rtl8852bs_runtime_addr_cam_build(&info, content,
+                                          sizeof(content)) != -EINVAL)
+    {
+      return -EIO;
+    }
+
+  info.sec_ent_mode = K1_RTL8852BS_SEC_ENT_MODE_CCMP;
+  info.sec_ent_keyid[K1_RTL8852BS_SEC_SLOT_GROUP] = 4u;
+  if (k1_rtl8852bs_runtime_addr_cam_build(&info, content,
+                                          sizeof(content)) != -EINVAL)
+    {
+      return -EIO;
+    }
+
+  info.sec_ent_keyid[K1_RTL8852BS_SEC_SLOT_GROUP] = 2u;
+  info.sec_ent[1] = 3u;
+  if (k1_rtl8852bs_runtime_addr_cam_build(&info, content,
+                                          sizeof(content)) != -EINVAL)
+    {
+      return -EIO;
+    }
+
+  /* The security CAM payload the same key install sends after that entry: a
+   * whole thirty-two byte entry written from offset zero, CCMP-128, and the
+   * sixteen key bytes unswapped from byte eight onwards.  The four dwords the
+   * vendor leaves as whatever its stack held have to be zero here.
+   */
+
+  ret = k1_rtl8852bs_runtime_sec_cam_build(&sec, sec_content,
+                                           sizeof(sec_content));
+  if (ret < 0 || k1_rtl8852bs_read_le32(sec_content) != 0x00200011u ||
+      k1_rtl8852bs_read_le32(sec_content + 4) != 0x00000006u ||
+      k1_rtl8852bs_read_le32(sec_content + 8) != 0x13121110u ||
+      k1_rtl8852bs_read_le32(sec_content + 12) != 0x17161514u ||
+      k1_rtl8852bs_read_le32(sec_content + 16) != 0x1b1a1918u ||
+      k1_rtl8852bs_read_le32(sec_content + 20) != 0x1f1e1d1cu ||
+      k1_rtl8852bs_read_le32(sec_content + 24) != 0 ||
+      k1_rtl8852bs_read_le32(sec_content + 28) != 0 ||
+      k1_rtl8852bs_read_le32(sec_content + 32) != 0 ||
+      k1_rtl8852bs_read_le32(sec_content + 36) != 0)
+    {
+      return ret < 0 ? ret : -EIO;
+    }
+
+  sec.ext_key = true;
+  sec.spp_mode = true;
+  ret = k1_rtl8852bs_runtime_sec_cam_build(&sec, sec_content,
+                                           sizeof(sec_content));
+  if (ret < 0 || k1_rtl8852bs_read_le32(sec_content + 4) != 0x00000036u)
+    {
+      return ret < 0 ? ret : -EIO;
+    }
+
+  /* A cipher outside the four-bit field, an empty write, a write that would
+   * run past the end of the entry, and a buffer that is not the payload size.
+   */
+
+  sec.ext_key = false;
+  sec.spp_mode = false;
+  sec.type = 0x10u;
+  if (k1_rtl8852bs_runtime_sec_cam_build(&sec, sec_content,
+                                         sizeof(sec_content)) != -EINVAL)
+    {
+      return -EIO;
+    }
+
+  sec.type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128;
+  sec.length = 0u;
+  if (k1_rtl8852bs_runtime_sec_cam_build(&sec, sec_content,
+                                         sizeof(sec_content)) != -EINVAL)
+    {
+      return -EIO;
+    }
+
+  sec.length = K1_RTL8852BS_SEC_CAM_ENTRY_SIZE;
+  sec.offset = 1u;
+  if (k1_rtl8852bs_runtime_sec_cam_build(&sec, sec_content,
+                                         sizeof(sec_content)) != -EINVAL)
+    {
+      return -EIO;
+    }
+
+  sec.offset = 0u;
+  if (k1_rtl8852bs_runtime_sec_cam_build(
+        &sec, sec_content, sizeof(sec_content) - 1u) != -EINVAL)
+    {
+      return -EIO;
+    }
+
+  /* Build the accepted case once more, so what the log prints is the payload
+   * shape a key install actually sends rather than the extended-key case the
+   * refusals were layered on top of.
+   */
+
+  ret = k1_rtl8852bs_runtime_sec_cam_build(&sec, sec_content,
+                                           sizeof(sec_content));
+  if (ret < 0 || k1_rtl8852bs_read_le32(sec_content + 4) !=
+      K1_RTL8852BS_SEC_CAM_ENC_CCMP128)
+    {
+      return ret < 0 ? ret : -EIO;
+    }
+
   k1_early_puts("K1 Wi-Fi GPL: runtime address CAM dword2=");
   k1_early_puthex(k1_rtl8852bs_read_le32(content + 8));
   k1_early_puts(" dword13=");
   k1_early_puthex(k1_rtl8852bs_read_le32(content + 52));
   k1_early_puts(" H2C=1/6/0\r\n");
+  k1_early_puts("K1 Wi-Fi GPL: runtime address CAM sec dword9=");
+  k1_early_puthex(k1_rtl8852bs_read_le32(content + 36));
+  k1_early_puts(" dword10=");
+  k1_early_puthex(k1_rtl8852bs_read_le32(content + 40));
+  k1_early_puts(" security CAM dword0=");
+  k1_early_puthex(k1_rtl8852bs_read_le32(sec_content));
+  k1_early_puts(" dword1=");
+  k1_early_puthex(k1_rtl8852bs_read_le32(sec_content + 4));
+  k1_early_puts(" H2C=1/a/1\r\n");
   k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 runtime address CAM "
                 "serialization complete\r\n");
   return OK;
@@ -6568,6 +7399,26 @@ struct k1_rtl8852bs_wpa_action_s
   uint16_t msg3_key_data_length;
   uint16_t msg3_mic_failures;
 
+  /* The group key message three carried, and how the two steps that recover
+   * it ended.  The Key Data field arrives wrapped with the key encryption
+   * half of the transient key, and it is only unwrapped after the message
+   * integrity code has been verified, so a wrong passphrase is already ruled
+   * out by then and an unwrap that still fails means the access point wrapped
+   * with something this host did not derive.
+   *
+   * key_data is the unwrap's output, kept here rather than on the stack
+   * because this runs inside a receive path; it is zeroed as soon as the
+   * element walk has read it, and the recovered key stays in gtk.  Both
+   * statuses hold -ENOENT until a verified message three has been seen, which
+   * keeps "never got that far" apart from "got there and failed".
+   */
+
+  uint8_t key_data[K1_RTL8852BS_WPA_KEY_DATA_MAX];
+  uint16_t key_data_bytes;
+  int gtk_unwrap_status;
+  int gtk_parse_status;
+  struct k1_rtl8852bs_gtk_s gtk;
+
   bool msg4_sent;
   int msg4_status;
   uint16_t msg4_bytes;
@@ -6576,6 +7427,38 @@ struct k1_rtl8852bs_wpa_action_s
 };
 
 static struct k1_rtl8852bs_wpa_action_s g_k1_rtl8852bs_wpa_action;
+
+/* The key slots of this port's one address CAM entry, and how the four
+ * commands that fill them ended.
+ *
+ * The slots live here rather than inside the submitter because the firmware
+ * accumulates them: the vendor's insert_key_to_addr_cam() re-sends the whole
+ * entry for every key, with every slot filled in so far, so the second key's
+ * re-send has to carry the first key's slot as well.  Every address CAM
+ * submission reads this, which is why it starts and stays all zero for a role
+ * that has installed no key -- that is exactly the entry shape this port sent
+ * at join and at association before it installed any.
+ *
+ * It is reset when a handshake is armed, so one association attempt cannot
+ * inherit the slots of an earlier one.  No key material is kept here; the CAM
+ * indices, the key identifiers and the mode are addressing, not secrets.
+ */
+
+struct k1_rtl8852bs_key_install_s
+{
+  uint8_t mode;
+  uint8_t valid;
+  uint8_t sec_ent[K1_RTL8852BS_ADDR_CAM_SEC_SLOTS];
+  uint8_t keyid[K1_RTL8852BS_ADDR_CAM_SEC_SLOTS];
+  int tk_cam_status;
+  int tk_sec_status;
+  int gtk_cam_status;
+  int gtk_sec_status;
+  bool tk_installed;
+  bool gtk_installed;
+};
+
+static struct k1_rtl8852bs_key_install_s g_k1_rtl8852bs_key_install;
 
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_wpa_arm
@@ -6598,6 +7481,20 @@ static void k1_rtl8852bs_runtime_wpa_arm(FAR const uint8_t *bssid,
                                          FAR const uint8_t *pmk)
 {
   memset(&g_k1_rtl8852bs_wpa_action, 0, sizeof(g_k1_rtl8852bs_wpa_action));
+
+  /* The installed key slots belong to the attempt, not to the boot: an address
+   * CAM send in this attempt must not carry a slot a previous attempt filled,
+   * because the security CAM entry behind it holds a key derived from a
+   * handshake that is over.
+   */
+
+  memset(&g_k1_rtl8852bs_key_install, 0,
+         sizeof(g_k1_rtl8852bs_key_install));
+  g_k1_rtl8852bs_key_install.tk_cam_status = -ENODATA;
+  g_k1_rtl8852bs_key_install.tk_sec_status = -ENODATA;
+  g_k1_rtl8852bs_key_install.gtk_cam_status = -ENODATA;
+  g_k1_rtl8852bs_key_install.gtk_sec_status = -ENODATA;
+
   if (bssid == NULL || pmk == NULL)
     {
       return;
@@ -6611,6 +7508,8 @@ static void k1_rtl8852bs_runtime_wpa_arm(FAR const uint8_t *bssid,
   g_k1_rtl8852bs_wpa_action.channel = channel;
   g_k1_rtl8852bs_wpa_action.msg2_status = -ENODATA;
   g_k1_rtl8852bs_wpa_action.msg4_status = -ENODATA;
+  g_k1_rtl8852bs_wpa_action.gtk_unwrap_status = -ENOENT;
+  g_k1_rtl8852bs_wpa_action.gtk_parse_status = -ENOENT;
   g_k1_rtl8852bs_wpa_action.armed = true;
 }
 
@@ -14036,15 +14935,16 @@ static void k1_rtl8852bs_runtime_wpa_key_transmit(
  *   would otherwise be answered with an integrity code computed under the
  *   wrong key.
  *
- *   Message three is not decrypted.  Its key data carries the group key
- *   wrapped under the key encryption key, and unwrapping it needs an AES
- *   implementation this port does not have and a security engine that could
- *   hold the result.  The integrity code covers the wrapped bytes as they
- *   arrived, so it verifies without unwrapping anything, and a verified code is
- *   the proof this exchange exists to produce: the access point could only have
- *   computed it from a pairwise key derived from the same master key, so it is
- *   the passphrase, the derivation and this port's frame bytes all confirmed at
- *   once.
+ *   Message three's key data carries the group key wrapped under the key
+ *   encryption key.  The integrity code covers those bytes exactly as they
+ *   arrived, so it is verified first and without unwrapping anything, and a
+ *   verified code is the proof this exchange exists to produce: the access
+ *   point could only have computed it from a pairwise key derived from the
+ *   same master key, so it is the passphrase, the derivation and this port's
+ *   frame bytes all confirmed at once.  Only afterwards is the wrap opened and
+ *   the group key descriptor read out of it, and only once message four is
+ *   already on its way, so that nothing added here can delay the answer the
+ *   access point is waiting for.
  *
  ****************************************************************************/
 
@@ -14054,7 +14954,10 @@ static void k1_rtl8852bs_runtime_wpa_observe(
 {
   FAR const uint8_t *eapol;
   FAR const uint8_t *key;
+  FAR const uint8_t *key_data;
   size_t eapol_length;
+  size_t key_data_length;
+  size_t plain_length = 0;
   uint16_t key_info;
   uint8_t mic[K1_RTL8852BS_EAPOL_KEY_MIC_SIZE];
   int ret;
@@ -14189,6 +15092,64 @@ static void k1_rtl8852bs_runtime_wpa_observe(
   g_k1_rtl8852bs_wpa_action.msg3_mic_valid = true;
   k1_rtl8852bs_runtime_wpa_key_transmit(
     true, key + K1_RTL8852BS_EAPOL_KEY_REPLAY_OFFSET);
+
+  /* The group key.  How many key data bytes there are is the smaller of what
+   * the field declares and what the frame actually carried, the same rule the
+   * locate step applies to the body length, because a truncated frame must
+   * not be read past its end.
+   */
+
+  key_data = key + K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE;
+  key_data_length = eapol_length - K1_RTL8852BS_EAPOL_HEADER_SIZE -
+                    K1_RTL8852BS_EAPOL_KEY_FIXED_SIZE;
+  if (key_data_length > g_k1_rtl8852bs_wpa_action.msg3_key_data_length)
+    {
+      key_data_length = g_k1_rtl8852bs_wpa_action.msg3_key_data_length;
+    }
+
+  /* Only a set Encrypted Key Data bit means the field is wrapped.  No WPA2
+   * access point sends a group key in the clear, but one that does is parsed
+   * rather than refused, because refusing it would report a missing group key
+   * where the real finding is an access point that sent one unprotected.
+   */
+
+  if ((key_info & K1_RTL8852BS_EAPOL_KEY_INFO_ENCRYPTED) != 0u)
+    {
+      g_k1_rtl8852bs_wpa_action.gtk_unwrap_status =
+        k1_rtl8852bs_aes_key_unwrap(
+          g_k1_rtl8852bs_wpa_action.ptk + K1_RTL8852BS_WPA_KEK_OFFSET,
+          key_data, key_data_length, g_k1_rtl8852bs_wpa_action.key_data,
+          sizeof(g_k1_rtl8852bs_wpa_action.key_data), &plain_length);
+      if (g_k1_rtl8852bs_wpa_action.gtk_unwrap_status < 0)
+        {
+          return;
+        }
+    }
+  else if (key_data_length >
+           sizeof(g_k1_rtl8852bs_wpa_action.key_data))
+    {
+      g_k1_rtl8852bs_wpa_action.gtk_unwrap_status = -EMSGSIZE;
+      return;
+    }
+  else
+    {
+      memcpy(g_k1_rtl8852bs_wpa_action.key_data, key_data, key_data_length);
+      plain_length = key_data_length;
+      g_k1_rtl8852bs_wpa_action.gtk_unwrap_status = OK;
+    }
+
+  g_k1_rtl8852bs_wpa_action.key_data_bytes = (uint16_t)plain_length;
+  g_k1_rtl8852bs_wpa_action.gtk_parse_status =
+    k1_rtl8852bs_wpa_key_data_parse(g_k1_rtl8852bs_wpa_action.key_data,
+                                    plain_length,
+                                    &g_k1_rtl8852bs_wpa_action.gtk);
+
+  /* The unwrapped bytes have been read; the only copy of the group key that
+   * outlives this function is the one inside the descriptor above.
+   */
+
+  memset(g_k1_rtl8852bs_wpa_action.key_data, 0,
+         sizeof(g_k1_rtl8852bs_wpa_action.key_data));
 }
 
 static void k1_rtl8852bs_scanofld_observe_wifi(
@@ -18271,6 +19232,104 @@ static int k1_rtl8852bs_runtime_sta_sch_init(void)
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_sec_eng_init
+ *
+ * Description:
+ *   Perform the original sec_eng_init() on the security engine, which the
+ *   original runs inside dmac_init() next to the station scheduler and which
+ *   this port has never run at all.
+ *
+ *   The security engine is the block that encrypts a transmitted MPDU and
+ *   decrypts a received one with the key the security CAM holds for the
+ *   frame's address CAM entry.  A key installed into that CAM while these two
+ *   registers are still at their reset values would be read by a block whose
+ *   cipher clocks and per-direction enables nobody has ever set, so this has
+ *   to run before the first key is installed rather than before the first
+ *   encrypted frame.
+ *
+ *   Both registers are reported before and after, for the same reason the
+ *   station scheduler is: a run whose "before" value already carries the bits
+ *   has answered by itself whether the firmware set them on our behalf.
+ *
+ * Returned Value:
+ *   OK when both registers read back with the bits this routine asked for,
+ *   a negated errno otherwise.  -EIO means the write was accepted by the bus
+ *   but the register did not take it.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_sec_eng_init(void)
+{
+  uint32_t ctrl_before = 0;
+  uint32_t proc_before = 0;
+  uint32_t ctrl_after = 0;
+  uint32_t proc_after = 0;
+  int ret;
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_SEC_ENG_CTRL, &ctrl_before);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_SEC_MPDU_PROC, &proc_before);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_write32(
+    K1_RTL8852BS_SEC_ENG_CTRL,
+    (ctrl_before | K1_RTL8852BS_SEC_ENG_CTRL_SET) &
+    ~(uint32_t)K1_RTL8852BS_SEC_ENG_TX_PARTIAL_MODE);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_write32(
+    K1_RTL8852BS_SEC_MPDU_PROC,
+    proc_before | K1_RTL8852BS_SEC_MPDU_PROC_SET);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_SEC_ENG_CTRL, &ctrl_after);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_SEC_MPDU_PROC, &proc_after);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: sec-eng ctrl before=");
+  k1_early_puthex(ctrl_before);
+  k1_early_puts(" after=");
+  k1_early_puthex(ctrl_after);
+  k1_early_puts(" mpdu-proc before=");
+  k1_early_puthex(proc_before);
+  k1_early_puts(" after=");
+  k1_early_puthex(proc_after);
+  k1_early_puts("\r\n");
+
+  if ((ctrl_after & K1_RTL8852BS_SEC_ENG_CTRL_SET) !=
+      K1_RTL8852BS_SEC_ENG_CTRL_SET ||
+      (ctrl_after & K1_RTL8852BS_SEC_ENG_TX_PARTIAL_MODE) != 0 ||
+      (proc_after & K1_RTL8852BS_SEC_MPDU_PROC_SET) !=
+      K1_RTL8852BS_SEC_MPDU_PROC_SET)
+    {
+      return -EIO;
+    }
+
+  return OK;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_tx_prerequisites
  *
  * Description:
@@ -18357,6 +19416,11 @@ static void k1_rtl8852bs_runtime_tx_prerequisites(void)
 
   ret = k1_rtl8852bs_runtime_sta_sch_init();
   k1_early_puts("K1 Wi-Fi GPL: sta-sch init status=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+
+  ret = k1_rtl8852bs_runtime_sec_eng_init();
+  k1_early_puts("K1 Wi-Fi GPL: sec-eng init status=");
   k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
   k1_early_puts("\r\n");
 
@@ -19722,6 +20786,21 @@ static int k1_rtl8852bs_runtime_join_addr_cam_submit(
   memcpy(cam.target_mac, bssid, sizeof(cam.target_mac));
   memcpy(cam.bssid, bssid, sizeof(cam.bssid));
 
+  /* Whatever key slots have been installed so far, every time.  The firmware
+   * keeps one address CAM entry per index and this command replaces it whole,
+   * so a re-send that dropped an earlier slot would take that key back out of
+   * the entry.  Before the first key is installed this is all zero and the
+   * command is byte for byte the one the join and association steps already
+   * send.
+   */
+
+  cam.sec_ent_mode = g_k1_rtl8852bs_key_install.mode;
+  cam.sec_ent_valid = g_k1_rtl8852bs_key_install.valid;
+  memcpy(cam.sec_ent, g_k1_rtl8852bs_key_install.sec_ent,
+         sizeof(cam.sec_ent));
+  memcpy(cam.sec_ent_keyid, g_k1_rtl8852bs_key_install.keyid,
+         sizeof(cam.sec_ent_keyid));
+
   ret = k1_rtl8852bs_runtime_addr_cam_build(&cam, content, sizeof(content));
   if (ret < 0)
     {
@@ -19762,6 +20841,363 @@ static int k1_rtl8852bs_runtime_join_addr_cam_submit(
   k1_early_puts("\r\n");
 
   return firmware_return == 0 ? OK : -EIO;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_sec_cam_submit
+ *
+ * Description:
+ *   Write one key into one security CAM entry and wait for the firmware to
+ *   acknowledge it.
+ *
+ *   This is the second half of the vendor's mac_sta_add_key(): the address CAM
+ *   slot names the entry before the entry is written, which is why the caller
+ *   sends that command first.  The payload here is the key itself, so the
+ *   stack copy is zeroed as soon as the transport has taken it -- whether or
+ *   not the command succeeded -- and nothing derived from the key is printed.
+ *
+ * Input Parameters:
+ *   label    - what the log calls this command
+ *   sequence - the H2C sequence number the done-ack is matched on
+ *   info     - the entry to write
+ *
+ * Returned Value:
+ *   OK when the firmware acknowledged with a zero return code, otherwise a
+ *   negated errno.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_sec_cam_submit(
+  FAR const char *label, uint8_t sequence,
+  FAR const struct k1_rtl8852bs_sec_cam_info_s *info)
+{
+  uint8_t content[K1_RTL8852BS_SEC_CAM_CONTENT_SIZE];
+  uint8_t firmware_return = 0;
+  uint16_t available_pages = 0;
+  uint32_t fifo_address = 0;
+  int ret;
+
+  if (label == NULL || info == NULL)
+    {
+      return -EINVAL;
+    }
+
+  ret = k1_rtl8852bs_runtime_sec_cam_build(info, content, sizeof(content));
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_runtime_control_h2c_submit(
+    content, sizeof(content), K1_RTL8852BS_SEC_CAM_CATEGORY,
+    K1_RTL8852BS_SEC_CAM_CLASS, K1_RTL8852BS_SEC_CAM_FUNCTION,
+    sequence, true, &fifo_address, &available_pages);
+
+  memset(content, 0, sizeof(content));
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" H2C queued sequence=");
+  k1_early_puthex(sequence);
+  k1_early_puts(" pages=");
+  k1_early_puthex(available_pages);
+  k1_early_puts(" FIFO=");
+  k1_early_puthex(fifo_address);
+  k1_early_puts("\r\n");
+
+  ret = k1_rtl8852bs_runtime_done_ack_wait(
+    K1_RTL8852BS_SEC_CAM_CATEGORY, K1_RTL8852BS_SEC_CAM_CLASS,
+    K1_RTL8852BS_SEC_CAM_FUNCTION, sequence, &firmware_return);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" done-ack return=");
+  k1_early_puthex(firmware_return);
+  k1_early_puts("\r\n");
+
+  return firmware_return == 0 ? OK : -EIO;
+}
+
+/* What one key install needs to know about the key it is installing: the two
+ * log labels and H2C sequence numbers of its two commands, the address CAM
+ * slot the key occupies, the security CAM entry that holds it, the key
+ * identifier the air carries, and the sixteen key bytes.
+ */
+
+struct k1_rtl8852bs_key_request_s
+{
+  FAR const char *cam_label;
+  FAR const char *sec_label;
+  uint8_t cam_sequence;
+  uint8_t sec_sequence;
+  uint8_t slot;
+  uint8_t sec_cam_index;
+  uint8_t key_id;
+  FAR const uint8_t *key;
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_key_install
+ *
+ * Description:
+ *   Install one key into the hardware, in the order the vendor's
+ *   mac_sta_add_key() does it: the address CAM entry is re-sent first with the
+ *   key's slot filled in, and only then is the security CAM entry holding the
+ *   key bytes written.
+ *
+ *   The order is not cosmetic.  The slot is what tells the security engine
+ *   which entry to look the key up in for frames matching this address CAM
+ *   entry, and the firmware owns both structures; a security CAM entry written
+ *   before anything points at it is an entry no frame can reach.
+ *
+ *   When the address CAM command fails the slot is taken back out of the
+ *   cached entry, so the next key's re-send cannot carry a slot the firmware
+ *   never accepted.
+ *
+ * Input Parameters:
+ *   request              - which key, which slot, which entry, which sequences
+ *   self_mac, bssid, aid - the address CAM entry's own fields, unchanged from
+ *                          the association step's send
+ *   cam_status           - where the address CAM command's result is recorded
+ *   sec_status           - where the security CAM command's result is recorded
+ *
+ * Returned Value:
+ *   OK when both commands were acknowledged with a zero return code,
+ *   otherwise a negated errno.  Both statuses are written whether or not the
+ *   install succeeded, so the report can name which of the two stopped it.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_key_install(
+  FAR const struct k1_rtl8852bs_key_request_s *request,
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid, uint16_t aid,
+  FAR int *cam_status, FAR int *sec_status)
+{
+  struct k1_rtl8852bs_sec_cam_info_s sec;
+  uint8_t previous_mode;
+  uint8_t previous_valid;
+  uint8_t previous_ent;
+  uint8_t previous_keyid;
+  int ret;
+
+  if (request == NULL || request->cam_label == NULL ||
+      request->sec_label == NULL || request->key == NULL ||
+      cam_status == NULL || sec_status == NULL ||
+      request->slot >= K1_RTL8852BS_ADDR_CAM_SEC_SLOTS)
+    {
+      return -EINVAL;
+    }
+
+  previous_mode = g_k1_rtl8852bs_key_install.mode;
+  previous_valid = g_k1_rtl8852bs_key_install.valid;
+  previous_ent = g_k1_rtl8852bs_key_install.sec_ent[request->slot];
+  previous_keyid = g_k1_rtl8852bs_key_install.keyid[request->slot];
+
+  g_k1_rtl8852bs_key_install.mode = K1_RTL8852BS_SEC_ENT_MODE_CCMP;
+  g_k1_rtl8852bs_key_install.valid |= (uint8_t)(1u << request->slot);
+  g_k1_rtl8852bs_key_install.sec_ent[request->slot] = request->sec_cam_index;
+  g_k1_rtl8852bs_key_install.keyid[request->slot] = request->key_id;
+
+  ret = k1_rtl8852bs_runtime_join_addr_cam_submit(
+    request->cam_label, request->cam_sequence, self_mac, bssid, aid);
+  *cam_status = ret;
+  if (ret < 0)
+    {
+      g_k1_rtl8852bs_key_install.mode = previous_mode;
+      g_k1_rtl8852bs_key_install.valid = previous_valid;
+      g_k1_rtl8852bs_key_install.sec_ent[request->slot] = previous_ent;
+      g_k1_rtl8852bs_key_install.keyid[request->slot] = previous_keyid;
+      return ret;
+    }
+
+  memset(&sec, 0, sizeof(sec));
+  sec.index = request->sec_cam_index;
+  sec.offset = 0u;
+  sec.length = K1_RTL8852BS_SEC_CAM_ENTRY_SIZE;
+  sec.type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128;
+  memcpy(sec.key, request->key, sizeof(sec.key));
+
+  ret = k1_rtl8852bs_runtime_sec_cam_submit(request->sec_label,
+                                            request->sec_sequence, &sec);
+  memset(&sec, 0, sizeof(sec));
+  *sec_status = ret;
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_key_install_pair
+ *
+ * Description:
+ *   Install the two keys a WPA2-PSK association produced: the pairwise
+ *   transient key in address CAM slot 0 and security CAM entry 0, and the
+ *   group key in slot 2 and entry 1.
+ *
+ *   The slots are the ones security entry mode 2 allows -- the vendor's
+ *   check_key_index() gives a unicast key slots 0 to 1, a group key slots 2 to
+ *   4 and a management key slots 5 to 6 in that mode -- and the entry indices
+ *   are what its round-robin allocator hands out for the first two keys of a
+ *   fresh station.  The pairwise key install goes first because the group key's
+ *   address CAM re-send has to carry both slots, which only holds if the
+ *   pairwise slot is already in the cached entry.
+ *
+ *   What this proves when it succeeds is that the firmware accepted the keys,
+ *   not that traffic is encrypted with them.  Encrypted traffic additionally
+ *   needs the security fields of the transmit descriptor and a data path this
+ *   port does not have yet.
+ *
+ * Input Parameters:
+ *   self_mac, bssid, aid - the address CAM entry's own fields, unchanged from
+ *                          the association step's send
+ *
+ * Returned Value:
+ *   OK when both keys were installed and acknowledged, -ENOKEY when no
+ *   verified handshake for this BSS produced a pairwise key, -ENOENT when the
+ *   group key was never recovered, -EOPNOTSUPP when its length is not one a
+ *   CCMP-128 entry holds, or the failing command's own negated errno.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_key_install_pair(FAR const uint8_t *self_mac,
+                                                 FAR const uint8_t *bssid,
+                                                 uint16_t aid)
+{
+  struct k1_rtl8852bs_key_request_s request;
+  int ret;
+
+  if (self_mac == NULL || bssid == NULL)
+    {
+      return -EINVAL;
+    }
+
+  /* Only a handshake that ran to its end against this same access point may
+   * install a key.  Both halves matter: the integrity code is what proves the
+   * derived key is the access point's, and the address is what proves it is
+   * the access point this address CAM entry describes.
+   */
+
+  if (!g_k1_rtl8852bs_wpa_action.ptk_valid ||
+      !g_k1_rtl8852bs_wpa_action.msg3_mic_valid ||
+      !g_k1_rtl8852bs_wpa_action.complete ||
+      memcmp(g_k1_rtl8852bs_wpa_action.bssid, bssid,
+             sizeof(g_k1_rtl8852bs_wpa_action.bssid)) != 0)
+    {
+      return -ENOKEY;
+    }
+
+  memset(&request, 0, sizeof(request));
+  request.cam_label = "TK CAM";
+  request.sec_label = "TK SEC";
+  request.cam_sequence = K1_RTL8852BS_KEY_TK_CAM_H2C_SEQUENCE;
+  request.sec_sequence = K1_RTL8852BS_KEY_TK_SEC_H2C_SEQUENCE;
+  request.slot = K1_RTL8852BS_SEC_SLOT_PAIRWISE;
+  request.sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE;
+  request.key_id = 0u;
+  request.key = g_k1_rtl8852bs_wpa_action.ptk + K1_RTL8852BS_WPA_TK_OFFSET;
+
+  ret = k1_rtl8852bs_runtime_key_install(
+    &request, self_mac, bssid, aid,
+    &g_k1_rtl8852bs_key_install.tk_cam_status,
+    &g_k1_rtl8852bs_key_install.tk_sec_status);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  g_k1_rtl8852bs_key_install.tk_installed = true;
+
+  if (!g_k1_rtl8852bs_wpa_action.gtk.valid)
+    {
+      return -ENOENT;
+    }
+
+  if (g_k1_rtl8852bs_wpa_action.gtk.length != K1_RTL8852BS_SEC_CAM_KEY_SIZE)
+    {
+      return -EOPNOTSUPP;
+    }
+
+  memset(&request, 0, sizeof(request));
+  request.cam_label = "GTK CAM";
+  request.sec_label = "GTK SEC";
+  request.cam_sequence = K1_RTL8852BS_KEY_GTK_CAM_H2C_SEQUENCE;
+  request.sec_sequence = K1_RTL8852BS_KEY_GTK_SEC_H2C_SEQUENCE;
+  request.slot = K1_RTL8852BS_SEC_SLOT_GROUP;
+  request.sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_GROUP;
+  request.key_id = g_k1_rtl8852bs_wpa_action.gtk.key_id;
+  request.key = g_k1_rtl8852bs_wpa_action.gtk.key;
+
+  ret = k1_rtl8852bs_runtime_key_install(
+    &request, self_mac, bssid, aid,
+    &g_k1_rtl8852bs_key_install.gtk_cam_status,
+    &g_k1_rtl8852bs_key_install.gtk_sec_status);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  g_k1_rtl8852bs_key_install.gtk_installed = true;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_key_report
+ *
+ * Description:
+ *   Print what the key install did.  The address CAM slots are printed as the
+ *   firmware now holds them and each of the four commands has its own status,
+ *   so a run tells apart a key whose slot was refused from one whose entry
+ *   was, and a group key that was never recovered from one that was refused.
+ *
+ *   Nothing derived from either key appears here: the mode, the slot mask, the
+ *   security CAM indices and the key identifiers are addressing that the access
+ *   point already broadcasts or that this port chose.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_key_report(FAR const char *label)
+{
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" sec-mode=");
+  k1_early_puthex(g_k1_rtl8852bs_key_install.mode);
+  k1_early_puts(" sec-valid=");
+  k1_early_puthex(g_k1_rtl8852bs_key_install.valid);
+  k1_early_puts(" tk-ent=");
+  k1_early_puthex(
+    g_k1_rtl8852bs_key_install.sec_ent[K1_RTL8852BS_SEC_SLOT_PAIRWISE]);
+  k1_early_puts(" tk-keyid=");
+  k1_early_puthex(
+    g_k1_rtl8852bs_key_install.keyid[K1_RTL8852BS_SEC_SLOT_PAIRWISE]);
+  k1_early_puts(" tk-cam=");
+  k1_early_puthex((uintreg_t)(g_k1_rtl8852bs_key_install.tk_cam_status < 0 ?
+                              -g_k1_rtl8852bs_key_install.tk_cam_status : 0));
+  k1_early_puts(" tk-sec=");
+  k1_early_puthex((uintreg_t)(g_k1_rtl8852bs_key_install.tk_sec_status < 0 ?
+                              -g_k1_rtl8852bs_key_install.tk_sec_status : 0));
+  k1_early_puts(" tk=");
+  k1_early_puthex(g_k1_rtl8852bs_key_install.tk_installed ? 1u : 0u);
+  k1_early_puts(" gtk-ent=");
+  k1_early_puthex(
+    g_k1_rtl8852bs_key_install.sec_ent[K1_RTL8852BS_SEC_SLOT_GROUP]);
+  k1_early_puts(" gtk-keyid=");
+  k1_early_puthex(
+    g_k1_rtl8852bs_key_install.keyid[K1_RTL8852BS_SEC_SLOT_GROUP]);
+  k1_early_puts(" gtk-cam=");
+  k1_early_puthex((uintreg_t)(g_k1_rtl8852bs_key_install.gtk_cam_status < 0 ?
+                              -g_k1_rtl8852bs_key_install.gtk_cam_status : 0));
+  k1_early_puts(" gtk-sec=");
+  k1_early_puthex((uintreg_t)(g_k1_rtl8852bs_key_install.gtk_sec_status < 0 ?
+                              -g_k1_rtl8852bs_key_install.gtk_sec_status : 0));
+  k1_early_puts(" gtk=");
+  k1_early_puthex(g_k1_rtl8852bs_key_install.gtk_installed ? 1u : 0u);
+  k1_early_puts("\r\n");
 }
 
 /****************************************************************************
@@ -20182,6 +21618,12 @@ static void k1_rtl8852bs_runtime_assoc_report(FAR const char *label)
  *   point's own value sent in the clear, and because a nonce of all zeroes
  *   would otherwise be indistinguishable from a correct one.
  *
+ *   The group key is reported the same way: how many bytes came out of the
+ *   unwrap, the two errno values the unwrap and the element walk returned, and
+ *   the descriptor's length and key identifier, which are the access point's
+ *   choices rather than key material.  The key bytes themselves are not
+ *   printed.
+ *
  ****************************************************************************/
 
 static void k1_rtl8852bs_runtime_wpa_report(FAR const char *label)
@@ -20223,6 +21665,22 @@ static void k1_rtl8852bs_runtime_wpa_report(FAR const char *label)
   k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg3_mic_valid ? 1u : 0u);
   k1_early_puts(" mic-fail=");
   k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg3_mic_failures);
+  k1_early_puts(" keydata-plain=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.key_data_bytes);
+  k1_early_puts(" unwrap=");
+  k1_early_puthex((uintreg_t)
+                  (g_k1_rtl8852bs_wpa_action.gtk_unwrap_status < 0 ?
+                   -g_k1_rtl8852bs_wpa_action.gtk_unwrap_status : 0));
+  k1_early_puts(" kde=");
+  k1_early_puthex((uintreg_t)
+                  (g_k1_rtl8852bs_wpa_action.gtk_parse_status < 0 ?
+                   -g_k1_rtl8852bs_wpa_action.gtk_parse_status : 0));
+  k1_early_puts(" gtk=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.gtk.valid ? 1u : 0u);
+  k1_early_puts(" gtk-len=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.gtk.length);
+  k1_early_puts(" gtk-id=");
+  k1_early_puthex(g_k1_rtl8852bs_wpa_action.gtk.key_id);
   k1_early_puts(" msg4=");
   k1_early_puthex(g_k1_rtl8852bs_wpa_action.msg4_sent ? 1u : 0u);
   k1_early_puts(" msg4-status=");
@@ -21245,6 +22703,28 @@ static int k1_rtl8852bs_runtime_station_diagnostic(
       memset(pmk, 0, sizeof(pmk));
       k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station WPA2 four-way "
                     "handshake complete\r\n");
+
+      /* The keys go into the hardware only after the handshake has been
+       * reported complete, so a run that fails to install them still says
+       * plainly how far the handshake itself got.  The report reads the CAM
+       * slots and the four command results, never the keys.
+       */
+
+      ret = k1_rtl8852bs_runtime_key_install_pair(self_mac, bssid,
+                                                  decided->aid);
+      k1_rtl8852bs_runtime_key_report("station keys");
+      if (ret < 0)
+        {
+          goto error;
+        }
+
+      /* Installed and acknowledged, which is all this claims.  Encrypting
+       * traffic with them additionally needs the transmit descriptor's
+       * security fields and a data path this port does not have yet.
+       */
+
+      k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station WPA2 keys "
+                    "installed\r\n");
     }
 
   return OK;
