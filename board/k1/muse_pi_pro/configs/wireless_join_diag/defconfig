@@ -1,0 +1,37 @@
+# RTL8852BS2 station join: tell the firmware and the hardware that this host is
+# a station joined to one real access point, then prove the authentication
+# exchange still works while they believe it.
+#
+# The parent is the authentication profile whose whole chain already passed on
+# the board, so one run of this image re-validates everything proven before -
+# firmware download, the runtime control plane, the no-link role and CAM, the
+# passive 2.4 GHz 1-13 sweep with real Beacon RX, the wlan0 netdev whose wapi
+# scan reports those access points, the Probe Request/Response exchange, and
+# the directed Authentication Request/Response against a no-link address CAM -
+# and then adds the one new step.
+#
+# That step is the pair of commands the vendor connect path sends, in its order
+# and with its contents: MEDIA_RPT/JOININFO carrying the MACID, the
+# infrastructure network type and the station role, then one
+# MAC/ADDR_CAM_UPDATE for the same MACID whose target MAC and BSSID are the
+# access point and whose self role is client. Both ask for a done
+# acknowledgement, so the firmware gets the chance to reject the shape of
+# either one, and both acknowledgements have to return zero. FWROLE_MAINTAIN is
+# deliberately not resent, because the vendor path does not resend it either.
+#
+# A second sweep then re-runs the open-system authentication exchange against
+# the same access point. The image fails unless the access point still answers
+# AND that sweep still receives Beacons: an address CAM that now carries a
+# BSSID and an infrastructure network type is exactly the kind of change that
+# can start filtering receive traffic, so a run reporting a join while quietly
+# having stopped receiving would be worse than a failure.
+#
+# This does NOT associate. No association request is sent, no association ID is
+# asked for or granted, and the port's TSF is not synchronised to the access
+# point's Beacons. Still RAM-only: no key, no data path, no IP address, no
+# wlan0 behaviour change, and nothing written to eMMC, SPI flash, eFuse or the
+# U-Boot environment.
+
+#include "../wireless_auth_diag/defconfig"
+
+CONFIG_K1_RTL8852BS2_RUNTIME_JOIN_DIAGNOSTIC=y

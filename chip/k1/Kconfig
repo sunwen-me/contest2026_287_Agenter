@@ -724,6 +724,41 @@ config K1_RTL8852BS2_RUNTIME_AUTH_DIAGNOSTIC
 		is created, no data is carried, and nothing is written to eMMC, SPI
 		flash, eFuse or the U-Boot environment.
 
+config K1_RTL8852BS2_RUNTIME_JOIN_DIAGNOSTIC
+	bool "Require the RTL8852BS2 station join to one access point"
+	default n
+	depends on K1_RTL8852BS2_RUNTIME_AUTH_DIAGNOSTIC
+	---help---
+		Tell the firmware and the hardware that this host is a station joined to
+		one real access point, and then require the authentication exchange to
+		still work while they believe it.
+
+		A first passive sweep picks the target the same way the directed exchange
+		does, because a BSSID may only be programmed once it has actually been
+		heard. The two commands the vendor connect path sends are then submitted
+		between sweeps, in its order and with its contents: MEDIA_RPT/JOININFO
+		first, carrying the MACID, the infrastructure network type and the station
+		role, and then one MAC/ADDR_CAM_UPDATE for the same MACID whose target MAC
+		and BSSID are the access point and whose self role is client. Both ask for
+		a done acknowledgement, and both acknowledgements have to return zero.
+		FWROLE_MAINTAIN is deliberately not resent, because the vendor path does
+		not resend it either: the firmware role created at bring-up is kept and
+		only its contents change.
+
+		A second sweep then re-runs the open-system authentication exchange against
+		the same access point, and two things are required of it. The access point
+		has to still answer, and the sweep has to still receive Beacons: an address
+		CAM that now carries a BSSID and an infrastructure network type is exactly
+		the kind of change that can start filtering receive traffic, so a run that
+		reported a join while quietly having stopped receiving would be worse than
+		a failure.
+
+		This does NOT associate. No association request is sent, no association ID
+		is asked for or granted, no key is installed, no network device is created,
+		no data is carried, and the port's TSF is not synchronised to the access
+		point's Beacons. Nothing is written to eMMC, SPI flash, eFuse or the U-Boot
+		environment.
+
 config K1_RTL8852BS2_WLAN_NETDEV
 	bool "Register the RTL8852BS2 wlan0 scan network device"
 	default n

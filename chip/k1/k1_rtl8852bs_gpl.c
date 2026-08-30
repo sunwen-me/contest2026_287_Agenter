@@ -445,6 +445,22 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_CUT_AMSDU_CTRL          0x9c40u
 #define K1_RTL8852BS_TX_SUB_CARRIER_VALUE    0xc088u
 #define K1_RTL8852BS_PTCL_RRSR1              0xc090u
+/* CMAC port 0.  The firmware is told which BSS a MACID belongs to over
+ * MEDIA_RPT/JOININFO, but the beacon timing, the network type and the TSF the
+ * hardware itself uses live in this register block, which mac_port_init()
+ * programs upstream.  This port does not program it yet, so these are read
+ * only, to record what the hardware believes while a join is reported.
+ */
+
+#define K1_RTL8852BS_PORT_CFG_P0             0xc400u
+#define K1_RTL8852BS_TBTT_PROHIB_P0          0xc404u
+#define K1_RTL8852BS_BCN_AREA_P0             0xc408u
+#define K1_RTL8852BS_BCNERLYINT_CFG_P0       0xc40cu
+#define K1_RTL8852BS_TBTT_AGG_P0_WORD        0xc410u
+#define K1_RTL8852BS_BCN_SPACE_CFG_P0        0xc414u
+#define K1_RTL8852BS_TSFTR_LOW_P0            0xc438u
+#define K1_RTL8852BS_TSFTR_HIGH_P0           0xc43cu
+
 #define K1_RTL8852BS_PTCL_COMMON_SETTING0    0xc600u
 #define K1_RTL8852BS_TB_PPDU_CTRL            0xc60cu
 #define K1_RTL8852BS_PTCLRPT_FULL_HDL        0xc660u
@@ -1374,6 +1390,19 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_SCAN_OFLD_NEXT_CONTENT_SIZE   4u
 #define K1_RTL8852BS_SCAN_OFLD_PASSIVE_PERIOD_MSEC 250u
 
+/* How long this host lets a dwell run before it submits the next-channel
+ * command.  It has to be shorter than the channel-list period above, which
+ * mac_ax_scanofld_chinfo documents as "how long to stay on this ch": the
+ * firmware leaves a channel when that period expires whether or not the host
+ * has asked it to, and the host's deadline only starts when it reads the
+ * enter-channel notification, so equal values make every channel a race the
+ * host can lose.  The margin has to cover the notification's read latency
+ * plus the console output one dwell can produce, and what is left still
+ * spans more than one 100 ms beacon interval.
+ */
+
+#define K1_RTL8852BS_SCAN_OFLD_PASSIVE_DWELL_MSEC  180u
+
 /* A dwell only yields frames while the host keeps draining the RX FIFO, so
  * the scan path needs room for a multi-frame aggregate rather than the
  * single-C2H ceiling used by the done-ack helpers.  The bounded BSS table
@@ -1422,6 +1451,23 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_PKT_OFLD_CLASS                 9u
 #define K1_RTL8852BS_PKT_OFLD_FUNCTION              0x1u
 #define K1_RTL8852BS_PKT_OFLD_H2C_SEQUENCE          9u
+
+/* Sequence numbers for the two commands that move the recorded no-link role
+ * to an infrastructure station joined to one access point.  The upstream
+ * connect path is _change_role() with MAC_AX_ROLE_CON_DISCONN and opmode
+ * MAC_AX_ROLE_CONNECT: it sends MEDIA_RPT/JOININFO first and then the
+ * MAC/ADDR_CAM_UPDATE for the same MACID, and it does not resend
+ * FWROLE_MAINTAIN, so the firmware role created at bring-up stays as it is.
+ * Both commands ask for a done acknowledgement, so both need a sequence the
+ * boot path has not already used: 0 to 9 are taken by the loopback, MACID
+ * unpause, aggregate loopback, role, CAM, scan-offload and packet-offload
+ * commands.
+ */
+
+#define K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE         10u
+#define K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE          11u
+#define K1_RTL8852BS_JOIN_NETWORK_TYPE_INFRA        2u
+#define K1_RTL8852BS_JOIN_WIFI_ROLE_STATION         1u
 #define K1_RTL8852BS_PKT_OFLD_HEADER_SIZE           4u
 #define K1_RTL8852BS_PKT_OFLD_OP_ADD                0u
 #define K1_RTL8852BS_PKT_OFLD_OP_SHIFT              8u
@@ -5347,6 +5393,7 @@ struct k1_rtl8852bs_auth_action_s
   bool transmitted;
   int transmit_status;
   uint16_t requests;
+  uint16_t request_sequence;
   uint16_t responses_to_self;
   uint16_t responses_from_target;
   uint16_t frames_seen;
@@ -5358,6 +5405,52 @@ struct k1_rtl8852bs_auth_action_s
 };
 
 static struct k1_rtl8852bs_auth_action_s g_k1_rtl8852bs_auth_action;
+
+/* The access point a directed authentication exchange has already been
+ * answered by in this run.  A later step that wants to measure what its own
+ * commands changed has to aim at the same access point: whether an access
+ * point answers this host at all is a property of that access point and of
+ * the link to it, so re-picking the strongest BSS of a fresh sweep can swap in
+ * one that would never have answered and make a working step read as broken.
+ */
+
+struct k1_rtl8852bs_auth_proven_s
+{
+  uint8_t bssid[6];
+  uint8_t channel;
+  bool valid;
+};
+
+static struct k1_rtl8852bs_auth_proven_s g_k1_rtl8852bs_auth_proven;
+
+/* The sequence number the next host-built management frame carries.  IEEE
+ * 802.11 clause 10.3.2.14 lets a receiver keep a cache of recently received
+ * <address 2, sequence number, fragment number> tuples and discard a frame
+ * that repeats one, and it does so in the MAC, below the state machine that
+ * would have answered: the frame is acknowledged and then dropped, so a
+ * station that transmits every request with the same number gets exactly one
+ * answer per access point and silence afterwards.  A counter here is also
+ * simply what the standard requires of a transmitter, and it is what the
+ * upstream driver ends up sending, because the sequence number the host stack
+ * assigns is copied into both the frame and the descriptor.
+ *
+ * The counter is twelve bits and wraps, which is the field's own width.  It
+ * belongs to this host rather than to one exchange, so every directed request
+ * this port builds advances it.  The broadcast Probe Request the transmit
+ * positive control sends does not take a number from it: that frame is sent
+ * once per run and is answered by address, not by sequence.
+ */
+
+static uint16_t g_k1_rtl8852bs_mgmt_sequence;
+
+static uint16_t k1_rtl8852bs_runtime_mgmt_sequence_next(void)
+{
+  uint16_t sequence = g_k1_rtl8852bs_mgmt_sequence;
+
+  g_k1_rtl8852bs_mgmt_sequence =
+    (uint16_t)((sequence + 1u) & K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK);
+  return sequence;
+}
 
 static int k1_rtl8852bs_runtime_mgmt_tx_frame(FAR const uint8_t *frame,
                                               size_t frame_length,
@@ -9344,10 +9437,15 @@ static int k1_rtl8852bs_runtime_probe_request_build(
  *   it, which is the descriptor k1_rtl8852bs_runtime_mgmt_tx_build() already
  *   proved reaches the protocol engine.
  *
- *   The sequence-control field is left zero.  The management descriptor
- *   selects neither hardware sequence numbering nor a MAC-table sequence
- *   counter, so the number in the descriptor owns the frame and no station
- *   record has to have been configured for the transmit to be legal.
+ *   The caller supplies the sequence number, and it is written into the
+ *   frame's own sequence-control field with a zero fragment number.  The
+ *   management descriptor selects neither hardware sequence numbering nor a
+ *   MAC-table sequence counter, so this field is the number that goes on the
+ *   air and no station record has to have been configured for the transmit to
+ *   be legal.  It must differ from the number the previous request carried:
+ *   an access point that caches recently received sequence numbers per
+ *   transmitter acknowledges a repeat of one and then discards it, which
+ *   looks exactly like an access point that stopped answering.
  *
  * Input Parameters:
  *   frame        - Receives the frame.
@@ -9355,6 +9453,7 @@ static int k1_rtl8852bs_runtime_probe_request_build(
  *   self_mac     - The eFuse self MAC, used as transmitter address.
  *   bssid        - The access point selected from a scan result.  It is both
  *                  the destination and the BSSID of the frame.
+ *   sequence     - The twelve-bit sequence number for this frame.
  *   length       - Receives the number of bytes written.
  *
  * Returned Value:
@@ -9364,13 +9463,14 @@ static int k1_rtl8852bs_runtime_probe_request_build(
 
 static int k1_rtl8852bs_runtime_auth_request_build(
   FAR uint8_t *frame, size_t frame_length, FAR const uint8_t *self_mac,
-  FAR const uint8_t *bssid, FAR size_t *length)
+  FAR const uint8_t *bssid, uint16_t sequence, FAR size_t *length)
 {
   size_t offset;
 
   if (frame == NULL || length == NULL || self_mac == NULL || bssid == NULL ||
       !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
       !k1_rtl8852bs_addr_cam_mac_valid(bssid) ||
+      sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK ||
       frame_length < K1_RTL8852BS_AUTH_FRAME_SIZE)
     {
       return -EINVAL;
@@ -9388,6 +9488,13 @@ static int k1_rtl8852bs_runtime_auth_request_build(
   memcpy(frame + 4, bssid, 6);
   memcpy(frame + 10, self_mac, 6);
   memcpy(frame + 16, bssid, 6);
+
+  /* Sequence control: the twelve-bit sequence number in the upper bits and
+   * fragment number zero, because a management frame this short is never
+   * fragmented.
+   */
+
+  k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
   offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
 
   k1_rtl8852bs_write_le16(frame + offset, K1_RTL8852BS_AUTH_ALGORITHM_OPEN);
@@ -9424,6 +9531,7 @@ static void k1_rtl8852bs_runtime_auth_transmit(void)
 {
   uint8_t frame[K1_RTL8852BS_AUTH_FRAME_SIZE];
   size_t frame_length = 0;
+  uint16_t sequence;
   int ret;
 
   g_k1_rtl8852bs_auth_action.transmitted = true;
@@ -9433,12 +9541,20 @@ static void k1_rtl8852bs_runtime_auth_transmit(void)
       return;
     }
 
+  /* One number per transmit, consumed whether or not the frame is accepted:
+   * a number that reached the air must never be reused, and a request the
+   * transmit path rejected may still have been written into the FIFO.
+   */
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+  g_k1_rtl8852bs_auth_action.request_sequence = sequence;
+
   ret = k1_rtl8852bs_runtime_auth_request_build(
     frame, sizeof(frame), g_k1_rtl8852bs_scan_self_mac,
-    g_k1_rtl8852bs_auth_action.bssid, &frame_length);
+    g_k1_rtl8852bs_auth_action.bssid, sequence, &frame_length);
   if (ret >= 0)
     {
-      ret = k1_rtl8852bs_runtime_mgmt_tx_frame(frame, frame_length, 0u,
+      ret = k1_rtl8852bs_runtime_mgmt_tx_frame(frame, frame_length, sequence,
                                                 false);
       if (ret >= 0)
         {
@@ -9452,6 +9568,8 @@ static void k1_rtl8852bs_runtime_auth_transmit(void)
   k1_early_puthex(g_k1_rtl8852bs_auth_action.channel);
   k1_early_puts(" bytes=");
   k1_early_puthex((uintreg_t)frame_length);
+  k1_early_puts(" sn=");
+  k1_early_puthex(sequence);
   k1_early_puts(" status=");
   k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
   k1_early_puts("\r\n");
@@ -9768,8 +9886,11 @@ static int k1_rtl8852bs_runtime_scanofld_passive_start_build(
  * Description:
  *   Perform the host side of the original scan-offload state machine after
  *   the channel-entry C2H.  SCANOFLD holds the current channel until this
- *   FW_OFLD/SCANOFLD_DRV_CTRL/NEXT_CH command is received.  It requests no
- *   probe, null, data, or other transmitted frame.
+ *   FW_OFLD/SCANOFLD_DRV_CTRL/NEXT_CH command is received or the channel
+ *   entry's own period expires, whichever comes first: mac_ax_scanofld_chinfo
+ *   documents period as "how long to stay on this ch", so this command only
+ *   ever cuts a dwell short and is not what keeps the radio parked past it.
+ *   It requests no probe, null, data, or other transmitted frame.
  ****************************************************************************/
 
 static int k1_rtl8852bs_runtime_scanofld_next_channel_submit(uint8_t channel)
@@ -11675,6 +11796,14 @@ struct k1_rtl8852bs_scanofld_passive_match_s
   uint8_t first_channel;
   uint16_t entered_channels;
   uint16_t advanced_channels;
+
+  /* Channels the firmware left on its own because its channel-list
+   * period expired before this host's dwell deadline did.  Counted apart
+   * from advanced_channels so a lost race is visible rather than looking
+   * like a dwell this host ended.
+   */
+
+  uint16_t firmware_advanced_channels;
   uint8_t bss_count;
   uint8_t bss_dropped;
   uint8_t dwell_channel;
@@ -12629,7 +12758,32 @@ static int k1_rtl8852bs_runtime_scanofld_passive_match(
     {
       channel_mask = 1u << channel_index;
       match->entered_channels |= channel_mask;
-      if ((match->advanced_channels & channel_mask) == 0 &&
+
+      /* The firmware leaves a channel when the channel-list period expires,
+       * whether or not the host asked it to, so this notification can arrive
+       * while a dwell is still pending for the channel it just left.  Retire
+       * that dwell here.  Leaving it pending would skip this channel's dwell
+       * altogether and then push the firmware one channel further with a
+       * next-channel command naming a channel it no longer sits on, and the
+       * channel it skipped would never be accounted for, which is what makes
+       * the sweep run out its poll budget instead of completing.
+       */
+
+      if (match->dwell_pending && match->dwell_channel != channel)
+        {
+          int pending_index = k1_rtl8852bs_scanofld_passive_channel_index(
+            match->dwell_channel);
+
+          if (pending_index >= 0)
+            {
+              match->firmware_advanced_channels |= 1u << pending_index;
+            }
+
+          match->dwell_pending = false;
+        }
+
+      if (((match->advanced_channels |
+            match->firmware_advanced_channels) & channel_mask) == 0 &&
           !match->dwell_pending)
         {
           /* The original PHL scan state machine waits for the configured
@@ -12643,7 +12797,7 @@ static int k1_rtl8852bs_runtime_scanofld_passive_match(
           match->dwell_pending = true;
           match->dwell_channel = channel;
           match->dwell_deadline = clock_systime_ticks() +
-            MSEC2TICK(K1_RTL8852BS_SCAN_OFLD_PASSIVE_PERIOD_MSEC);
+            MSEC2TICK(K1_RTL8852BS_SCAN_OFLD_PASSIVE_DWELL_MSEC);
 
           /* Give every dwell its own small frame-dump budget so the decode
            * evidence covers every channel instead of only the first.
@@ -13028,6 +13182,7 @@ static void k1_rtl8852bs_runtime_tx_witness_reset(void)
 
 static void k1_rtl8852bs_runtime_fault_snapshot(FAR const char *stage,
                                                 bool deep);
+static void k1_rtl8852bs_runtime_port_log(FAR const char *phase);
 
 static void k1_rtl8852bs_runtime_tx_witness_deep(void)
 {
@@ -13230,6 +13385,18 @@ static void k1_rtl8852bs_runtime_tx_witness_sample(unsigned int attempt)
     {
       w->mid_snapshot_done = true;
       k1_rtl8852bs_runtime_fault_snapshot("mid-sweep", false);
+
+      /* The port and the receive filter are read from inside the sweep as
+       * well.  Every other reading of them is taken before a sweep starts or
+       * after it has restored them, which cannot see a value the firmware
+       * changes while the sweep is running -- and a receive filter the
+       * firmware rewrote mid-sweep is one of the few things that would
+       * explain a sweep that stops receiving without the host writing
+       * anything.  Two lines against this snapshot's sixty is not what moves
+       * the timing.
+       */
+
+      k1_rtl8852bs_runtime_port_log("mid-sweep");
     }
 }
 
@@ -14168,7 +14335,8 @@ static int k1_rtl8852bs_runtime_scanofld_passive_wait(
               if (!complete && match->done_ack.matched &&
                   match->entered_channels ==
                     (1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) - 1u &&
-                  match->advanced_channels ==
+                  (match->advanced_channels |
+                   match->firmware_advanced_channels) ==
                     (1u << K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT) - 1u &&
                   match->saw_scan_end)
                 {
@@ -14251,6 +14419,26 @@ out:
 
   k1_rtl8852bs_scanofld_log_rx(match);
   k1_rtl8852bs_scanofld_log_bss_table(match);
+
+  /* The channel walk, printed whether or not the sweep failed.  Which
+   * channels this host retired and which the firmware left on its own is what
+   * separates a dwell this host ended from a lost race, and a sweep that
+   * succeeded needs the distinction as much as one that did not: every
+   * channel can be accounted for while the firmware ran ahead of the host on
+   * most of them, which is a sweep whose dwells were far shorter than they
+   * were asked to be.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: passive scan walk enter-mask=");
+  k1_early_puthex(match->entered_channels);
+  k1_early_puts(" next=");
+  k1_early_puthex(match->advanced_channels);
+  k1_early_puts(" fw-next=");
+  k1_early_puthex(match->firmware_advanced_channels);
+  k1_early_puts(" end=");
+  k1_early_puthex(match->saw_scan_end ? 1 : 0);
+  k1_early_puts("\r\n");
+
   if (ret < 0)
     {
       k1_early_puts("K1 Wi-Fi GPL: passive scan-offload wait error=");
@@ -14265,6 +14453,8 @@ out:
       k1_early_puthex(match->entered_channels);
       k1_early_puts(" next=");
       k1_early_puthex(match->advanced_channels);
+      k1_early_puts(" fw-next=");
+      k1_early_puthex(match->firmware_advanced_channels);
       k1_early_puts(" end=");
       k1_early_puthex(match->saw_scan_end ? 1 : 0);
       k1_early_puts(" last=ch");
@@ -14704,7 +14894,7 @@ static void k1_rtl8852bs_runtime_tx_state_log(
 
   unsigned int index;
 
-  k1_early_puts("K1 Wi-Fi GPL: active scan TX PPDU ");
+  k1_early_puts("K1 Wi-Fi GPL: TX PPDU ");
   k1_early_puts(phase);
   for (index = 0; index < K1_RTL8852BS_TX_PPDU_TYPES; index++)
     {
@@ -14728,7 +14918,7 @@ static void k1_rtl8852bs_runtime_tx_state_log(
 
   k1_early_puts("\r\n");
 
-  k1_early_puts("K1 Wi-Fi GPL: active scan TX state ");
+  k1_early_puts("K1 Wi-Fi GPL: TX state ");
   k1_early_puts(phase);
   k1_early_puts(" ppdu-sel=");
   k1_early_puthex(now->ppdu_sel);
@@ -15821,12 +16011,15 @@ static void k1_rtl8852bs_runtime_tx_prerequisites_report(void)
  *     WD BODY dword0  store and forward, WD INFO present, DMA channel B0MG.
  *                     The WD page bit belongs to the PCIe variant and stays
  *                     clear here.  Hardware sequence selection and hardware
- *                     sequence mode both stay zero, so the sequence in the WD
- *                     BODY owns the frame and no MAC-table sequence counter
- *                     has to have been configured first.
+ *                     sequence mode both stay zero, so the sequence-control
+ *                     field of the frame itself is what goes on the air and no
+ *                     MAC-table sequence counter has to have been configured
+ *                     first.
  *     WD BODY dword2  frame length, band-0 management queue selector 0x12 and
  *                     the MACID whose address CAM record this port programs.
- *     WD BODY dword3  the software sequence number.
+ *     WD BODY dword3  the software sequence number, which the caller keeps
+ *                     equal to the one in the frame so the hardware's own
+ *                     bookkeeping agrees with what was transmitted.
  *     WD INFO dword0  a fixed rate is selected, that rate is 1 Mbit/s CCK,
  *                     and data rate fallback is disabled, so nothing about
  *                     this transmit depends on a rate table.
@@ -16447,7 +16640,7 @@ int k1_rtl8852bs_fwdl_runtime_scanofld_active_diagnostic(
       goto error;
     }
 
-  k1_rtl8852bs_runtime_tx_state_log("before", &before, NULL);
+  k1_rtl8852bs_runtime_tx_state_log("scan-before", &before, NULL);
 
   /* The dispatcher and the error status words are read at four points on this
    * path because the run that produced the evidence could not say which step
@@ -16499,7 +16692,7 @@ int k1_rtl8852bs_fwdl_runtime_scanofld_active_diagnostic(
   ret = k1_rtl8852bs_runtime_tx_state_sample(&after);
   if (ret == OK)
     {
-      k1_rtl8852bs_runtime_tx_state_log("after", &after, &before);
+      k1_rtl8852bs_runtime_tx_state_log("scan-after", &after, &before);
     }
 
   /* The firmware and its own coexistence logic run during the sweep, so the
@@ -16598,6 +16791,131 @@ int k1_rtl8852bs_runtime_scanofld_passive_scan(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_scan_target_select
+ *
+ * Description:
+ *   Choose one access point out of a completed sweep.  The strongest evidence
+ *   available for "this one is really in range" is the number of beacons
+ *   received from it, so the access point with the most beacons wins.  An
+ *   entry that advertised no channel, or whose BSSID is not a usable unicast
+ *   address, cannot be aimed at and is skipped.
+ *
+ * Returned Value:
+ *   The selected entry, or NULL when the sweep found nothing usable.
+ *
+ ****************************************************************************/
+
+static FAR const struct k1_rtl8852bs_scan_bss_s *
+k1_rtl8852bs_runtime_scan_target_select(
+  FAR const struct k1_rtl8852bs_scan_result_s *result)
+{
+  FAR const struct k1_rtl8852bs_scan_bss_s *target = NULL;
+  unsigned int index;
+
+  if (result == NULL)
+    {
+      return NULL;
+    }
+
+  for (index = 0; index < result->bss_count &&
+       index < K1_RTL8852BS_SCAN_BSS_MAX; index++)
+    {
+      FAR const struct k1_rtl8852bs_scan_bss_s *bss = &result->bss[index];
+
+      if (bss->channel == 0 ||
+          !k1_rtl8852bs_addr_cam_mac_valid(bss->bssid))
+        {
+          continue;
+        }
+
+      if (target == NULL || bss->beacon_frames > target->beacon_frames)
+        {
+          target = bss;
+        }
+    }
+
+  return target;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_scan_beacon_frames
+ *
+ * Description:
+ *   How many Beacons one sweep accepted from one BSSID.  A join is reported
+ *   against a single access point, so the sweep-wide Beacon total says less
+ *   than this does: it can stay healthy on other access points' Beacons while
+ *   the one this host claims to have joined has gone silent.
+ *
+ * Returned Value:
+ *   The Beacon count, or zero when the sweep reported no entry for the BSSID.
+ *
+ ****************************************************************************/
+
+static uint16_t k1_rtl8852bs_runtime_scan_beacon_frames(
+  FAR const struct k1_rtl8852bs_scan_result_s *result,
+  FAR const uint8_t *bssid)
+{
+  unsigned int index;
+
+  if (result == NULL || bssid == NULL)
+    {
+      return 0;
+    }
+
+  for (index = 0; index < result->bss_count &&
+       index < K1_RTL8852BS_SCAN_BSS_MAX; index++)
+    {
+      if (memcmp(result->bss[index].bssid, bssid, 6) == 0)
+        {
+          return result->bss[index].beacon_frames;
+        }
+    }
+
+  return 0;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_auth_report
+ *
+ * Description:
+ *   Print the one line that separates the three ways the authentication
+ *   exchange can end: never accepted by the transmit path, transmitted and
+ *   unanswered, or answered.  The label is a parameter because the exchange
+ *   is run by more than one diagnostic and each of them needs a line the
+ *   acceptance harness can tell apart.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_auth_report(FAR const char *label)
+{
+  k1_early_puts("K1 Wi-Fi GPL: ");
+  k1_early_puts(label);
+  k1_early_puts(" req=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.requests);
+  k1_early_puts(" req-sn=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.request_sequence);
+  k1_early_puts(" tx-status=");
+  k1_early_puthex((uintreg_t)
+                  (g_k1_rtl8852bs_auth_action.transmit_status < 0 ?
+                   -g_k1_rtl8852bs_auth_action.transmit_status : 0));
+  k1_early_puts(" frames=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.frames_seen);
+  k1_early_puts(" rsp-self=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.responses_to_self);
+  k1_early_puts(" rsp-target=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.responses_from_target);
+  k1_early_puts(" alg=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_algorithm);
+  k1_early_puts(" seq=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_sequence);
+  k1_early_puts(" status=");
+  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_status);
+  k1_early_puts(" a2=");
+  k1_rtl8852bs_scanofld_log_bytes(g_k1_rtl8852bs_auth_action.response_a2, 6);
+  k1_early_puts("\r\n");
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_fwdl_runtime_auth_diagnostic
  *
  * Description:
@@ -16652,8 +16970,7 @@ int k1_rtl8852bs_runtime_scanofld_passive_scan(
 int k1_rtl8852bs_fwdl_runtime_auth_diagnostic(FAR const uint8_t *self_mac)
 {
   struct k1_rtl8852bs_scan_result_s result;
-  FAR const struct k1_rtl8852bs_scan_bss_s *target = NULL;
-  unsigned int index;
+  FAR const struct k1_rtl8852bs_scan_bss_s *target;
   int sweep_ret;
   int ret;
 
@@ -16671,23 +16988,7 @@ int k1_rtl8852bs_fwdl_runtime_auth_diagnostic(FAR const uint8_t *self_mac)
       goto error;
     }
 
-  for (index = 0; index < result.bss_count &&
-       index < K1_RTL8852BS_SCAN_BSS_MAX; index++)
-    {
-      FAR const struct k1_rtl8852bs_scan_bss_s *bss = &result.bss[index];
-
-      if (bss->channel == 0 ||
-          !k1_rtl8852bs_addr_cam_mac_valid(bss->bssid))
-        {
-          continue;
-        }
-
-      if (target == NULL || bss->beacon_frames > target->beacon_frames)
-        {
-          target = bss;
-        }
-    }
-
+  target = k1_rtl8852bs_runtime_scan_target_select(&result);
   if (target == NULL)
     {
       ret = -EHOSTUNREACH;
@@ -16708,27 +17009,7 @@ int k1_rtl8852bs_fwdl_runtime_auth_diagnostic(FAR const uint8_t *self_mac)
   sweep_ret = k1_rtl8852bs_runtime_scanofld_passive_scan(&result);
   k1_rtl8852bs_runtime_auth_disarm();
 
-  k1_early_puts("K1 Wi-Fi GPL: auth req=");
-  k1_early_puthex(g_k1_rtl8852bs_auth_action.requests);
-  k1_early_puts(" tx-status=");
-  k1_early_puthex((uintreg_t)
-                  (g_k1_rtl8852bs_auth_action.transmit_status < 0 ?
-                   -g_k1_rtl8852bs_auth_action.transmit_status : 0));
-  k1_early_puts(" frames=");
-  k1_early_puthex(g_k1_rtl8852bs_auth_action.frames_seen);
-  k1_early_puts(" rsp-self=");
-  k1_early_puthex(g_k1_rtl8852bs_auth_action.responses_to_self);
-  k1_early_puts(" rsp-target=");
-  k1_early_puthex(g_k1_rtl8852bs_auth_action.responses_from_target);
-  k1_early_puts(" alg=");
-  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_algorithm);
-  k1_early_puts(" seq=");
-  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_sequence);
-  k1_early_puts(" status=");
-  k1_early_puthex(g_k1_rtl8852bs_auth_action.response_status);
-  k1_early_puts(" a2=");
-  k1_rtl8852bs_scanofld_log_bytes(g_k1_rtl8852bs_auth_action.response_a2, 6);
-  k1_early_puts("\r\n");
+  k1_rtl8852bs_runtime_auth_report("auth");
 
   if (sweep_ret < 0)
     {
@@ -16742,12 +17023,661 @@ int k1_rtl8852bs_fwdl_runtime_auth_diagnostic(FAR const uint8_t *self_mac)
       goto error;
     }
 
+  /* Remember which access point answered, for the steps that follow.  The
+   * BSSID is taken from the armed request rather than from the response, so
+   * this records the access point this host aimed at and not whatever address
+   * a frame happened to carry.
+   */
+
+  memcpy(g_k1_rtl8852bs_auth_proven.bssid, g_k1_rtl8852bs_auth_action.bssid,
+         sizeof(g_k1_rtl8852bs_auth_proven.bssid));
+  g_k1_rtl8852bs_auth_proven.channel = g_k1_rtl8852bs_auth_action.channel;
+  g_k1_rtl8852bs_auth_proven.valid = true;
+
   k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 authentication response "
                 "complete\r\n");
   return OK;
 
 error:
   k1_early_puts("K1 Wi-Fi GPL: authentication response error=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_port_log
+ *
+ * Description:
+ *   Record what CMAC port 0 holds.  A join tells the firmware this host is an
+ *   infrastructure station whose TSF follows port 0, while mac_port_init() --
+ *   the upstream step that programs the port's network type, beacon spacing,
+ *   TBTT prohibit window, beacon early time and function enable -- is not
+ *   ported yet.  Reading the block on both sides of a join is what keeps a
+ *   statement about the port evidence rather than assumption.  The receive
+ *   filter is read alongside it because the same call sites are the ones that
+ *   could plausibly change it.
+ *
+ *   Nothing here writes, and every value printed was read back from the
+ *   part.  A read failure prints as such instead of as a zero register.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_port_log(FAR const char *phase)
+{
+  static const uint16_t addresses[] =
+  {
+    K1_RTL8852BS_PORT_CFG_P0,
+    K1_RTL8852BS_TBTT_PROHIB_P0,
+    K1_RTL8852BS_BCN_AREA_P0,
+    K1_RTL8852BS_BCNERLYINT_CFG_P0,
+    K1_RTL8852BS_TBTT_AGG_P0_WORD,
+    K1_RTL8852BS_BCN_SPACE_CFG_P0,
+    K1_RTL8852BS_TSFTR_LOW_P0,
+    K1_RTL8852BS_TSFTR_HIGH_P0
+  };
+
+  static FAR const char * const names[] =
+  {
+    " c400=", " c404=", " c408=", " c40c=",
+    " c410=", " c414=", " c438=", " c43c="
+  };
+
+  struct k1_rtl8852bs_scan_rx_filter_state_s filter;
+  unsigned int index;
+  uint32_t value;
+  int ret;
+
+  k1_early_puts("K1 Wi-Fi GPL: port0 ");
+  k1_early_puts(phase);
+
+  for (index = 0; index < sizeof(addresses) / sizeof(addresses[0]); index++)
+    {
+      k1_early_puts(names[index]);
+      value = 0;
+      ret = k1_rtl8852bs_mac_read32(addresses[index], &value);
+      if (ret < 0)
+        {
+          k1_early_puts("read-error");
+        }
+      else
+        {
+          k1_early_puthex(value);
+        }
+    }
+
+  k1_early_puts("\r\n");
+
+  memset(&filter, 0, sizeof(filter));
+  ret = k1_rtl8852bs_scan_rx_filter_read(&filter);
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: port0 ");
+      k1_early_puts(phase);
+      k1_early_puts(" filter read-error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+      return;
+    }
+
+  k1_rtl8852bs_scan_rx_filter_log(phase, &filter);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_join_info_submit
+ *
+ * Description:
+ *   Tell the firmware that the recorded MACID is now a station joined to one
+ *   access point.  This is the first half of what upstream _change_role()
+ *   does with MAC_AX_ROLE_CON_DISCONN and opmode MAC_AX_ROLE_CONNECT: it
+ *   sends MEDIA_RPT/JOININFO and deliberately does not resend
+ *   FWROLE_MAINTAIN, because the firmware role created during bring-up is
+ *   kept and only its contents change.  The command asks for a done
+ *   acknowledgement, which is where the firmware gets to reject its shape.
+ *
+ *   Upstream sends this and the address CAM update back to back.  This port
+ *   submits them separately so that a change in what the part receives can be
+ *   attributed to one of the two rather than to the pair; the commands and
+ *   their order are unchanged, the only difference is that this port looks in
+ *   between.
+ *
+ *   This must not be called from inside a sweep's receive loop.  The done
+ *   acknowledgement wait drains the receive FIFO, so it would swallow the
+ *   frames the sweep is accounting for; the sweeps have to be finished.
+ *
+ * Returned Value:
+ *   OK when the command was accepted and its done acknowledgement returned
+ *   zero, a negated errno otherwise.  -EIO means the firmware answered but
+ *   rejected it.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_join_info_submit(void)
+{
+  struct k1_rtl8852bs_join_info_s join =
+  {
+    .mac_id = 0u,
+    .port = 0u,
+    .network_type = K1_RTL8852BS_JOIN_NETWORK_TYPE_INFRA,
+    .wifi_role = K1_RTL8852BS_JOIN_WIFI_ROLE_STATION,
+    .self_role = 0u,
+    .disconnected = false
+  };
+
+  uint8_t content[K1_RTL8852BS_JOININFO_SIZE];
+  uint8_t firmware_return = 0;
+  uint16_t available_pages = 0;
+  uint32_t fifo_address = 0;
+  int ret;
+
+  ret = k1_rtl8852bs_runtime_join_info_build(&join, content,
+                                             sizeof(content));
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_runtime_control_h2c_submit(
+    content, sizeof(content), K1_RTL8852BS_JOININFO_CATEGORY,
+    K1_RTL8852BS_JOININFO_CLASS, K1_RTL8852BS_JOININFO_FUNCTION,
+    K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE, true, &fifo_address,
+    &available_pages);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: join info H2C queued sequence=");
+  k1_early_puthex(K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE);
+  k1_early_puts(" pages=");
+  k1_early_puthex(available_pages);
+  k1_early_puts(" FIFO=");
+  k1_early_puthex(fifo_address);
+  k1_early_puts("\r\n");
+
+  ret = k1_rtl8852bs_runtime_done_ack_wait(
+    K1_RTL8852BS_JOININFO_CATEGORY, K1_RTL8852BS_JOININFO_CLASS,
+    K1_RTL8852BS_JOININFO_FUNCTION, K1_RTL8852BS_JOIN_INFO_H2C_SEQUENCE,
+    &firmware_return);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: join info done-ack return=");
+  k1_early_puthex(firmware_return);
+  k1_early_puts("\r\n");
+
+  return firmware_return == 0 ? OK : -EIO;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_join_addr_cam_submit
+ *
+ * Description:
+ *   Move the recorded no-link address CAM entry to an infrastructure station
+ *   joined to one access point.  This is the second half of upstream
+ *   _change_role(): one MAC/ADDR_CAM_UPDATE for the same MACID, carrying both
+ *   the address CAM and the BSSID CAM in a single payload, with a done
+ *   acknowledgement.
+ *
+ *   The entry keeps the index pair it was created with.  The upstream BSSID
+ *   CAM allocator looks for a role that already holds the BSSID being
+ *   programmed, and on a change the role it finds is this one because the
+ *   caller updated it first, so it reuses index 0.  This port has exactly one
+ *   role, so index 0 is both what that allocator would return and what the
+ *   entry already occupies.
+ *
+ *   For an infrastructure station the upstream fill is self MAC = this host,
+ *   target MAC = BSSID = the access point, self role = client, TSF sync = the
+ *   port, and aid = whatever an association response granted, which is zero
+ *   while there is not one yet.  set_role_bss_clr() also runs upstream; it
+ *   writes the port's HE BSS colour, which is zero for this legacy 2.4 GHz
+ *   station and is already zero from the no-link create, so it is not
+ *   repeated here.
+ *
+ *   Like the JOININFO half, this must not be called from inside a sweep's
+ *   receive loop.
+ *
+ * Input Parameters:
+ *   self_mac - the eFuse self MAC the role and the address CAM were created
+ *              with
+ *   bssid    - the target access point's BSSID
+ *   aid      - the association ID; zero until an association response grants
+ *              one
+ *
+ * Returned Value:
+ *   OK when the command was accepted and its done acknowledgement returned
+ *   zero, a negated errno otherwise.  -EIO means the firmware answered but
+ *   rejected it.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_join_addr_cam_submit(
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid, uint16_t aid)
+{
+  struct k1_rtl8852bs_addr_cam_info_s cam =
+  {
+    .address_cam_index = 0u,
+    .bssid_cam_index = 0u,
+    .mac_id = 0u,
+    .port = 0u,
+    .network_type = K1_RTL8852BS_JOIN_NETWORK_TYPE_INFRA,
+    .self_role = 0u,
+    .address_mask = 0u,
+    .mask_selection = 0u,
+    .tsf_sync = 0u
+  };
+
+  uint8_t content[K1_RTL8852BS_ADDR_CAM_SIZE];
+  uint8_t firmware_return = 0;
+  uint16_t available_pages = 0;
+  uint32_t fifo_address = 0;
+  int ret;
+
+  if (self_mac == NULL || bssid == NULL ||
+      !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(bssid))
+    {
+      return -EINVAL;
+    }
+
+  cam.aid = aid;
+  memcpy(cam.self_mac, self_mac, sizeof(cam.self_mac));
+  memcpy(cam.target_mac, bssid, sizeof(cam.target_mac));
+  memcpy(cam.bssid, bssid, sizeof(cam.bssid));
+
+  ret = k1_rtl8852bs_runtime_addr_cam_build(&cam, content, sizeof(content));
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_runtime_control_h2c_submit(
+    content, sizeof(content), K1_RTL8852BS_ADDR_CAM_CATEGORY,
+    K1_RTL8852BS_ADDR_CAM_CLASS, K1_RTL8852BS_ADDR_CAM_FUNCTION,
+    K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE, true, &fifo_address,
+    &available_pages);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: join CAM H2C queued sequence=");
+  k1_early_puthex(K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE);
+  k1_early_puts(" pages=");
+  k1_early_puthex(available_pages);
+  k1_early_puts(" FIFO=");
+  k1_early_puthex(fifo_address);
+  k1_early_puts("\r\n");
+
+  ret = k1_rtl8852bs_runtime_done_ack_wait(
+    K1_RTL8852BS_ADDR_CAM_CATEGORY, K1_RTL8852BS_ADDR_CAM_CLASS,
+    K1_RTL8852BS_ADDR_CAM_FUNCTION, K1_RTL8852BS_JOIN_CAM_H2C_SEQUENCE,
+    &firmware_return);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: join CAM done-ack return=");
+  k1_early_puthex(firmware_return);
+  k1_early_puts("\r\n");
+
+  return firmware_return == 0 ? OK : -EIO;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_join_target_select
+ *
+ * Description:
+ *   Choose the access point the join step aims at.  When a directed
+ *   authentication exchange has already been answered in this run, that
+ *   access point is preferred over the sweep's strongest one for as long as
+ *   this sweep still sees it.
+ *
+ *   That preference is what makes the step's result readable.  The question
+ *   here is what the two connect commands change, which can only be answered
+ *   against an access point already proven to answer this host; the strongest
+ *   BSS of a fresh sweep is a different access point from one run to the next,
+ *   and on the board it did change, so a run that never had an answer to lose
+ *   read exactly like a run whose commands broke the exchange.
+ *
+ * Input Parameters:
+ *   result - a completed sweep
+ *   proven - set to true when the returned entry is the access point that
+ *            already answered, false when it is the sweep's own choice
+ *
+ * Returned Value:
+ *   The selected entry, or NULL when the sweep found nothing usable.
+ *
+ ****************************************************************************/
+
+static FAR const struct k1_rtl8852bs_scan_bss_s *
+k1_rtl8852bs_runtime_join_target_select(
+  FAR const struct k1_rtl8852bs_scan_result_s *result, FAR bool *proven)
+{
+  unsigned int index;
+
+  if (proven != NULL)
+    {
+      *proven = false;
+    }
+
+  if (result == NULL)
+    {
+      return NULL;
+    }
+
+  if (g_k1_rtl8852bs_auth_proven.valid)
+    {
+      for (index = 0; index < result->bss_count &&
+           index < K1_RTL8852BS_SCAN_BSS_MAX; index++)
+        {
+          FAR const struct k1_rtl8852bs_scan_bss_s *bss = &result->bss[index];
+
+          if (bss->channel != 0 &&
+              memcmp(bss->bssid, g_k1_rtl8852bs_auth_proven.bssid,
+                     sizeof(g_k1_rtl8852bs_auth_proven.bssid)) == 0)
+            {
+              if (proven != NULL)
+                {
+                  *proven = true;
+                }
+
+              return bss;
+            }
+        }
+    }
+
+  return k1_rtl8852bs_runtime_scan_target_select(result);
+}
+
+/* What one directed authentication attempt inside the join step observed: the
+ * sweep that carried the request, and whether the access point answered.
+ */
+
+struct k1_rtl8852bs_join_attempt_s
+{
+  uint16_t beacon_frames;
+  uint8_t bss_count;
+  bool response;
+  int sweep_ret;
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_join_auth_attempt
+ *
+ * Description:
+ *   Run one open-system authentication attempt against one access point and
+ *   record what it produced.  The request goes out from inside the sweep, at
+ *   the dwell that enters the access point's channel, which is the only place
+ *   this component knows the radio is parked there.
+ *
+ *   The transmit side is sampled around the sweep rather than trusted from the
+ *   submission return, because the two failures this step has to tell apart
+ *   are a request that never reached the air and one that reached it and went
+ *   unanswered.  Only the MACTX MPDU/DMA and PPDU counters move when a frame
+ *   actually left the MAC; the pause, sleep, drop and contention words printed
+ *   beside them are where a frame that did not leave was held.
+ *
+ * Input Parameters:
+ *   auth_label       - label for the exchange report line
+ *   tx_before_label  - phase name for the transmit snapshot taken first
+ *   tx_after_label   - phase name for the transmit snapshot taken afterwards
+ *   bssid, channel   - the access point to aim at
+ *   result           - sweep result buffer, overwritten by this attempt
+ *   attempt          - filled in with what this attempt observed
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_join_auth_attempt(
+  FAR const char *auth_label, FAR const char *tx_before_label,
+  FAR const char *tx_after_label, FAR const uint8_t *bssid, uint8_t channel,
+  FAR struct k1_rtl8852bs_scan_result_s *result,
+  FAR struct k1_rtl8852bs_join_attempt_s *attempt)
+{
+  struct k1_rtl8852bs_tx_state_s before;
+  struct k1_rtl8852bs_tx_state_s after;
+  bool before_valid;
+
+  if (attempt == NULL || result == NULL)
+    {
+      return;
+    }
+
+  memset(attempt, 0, sizeof(*attempt));
+
+  before_valid = k1_rtl8852bs_runtime_tx_state_sample(&before) == OK;
+  if (before_valid)
+    {
+      k1_rtl8852bs_runtime_tx_state_log(tx_before_label, &before, NULL);
+    }
+
+  k1_rtl8852bs_runtime_auth_arm(bssid, channel);
+  attempt->sweep_ret = k1_rtl8852bs_runtime_scanofld_passive_scan(result);
+  k1_rtl8852bs_runtime_auth_disarm();
+
+  if (k1_rtl8852bs_runtime_tx_state_sample(&after) == OK)
+    {
+      k1_rtl8852bs_runtime_tx_state_log(tx_after_label, &after,
+                                        before_valid ? &before : NULL);
+    }
+
+  k1_rtl8852bs_runtime_auth_report(auth_label);
+
+  attempt->bss_count = result->bss_count;
+  attempt->beacon_frames = k1_rtl8852bs_runtime_scan_beacon_frames(result,
+                                                                  bssid);
+  attempt->response = g_k1_rtl8852bs_auth_action.response_valid;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_fwdl_runtime_join_diagnostic
+ *
+ * Description:
+ *   Tell the firmware and the hardware that this host is a station joined to
+ *   one real access point, and then prove the authentication exchange still
+ *   works while they believe it.  This is the state every later step needs:
+ *   an association request, a key and a data path all assume the address CAM
+ *   holds the peer's BSSID rather than an empty no-link record.
+ *
+ *   An ordinary passive sweep picks the target first, because a BSSID may only
+ *   be programmed once it has actually been heard, and the access point that
+ *   already answered this host's authentication request is preferred over the
+ *   sweep's strongest BSS.  MEDIA_RPT/JOININFO and then MAC/ADDR_CAM_UPDATE
+ *   are sent in the order the upstream connect path uses them, each with a
+ *   done acknowledgement, which is where the firmware gets the chance to
+ *   reject the shape of either command.
+ *
+ *   The open-system authentication exchange is then run three times against
+ *   that one access point: once before either command, once after JOININFO
+ *   and once after the address CAM update.  Only the last one decides the
+ *   result; the other two exist so a failure can be charged to something.  The
+ *   first says whether the exchange still works at all at this point in the
+ *   run, and the middle one splits the two commands apart, which a single
+ *   post-join attempt cannot do.
+ *
+ *   Two things are required of the last attempt, and both are ways this step
+ *   could go wrong rather than ceremony.  The exchange has to still produce
+ *   the access point's Authentication Response, and its sweep has to still see
+ *   beacons: an address CAM that now carries a BSSID and an infrastructure
+ *   network type is exactly the kind of change that can start filtering
+ *   receive traffic, and a run that reports a join while quietly having
+ *   stopped receiving would be worse than a failure.
+ *
+ *   What this does NOT do: it does not associate, it asks for no association
+ *   ID, it installs no key, it creates no network device, it carries no data,
+ *   and it does not synchronise the port's TSF to the access point's beacons.
+ *   The firmware and the address CAM are told which BSS this host belongs to;
+ *   that is the whole claim.  Nothing is written to eMMC, SPI flash, eFuse or
+ *   the U-Boot environment.
+ *
+ * Input Parameters:
+ *   self_mac - the eFuse self MAC the role and the address CAM were created
+ *              with
+ *
+ * Returned Value:
+ *   OK when both commands were acknowledged, the sweep still received
+ *   beacons and the access point still answered the authentication request; a
+ *   negated errno otherwise.  -EHOSTUNREACH means the first sweep found no
+ *   access point to aim at, -ENODATA that the sweep after the join stopped
+ *   receiving or the request went unanswered, -EIO that the firmware rejected
+ *   one of the two commands.
+ *
+ ****************************************************************************/
+
+int k1_rtl8852bs_fwdl_runtime_join_diagnostic(FAR const uint8_t *self_mac)
+{
+  struct k1_rtl8852bs_scan_result_s result;
+  FAR const struct k1_rtl8852bs_scan_bss_s *target;
+  uint8_t bssid[6];
+  uint8_t channel;
+  struct k1_rtl8852bs_join_attempt_s prejoin;
+  struct k1_rtl8852bs_join_attempt_s info;
+  struct k1_rtl8852bs_join_attempt_s cam;
+  bool proven;
+  int ret;
+
+  if (self_mac == NULL || !k1_rtl8852bs_addr_cam_mac_valid(self_mac))
+    {
+      ret = -EINVAL;
+      goto error;
+    }
+
+  k1_rtl8852bs_scanofld_set_self_mac(self_mac);
+
+  ret = k1_rtl8852bs_runtime_scanofld_passive_scan(&result);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  target = k1_rtl8852bs_runtime_join_target_select(&result, &proven);
+  if (target == NULL)
+    {
+      ret = -EHOSTUNREACH;
+      goto error;
+    }
+
+  /* The selection points into the sweep result, which the later sweeps
+   * overwrite, so keep what is still needed after them.
+   */
+
+  memcpy(bssid, target->bssid, sizeof(bssid));
+  channel = target->channel;
+
+  k1_early_puts("K1 Wi-Fi GPL: join target bssid=");
+  k1_rtl8852bs_scanofld_log_bytes(bssid, sizeof(bssid));
+  k1_early_puts(" channel=");
+  k1_early_puthex(channel);
+  k1_early_puts(" beacons=");
+  k1_early_puthex(target->beacon_frames);
+  k1_early_puts(" cap=");
+  k1_early_puthex(target->capability);
+  k1_early_puts(" proven=");
+  k1_early_puthex(proven ? 1u : 0u);
+  k1_early_puts("\r\n");
+
+  k1_rtl8852bs_runtime_port_log("pre-join");
+
+  /* Three attempts against the same access point, with one of the two connect
+   * commands submitted before each of the last two.  The first one carries no
+   * command at all and is the control: the exchange has already been answered
+   * once in this run, so an attempt that fails here fails for a reason that
+   * has nothing to do with JOININFO or the address CAM -- a repeat of the
+   * request the access point no longer answers, or a transmit path that stops
+   * working once the earlier steps have run.  Without it a failure after the
+   * commands cannot be charged to them.
+   *
+   * Submitting the two commands one at a time, rather than back to back as
+   * upstream does, is what separates their effects from each other.
+   */
+
+  k1_rtl8852bs_runtime_join_auth_attempt("prejoin auth", "prejoin-before",
+                                         "prejoin-after", bssid, channel,
+                                         &result, &prejoin);
+
+  ret = k1_rtl8852bs_runtime_join_info_submit();
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  k1_rtl8852bs_runtime_port_log("post-join-info");
+
+  k1_rtl8852bs_runtime_join_auth_attempt("joininfo auth", "joininfo-before",
+                                         "joininfo-after", bssid, channel,
+                                         &result, &info);
+
+  ret = k1_rtl8852bs_runtime_join_addr_cam_submit(self_mac, bssid, 0u);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  k1_rtl8852bs_runtime_port_log("post-join-cam");
+
+  k1_rtl8852bs_runtime_join_auth_attempt("join auth", "join-before",
+                                         "join-after", bssid, channel,
+                                         &result, &cam);
+
+  k1_early_puts("K1 Wi-Fi GPL: join step prejoin-bss=");
+  k1_early_puthex(prejoin.bss_count);
+  k1_early_puts(" prejoin-beacons=");
+  k1_early_puthex(prejoin.beacon_frames);
+  k1_early_puts(" prejoin-rsp=");
+  k1_early_puthex(prejoin.response ? 1u : 0u);
+  k1_early_puts(" prejoin-sweep=");
+  k1_early_puthex((uintreg_t)(prejoin.sweep_ret < 0 ?
+                              -prejoin.sweep_ret : 0));
+  k1_early_puts(" joininfo-bss=");
+  k1_early_puthex(info.bss_count);
+  k1_early_puts(" joininfo-beacons=");
+  k1_early_puthex(info.beacon_frames);
+  k1_early_puts(" joininfo-rsp=");
+  k1_early_puthex(info.response ? 1u : 0u);
+  k1_early_puts(" joininfo-sweep=");
+  k1_early_puthex((uintreg_t)(info.sweep_ret < 0 ? -info.sweep_ret : 0));
+  k1_early_puts(" cam-bss=");
+  k1_early_puthex(cam.bss_count);
+  k1_early_puts(" cam-beacons=");
+  k1_early_puthex(cam.beacon_frames);
+  k1_early_puts(" cam-rsp=");
+  k1_early_puthex(cam.response ? 1u : 0u);
+  k1_early_puts(" cam-sweep=");
+  k1_early_puthex((uintreg_t)(cam.sweep_ret < 0 ? -cam.sweep_ret : 0));
+  k1_early_puts("\r\n");
+
+  k1_early_puts("K1 Wi-Fi GPL: join bss=");
+  k1_early_puthex(cam.bss_count);
+  k1_early_puts(" network-type=");
+  k1_early_puthex(K1_RTL8852BS_JOIN_NETWORK_TYPE_INFRA);
+  k1_early_puts(" aid=0x0 bssid=");
+  k1_rtl8852bs_scanofld_log_bytes(bssid, sizeof(bssid));
+  k1_early_puts("\r\n");
+
+  /* Only the last attempt decides.  It is the one that ran with both commands
+   * in place, which is what this step claims when it reports success.
+   */
+
+  if (cam.sweep_ret < 0)
+    {
+      ret = cam.sweep_ret;
+      goto error;
+    }
+
+  if (cam.bss_count == 0 || !cam.response)
+    {
+      ret = -ENODATA;
+      goto error;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 station join complete\r\n");
+  return OK;
+
+error:
+  k1_early_puts("K1 Wi-Fi GPL: station join error=");
   k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
   k1_early_puts("\r\n");
   return ret;

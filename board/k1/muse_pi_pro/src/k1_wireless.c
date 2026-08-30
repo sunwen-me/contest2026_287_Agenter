@@ -966,6 +966,27 @@ int k1_wireless_initialize(void)
                       ret = probe_ret;
                     }
                 }
+
+#    ifdef CONFIG_K1_RTL8852BS2_RUNTIME_JOIN_DIAGNOSTIC
+
+              /* The join runs after the directed exchange rather than before
+               * it, so that one run shows both: the exchange against a
+               * no-link address CAM first, then the same exchange once the
+               * firmware and the address CAM have been told which BSS this
+               * host belongs to.  Reversing them would leave no evidence that
+               * programming the peer's BSSID changed nothing it should not.
+               */
+
+              if (probe_ret >= 0)
+                {
+                  probe_ret =
+                    k1_rtl8852bs_fwdl_runtime_join_diagnostic(wifi_mac);
+                  if (probe_ret < 0)
+                    {
+                      ret = probe_ret;
+                    }
+                }
+#    endif
 #  endif
 #endif
 

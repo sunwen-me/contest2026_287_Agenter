@@ -262,6 +262,13 @@ def parse_args() -> argparse.Namespace:
               "received back"),
     )
     parser.add_argument(
+        "--require-runtime-join", action="store_true",
+        help=("fail unless the firmware acknowledges the JOININFO and the "
+              "infrastructure address CAM update for the access point a sweep "
+              "chose, and the authentication exchange and the Beacon receive "
+              "still work afterwards"),
+    )
+    parser.add_argument(
         "--require-wlan0-scan", action="store_true",
         help=("fail unless wlan0 registers and a wapi passive scan returns at "
               "least one Beacon/Probe-Response BSS through SIOCGIWSCAN"),
@@ -1464,6 +1471,70 @@ def main() -> int:
             )
             if auth_end_result is None:
                 missing.append("RTL8852BS2 authentication completion")
+        if args.require_runtime_join:
+            # Two commands and then a repeat of the whole directed exchange.
+            # The firmware return of each done acknowledgement is what says the
+            # command was understood rather than merely queued, and the Beacon
+            # count of the sweep that follows is what says programming a BSSID
+            # and an infrastructure network type into the address CAM did not
+            # quietly start filtering receive traffic.
+            join_target_result = None
+            for candidate in re.finditer(
+                    rb"K1 Wi-Fi GPL: join target bssid=([0-9a-f]{12}) "
+                    rb"channel=(?:0x)?0*[1-9a-fA-F]",
+                    started):
+                if candidate.group(1).strip(b"0"):
+                    join_target_result = candidate
+                    break
+
+            if join_target_result is None:
+                missing.append("RTL8852BS2 station join target BSS")
+                join = started
+            else:
+                join = started[join_target_result.end():]
+
+            join_info_result = re.search(
+                rb"K1 Wi-Fi GPL: join info done-ack "
+                rb"return=0x0+(?![0-9a-fA-F])",
+                join,
+            )
+            if join_info_result is None:
+                missing.append("RTL8852BS2 station join JOININFO done-ack")
+
+            join_cam_result = re.search(
+                rb"K1 Wi-Fi GPL: join CAM done-ack "
+                rb"return=0x0+(?![0-9a-fA-F])",
+                join,
+            )
+            if join_cam_result is None:
+                missing.append(
+                    "RTL8852BS2 station join address CAM done-ack")
+
+            # The label keeps this line apart from the pre-join exchange's own
+            # report, so --require-runtime-auth and this check cannot be
+            # satisfied by the same line.
+            join_auth_result = re.search(
+                rb"K1 Wi-Fi GPL: join auth req=(?:0x)?0*[1-9a-fA-F][^\r\n]*"
+                rb" rsp-self=(?:0x)?0*[1-9a-fA-F]",
+                join,
+            )
+            if join_auth_result is None:
+                missing.append(
+                    "RTL8852BS2 Authentication Response RX after the join")
+
+            join_rx_result = re.search(
+                rb"K1 Wi-Fi GPL: join bss=(?:0x)?0*[1-9a-fA-F]",
+                join,
+            )
+            if join_rx_result is None:
+                missing.append("RTL8852BS2 Beacon RX after the join")
+
+            join_end_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 station join complete\r?\n",
+                join,
+            )
+            if join_end_result is None:
+                missing.append("RTL8852BS2 station join completion")
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "
