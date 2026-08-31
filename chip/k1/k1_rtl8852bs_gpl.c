@@ -1595,6 +1595,7 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_TXRPT_TAG_DATA_MAINLINE    0x2u
 #define K1_RTL8852BS_TXRPT_TAG_ARP              0x3u
 #define K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST    0x4u
+#define K1_RTL8852BS_TXRPT_TAG_LOOPBACK         0x5u
 #define K1_RTL8852BS_RXDESC_PACKET_TYPE_C2H     10u
 #define K1_RTL8852BS_CCXRPT_C2H_CATEGORY        1u
 #define K1_RTL8852BS_CCXRPT_C2H_CLASS           0x9u
@@ -25635,6 +25636,30 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_RESIDENT_DEAUTH_BODY       26u
 #define K1_RTL8852BS_RESIDENT_OTHER_HEAD        16u
 
+/* The MAC loopback readback, which is increment 3r.
+ *
+ * One protected data frame is submitted with the transmit path looped back
+ * inside the MAC, and the frame that comes back around is compared with the
+ * plaintext that was handed to the descriptor.  The loopback tap is in the
+ * CMAC, downstream of the DMAC security engine, so whatever the engine did to
+ * the frame has already been done by the time the frame is looped: this is a
+ * question the port can ask itself, with no access point and no second host
+ * involved.
+ *
+ * The verdicts are numbered because the line is read by the harness as well
+ * as by a person.  PLAIN is the finding this increment exists to look for.
+ */
+
+#define K1_RTL8852BS_LOOPBACK_VERDICT_NONE      0x0u
+#define K1_RTL8852BS_LOOPBACK_VERDICT_CIPHER    0x1u
+#define K1_RTL8852BS_LOOPBACK_VERDICT_HEADER    0x2u
+#define K1_RTL8852BS_LOOPBACK_VERDICT_PLAIN     0x3u
+#define K1_RTL8852BS_LOOPBACK_VERDICT_RXDEC     0x4u
+#define K1_RTL8852BS_LOOPBACK_VERDICT_SHORT     0x5u
+#define K1_RTL8852BS_LOOPBACK_LLC_NOWHERE       0xffu
+#define K1_RTL8852BS_LOOPBACK_WAIT_MSEC         300u
+#define K1_RTL8852BS_LOOPBACK_TARGET_IP         0xc0a80101u
+
 /* When the one protected data frame goes out, and how often it is repeated.
  *
  * It waits longer than the Probe Request does because it is only worth sending
@@ -27120,6 +27145,354 @@ errout:
   return ret;
 }
 
+/* What one frame out of MAC loopback said about the transmit path.  The five
+ * verdicts are the five things the comparison can mean, and they are numbered
+ * rather than named in the log because the log is read by a regular
+ * expression as well as by a person.
+ */
+
+struct k1_rtl8852bs_loopback_readback_s
+{
+  uint32_t looped;              /* PPDUs the loopback counter counted */
+  uint32_t rx_reads;            /* aggregate reads made while waiting */
+  uint32_t self_frames;         /* frames this host itself transmitted */
+  uint32_t frame_length;        /* the looped frame, as received */
+  uint32_t frame_control;
+  uint32_t sequence;
+  uint32_t diff_bytes;          /* bytes of the cipher's span that changed */
+  uint8_t header_length;
+  uint8_t llc_at;               /* 0, 8, or nowhere */
+  uint8_t diff_first;
+  uint8_t verdict;
+  uint8_t sec_type;
+  uint8_t sec_cam_index;
+  uint8_t body[K1_RTL8852BS_CCMP_HEADER_SIZE];
+  bool body_valid;
+  bool pn_match;
+  bool protected_frame;
+  bool hw_dec;
+  bool sw_dec;
+  bool a1_match;
+  bool icv_error;
+  bool frame_valid;
+  int tx_status;
+  int status;
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_loopback_classify
+ *
+ * Description:
+ *   Decide what the transmit path did to one frame, by comparing the frame
+ *   that came back out of MAC loopback with the plaintext that was handed to
+ *   the descriptor.  This is the whole point of increment 3r, so it is a pure
+ *   function of its arguments and is exercised in memory before the part is
+ *   asked anything: a verdict about the hardware that the reader could have
+ *   got wrong is not evidence.
+ *
+ *   The CCMP header is not a witness.  This component writes that header
+ *   itself, so it is present whether or not the security engine ran, and its
+ *   packet number surviving the round trip says only that the header was not
+ *   rewritten.  Three things do speak:
+ *
+ *     - the body.  Everything from the LLC/SNAP header onwards is what the
+ *       engine would have replaced with ciphertext, so a body identical to
+ *       the submitted plaintext means nothing encrypted it.
+ *     - the length.  CCMP appends an eight-byte integrity code, so an
+ *       encrypted frame comes back eight bytes longer than it went in.
+ *     - hw_dec.  The return path has its own security engine, and a frame it
+ *       decrypted on the way back reads as plaintext no matter what the
+ *       transmit path did, so that case is named rather than mistaken for a
+ *       frame that was never encrypted.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_loopback_classify(
+  FAR const uint8_t *looped, size_t looped_length,
+  FAR const uint8_t *plain, size_t plain_length, size_t header_length,
+  bool hw_dec, FAR struct k1_rtl8852bs_loopback_readback_s *out)
+{
+  static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
+    {
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06
+    };
+
+  size_t body;
+  size_t span;
+  size_t index;
+
+  out->llc_at = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  out->diff_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  out->diff_bytes = 0;
+  out->pn_match = false;
+
+  body = header_length + K1_RTL8852BS_CCMP_HEADER_SIZE;
+  if (looped_length < body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE ||
+      plain_length < body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE)
+    {
+      out->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_SHORT;
+      return;
+    }
+
+  if (memcmp(looped + header_length, llc_snap,
+             K1_RTL8852BS_LLC_SNAP_HEADER_SIZE) == 0)
+    {
+      out->llc_at = 0;
+    }
+  else if (memcmp(looped + body, llc_snap,
+                  K1_RTL8852BS_LLC_SNAP_HEADER_SIZE) == 0)
+    {
+      out->llc_at = (uint8_t)K1_RTL8852BS_CCMP_HEADER_SIZE;
+    }
+
+  out->pn_match = memcmp(looped + header_length, plain + header_length,
+                         K1_RTL8852BS_CCMP_HEADER_SIZE) == 0;
+
+  /* The comparison runs over the part of the frame the cipher covers, and
+   * only over as much of it as both frames actually hold, so a truncated
+   * read reports the bytes it could compare instead of reading past either
+   * buffer.
+   */
+
+  span = plain_length - body;
+  if (looped_length - body < span)
+    {
+      span = looped_length - body;
+    }
+
+  for (index = 0; index < span; index++)
+    {
+      if (looped[body + index] != plain[body + index])
+        {
+          out->diff_bytes++;
+          if (out->diff_first == K1_RTL8852BS_LOOPBACK_LLC_NOWHERE)
+            {
+              out->diff_first = (uint8_t)index;
+            }
+        }
+    }
+
+  if (hw_dec)
+    {
+      out->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_RXDEC;
+    }
+  else if (out->diff_bytes > 0)
+    {
+      out->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_CIPHER;
+    }
+  else if (looped_length >= plain_length + K1_RTL8852BS_CCMP_MIC_SIZE)
+    {
+      out->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_HEADER;
+    }
+  else
+    {
+      out->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_PLAIN;
+    }
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_loopback_selftest
+ *
+ * Description:
+ *   Put the five readings the classifier can produce in front of it, in
+ *   memory, before the part is asked anything.  The frame it compares against
+ *   is built by the same builder the loopback stage submits, so the test is
+ *   about the classifier and not about a hand-written copy of the frame.
+ *
+ *   The case that matters most is the fourth.  A frame the return path
+ *   decrypted reads byte for byte like a frame that was never encrypted, and
+ *   reporting that as "the hardware sent plaintext" would be exactly the
+ *   wrong conclusion, so hw_dec is required to outrank the comparison.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_loopback_selftest(void)
+{
+  static const uint8_t self[6] =
+    {
+      0x02, 0x11, 0x22, 0x33, 0x44, 0x55
+    };
+
+  static const uint8_t bssid[6] =
+    {
+      0x06, 0xaa, 0xbb, 0xcc, 0xdd, 0xee
+    };
+
+  static const uint8_t peer[6] =
+    {
+      0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f
+    };
+
+  struct k1_rtl8852bs_loopback_readback_s probe;
+  FAR uint8_t *plain;
+  FAR uint8_t *looped;
+  size_t plain_length = 0;
+  size_t index;
+  uint8_t header_length = 0;
+  uint8_t plain_verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
+  uint8_t cipher_verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
+  uint8_t header_verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
+  uint8_t rxdec_verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
+  uint8_t short_verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
+  uint32_t cipher_diff = 0;
+  uint8_t cipher_first = 0;
+  uint8_t plain_llc = 0;
+  bool plain_pn = false;
+  int stage = 0;
+  int ret;
+
+  plain = kmm_malloc(2u * K1_RTL8852BS_RESIDENT_FRAME_MAX);
+  if (plain == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  looped = plain + K1_RTL8852BS_RESIDENT_FRAME_MAX;
+  memset(plain, 0, 2u * K1_RTL8852BS_RESIDENT_FRAME_MAX);
+  memset(&probe, 0, sizeof(probe));
+
+  ret = k1_rtl8852bs_runtime_arp_probe_build(
+    plain, K1_RTL8852BS_RESIDENT_FRAME_MAX, self, bssid, peer, 0xc0a80101u,
+    0x222u, 5ull, &plain_length, &header_length);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* One: the frame comes back exactly as it was handed over.  Nothing
+   * encrypted it, and this is the reading increment 3r exists to detect.
+   */
+
+  memcpy(looped, plain, plain_length);
+  k1_rtl8852bs_runtime_loopback_classify(looped, plain_length, plain,
+                                         plain_length, header_length, false,
+                                         &probe);
+  plain_verdict = probe.verdict;
+  plain_llc = probe.llc_at;
+  plain_pn = probe.pn_match;
+  if (probe.verdict != K1_RTL8852BS_LOOPBACK_VERDICT_PLAIN ||
+      probe.llc_at != K1_RTL8852BS_CCMP_HEADER_SIZE ||
+      probe.diff_bytes != 0 || !probe.pn_match)
+    {
+      ret = -EPROTO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Two: the cipher's span is unrecognisable and the frame is eight bytes
+   * longer for the integrity code.  Both witnesses agree, so this is what an
+   * encrypted transmit looks like on the way back.
+   */
+
+  for (index = header_length + K1_RTL8852BS_CCMP_HEADER_SIZE;
+       index < plain_length; index++)
+    {
+      looped[index] = (uint8_t)(plain[index] ^ 0xffu);
+    }
+
+  memset(looped + plain_length, 0x5a, K1_RTL8852BS_CCMP_MIC_SIZE);
+  k1_rtl8852bs_runtime_loopback_classify(
+    looped, plain_length + K1_RTL8852BS_CCMP_MIC_SIZE, plain, plain_length,
+    header_length, false, &probe);
+  cipher_verdict = probe.verdict;
+  cipher_diff = probe.diff_bytes;
+  cipher_first = probe.diff_first;
+  if (probe.verdict != K1_RTL8852BS_LOOPBACK_VERDICT_CIPHER ||
+      probe.llc_at != K1_RTL8852BS_LOOPBACK_LLC_NOWHERE ||
+      probe.diff_bytes != plain_length - header_length -
+                          K1_RTL8852BS_CCMP_HEADER_SIZE ||
+      probe.diff_first != 0 || !probe.pn_match)
+    {
+      ret = -EPROTO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Three: an integrity code was appended but the body is untouched.  Neither
+   * reading explains the other, so it gets its own verdict instead of being
+   * folded into one of the two that do.
+   */
+
+  memcpy(looped, plain, plain_length);
+  memset(looped + plain_length, 0x5a, K1_RTL8852BS_CCMP_MIC_SIZE);
+  k1_rtl8852bs_runtime_loopback_classify(
+    looped, plain_length + K1_RTL8852BS_CCMP_MIC_SIZE, plain, plain_length,
+    header_length, false, &probe);
+  header_verdict = probe.verdict;
+  if (probe.verdict != K1_RTL8852BS_LOOPBACK_VERDICT_HEADER ||
+      probe.diff_bytes != 0 ||
+      probe.llc_at != K1_RTL8852BS_CCMP_HEADER_SIZE)
+    {
+      ret = -EPROTO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Four: the same bytes again, but the receive descriptor says the return
+   * path decrypted the frame.  Then the plaintext is the return path's work
+   * and says nothing about the transmit path, and the verdict has to say so.
+   */
+
+  k1_rtl8852bs_runtime_loopback_classify(
+    looped, plain_length + K1_RTL8852BS_CCMP_MIC_SIZE, plain, plain_length,
+    header_length, true, &probe);
+  rxdec_verdict = probe.verdict;
+  if (probe.verdict != K1_RTL8852BS_LOOPBACK_VERDICT_RXDEC)
+    {
+      ret = -EPROTO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Five: too short for either offset to be read.  A frame like this must not
+   * be reported as plaintext just because no difference was found in the
+   * bytes that were never compared.
+   */
+
+  k1_rtl8852bs_runtime_loopback_classify(
+    looped, header_length + K1_RTL8852BS_CCMP_HEADER_SIZE + 4u, plain,
+    plain_length, header_length, false, &probe);
+  short_verdict = probe.verdict;
+  if (probe.verdict != K1_RTL8852BS_LOOPBACK_VERDICT_SHORT ||
+      probe.diff_bytes != 0 ||
+      probe.llc_at != K1_RTL8852BS_LOOPBACK_LLC_NOWHERE)
+    {
+      ret = -EPROTO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  ret = OK;
+
+errout:
+  k1_early_puts("K1 Wi-Fi GPL: resident loopback selftest plain=");
+  k1_early_puthex(plain_verdict);
+  k1_early_puts(" cipher=");
+  k1_early_puthex(cipher_verdict);
+  k1_early_puts(" header=");
+  k1_early_puthex(header_verdict);
+  k1_early_puts(" rxdec=");
+  k1_early_puthex(rxdec_verdict);
+  k1_early_puts(" short=");
+  k1_early_puthex(short_verdict);
+  k1_early_puts(" diff=");
+  k1_early_puthex(cipher_diff);
+  k1_early_puts(" first=");
+  k1_early_puthex(cipher_first);
+  k1_early_puts(" llc=");
+  k1_early_puthex(plain_llc);
+  k1_early_puts(" pn=");
+  k1_early_puthex(plain_pn ? 1 : 0);
+  k1_early_puts(" stage=");
+  k1_early_puthex((uintreg_t)stage);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+  kmm_free(plain);
+  return ret;
+}
+
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_observe
  *
@@ -28066,6 +28439,430 @@ done:
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_loopback_report
+ *
+ * Description:
+ *   One line for the readback, printed on every path including the failing
+ *   ones, so that a stage that never got as far as a frame is distinguishable
+ *   from one that got a frame and read plaintext in it.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_loopback_report(
+  FAR const struct k1_rtl8852bs_loopback_readback_s *out, uint32_t cleared,
+  int stage, int status)
+{
+  size_t index;
+
+  k1_early_puts("K1 Wi-Fi GPL: resident loopback readback verdict=");
+  k1_early_puthex(out->verdict);
+  k1_early_puts(" looped=");
+  k1_early_puthex(out->looped);
+  k1_early_puts(" count-clr=");
+  k1_early_puthex(cleared);
+  k1_early_puts(" reads=");
+  k1_early_puthex(out->rx_reads);
+  k1_early_puts(" self=");
+  k1_early_puthex(out->self_frames);
+  k1_early_puts(" frame=");
+  k1_early_puthex(out->frame_valid ? 1 : 0);
+  k1_early_puts(" len=");
+  k1_early_puthex(out->frame_length);
+  k1_early_puts(" fc=");
+  k1_early_puthex(out->frame_control);
+  k1_early_puts(" seq=");
+  k1_early_puthex(out->sequence);
+  k1_early_puts(" hdr=");
+  k1_early_puthex(out->header_length);
+  k1_early_puts(" llc=");
+  k1_early_puthex(out->llc_at);
+  k1_early_puts(" diff-bytes=");
+  k1_early_puthex(out->diff_bytes);
+  k1_early_puts(" diff-first=");
+  k1_early_puthex(out->diff_first);
+  k1_early_puts(" pn=");
+  k1_early_puthex(out->pn_match ? 1 : 0);
+  k1_early_puts(" prot=");
+  k1_early_puthex(out->protected_frame ? 1 : 0);
+  k1_early_puts(" hw-dec=");
+  k1_early_puthex(out->hw_dec ? 1 : 0);
+  k1_early_puts(" sw-dec=");
+  k1_early_puthex(out->sw_dec ? 1 : 0);
+  k1_early_puts(" a1-match=");
+  k1_early_puthex(out->a1_match ? 1 : 0);
+  k1_early_puts(" icv=");
+  k1_early_puthex(out->icv_error ? 1 : 0);
+  k1_early_puts(" sec-type=");
+  k1_early_puthex(out->sec_type);
+  k1_early_puts(" sec-cam=");
+  k1_early_puthex(out->sec_cam_index);
+  k1_early_puts(" body=");
+  if (out->body_valid)
+    {
+      for (index = 0; index < sizeof(out->body); index++)
+        {
+          k1_early_puthex(out->body[index]);
+        }
+    }
+  else
+    {
+      k1_early_puthex(0);
+    }
+
+  k1_early_puts(" tx=");
+  k1_early_puthex((uintreg_t)(out->tx_status < 0 ? -out->tx_status : 0));
+  k1_early_puts(" stage=");
+  k1_early_puthex((uintreg_t)stage);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(status < 0 ? -status : 0));
+  k1_early_puts("\r\n");
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_secure_loopback_readback
+ *
+ * Description:
+ *   Ask the transmit path what it is actually emitting, with the access point
+ *   taken out of the question.  One protected ARP frame is submitted with MAC
+ *   loopback engaged, and the frame that comes back around the MAC is compared
+ *   with the plaintext that was handed to the descriptor.
+ *
+ *   This is worth doing because the window has taken the air-side reading as
+ *   far as it goes.  Four frames went out, the firmware reported all four,
+ *   two of them were ARP requests aimed at a host that had just been heard
+ *   asking for addresses itself, one of those was broadcast so that no wrong
+ *   destination address could explain it, and nothing ever answered.  An
+ *   acknowledgement is sent before any key is consulted, so the access point's
+ *   behaviour cannot distinguish a frame it decrypted from one it discarded
+ *   after decrypting: what is missing is a look at the frame itself.
+ *
+ *   The loopback tap can supply that look because of where it sits.  Loopback
+ *   is enabled by a CMAC register while the security engine is a DMAC block,
+ *   so a frame arriving back at the host has already passed the engine.  If
+ *   the engine ran, the frame's body is ciphertext and eight bytes longer for
+ *   the integrity code; if it did not, the body is the plaintext that was
+ *   submitted.  No access point, no second host and no host privileges are
+ *   involved in the difference.
+ *
+ *   The frame is addressed to the broadcast address so that the stage needs no
+ *   peer learned from the air and can therefore run in any window, and its
+ *   target address is the gateway, which nothing here expects to answer: the
+ *   frame is never meant to be radiated at all.  It carries its own report tag
+ *   so that its transmit report cannot be confused with the window's other
+ *   four frames.
+ *
+ * Input Parameters:
+ *   self_mac - the eFuse self MAC: address 2, and what identifies the looped
+ *              frame on the way back
+ *   bssid    - the access point, which is address 1
+ *
+ * Returned Value:
+ *   OK when the loopback engaged, the frame was submitted and a frame this
+ *   host transmitted came back; a negated errno otherwise.  The verdict is
+ *   not a failure: a frame that comes back as plaintext is the finding this
+ *   stage exists to produce, and it is reported rather than refused.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_secure_loopback_readback(
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid)
+{
+  static const uint8_t broadcast[6] =
+  {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+  };
+
+  struct k1_rtl8852bs_tx_security_s security =
+    {
+      .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+      .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE
+    };
+
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_resources_s before_res;
+  struct k1_rtl8852bs_data_tx_resources_s after_res;
+  struct k1_rtl8852bs_rx_frame_s frame;
+  struct k1_rtl8852bs_loopback_readback_s readback;
+  FAR struct k1_rtl8852bs_loopback_readback_s *out = &readback;
+  FAR uint8_t *packet;
+  FAR uint8_t *buffer;
+  FAR const uint8_t *plain;
+  FAR const uint8_t *payload;
+  size_t frame_length = 0;
+  size_t length;
+  size_t offset;
+  size_t rx_header;
+  unsigned int drained;
+  unsigned int waited;
+  uint16_t frame_control;
+  uint16_t sequence;
+  uint8_t header_length = 0;
+  uint64_t packet_number;
+  uint32_t saved = 0;
+  uint32_t engaged = 0;
+  uint32_t cleared = 0;
+  int stage = 0;
+  int restore_ret;
+  int ret;
+
+  memset(out, 0, sizeof(*out));
+  out->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
+  out->llc_at = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  out->diff_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+
+  packet = kmm_malloc(K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                      K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+  buffer = kmm_malloc(K1_RTL8852BS_SCAN_OFLD_RX_MAX);
+  if (packet == NULL || buffer == NULL)
+    {
+      ret = -ENOMEM;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  memset(packet, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+  plain = packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE;
+
+  /* Saved first and restored unconditionally.  The window this runs inside
+   * still has to hold the channel afterwards, and a MAC left looped back
+   * would take the radio out from under everything that follows.
+   */
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_MAC_LOOPBACK, &saved);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto errout;
+    }
+
+  k1_rtl8852bs_mac_write32(K1_RTL8852BS_MAC_LOOPBACK_COUNT,
+                           K1_RTL8852BS_MAC_LOOPBACK_COUNT_CLR);
+  k1_rtl8852bs_mac_read32(K1_RTL8852BS_MAC_LOOPBACK_COUNT, &cleared);
+
+  ret = k1_rtl8852bs_mac_write32(K1_RTL8852BS_MAC_LOOPBACK,
+                                 saved | K1_RTL8852BS_MAC_LOOPBACK_EN);
+  if (ret == OK)
+    {
+      ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_MAC_LOOPBACK, &engaged);
+    }
+
+  if (ret == OK && (engaged & K1_RTL8852BS_MAC_LOOPBACK_EN) == 0)
+    {
+      ret = -EIO;
+    }
+
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto restore;
+    }
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+  packet_number = k1_rtl8852bs_runtime_tx_packet_number_next();
+  out->sequence = sequence;
+
+  ret = k1_rtl8852bs_runtime_arp_probe_build(
+    packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, broadcast,
+    K1_RTL8852BS_LOOPBACK_TARGET_IP, sequence, packet_number, &frame_length,
+    &header_length);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto restore;
+    }
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, sequence, header_length,
+    K1_RTL8852BS_TXRPT_TAG_LOOPBACK, &security, packet,
+    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto restore;
+    }
+
+  k1_rtl8852bs_runtime_sch_tx_en_data();
+
+  ret = k1_rtl8852bs_data_tx_resources_read(
+    K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &before_res);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto restore;
+    }
+
+  if (before_res.channel_used_pages +
+      layout.required_wde_pages > before_res.channel_max_pages ||
+      before_res.wp_available_pages <
+      layout.required_ple_pages + K1_RTL8852BS_DATA_TX_PLE_RESERVE)
+    {
+      ret = -ENOSPC;
+      stage = __LINE__;
+      goto restore;
+    }
+
+  ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
+                           layout.transfer_length);
+  out->tx_status = ret;
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto restore;
+    }
+
+  for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
+    {
+      if (k1_rtl8852bs_data_tx_resources_read(
+            K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &after_res) != OK ||
+          after_res.channel_used_pages == before_res.channel_used_pages)
+        {
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  /* Bounded, and bounded short.  This runs inside the resident window, so
+   * every millisecond spent here is a millisecond the window is not draining
+   * the receive FIFO in; a frame that went around the MAC and did not come
+   * back within three hundred of them is not going to.
+   */
+
+  for (waited = 0; waited < K1_RTL8852BS_LOOPBACK_WAIT_MSEC &&
+       !out->frame_valid; waited++)
+    {
+      ret = k1_rtl8852bs_runtime_rx_read(
+        buffer, K1_RTL8852BS_SCAN_OFLD_RX_MAX, &length);
+      if (ret == -EAGAIN || ret == -ENOSPC)
+        {
+          up_mdelay(K1_RTL8852BS_RUNTIME_DONE_ACK_POLL_MSEC);
+          continue;
+        }
+
+      if (ret < 0)
+        {
+          stage = __LINE__;
+          goto restore;
+        }
+
+      out->rx_reads++;
+      offset = 0;
+      while (offset < length)
+        {
+          ret = k1_rtl8852bs_runtime_rx_parse(buffer, length, offset, &frame);
+          if (ret < 0 || frame.next_offset <= offset)
+            {
+              ret = ret < 0 ? ret : -EPROTO;
+              stage = __LINE__;
+              goto restore;
+            }
+
+          offset = frame.next_offset;
+          if (frame.packet_type != K1_RTL8852BS_RXDESC_PACKET_TYPE_WIFI ||
+              frame.payload_length < K1_RTL8852BS_IEEE80211_HEADER_SIZE)
+            {
+              continue;
+            }
+
+          payload = buffer + frame.payload_offset;
+          if (memcmp(payload + 10, self_mac, 6) != 0)
+            {
+              continue;
+            }
+
+          /* A frame carrying this host as transmitter is a frame that went
+           * around the MAC.  The first one is the reading; a management frame
+           * from a sweep cannot appear here because no sweep is running, but
+           * the data-type test is kept so that a stray one could not be read
+           * as the submitted frame either.
+           */
+
+          out->self_frames++;
+          frame_control = k1_rtl8852bs_read_le16(payload);
+          if (((frame_control >> 2) & K1_RTL8852BS_IEEE80211_TYPE_MASK) !=
+              K1_RTL8852BS_IEEE80211_TYPE_DATA)
+            {
+              continue;
+            }
+
+          rx_header = k1_rtl8852bs_runtime_resident_header_length(
+            frame_control);
+          out->frame_valid = true;
+          out->frame_control = frame_control;
+          out->frame_length = (uint32_t)frame.payload_length;
+          out->header_length = (uint8_t)rx_header;
+          out->protected_frame = (frame_control & 0x4000u) != 0;
+          out->hw_dec = frame.hw_dec;
+          out->sw_dec = frame.sw_dec;
+          out->a1_match = frame.a1_match;
+          out->icv_error = frame.icv_error;
+          if (frame.descriptor_long)
+            {
+              out->sec_type = frame.sec_type;
+              out->sec_cam_index = frame.sec_cam_index;
+            }
+
+          /* The eight bytes at the header's end, which are the cipher header
+           * when the engine ran and the start of the LLC/SNAP header when it
+           * did not.  Neither is key material and neither is ciphertext, so
+           * both may be printed; the cipher's own span is reported as counted
+           * differences instead of as bytes.
+           */
+
+          if (frame.payload_length >= rx_header + sizeof(out->body))
+            {
+              memcpy(out->body, payload + rx_header, sizeof(out->body));
+              out->body_valid = true;
+            }
+
+          k1_rtl8852bs_runtime_loopback_classify(
+            payload, frame.payload_length, plain, frame_length, rx_header,
+            frame.hw_dec, out);
+          break;
+        }
+
+      if (!out->frame_valid)
+        {
+          up_mdelay(K1_RTL8852BS_RUNTIME_DONE_ACK_POLL_MSEC);
+        }
+    }
+
+  ret = out->frame_valid ? OK : -ENODATA;
+  if (!out->frame_valid)
+    {
+      stage = __LINE__;
+    }
+
+restore:
+  k1_rtl8852bs_mac_read32(K1_RTL8852BS_MAC_LOOPBACK_COUNT, &out->looped);
+  out->looped = (out->looped >> K1_RTL8852BS_MAC_LOOPBACK_COUNT_SHIFT) &
+                K1_RTL8852BS_MAC_LOOPBACK_COUNT_MASK;
+  restore_ret = k1_rtl8852bs_mac_write32(K1_RTL8852BS_MAC_LOOPBACK, saved);
+  if (ret == OK && restore_ret < 0)
+    {
+      ret = restore_ret;
+      stage = __LINE__;
+    }
+
+errout:
+  out->status = ret;
+  k1_rtl8852bs_runtime_loopback_report(out, cleared, stage, ret);
+  if (buffer != NULL)
+    {
+      kmm_free(buffer);
+    }
+
+  if (packet != NULL)
+    {
+      kmm_free(packet);
+    }
+
+  return ret;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_window
  *
  * Description:
@@ -28128,6 +28925,7 @@ static int k1_rtl8852bs_runtime_resident_window(
   int receive_ret = OK;
   int exit_ret = OK;
   int filter_ret = OK;
+  int loopback_ret = OK;
   int verdict;
   int ret;
 
@@ -28163,6 +28961,20 @@ static int k1_rtl8852bs_runtime_resident_window(
   if (ret < 0)
     {
       k1_early_puts("K1 Wi-Fi GPL: resident network selftest error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+    }
+
+  /* And the reader that decides what the transmit path emitted, for the same
+   * reason and at the same cost: the loopback readback later in this window
+   * produces a verdict about the hardware, and a verdict is only evidence when
+   * the part that reached it has been shown the five readings it can reach.
+   */
+
+  ret = k1_rtl8852bs_runtime_loopback_selftest();
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident loopback selftest error=");
       k1_early_puthex((uintreg_t)-ret);
       k1_early_puts("\r\n");
     }
@@ -28889,6 +29701,26 @@ static int k1_rtl8852bs_runtime_resident_window(
     {
       k1_rtl8852bs_runtime_txrpt_log("resident-c2h-tag",
                                     count.ccxrpt_tagged_first);
+    }
+
+  /* The window is over, the filter is back and the channel samples are taken,
+   * so the MAC can be borrowed: one protected frame goes out with the transmit
+   * path looped back inside the MAC, and comes back for the payload to be
+   * looked at.  It runs here, after everything the window itself measures, for
+   * two reasons.  It engages a register that would take the radio out from
+   * under a running window, and its verdict is a reading about the transmit
+   * path rather than about this window, so the verdict below must not depend
+   * on it -- a frame that comes back as plaintext is the finding, not a
+   * failure of the window that produced it.
+   */
+
+  loopback_ret = k1_rtl8852bs_runtime_secure_loopback_readback(self_mac,
+                                                               bssid);
+  if (loopback_ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident loopback readback error=");
+      k1_early_puthex((uintreg_t)-loopback_ret);
+      k1_early_puts("\r\n");
     }
 
   /* The verdict names the earliest thing that was wrong, so a run reads as

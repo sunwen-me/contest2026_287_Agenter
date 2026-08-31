@@ -875,6 +875,34 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   并认出 BSSID，第二次连 Beacon 归零；过滤器寄存器前后一致，与 3m 无关），是 run 48 那个
   未定位偶发的第二次出现，原样重跑即通。
 
+- **已写完待上板（增量 3r，判据 38 → 39）：把刚发出去的那一帧从 MAC 里绕回来，直接看载荷是密文
+  还是明文。** 3q 之后只剩一个怀疑对象，而它靠 AP 已经问不出来：ACK 在解密之前发出。
+  **为什么回环能回答**：回环开关 `0xcc20`（`B_AX_MACLBK_EN`）是 CMAC 侧寄存器，安全引擎
+  `R_AX_SEC_ENG_CTRL` 是 DMAC 侧的块，抽头在加密**之后**，所以绕回来的帧上引擎该做的事已经做完。
+  三个互相独立的证人：**帧体**（与提交明文逐字节相同 = 没人加密过它）、**长度**（CCMP 追加
+  8 字节 MIC，68 → 76）、**`hw_dec`**（回程也有引擎，被回程解开的帧读起来和从未加密的一样，
+  所以这一位必须**优先于**帧体比较，否则会把「回程解开了」误报成「发送端没加密」）。
+  **CCMP 头不是证人**——那 8 字节头是本组件自己写的，引擎跑没跑它都在。通路是活的：3n 的
+  maclbk 探针（run 52）绕回 13 个 PPDU 且主机确实收到 13 帧 `A2 = 自己`。
+  **判定器** `k1_rtl8852bs_runtime_loopback_classify()` 是纯函数，判定编号
+  `NONE 0x0 / CIPHER 0x1 / HEADER 0x2 / PLAIN 0x3 / RXDEC 0x4 / SHORT 0x5`，
+  `PLAIN` 就是本增量要找的那个。**唯一新增硬判据**是它的内存自校验
+  `--require-runtime-loopback-readback` 里那条固定行：`resident loopback selftest plain=0x3
+  cipher=0x1 header=0x2 rxdec=0x4 short=0x5 diff=0x24 first=0x0 llc=0x8 pn=0x1 stage=0x0
+  status=0x0`（比较用的明文由提交时同一个 `arp_probe_build` 生成，测的是判定器不是手抄的帧）。
+  **回读级** `k1_rtl8852bs_runtime_secure_loopback_readback()` 存 `0xcc20`、清计数器、置
+  `MACLBK_EN` 并回读确认，发**一帧**带 `TXRPT_TAG_LOOPBACK`（`0x5`）的受保护 ARP（A3 广播、
+  tpa 网关，所以不需要从空口学到任何对端），轮询 ≤300 ms 找 `A2 = 自己` 的数据帧，判定，
+  **无条件恢复** `0xcc20`。它排在窗口收尾之后、判决计算之前（回环会把电台从运行中的窗口底下
+  抽走；而且**回来一帧明文是结论不是失败**），所以那行 `resident loopback readback verdict= …`
+  只要求存在、不要求取值。`body=` 打的是 802.11 头结束处 8 字节（引擎跑了就是 CCMP 头的
+  PN/KeyID，没跑就是 LLC/SNAP 头开头，都不是密钥材料）；**密文跨度只报计数
+  `diff-bytes`/`diff-first`，不打字节**——本帧明文已知，打出密文等于公开一段密钥流。
+  **三种读数的下一步**：`verdict=0x1`（密文）→ 加密没问题，回头查 AP 的转发/隔离策略；
+  `verdict=0x3`（明文）→ SEC CAM／发送描述符里的加密指示没真正生效，去查
+  `sec_info_tbl_init` 与描述符的 SEC 字段；`verdict=0x4`（回程解密）→ 换用长描述符字段
+  `sec_type`/`sec_cam_idx` 复核，或把回程解密关掉再跑。
+
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
 - **Association Request 沉默的原因几乎总在请求内容里，不在发送路径里。** run 30 发了 6 次
@@ -976,8 +1004,9 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是增量 3r：按原厂做法开 MAC loopback，把本移植刚发出去的那一帧读回来，
-直接看载荷是密文还是明文。** 增量 3q 已在 run 53 上板（38/38），读数是「两帧受保护单播 ARP
+**当前实际下一步是把增量 3r 跑上板：MAC loopback 已经写完并编译通过，等一次上板读数。**
+它把本移植刚发出去的那一帧从 MAC 里绕回来直接看载荷是密文还是明文。
+增量 3q 已在 run 53 上板（38/38），读数是「两帧受保护单播 ARP
 Request 都发出去了、固件都报 OK、零回答」，其中第二帧的 A3 还是广播，所以「帧体错了」和
 「AP 后面没有 DHCP 服务器」两个嫌疑都不成立；**剩下的唯一怀疑就是硬件到底有没有真的加密**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送

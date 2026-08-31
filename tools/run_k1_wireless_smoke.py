@@ -317,6 +317,13 @@ def parse_args() -> argparse.Namespace:
               "reports what its protected ARP request did"),
     )
     parser.add_argument(
+        "--require-runtime-loopback-readback", action="store_true",
+        help=("fail unless the reader that decides whether a frame came back "
+              "out of MAC loopback as ciphertext or as the plaintext that was "
+              "submitted agrees with its offline model, and the resident "
+              "window reports what its own looped frame carried"),
+    )
+    parser.add_argument(
         "--require-runtime-wpa-msg1", action="store_true",
         help=("fail unless a pairwise master key is derived from a configured "
               "passphrase and the access point sends a first EAPOL-Key frame "
@@ -2396,6 +2403,95 @@ def main() -> int:
                     "[serial] protected ARP request: sent={0} bytes={1} "
                     "target={2} status={3}: {4}".format(
                         sent, byte_count, dotted(tpa), status, verdict),
+                    file=sys.stderr)
+        if args.require_runtime_loopback_readback:
+            # The last question the air-side readings left open: the access
+            # point acknowledges a frame before it consults any key, so its
+            # silence cannot separate a frame it decrypted and dropped from a
+            # frame that was never encrypted.  MAC loopback can, because the
+            # loopback tap is a CMAC register while the security engine is a
+            # DMAC block: a frame that comes back around has already passed
+            # the engine, so its payload says what the engine did.
+            #
+            # The reader is required to agree with its offline model first, and
+            # this is the only hard requirement here.  The verdict itself is
+            # deliberately not required to take any value: plaintext coming
+            # back is the finding this increment exists to produce, and a
+            # requirement that refused it would turn the finding into a failed
+            # run.
+            #
+            # The 0x prefix is mandatory in the last two: with it optional,
+            # `0+` can match the zero of "0x" and stop, so any nonzero value
+            # would satisfy the assertion.
+            loopback_model_result = re.search(
+                rb"K1 Wi-Fi GPL: resident loopback selftest"
+                rb" plain=(?:0x)?0*3 cipher=(?:0x)?0*1 header=(?:0x)?0*2"
+                rb" rxdec=(?:0x)?0*4 short=(?:0x)?0*5 diff=(?:0x)?0*24"
+                rb" first=0x0+(?![0-9a-fA-F]) llc=(?:0x)?0*8"
+                rb" pn=(?:0x)?0*1 stage=0x0+(?![0-9a-fA-F])"
+                rb" status=0x0+(?![0-9a-fA-F])",
+                started,
+            )
+            if loopback_model_result is None:
+                missing.append(
+                    "RTL8852BS2 loopback payload reader model")
+
+            # And the readback's own line, required to be present and not to
+            # carry any particular value.
+            loopback_result = re.search(
+                rb"K1 Wi-Fi GPL: resident loopback readback "
+                rb"verdict=(?:0x)?([0-9a-fA-F]+)"
+                rb" looped=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* self=(?:0x)?([0-9a-fA-F]+)"
+                rb" frame=(?:0x)?([0-9a-fA-F]+)"
+                rb" len=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* llc=(?:0x)?([0-9a-fA-F]+)"
+                rb" diff-bytes=(?:0x)?([0-9a-fA-F]+)"
+                rb" diff-first=(?:0x)?([0-9a-fA-F]+)"
+                rb" pn=(?:0x)?([0-9a-fA-F]+)"
+                rb" prot=(?:0x)?([0-9a-fA-F]+)"
+                rb" hw-dec=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* status=(?:0x)?([0-9a-fA-F]+)",
+                started,
+            )
+            if loopback_result is None:
+                missing.append(
+                    "RTL8852BS2 resident window MAC loopback readback")
+            else:
+                (verdict_code, looped, self_frames, frame_valid, frame_length,
+                 llc_at, diff_bytes, diff_first, pn_match, protected_frame,
+                 hw_dec, loopback_status) = (
+                     int(group, 16) for group in loopback_result.groups())
+
+                verdicts = {
+                    0x0: "nothing classified",
+                    0x1: "ciphertext, so the transmit path does encrypt",
+                    0x2: "an integrity code was appended but the body is "
+                         "unchanged",
+                    0x3: "the plaintext that was submitted, so the transmit "
+                         "path is not encrypting",
+                    0x4: "the return path decrypted it, so the payload says "
+                         "nothing about the transmit path",
+                    0x5: "too short to read either offset",
+                }
+                print(
+                    "[serial] MAC loopback readback: looped={0} self={1} "
+                    "frame={2} len={3} status={4}".format(
+                        looped, self_frames, frame_valid, frame_length,
+                        loopback_status),
+                    file=sys.stderr)
+                print(
+                    "[serial] looped payload: llc-at={0} diff-bytes={1} "
+                    "diff-first={2} pn-kept={3} protected={4} hw-dec={5}"
+                    .format(
+                        "nowhere" if llc_at == 0xff else llc_at, diff_bytes,
+                        "none" if diff_first == 0xff else diff_first,
+                        pn_match, protected_frame, hw_dec),
+                    file=sys.stderr)
+                print(
+                    "[serial] loopback verdict {0}: {1}".format(
+                        verdict_code,
+                        verdicts.get(verdict_code, "unknown")),
                     file=sys.stderr)
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
