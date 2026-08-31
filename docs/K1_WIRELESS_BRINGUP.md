@@ -7663,6 +7663,59 @@ resident loopback downlink sent= reads= seen= frame= len= fc= seq= hdr= llc=
 判据数仍然是 **40**：`--require-runtime-loopback-readback` 多卡一条「这一行必须存在」，值一律
 只报不判——理由和 3r 一样，这里没有一个「正确值」，两种结果都是结论。
 
+#### run 58 的读数：`a1-match=0x1` `hw-dec=0x1` `sec-cam=0x0`——接收路径接住了它
+
+run 57 先在主动扫描处失败了（`passive scan-offload error=0x3d` ＝ ENODATA，13 个 PPDU
+发出去没有一个 Probe Response 回来，bring-up `-61`），属于早就登记过的空接收窗抖动家族，
+3t 的联机代码一行都没执行；那一次唯一跑到的是离线帧模型检查，它给出了 `dl-fc=0x4208`，
+也就是 from-DS 帧头在硬件上构造正确。重跑的 run 58（`k1-wpa-20260831T194727Z.log`）
+**四十条判据全过、`RUN_EXIT=0`**，第二行是这样：
+
+```
+resident loopback downlink sent=0x1 reads=0x1 seen=0x1 frame=0x1 len=0x50
+  fc=0x4208 seq=0xf hdr=0x18 llc=0x8 diff-bytes=0x0 diff-first=0xff
+  verdict=0x4 pn=0x1 prot=0x1 hw-dec=0x1 sw-dec=0x0 a1-match=0x1 icv=0x0
+  sec-type=0x6 sec-cam=0x0 body=0x6 0x0 0x0 0x20 0x0 0x0 0x0 0x0
+  tx=0x0 stage=0x0 status=0x0
+```
+
+一个字段一个字段读：
+
+- `sent=0x1 seen=0x1 frame=0x1 pn=0x1`——第二帧进了发送 FIFO，窗口里回来一帧「A1 ＝自己
+  且 A2 ＝BSSID」的帧，并且它的 CCMP PN 与刚发出去的那个相等，所以回来的就是它本身。
+- `a1-match=0x1`——**关联以来第一次**。3q/3r/3s 的每一次读数里这一位都是 `0x0`，因为在此
+  之前接收方向上出现过的每一帧都是组播。MAC 认出了 A1 是本站，也就是说 ADDR_CAM 里的自身
+  地址是对的。
+- `prot=0x1 hw-dec=0x1 icv=0x0`——硬件解了密，ICV 没有报错。
+- `sec-cam=0x0`——用的是 **CAM 第 0 项，即成对密钥那一项**。此前接收方向上每一次成功解密
+  （run 39 的 2 帧、run 42 的 13 帧、run 55 的 7 帧）都落在第 1 项（GTK）上，成对密钥在接
+  收方向上从来没被命中过；现在被命中了，`sec-type=0x6`。
+- `verdict=0x4`（RXDEC）＋ `llc=0x8 diff-bytes=0x0`——解出来的正文与提交的明文逐字节相同，
+  LLC/SNAP 落在 802.11 头之后 8 字节处，也就是硬件原地解密、把 8 字节 CCMP 头留在原处。
+- `body=06 00 00 20 00 00 00 00` 就是那个 CCMP 头（PN 6、ExtIV 位、KeyID 0），既不是密钥也
+  不是密文。
+- `stage=0x0 status=0x0`——没有任何一步提前退出。
+
+同一次的第一行把 3s 的结论又复现了一遍：`fc=0x4108 diff-bytes=0x24 sw-diff=0x0
+sw-mic-diff=0x0`，发送方向的密文与软件 CCMP 仍然逐字节相同。
+
+#### 结论：(B2) 排除，只剩 (B1)——以及一句必须写清的限界
+
+三种预设读数里落到的是第一种：**接收路径能接住一帧发给自己的单播，并且用成对密钥正确解开
+它。** ADDR_CAM 的自身地址、SEC CAM 的成对密钥映射，在接收方向上都是对的。「发出去、被
+ACK、没人回」这件事因此不能再用「本机收不下发给自己的帧」来解释。
+
+限界必须写下来，否则这条结论会被读得比它实际证明的更多：MAC 回环不经过 BB/RF，所以这一帧
+证明的是 MAC 的地址过滤与 SEC 引擎，不是空口上的单播接收链路。空口那一半另有证据，但是分
+段的：Beacon／Probe Response 是空口收到的（管理帧，不加密）；GTK 加密的广播数据帧是空口收
+到并解开的（run 39/42/55）。唯一从未观察到的组合是**空口来的单播数据帧**——而这恰好就是 AP
+要回给我们的那一种。这一帧确实走过了接收 DMA 与地址过滤（否则 `a1-match` 不会置位），所以
+「接收过滤把发给自己的单播数据整类丢掉」这种解释也变得不大可能，但回环是否绕过了过滤器的
+某一级，本移植还没有从原厂寄存器定义上核实过。
+
+所以准确的说法是：(B2) 在 MAC/SEC 这一层被排除，剩下 (B1)（AP 不投递：客户端隔离，或者要
+求先拿到 DHCP 地址），以及一个只在空口才会显形的接收侧配置的余量。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来
