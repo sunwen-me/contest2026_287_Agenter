@@ -558,9 +558,16 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   还差的是数据队列那一路真的发（增量 3j）：把 CCMP 头拼进帧、帧长按「不含 MIC」算、走数据
   DMA 通道提交、观察 AP 回应（候选首帧 DHCP Discover，驻留窗口已经在数
   `data_frames_to_self`），以及每密钥的单调 PN 计数器——现在 PN 还只是函数参数。
-- **代码完成、尚未上板（增量 3j）：真的往数据队列发一帧被 CCMP 保护的数据帧。** run 41 待跑，
-  离线断言全过、`-fsyntax-only` 干净、两个方向的镜像哈希都记下了，但**一次都没上过板，别当成
-  硬件结论**。没有新的 Kconfig 符号（内存那半仍挂在
+- **已上板（增量 3j，run 42）：两帧被 CCMP 保护的数据帧被 band-0 BE 队列收下，`status=0x0`，
+  但 AP 没有回应。** `out/k1-serial/k1-wpa-20260831T031058Z.log`，37 条 `--require-*` 全过：
+  `resident data tx sn=0xb … pn=0x1 status=0x0`、`sn=0xc … pn=0x2 status=0x0`、
+  `resident window data tx sent=0x2 bytes=0x146 status=0x0 tk=0x1 dhcp-reply=0x0`。
+  **能说的**：提交路径（48 字节描述符 ＋ 326 字节帧、固定地址 FIFO 编码、页配额）在真机上没报错，
+  PN 在同一把密钥下递增而不重复，发的时候成对密钥确实还在 CAM 里。**不能说的**：`status=0x0`
+  只等于「队列收下了」，既不等于 MAC 发出去了，也不等于 AP 解开了——`dhcp-reply=0x0`。
+  同一个窗口 RX 侧是通的：`data sec total=0xd target=0xd prot=0xd group=0xd hw-dec=0xd
+  icv=0x0 crc=0x0`，AP 的 13 帧组播数据帧全部被硬件用本端装进去的 GTK 解开、零错误，
+  `a1-match=0x0`（没有一帧是单播给本端的）。没有新的 Kconfig 符号（内存那半仍挂在
   `CONFIG_K1_RTL8852BS2_RUNTIME_DATA_TX_DIAGNOSTIC` 下），新判据
   `--require-runtime-data-secure-tx`，判据数 36 → **37**。
   做的事：(a) `..._runtime_dhcp_discover_build()` 拼一帧 **326** 字节的到-DS 保护数据帧——
@@ -573,8 +580,11 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   和硬件头转换用，都没开），`AX_TXD_BK` BIT(13) 置一（原厂在 `ampdu_en==FALSE` 时置）、
   `AGG_EN` 保持零，队列是 band 0 BE（`qsel=0`、`ch_dma=0`），`info2` 复用 3i 的
   `(sec_type<<9)|BIT(8)|sec_cam_idx`。(c) `..._runtime_sch_tx_en_data()` 打开 `R_AX_CTN_TXEN`
-  的 BIT(0)（`B_AX_CTN_TXEN_BE_0`）——**本移植此前只开过 MGQ `0x100` 与 CPUMGQ `0x400`，
-  数据队列那一位从来没开过**。(d) PN 从函数参数升成真计数器
+  的 BIT(0)（`B_AX_CTN_TXEN_BE_0`）——**run 42 更正：这一位早就是开的，这个写是空操作。**
+  同一份日志里这个寄存器在扫描阶段读出 `0x700`，从 `TX state prejoin-before` 起就已经是
+  `0xffff`（16 位全开），也就是关联那一段（固件或 JOININFO 那条路）已经把所有队列打开了。
+  「本移植此前只显式开过 MGQ `0x100` 与 CPUMGQ `0x400`」说的是**本移植写过什么**，不是硬件当时
+  的状态——别再把「开了 BE 队列」当成这一帧能提交的原因。留着这个 OR ＋ 回读没坏处。(d) PN 从函数参数升成真计数器
   `g_k1_rtl8852bs_tx_packet_number`，从 1 起算、单调加一、装新密钥时归零。
   (e) `..._runtime_dhcp_reply_match()`：`op==2 && xid==ours && chaddr==self`，先试
   `header_length+8` 再试 `header_length` 找 LLC/SNAP（解密后的帧**保留** CCMP 头，明文帧没有），
@@ -590,22 +600,32 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `body0=0x0040a400 body2=0x146 body3=0x2123 info0=0x40000400 info1=0 info2=0xd00`
   （不保护时 `body0=0x00408400`、`info2=0`），布局 `fifo=0x1002f transfer=0x178` 8 个 PLE page
   1 个 WDE page，另有 7 个描述符负例、1 个建帧负例、PN 连续 1／2、一帧合成回应在
-  `header_length` 24 与 40 两处都匹配 ＋ 6 个匹配器负例。
+  `header_length` 24 与 **32** 两处都匹配 ＋ 6 个匹配器负例。
+  **run 41b 抓到的错（已修）**：那条「32」原来写的是合成回应的 `ip_offset`（40），而回应里
+  LLC/SNAP 头在 32，匹配器先试 `48` 再试 `40` 都落空，于是这个自检在板上返回 `-EIO`，
+  **那条断言从来没有测到它声称要测的回退路径**。定位方式值得复用：把这几个纯内存函数连同自检
+  用 `awk` 抽出来、补十来行桩、`gcc` 编成主机程序跑同一套断言，一次就指到出错的行，不用再上板
+  试错（脚本 `/tmp/h3j-gen.sh`，靠 `grep` 定位行号，不进仓库）。同时给这个自检加了 `stage`：
+  每个 `goto error;` 前记 `__LINE__`，错误行多打 ` stage=`，下次失败直接指到源码行。
   **`dhcp-reply=` 是报告不是判据**：一台背后没有 DHCP 服务器的 AP 会把这一帧解得好好的却永远
   不回，所以判据只卡「离线模型全对 ＋ 数据队列收下了一帧且当时确实装着成对密钥」。
-  镜像：带密钥 `9833e8cd…`（`--clean` 与切回来的增量同一个哈希），`--no-key` `095e1663…`。
-  **上板要看三件事**：`resident data scheduler TX enable` 的 `after=` 里 BE 位真的置上、
-  `resident data tx … status=0x0`、以及 `resident window data tx … dhcp-reply=`。
+  镜像：带密钥 `f5f37b62…`（run 42 跑的就是它，`--no-key` 来回切一次后重建同哈希），`--no-key` `d26f52a2…`；修断言之前的那两个是 `9833e8cd…` / `095e1663…`。
   环境坑（这次踩到）：用 ninja 直接编单个对象文件会触发一次半途失败的 cmake 重配
   （`ccache` 不在那个 shell 的 PATH 上），留下的 `build.ninja` 里 `-march` 退成 `rv64imac`，
   整棵树报 `extension 'zicsr' required`。`--clean` 一次即恢复。以后快速语法检查从
   `compile_commands.json` 取命令行、去掉 ccache 前缀、加 `-fsyntax-only` 自己跑。
-- **下一步优先级**：(1) 把增量 3j 跑上板（run 41）——**发送这一路的代码已经全部写完**（见上一
-  条：帧、48 字节描述符、BE 队列的调度器使能位、PN 计数器、回应匹配器、驻留窗口里的两次发送），
-  描述符的安全字段与 CCMP 头在 run 40 上板确认过，RX 侧那一半在 run 39 上板证明过，**唯一还没
-  发生的事是让硬件真的把这一帧发出去**。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
-  信道本来就是驻留的（增量 3h 的更正一），所以挡在「密钥装好」和「能收发数据」之间的
-  只剩这一条——描述符不引用安全 CAM index，硬件就不会去加密。
+- **下一步优先级**：(1) 增量 3k——**把「队列收下了」和「MAC 真的发出去了」分开**。run 42 之后
+  这两件事仍然并在一起：`status=0x0` 只说明描述符和帧被写进了 band-0 BE 队列，而
+  `dhcp-reply=0x0`，所以「AP 解开了本端发的保护帧」一点证据都没有。现成的手段就在同一份日志里：
+  关联那一段打的 `TX state …` 带 `mactx-mpdu` / `mactx-dma` / `cmac-drop` / `dmac-drop`
+  （还有 `ppdu-sel`、`macid-sleep`、`macid-pause`），把同一个 dump 挪到数据发送前后各打一次，
+  `mactx-mpdu` 的增量回答「MAC 有没有把这两个 MPDU 送出去」，两个 drop 计数回答「有没有在
+  CMAC/DMAC 就被丢掉」，`macid-pause` 回答「这个 MACID 是不是被暂停了」。**先做这个，再考虑
+  TX report（有没有被 ACK）**；在拿到这个读数之前不要把 run 42 说成「发出去了」。
+  发送这一路的代码本身已经全部写完并上板：帧、48 字节描述符、PN 计数器、回应匹配器、驻留窗口里
+  的两次发送；描述符的安全字段与 CCMP 头在 run 40 确认过，RX 侧那一半在 run 39（单播 PTK）与
+  run 42（13 帧组播 GTK，`hw-dec=0xd icv=0x0`）证明过。密钥在硬件里（3f）、port 使能（3g）、
+  信道驻留（3h 更正一）、调度器队列位本来就是开的（3j 更正）。
   字段位置和取值现在都有出处：WD info dword2（描述符偏移 `24+8`）里 `sec_type` [12:9]、
   `sec_hw_enc` BIT(8)、`sec_cam_idx` [7:0]（原厂 `trx_desc_8852b.c:295-297` 与
   `txdesc.h:136-140`，和 mainline `RTW89_TXWD_INFO2_SEC_*` 逐位相同；8852B 的 WD body
@@ -748,8 +768,11 @@ Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手�
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
 **当前实际下一步是数据面的上板验证：增量 3j 的发送路径已经写完，但一次没上过板**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
-描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），但**硬件还没有真的按这套
-配置发出过一帧**，所以到目前为止本端仍然一帧 CCMP 都没发过。增量 3h 本身（不跑扫描的驻留收发窗口）
+描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 42 也确实把两帧保护数据帧
+交给了 band-0 BE 队列并拿到 `status=0x0`，但**队列收下不等于 MAC 发出去，更不等于 AP 解开了**
+（`dhcp-reply=0x0`），所以到目前为止仍然没有「本端发出的 CCMP 帧被对端解开」的证据。
+反过来，**接收侧的 CCMP 解密在真实空口上已经成立**：run 39 是单播 PTK、run 42 是 13 帧组播 GTK
+（`hw-dec=0xd icv=0x0 crc=0x0`）。增量 3h 本身（不跑扫描的驻留收发窗口）
 已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题
 都已修完）。
 做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e/3f/3g/3h 镜像：
@@ -765,8 +788,9 @@ tools/run_k1_wpa.sh               # 上板：37 条 --require-*，K1_RESET_MODE 
 `--require-runtime-data-secure-tx`），不用再手抄那条长命令：
 `tools/run_k1_wpa.sh` 把这 37 条固定下来，复位方式用环境变量
 `K1_RESET_MODE`（默认 `--nsh-reboot`，板子不在 `nsh>` 时设成 `--manual-reset` 再按 RST），
-额外参数原样透传。**它不接受也不打印任何口令**。run 40 用它跑，36 条一条没失败，日志
-`out/k1-serial/k1-wpa-20260831T010437Z.log`；run 35 跑的是其中 34 条（那时还没有最后两条）、
+额外参数原样透传。**它不接受也不打印任何口令**。run 42 用它跑，**37 条一条没失败**，日志
+`out/k1-serial/k1-wpa-20260831T031058Z.log`；run 40 跑的是其中 36 条（那时还没有最后一条）、
+一条没失败，日志 `out/k1-serial/k1-wpa-20260831T010437Z.log`；run 35 跑的是其中 34 条（那时还没有最后两条）、
 一条没失败、以 `PASS: K1 wireless RAM image reached NSH` 收尾，日志
 `out/k1-serial/k1-wpa-20260830T194339Z.log`（run 34 是其中 33 条，日志
 `out/k1-serial/k1-wpa-20260830T174332Z.log`；run 33 是 31 条，日志

@@ -6330,7 +6330,7 @@ CCMP 头拼进帧、把帧长按「不含 MIC」算好、走数据 DMA 通道提
 
 ### 增量 3j：真的往数据队列发一帧被 CCMP 保护的帧
 
-（**尚未上板**：run 41 待跑。本节所有期望值都是离线的字面量，上板读数一栏留空，别当成硬件结论）
+（**run 42 已上板：两帧被 CCMP 保护的 326 字节数据帧被 band-0 BE 队列收下、`status=0x0`，但 AP 没有回应，读数见下面「上板读数」**）
 
 增量 3i 把发送侧的安全字段和 CCMP 头做完了，但一帧没发。这一步补上「发」：把 CCMP 头拼进一帧
 到-DS 的数据帧、按「帧长不含 MIC」算好长度、走 band 0 的 BE 数据队列提交，并在驻留窗口里等
@@ -6420,11 +6420,54 @@ STF_MODE 与 WDINFO_EN 在低位；`body3 = 0x2123` 是 `seq 0x123 | BK`；`0x14
 `transfer_length = 0x178 = 376`：374 向上取到 8 字节整数倍。合成回应放在 `header_length` 40
 也匹配，是为了证明「明文帧没有 CCMP 头」那条回退路径也走得通，不是只在解密后的偏移上巧合。
 
-#### 上板读数
+#### 上板读数（run 42）
 
-留空——run 41 还没跑。上板后要看的是三件事：`resident data scheduler TX enable` 的
-`after=` 里 BE 位真的置上、`resident data tx … status=0x0`（队列收下了这一帧）、以及
-`resident window data tx … dhcp-reply=`。
+`out/k1-serial/k1-wpa-20260831T031058Z.log`，37 条 `--require-*` 判据全过，
+`PASS: K1 wireless RAM image reached NSH`：
+
+```
+K1 Wi-Fi GPL: resident data scheduler TX enable before=0x000000000000ffff after=0x000000000000ffff wanted=0x0000000000000001
+K1 Wi-Fi GPL: resident data tx sn=0x000000000000000b bytes=0x0000000000000146 xid=0x000000008bac2070 pn=0x0000000000000001 status=0x0000000000000000
+K1 Wi-Fi GPL: resident data tx sn=0x000000000000000c bytes=0x0000000000000146 xid=0x000000008bac2070 pn=0x0000000000000002 status=0x0000000000000000
+K1 Wi-Fi GPL: resident window data tx sent=0x0000000000000002 bytes=0x0000000000000146 sn=0x000000000000000c xid=0x000000008bac2070 status=0x0000000000000000 tk=0x0000000000000001 dhcp-reply=0x0000000000000000 offer-ip=0x0000000000000000
+```
+
+- `status=0x0` 两次、`sent=0x2`、`bytes=0x146`：两帧 326 字节的帧都被 band-0 BE 队列收下，
+  提交路径（描述符 48 字节 ＋ 帧、固定地址 FIFO 编码、页配额）在真机上没有报错。`pn=0x1`
+  然后 `pn=0x2`：同一把密钥下的 CCMP 包号确实在递增而不是重复，`sn=0xb`→`0xc` 同理。
+  `tk=0x1`：发这两帧的时候成对密钥确实还装在 CAM 里，所以 `sent` 不是「没装密钥也算发了」。
+- **`before=0xffff`——这个增量新开的调度器位其实早就是开的。** 本节原来的说法（`cmac_init()`
+  的静态子集把 `R_AX_CTN_TXEN` 留在复位值、只有两个管理队列被显式打开）在真机上不成立：同一份
+  日志里，扫描阶段这个寄存器读出来是 `0x700`，而从 `TX state prejoin-before` 起就已经是
+  `0xffff`，也就是关联那一段（固件或 JOININFO 那条路）已经把 16 个队列位全打开了。所以这次
+  的 `before | BIT(0)` 是个空操作，**队列使能不是缺的那一块**。留着它没有坏处（OR 语义、
+  回读校验），但不要再把「打开了 BE 队列」当成这一帧能提交的原因。
+- **`dhcp-reply=0x0`：AP 没有回应，所以「本端发的保护帧被 AP 解开了」这件事仍然没有证据。**
+  这一栏是报告而不是判据（原因见下面「还没做的」）。同一个驻留窗口里 RX 侧的读数说明这不是
+  「链路整体不通」：`resident window data sec total=0xd target=0xd prot=0xd group=0xd
+  hw-dec=0xd icv=0x0 crc=0x0`——AP 的 13 帧组播数据帧全部被硬件用**我们装进去的 GTK**
+  解开了，一个 ICV/CRC 错都没有；`a1-match=0x0` 说明这 13 帧里没有一帧是单播给本端的。
+  换句话说：下行的组密钥解密在真实空口上是通的，上行这两帧只知道「队列收下了」。
+
+#### 这一节是怎么被抓出错的（run 41b → 主机复现 → run 42）
+
+第一次上板（run 41b，`k1-wpa-20260831T025759Z.log`）板子起得好好的，却停在这个内存自检上：
+`runtime protected data TX error=0x0000000000000005`（`-EIO`），而这个自检里有 20 个
+`goto error` 共用同一个 errno，日志上看不出是哪一条断言。**不要靠再上板一次去试错**：把这几个
+纯内存函数（建帧、两个校验和、描述符、回应匹配、PN 递增）连同自检本身用 `awk` 从驱动里抽出来，
+补上十来行桩（`k1_early_puts`→`printf`、`kmm_malloc`→`malloc`、常量从同一份源码里 `grep`
+出来），`gcc` 一编就能在主机上跑同一套断言，一次就指到出错的那一行。脚本留在
+`/tmp/h3j-gen.sh`（不进仓库，靠 `grep` 定位行号所以改了驱动也还能用）。
+
+抓到的错是**断言自己的入参写错了**，不是被测代码：验「收方把密码头剥掉之后报的头长度」这条回退
+路径时，第三个参数传的是合成回应的 `ip_offset`（40），而回应里 LLC/SNAP 头在 32。匹配器先试
+`40+8=48` 再试 `40`，两处都不是 LLC/SNAP，于是必然返回 false。改成
+`ip_offset - K1_RTL8852BS_LLC_SNAP_HEADER_SIZE`（32）之后，第一次试 40 落空、第二次试 32
+命中，回退路径才真的被走到——**原来那条断言从来没有测到它声称要测的东西**。
+
+顺手补掉「20 条断言共用一个 errno」这个坑：函数里加一个 `stage`，每个 `goto error;` 前面记下
+`__LINE__`，错误行多打一个 ` stage=`。这样下一次失败直接指到源码行。用「把 bug 放回去重编」
+自测过它会打出非零 `stage`。
 
 #### 还没做的
 
@@ -6432,6 +6475,13 @@ STF_MODE 与 WDINFO_EN 在低位；`body3 = 0x2123` 是 `seq 0x123 | BK`；`0x14
 「离线模型全对 ＋ 数据队列收下了一帧、且当时确实装着成对密钥」；`dhcp-reply=` 是**报告而不是
 判据**，因为一台背后没有 DHCP 服务器的 AP 会把这一帧解得好好的却永远不回。等哪一次 run 真的
 拿到回应，那一行才是「本端发的保护帧被 AP 解开了」的证据，届时再决定要不要升成判据。
+
+**下一件该做的是把「队列收下了」和「MAC 真的发出去了」分开。** run 42 之后这两件事还是并在一起
+的：`status=0x0` 只说明描述符和帧被写进了队列。日志里已经有现成的手段——关联那一段打的
+`TX state …` 里带 `mactx-mpdu` / `mactx-dma` / `cmac-drop` / `dmac-drop`，把同一个 dump 挪到
+数据发送的前后各打一次，`mactx-mpdu` 的增量就能回答「MAC 有没有把这两个 MPDU 送出去」，
+两个 drop 计数能回答「有没有在 CMAC/DMAC 就被丢掉」。再往上才是 TX report（有没有被 ACK）。
+在拿到这个增量之前，不要把 run 42 说成「发出去了」——只能说「队列收下了，且当时装着成对密钥」。
 `wlan0` 的行为一个字节没变，没有 DHCP 客户端、没有联网——这一帧是驻留窗口自己拼出来的，不走
 网络栈。密钥的三层处理照旧（profile 留空、构建脚本从 `~/.config/k1-wifi-psk.env` 读、
 `out/k1-wpa` 不发布）；新增的打印里没有任何由密钥派生的值——打的是描述符的位、帧长、seq、
@@ -6440,9 +6490,13 @@ eMMC / SPI flash / eFuse / U-Boot 环境一个都没写。
 
 #### 构建
 
-- 带密钥：`9833e8cdfe16ccc5fceb9c89fa8db03630192b0aec36b40c289afe245b4d0fcf`
-  （`--clean` 与切回来的增量构建同一个哈希）
-- `--no-key`：`095e1663c421d9caf5de62944881e2886c05e5e54cfb1c6b944f253796f0610f`
+- 带密钥：`f5f37b62766e3b6e9bb7d64e36fa6f79b521a7dc551885ea9b3507e18a699efe`
+  （修掉那条断言、加上 `stage=` 之后的镜像，run 42 跑的就是它；`--no-key` 来回切一次之后
+  重新构建仍是同一个哈希）
+- `--no-key`：`d26f52a2fbfe53e7fdaec6850821d46273b50ecbfbf8ca283c7dd5a3dd3a08b3`
+- 修断言之前那两个（run 41b 跑的是第一个）：带密钥
+  `9833e8cdfe16ccc5fceb9c89fa8db03630192b0aec36b40c289afe245b4d0fcf`、`--no-key`
+  `095e1663c421d9caf5de62944881e2886c05e5e54cfb1c6b944f253796f0610f`
 
 顺带记一个环境坑：这次第一次构建整棵树都报 `unrecognized opcode 'csrr…', extension 'zicsr'
 required`。原因不是工具链，是**上一次用 ninja 单独编一个文件时触发了一次半途失败的 cmake

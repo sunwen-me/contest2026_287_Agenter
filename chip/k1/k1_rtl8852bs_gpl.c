@@ -21294,6 +21294,12 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   uint32_t offered = 0;
   uint64_t first_pn;
   uint64_t second_pn;
+
+  /* The source line of the check that refused the model, so a failure on the
+   * board names one assertion instead of one errno shared by twenty of them.
+   */
+
+  int stage = 0;
   int ret;
 
   buffer = kmm_malloc(2u * K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX +
@@ -21317,6 +21323,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
     0x0a0b0c0du, &frame_length, &header_length);
   if (ret < 0)
     {
+      stage = __LINE__;
       goto error;
     }
 
@@ -21331,6 +21338,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
       memcmp(frame + ip_offset, expect_ip, sizeof(expect_ip)) != 0)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21343,6 +21351,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
                                      K1_RTL8852BS_IPV4_HEADER_SIZE)) != 0)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21361,6 +21370,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
           frame + offset, frame_length - offset)) != 0)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21374,6 +21384,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
     K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
   if (ret < 0)
     {
+      stage = __LINE__;
       goto error;
     }
 
@@ -21400,6 +21411,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
       info0 != 0x40000400u || info1 != 0u || info2 != 0x00000d00u)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21413,6 +21425,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
       layout.required_ple_pages != 8u || layout.required_wde_pages != 1u)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21427,6 +21440,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
     K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
   if (ret < 0)
     {
+      stage = __LINE__;
       goto error;
     }
 
@@ -21436,6 +21450,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
                              K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8) != 0u)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21463,6 +21478,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
         K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE - 1u, &layout) != -EINVAL)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21472,6 +21488,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
         K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21481,6 +21498,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
         K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21495,6 +21513,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
         1ull, 0x0a0b0c0du, &frame_length, &header_length) != -EINVAL)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21508,6 +21527,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   if (first_pn != 1ull || second_pn != 2ull)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21533,6 +21553,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
     K1_RTL8852BS_CCMP_HEADER_SIZE);
   if (ret < 0)
     {
+      stage = __LINE__;
       goto error;
     }
 
@@ -21587,20 +21608,28 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
         0x0a0b0c0du, &offered) || offered != 0xc0a8017bu)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
-  /* Reached at the offset an unprotected frame would put its plaintext at,
-   * the same answer must still be read: the cipher header is not there, so the
-   * first placement fails to find an LLC/SNAP header and the second finds it.
+  /* Told that the header ends where the LLC/SNAP header begins -- which is
+   * what a receiver that stripped the cipher header reports -- the same answer
+   * must still be read: the first placement looks eight bytes past the
+   * LLC/SNAP header and misses, and the second lands on it.  That offset is
+   * the LLC/SNAP header's, not the reply's ip_offset: ip_offset is eight bytes
+   * further on, where neither placement finds an LLC/SNAP header at all, which
+   * is what this check asked for before and why it failed on the board.
    */
 
   offered = 0;
   if (!k1_rtl8852bs_runtime_dhcp_reply_match(
-        reply, reply_length, ip_offset, self, 0x0a0b0c0du, &offered) ||
+        reply, reply_length,
+        ip_offset - K1_RTL8852BS_LLC_SNAP_HEADER_SIZE, self, 0x0a0b0c0du,
+        &offered) ||
       offered != 0xc0a8017bu)
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21625,6 +21654,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
         K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, 0x0a0b0c0du, &offered))
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21634,6 +21664,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
         0x0a0b0c0du, &offered))
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21645,6 +21676,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
         0x0a0b0c0du, &offered))
     {
       ret = -EIO;
+      stage = __LINE__;
       goto error;
     }
 
@@ -21690,6 +21722,8 @@ error:
   kmm_free(buffer);
   k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX error=");
   k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts(" stage=");
+  k1_early_puthex((uintreg_t)stage);
   k1_early_puts("\r\n");
   return ret < 0 ? ret : -EIO;
 }
