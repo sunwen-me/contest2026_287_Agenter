@@ -807,8 +807,11 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   ccxrpt-tag-seen=0x6 offer-attempt=0x0 dhcp-reply=0x0 offer-ip=0x0`。两种填法都上了空口、
   都各自回了署名报告（`tag-seen` 的 bit 1 与 bit 2）、都 `tx-state=0`（被 AP ACK），
   **两种都没有换来 DHCP Offer**。结论：`AX_TXD_HDR_LLC_LEN` 不是原因；老注释的**结论**对，
-  **理由**不对，现在这个结论有板上证据了。同一轮**没有**改 `AX_TXD_BMC`（DHCP Discover 的
-  A1 是广播，原厂本来就置 1），以保证只有一个变量。
+  **理由**不对，现在这个结论有板上证据了。同一轮**没有**动 `AX_TXD_BMC`：本移植的
+  DHCP Discover 是 STA→AP，**A1 是 AP 的单播地址**（addr3 才是广播），所以 `info1=0`
+  一直没置这个位——正因为如此，3o 的 `tx-state=0 txcnt=1 ok=1` 才真的是 AP 的 ACK，
+  而不是广播帧那种「不等 ACK 也算成功」。原厂在 `info->bc || info->mc` 时才置它，
+  mainline 的 `rtw89_txrx.h` 干脆没有这个字段；置了反而有把安全引擎推向组密钥的风险。
   **同一轮另一条更有分量的读数在接收侧**：`data sec total=0x18 target=0x14 prot=0x18
   group=0x18 a1-match=0x0 hw-dec=0x14 sw-dec=0x4 icv=0x0 crc=0x0 dec=0x14`，且
   `llc-iv=0x14 llc-plain=0x0`——20 帧组播被**硬件**解开、**0 个 ICV 错**、每一份明文都以
