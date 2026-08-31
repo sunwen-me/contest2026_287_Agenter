@@ -6583,8 +6583,9 @@ resident window data tx sent=0x2 … status=0x0 tk=0x1 dhcp-reply=0x0 offer-ip=0
   也没有在 CMAC 或 DMAC 被丢。
 - **`dhcp-reply=0x0` 照旧，AP 没有回应。** 所以缺口现在被压缩到很窄的一段：帧离开了 MAC，但
   「AP 有没有收下并 ACK」和「AP 有没有用我们派生的密钥解开」这两件事日志里仍然没有证据。
-  下一步就是 TX report（C2H `0x0c`）——ACK 与重传次数在那里，那是唯一能把「发出去了」和
-  「对端收到了」分开的读数。
+  下一步就是 TX report——ACK 与重传次数在那里，那是唯一能把「发出去了」和「对端收到了」分开的
+  读数。（这里最初写成「C2H `0x0c`」，机制是错的；正确的是接收路径上的 rpkt type 6，见增量
+  3l。）
 - 同一个窗口 RX 侧：`total=0xe target=0xb prot=0xe group=0xd hw-dec=0xb sw-dec=0x3 icv=0x0
   crc=0x0 a1-match=0x0`——AP 的组播数据帧继续被硬件用本端装进去的 GTK 解开、零 ICV/CRC 错；
   `a1-match=0x0` 说明这个窗口里没有一帧是单播给本端的（ACK 不是数据帧，本来也不会出现在这里）。
@@ -6594,7 +6595,8 @@ resident window data tx sent=0x2 … status=0x0 tk=0x1 dhcp-reply=0x0 offer-ip=0
 **这一步只增加分辨率，不修任何东西**，而它劈出来的是两种情形里的第一种：
 
 - `mpdu` 有增量（**run 43 就是这一种**）：帧确实离开了 MAC。那么问题在更外层——有没有被 ACK
-  （TX report）、AP 有没有解开、AP 背后有没有 DHCP 服务器。下一步是 TX report（C2H `0x0c`）。
+  （TX report）、AP 有没有解开、AP 背后有没有 DHCP 服务器。下一步是 TX report（接收包类型 6，
+  不是 C2H；见增量 3l）。
 - `mpdu` 一直是 0：帧写进了队列却没出去，那会是新的第一号缺陷。`block` 和 `data-before` 那一行
   的 `macid-sleep=` / `macid-pause=` / `cmac-drop=` / `dmac-drop=` 直接说明是不是在提交那一刻
   就被拦住了；如果四个都是 0 而 `mpdu` 还是 0，那要往调度器（`R_AX_CTN_TXEN` 之外的 SCH 使能、
@@ -6617,6 +6619,138 @@ run 43 之后可以说的是「MAC 把这两个 MPDU 发出去了，速率 CCK 1
 关掉的那一份用的是把 `CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC` 那一行删掉的
 `config.h` 副本（放在一个更早的 `-I` 目录里），两边都没有告警——新加的静态函数调用在关掉诊断
 时也不会留下未使用的东西。
+
+### 增量 3l：把「MAC 发出去了」和「对端 ACK 了」分开——TX report 一直在来，是我们在丢
+
+run 43 之后缺口只剩一段：帧确实离开了 MAC（`mpdu=0x2 cck=0x2 block=0x0`，每次写
+`delta-mactx-mpdu=0x1 delta-mactx-dma=0x1`），但「有没有被 ACK」「重传了几次」「最终什么速率」
+三个读数一个都没有。这一节把它们取出来，而且**一行发送代码都没改**。
+
+#### 先更正一条写错的机制
+
+本文件和 handoff 此前都写「TX report（C2H `0x0c`）」，两处都错，读了原厂之后更正如下。
+
+- **TX report 不是 C2H，它是接收路径上自己的一种包类型。** mainline
+  `drivers/net/wireless/realtek/rtw89/core.h` 的 `enum rtw89_core_rx_type` 是
+  `WIFI=0, PPDU_STAT=1, CHAN_INFO=2, BB_SCOPE=3, F2P_TXCMD=4, SS2FW=5, TX_REPORT=6,
+  TX_REL_HOST=7, DFS_REPORT=8, TX_REL_CPU=9, C2H=10, …`。这个 4 位字段就是本 port 早就在解的
+  `K1_RTL8852BS_RXDESC_PACKET_TYPE_SHIFT 24` / `..._MASK 0xf`——也就是说本 port 一直在读它，
+  只认 0（空口帧）和 10（C2H）。
+- **不要去置 `AX_TXD_SPE_RPT`。** 本 port 的初始化表已经把 `R_AX_PTCLRPT_FULL_HDL` 的
+  `SPE_RPT_PATH` 写成 `WLCPU`（`K1_RTL8852BS_SPE_RPT_PATH_WLCPU`，与 mainline
+  `rtw89_mac.c` 的 `B_AX_SPE_RPT_PATH_MASK, FWD_TO_WLCPU` 一致）。在这种配置下请求 special
+  report 只会把报文送去固件，比现在离主机更远，是反方向的一步。
+- 固件转发的那一路确实存在，但用不上：C2H category `MAC`=`0x1`／class `MISC`=`0x9`／function
+  `CCXRPT`=`0x1`，内容是 `struct fwcmd_ccxrpt` 六个 dword（原厂 `fwcmd_intf.h`）。既然主机侧
+  这一路已经直达，就不必绕固件。
+- 顺带排除掉两个看着像的：`FWCMD_C2H_FUNC_USR_TX_RPT_INFO 0x7` 是按 AC 统计排队时延和待发字节
+  的报表，不是逐帧 ACK 状态；`enum mac_ax_pkt_t`（`mac_def.h`，C2H=6、PPDU=7）是原厂的软件抽
+  象，**和线上编码不是一套**，照它去认 6 会把 C2H 当成 TX report。
+
+#### 证据：硬件一直在报告本端自己的发送
+
+run 43 的扫描窗口本来就打了一个分类型直方图（`passive scan rpkt types=`）。13 个窗口里 type 6
+只在三处非零——**22、5、27**——而那正好是本 port 发过管理帧的三个窗口（第一处那个窗口里就有两行
+`auth request tx … status=0x0`）；其余十个窗口一个都没有。也就是说硬件从一开始就在报告本端的
+发送结果，而驻留数据窗口的接收排空只对 `frame.packet_type == 0` 做事，其他类型连计数都没有，
+直接丢掉。所以这一步缺的不是硬件机制，只是解析。
+
+#### 报文体：六个 dword
+
+字段表来自原厂 `phi/hal_g6/mac/mac_ax/mac_8852b/mac_txccxrpt.h`（按 blob sha 单文件下载，未入
+库），语义来自 `fwofld.c` 的 `mac_ccxrpt_parsing()` 与 `get_ccxrpt_event()`——两者都把 word0
+当偏移 0、word3 当偏移 12 读，这同时说明报文体就从载荷偏移 0 开始，前面没有额外包头。
+
+| dword | 用到的字段 |
+| --- | --- |
+| 0 | `RPT_SEL` [4:0]、`POLLUTED` BIT(5)、`TX_STATE` [7:6]、`SW_DEFINE` [11:8]、`MACID` [22:16]、`QSEL` [29:24] |
+| 1 | `QUEUE_TIME` [15:0]、`ACCTXTIME` [23:16] |
+| 2 | `FINAL_RATE` [8:0]、`DATA_BW` [13:12]、`FINAL_RTS_RATE` [24:16] |
+| 3 | `TOTAL_PKT_NUM` [7:0]、`DATA_TX_CNT` [13:8]、`PKT_OK_NUM` [23:16]、`RTS_TX_COUNT` [29:24] |
+| 4 | `INIT_RATE` [8:0]、`PPDU_TYPE` [13:12]、`SU_TXPWR` [21:16] |
+| 5 | `USER_DEFINE` [7:0]、`FW_DEFINE` [15:8]、`TXPWR_PD` [20:16] |
+
+**关键的一条**：`get_ccxrpt_event()` 在 `tx_state` 为 0 时报 `MSG_EVT_CCX_REPORT_TX_OK`，非零
+时报 `MSG_EVT_CCX_REPORT_TX_FAIL`。所以 `tx-state=0` 就是原厂自己的「对端 ACK 了这一帧」，
+这正是 MAC 计数器给不出的那个读数：计数器说帧出去了，不说有人回。
+
+#### 这一节加了什么
+
+- `K1_RTL8852BS_RXDESC_PACKET_TYPE_TXRPT 6` 与一整套 `K1_RTL8852BS_TXRPT_*` 位移／掩码，从上面
+  那张表抄下来，注释里写清来源（原厂头文件、`fwofld.c` 的两个解析函数、mainline 的枚举）。
+- 驻留窗口计数结构里八个计数（`txrpt`、`txrpt_short`、`txrpt_self`、`txrpt_ok`、`txrpt_fail`、
+  `txrpt_data`、`txrpt_data_ok`、`txrpt_data_fail`）和两份原始报文（第一份、以及 Discover 写
+  出去之后的第一份），各六个 dword 原样留着。
+- `k1_rtl8852bs_runtime_resident_observe_txrpt()`：从排空里按类型 6 调用，**只计数不打印**。
+  长度不足 24 字节的只加 `txrpt_short` 并且不解码，所以「类型对、长度不对」的包不可能被静悄悄
+  地读错。打印一律推到关窗之后——115200 下一行 150 字符约 13 ms，窗口里那点 dwell 不能这么花。
+- 关窗后两组行：`resident window txrpt first …` 和 `… data …`，每组先打六个原始 dword
+  （`raw=` 用八位十六进制的 `put_word`，比 `puthex` 的十六位窄一半），再打解出来的
+  `sel/polluted/tx-state/sw/macid/qsel/qtime/rate/pkt/txcnt/ok/rts`。**原始值和解码值同时打**，
+  是因为字段表是从原厂头文件抄的、还没在这块硬件上验证过；解码和它自己的输入对不上时，日志里
+  看得出来，而不是被相信。
+- 汇总行 `resident window data tx …` 在 `block=` 后面追加
+  ` txrpt= txrpt-self= txrpt-ok= txrpt-fail= txrpt-dat= txrpt-dat-ok= txrpt-dat-fail=
+  txrpt-short=`（追加在末尾，不动既有字段的相对顺序，harness 的 ` tk=` 紧跟 `status=` 的约定
+  照旧成立）。
+
+归属做了两道限制。一是 `macid` 必须等于本 port 的 MACID 0——硬件也会为它自己发的帧报告；两条
+发送路径（管理帧 20078、数据帧 21164）用的都是这一个 MACID，所以两者都收得到。二是
+`txrpt-dat*` 只统计 Discover 已经写出去之后到的报文，否则本窗口那一帧定向 Probe Request 的
+ACK 会被当成保护数据帧的 ACK。
+
+#### 怎么读这几个数
+
+- **先看 `first` 那一份，它是自校准。** 它属于本窗口的定向 Probe Request，而这个窗口的判据本来
+  就要求收到 Probe Response——那一帧 AP 确实回了。所以它的 `tx-state` 必须是 0；**如果不是 0，
+  说明字段表对不上，而不是发送失败**。同时 `macid` 应当是 0，`qsel` 应当是 `0x12`（B0MG）。
+- 再看 `data` 那一份：`qsel` 应当是 0（B0BE），`tx-state=0` 就是「AP 的 MAC ACK 了这个加密
+  帧」。`txcnt` 是数据重传次数，`rate` 是最终速率（这条路要的是 CCK 1M），`qtime` 是排队时间。
+- `txrpt-dat-ok` 大于 0 ⇒ 帧被 ACK 了，剩下的故障在 MAC 之上（AP 解不开、PN/keyid、或者 AP
+  背后没有 DHCP 服务器）。`txrpt-dat-fail` 大于 0 而 ok 为 0 ⇒ 重传耗尽都没人回，问题落回
+  速率／功率／寻址。
+- `txrpt-short` 应当是 0；不为 0 说明类型 6 的载荷不是 24 字节，那时上面的解码一概不可信。
+- 提醒一句 run 43 已经证明的事：那一次**四次握手是成功的**（`WPA2 four-way handshake complete`,
+  AP 用 Msg3 回了我们的 Msg2），所以「AP 收得到本端的帧」这件事对**未加密**帧早就成立了。
+  真正未知的只有「CCMP 加密的 Discover 有没有被 ACK」这一段，`tx-state` 就是它。
+
+#### 判据
+
+harness 在既有的 `--require-runtime-data-secure-tx` 里加了一条：驻留窗口那行必须带齐全部八个
+`txrpt` 字段。这些字段是无条件打印的，所以这条检查说的是「这个仪器跑了」；**数值只打到
+stderr（`[serial] transmit reports: total=… self=… ok=… fail=… data=… data-ok=… data-fail=…
+short=…`）和两行解码回显，不作判据**——理由和 3k 的计数器、和 `dhcp-reply` 一样：「重传耗尽」
+正是这个仪器要能看见的读数，不是让这次运行失败的理由。新检查挂在已有的开关里面，没有新增开关，所以 `run_k1_wpa.sh`
+带的 `--require-*` 数量仍是 **37**。
+
+自测：把 harness 用 `ast` 解析出来、`literal_eval` 出真正的正则，拿去跑合成行与真实日志。合成
+的汇总行匹配、8 个捕获组取值正确；3k 的两条在同一行上仍然匹配；**把 ` txrpt=` 之后截掉的旧版
+汇总行匹配不到新判据**（负例）；两行解码回显各自匹配。真实日志一侧，run 43
+（`k1-wpa-20260831T040606Z.log`）3k 的两条仍过、新的这条不过——它跑的镜像还没有这些字段，正
+是应该的。
+
+#### 构建
+
+- 带密钥：`ad957aef8313432016af770db57278590cc9bf78a44411d36682ec920339b47a`
+  （`--no-key` 来回切一次之后重新构建仍是同一个哈希）
+- `--no-key`：`03c8236d60c8de1ad60647720950070e5c04f3f68a368853fc9f244e5ef1c6ba`
+
+两个配置（驻留诊断开与关）都用 `compile_commands.json` 里的命令行加 `-fsyntax-only` 过了一遍，
+关掉的那一份用把 `CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC` 删掉的 `config.h` 副本
+（放在一个更早的 `-I` 目录里），两边都干净：新加的两个静态函数都在同一个诊断 `#ifdef` 里，关掉
+时不会留下未使用的东西。
+
+`wlan0` 一个字节没变；打出来的是报文的原始 dword 和解出来的发送状态／重传次数／速率／队列，
+都不是凭证。仍然是 RAM-only：eMMC / SPI flash / eFuse / U-Boot 环境一个都没写。
+
+#### 还没做的
+
+上板 run 44 还没跑，所以这一节现在只有代码和判据，没有读数。跑完之后要先确认 `first` 那份的
+`tx-state=0`（字段表对得上），再看 `data` 那份。万一 type 6 的报文只覆盖管理帧而不覆盖数据帧
+（`txrpt-dat=0` 而 `txrpt-self` 不为 0），备用方案是给数据帧描述符置 `AX_TXD_SPE_RPT`
+（dword9 BIT(10)，即 WD INFO `dword3`）加 `AX_TXD_SW_DEFINE` [3:0] 作标签，**并且**要么把
+`R_AX_PTCLRPT_FULL_HDL` 的 `SPE_RPT_PATH` 从 `WLCPU` 改开，要么在 C2H 分发里认
+cat `0x1`／class `0x9`／func `0x1`。
 
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 

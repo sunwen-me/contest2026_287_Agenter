@@ -2163,6 +2163,57 @@ def main() -> int:
                     f"{int(data_secure_counters.group(2), 16)} block="
                     f"{int(data_secure_counters.group(3), 16)}",
                     file=sys.stderr)
+
+            # And the fourth question, which is the one the counters still
+            # cannot answer: whether anything acknowledged the frame the MAC
+            # emitted.  The hardware answers it in a transmit report, and the
+            # summary prints what the window collected unconditionally, so the
+            # fields being present is what says this instrument ran.  Their
+            # values are printed and not required for the same reason as the
+            # counters above: a report that says the retries ran out is the
+            # reading this was added to be able to see.
+            data_secure_txrpt_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window data tx [^\r\n]*"
+                rb" txrpt=(?:0x)?([0-9a-fA-F]+)"
+                rb" txrpt-self=(?:0x)?([0-9a-fA-F]+)"
+                rb" txrpt-ok=(?:0x)?([0-9a-fA-F]+)"
+                rb" txrpt-fail=(?:0x)?([0-9a-fA-F]+)"
+                rb" txrpt-dat=(?:0x)?([0-9a-fA-F]+)"
+                rb" txrpt-dat-ok=(?:0x)?([0-9a-fA-F]+)"
+                rb" txrpt-dat-fail=(?:0x)?([0-9a-fA-F]+)"
+                rb" txrpt-short=(?:0x)?([0-9a-fA-F]+)",
+                data_secure,
+            )
+            if data_secure_txrpt_result is None:
+                missing.append(
+                    "RTL8852BS2 transmit reports collected across a "
+                    "protected data write")
+            else:
+                values = [int(group, 16)
+                          for group in data_secure_txrpt_result.groups()]
+                print(
+                    "[serial] transmit reports: total={0} self={1} ok={2} "
+                    "fail={3} data={4} data-ok={5} data-fail={6} "
+                    "short={7}".format(*values),
+                    file=sys.stderr)
+
+            # The decoded reports themselves.  The first one belongs to a
+            # management frame the access point answered inside the same
+            # window, so a transmit state that is not zero there says the
+            # field map is wrong rather than that a transmission failed, and
+            # that distinction is worth seeing before the data report is read.
+            for phase in (b"first", b"data"):
+                decoded = re.search(
+                    rb"K1 Wi-Fi GPL: resident window txrpt " + phase +
+                    rb" (sel=[^\r\n]*)",
+                    data_secure,
+                )
+                if decoded is not None:
+                    print(
+                        "[serial] transmit report "
+                        f"{phase.decode()}: "
+                        f"{decoded.group(1).decode('ascii', 'replace')}",
+                        file=sys.stderr)
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

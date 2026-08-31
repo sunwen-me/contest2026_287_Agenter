@@ -1443,6 +1443,53 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RXDESC_ADDR_CAM_VALID      (1u << 28)
 #define K1_RTL8852BS_RXDESC_SEC_TYPE_SHIFT      17u
 #define K1_RTL8852BS_RXDESC_SEC_TYPE_MASK       0xfu
+
+/* The report the hardware sends back once it has finished with a frame this
+ * host asked it to transmit.  It arrives on the receive path as a packet type
+ * of its own -- rpkt_type 6, RTW89_CORE_RX_TYPE_TX_REPORT in mainline's
+ * enum rtw89_core_rx_type, the same enumeration whose 0 and 10 this path
+ * already depends on for air frames and for C2H -- and its body is the six
+ * words the vendor tree lays out in mac_8852b/mac_txccxrpt.h and reads back
+ * in fwofld.c's mac_ccxrpt_parsing() and get_ccxrpt_event(): word 0 for the
+ * transmit state, the software tag and the MACID, word 3 for the two packet
+ * counts.  A transmit state of zero is that same file's own test for a frame
+ * the peer acknowledged, and that is the one reading the MAC's transmit
+ * counters cannot give.  They say a frame left the MAC; they do not say
+ * anybody answered it.
+ *
+ * Run 43's log is the evidence that these reports already arrive.  The scan
+ * window's per-type histogram counted 22, 5 and 27 packets of type 6 in
+ * exactly the three windows this port transmitted management frames in, and
+ * none in any other window, so the hardware has been reporting on this
+ * port's own transmissions all along while the receive drain discarded them.
+ * Nothing in the descriptor or in the report path has to be switched on for
+ * this; only the discarding has to stop.
+ */
+
+#define K1_RTL8852BS_RXDESC_PACKET_TYPE_TXRPT   6u
+#define K1_RTL8852BS_TXRPT_WORDS                6u
+#define K1_RTL8852BS_TXRPT_SIZE                 (K1_RTL8852BS_TXRPT_WORDS * 4u)
+#define K1_RTL8852BS_TXRPT_RPT_SEL_MASK         0x1fu
+#define K1_RTL8852BS_TXRPT_POLLUTED             (1u << 5)
+#define K1_RTL8852BS_TXRPT_TX_STATE_SHIFT       6u
+#define K1_RTL8852BS_TXRPT_TX_STATE_MASK        0x3u
+#define K1_RTL8852BS_TXRPT_TX_STATE_OK          0u
+#define K1_RTL8852BS_TXRPT_SW_DEFINE_SHIFT      8u
+#define K1_RTL8852BS_TXRPT_SW_DEFINE_MASK       0xfu
+#define K1_RTL8852BS_TXRPT_MACID_SHIFT          16u
+#define K1_RTL8852BS_TXRPT_MACID_MASK           0x7fu
+#define K1_RTL8852BS_TXRPT_QSEL_SHIFT           24u
+#define K1_RTL8852BS_TXRPT_QSEL_MASK            0x3fu
+#define K1_RTL8852BS_TXRPT_QUEUE_TIME_MASK      0xffffu
+#define K1_RTL8852BS_TXRPT_FINAL_RATE_MASK      0x1ffu
+#define K1_RTL8852BS_TXRPT_TOTAL_PKT_NUM_MASK   0xffu
+#define K1_RTL8852BS_TXRPT_DATA_TX_CNT_SHIFT    8u
+#define K1_RTL8852BS_TXRPT_DATA_TX_CNT_MASK     0x3fu
+#define K1_RTL8852BS_TXRPT_PKT_OK_NUM_SHIFT     16u
+#define K1_RTL8852BS_TXRPT_PKT_OK_NUM_MASK      0xffu
+#define K1_RTL8852BS_TXRPT_RTS_TX_COUNT_SHIFT   24u
+#define K1_RTL8852BS_TXRPT_RTS_TX_COUNT_MASK    0x3fu
+
 #define K1_RTL8852BS_IEEE80211_TYPE_MASK        0x3u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_SHIFT    4u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_MASK     0xfu
@@ -25073,6 +25120,37 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t data_tx_mpdu;
   uint32_t data_tx_cck;
   uint32_t data_tx_block;
+
+  /* What the hardware reported back about the frames it transmitted.  txrpt
+   * counts every transmit report the window received and txrpt_short the ones
+   * too small to be one, which are counted and not decoded so a packet of the
+   * right type and the wrong size can never be read as a report.  txrpt_self
+   * is the subset carrying this port's own MACID, split by the report's
+   * transmit state into txrpt_ok -- the peer acknowledged it -- and
+   * txrpt_fail.
+   *
+   * The txrpt_data set is the same split restricted to reports that arrived
+   * after a Discover had been written, so an acknowledgement of the window's
+   * own Probe Request is not read as an acknowledgement of the protected data
+   * frame.  txrpt_first and txrpt_data_first keep the six raw words of the
+   * first report of each kind, which is what makes the decode checkable: the
+   * Probe Request in txrpt_first is a frame the access point demonstrably
+   * answered, so a transmit state that is not zero there says the field map
+   * is wrong rather than that the transmission failed.
+   */
+
+  uint32_t txrpt;
+  uint32_t txrpt_short;
+  uint32_t txrpt_self;
+  uint32_t txrpt_ok;
+  uint32_t txrpt_fail;
+  uint32_t txrpt_data;
+  uint32_t txrpt_data_ok;
+  uint32_t txrpt_data_fail;
+  uint32_t txrpt_first[K1_RTL8852BS_TXRPT_WORDS];
+  uint32_t txrpt_data_first[K1_RTL8852BS_TXRPT_WORDS];
+  bool txrpt_first_valid;
+  bool txrpt_data_first_valid;
   uint16_t data_tx_sequence;
   int data_tx_status;
 };
@@ -26045,6 +26123,164 @@ static int k1_rtl8852bs_runtime_sch_tx_en_data(void)
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_txrpt_log
+ *
+ * Description:
+ *   One transmit report, raw and decoded on the same line.  The six words are
+ *   printed alongside the fields taken out of them because the field map is
+ *   read from the vendor header and has not yet been confirmed against this
+ *   hardware: a decode that contradicts its own input is then visible in the
+ *   log instead of believed.  This runs after the window has closed, never
+ *   inside it, because a line this long costs milliseconds of dwell.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_txrpt_log(FAR const char *phase,
+                                           FAR const uint32_t *word)
+{
+  unsigned int index;
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window txrpt ");
+  k1_early_puts(phase);
+  k1_early_puts(" raw=");
+  for (index = 0; index < K1_RTL8852BS_TXRPT_WORDS; index++)
+    {
+      if (index != 0)
+        {
+          k1_early_puts(",");
+        }
+
+      k1_rtl8852bs_runtime_put_word(word[index]);
+    }
+
+  k1_early_puts("\r\n");
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window txrpt ");
+  k1_early_puts(phase);
+  k1_early_puts(" sel=");
+  k1_early_puthex(word[0] & K1_RTL8852BS_TXRPT_RPT_SEL_MASK);
+  k1_early_puts(" polluted=");
+  k1_early_puthex((word[0] & K1_RTL8852BS_TXRPT_POLLUTED) != 0 ? 1 : 0);
+  k1_early_puts(" tx-state=");
+  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_TX_STATE_SHIFT) &
+                  K1_RTL8852BS_TXRPT_TX_STATE_MASK);
+  k1_early_puts(" sw=");
+  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_SW_DEFINE_SHIFT) &
+                  K1_RTL8852BS_TXRPT_SW_DEFINE_MASK);
+  k1_early_puts(" macid=");
+  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_MACID_SHIFT) &
+                  K1_RTL8852BS_TXRPT_MACID_MASK);
+  k1_early_puts(" qsel=");
+  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_QSEL_SHIFT) &
+                  K1_RTL8852BS_TXRPT_QSEL_MASK);
+  k1_early_puts(" qtime=");
+  k1_early_puthex(word[1] & K1_RTL8852BS_TXRPT_QUEUE_TIME_MASK);
+  k1_early_puts(" rate=");
+  k1_early_puthex(word[2] & K1_RTL8852BS_TXRPT_FINAL_RATE_MASK);
+  k1_early_puts(" pkt=");
+  k1_early_puthex(word[3] & K1_RTL8852BS_TXRPT_TOTAL_PKT_NUM_MASK);
+  k1_early_puts(" txcnt=");
+  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_DATA_TX_CNT_SHIFT) &
+                  K1_RTL8852BS_TXRPT_DATA_TX_CNT_MASK);
+  k1_early_puts(" ok=");
+  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_PKT_OK_NUM_SHIFT) &
+                  K1_RTL8852BS_TXRPT_PKT_OK_NUM_MASK);
+  k1_early_puts(" rts=");
+  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_RTS_TX_COUNT_SHIFT) &
+                  K1_RTL8852BS_TXRPT_RTS_TX_COUNT_MASK);
+  k1_early_puts("\r\n");
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_observe_txrpt
+ *
+ * Description:
+ *   Account for one transmit report out of the receive drain.  Nothing is
+ *   printed here -- the window is still open -- only counted, with the first
+ *   report and the first report that followed a Discover kept whole so both
+ *   can be read out afterwards.
+ *
+ *   A report is attributed to this port only when it carries this port's
+ *   MACID, and to the protected data frame only when it arrived after one was
+ *   written.  Both restrictions matter: the hardware reports on frames it
+ *   sends on its own behalf as well, and the window transmits a Probe Request
+ *   before it transmits any data.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_resident_observe_txrpt(
+              FAR const uint8_t *payload, size_t length,
+              FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  uint32_t word[K1_RTL8852BS_TXRPT_WORDS];
+  unsigned int index;
+  unsigned int macid;
+  unsigned int state;
+  bool mine;
+
+  count->txrpt++;
+
+  if (payload == NULL || length < K1_RTL8852BS_TXRPT_SIZE)
+    {
+      count->txrpt_short++;
+      return;
+    }
+
+  for (index = 0; index < K1_RTL8852BS_TXRPT_WORDS; index++)
+    {
+      word[index] = k1_rtl8852bs_read_le32(payload + index * 4u);
+    }
+
+  if (!count->txrpt_first_valid)
+    {
+      memcpy(count->txrpt_first, word, sizeof(word));
+      count->txrpt_first_valid = true;
+    }
+
+  macid = (word[0] >> K1_RTL8852BS_TXRPT_MACID_SHIFT) &
+          K1_RTL8852BS_TXRPT_MACID_MASK;
+  state = (word[0] >> K1_RTL8852BS_TXRPT_TX_STATE_SHIFT) &
+          K1_RTL8852BS_TXRPT_TX_STATE_MASK;
+  mine = macid == K1_RTL8852BS_MGMT_TX_MACID;
+
+  if (!mine)
+    {
+      return;
+    }
+
+  count->txrpt_self++;
+  if (state == K1_RTL8852BS_TXRPT_TX_STATE_OK)
+    {
+      count->txrpt_ok++;
+    }
+  else
+    {
+      count->txrpt_fail++;
+    }
+
+  if (count->data_tx_sent == 0)
+    {
+      return;
+    }
+
+  count->txrpt_data++;
+  if (state == K1_RTL8852BS_TXRPT_TX_STATE_OK)
+    {
+      count->txrpt_data_ok++;
+    }
+  else
+    {
+      count->txrpt_data_fail++;
+    }
+
+  if (!count->txrpt_data_first_valid)
+    {
+      memcpy(count->txrpt_data_first, word, sizeof(word));
+      count->txrpt_data_first_valid = true;
+    }
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_data_tx
  *
  * Description:
@@ -26534,6 +26770,19 @@ static int k1_rtl8852bs_runtime_resident_window(
               break;
             }
 
+          /* A transmit report is the one packet in this stream that is about
+           * this port's own transmission rather than about what the air
+           * carried, so it is taken out before the air frames are looked at.
+           * Counting only: the window is still open and every character
+           * printed inside it costs dwell.
+           */
+
+          if (frame.packet_type == K1_RTL8852BS_RXDESC_PACKET_TYPE_TXRPT)
+            {
+              k1_rtl8852bs_runtime_resident_observe_txrpt(
+                buffer + frame.payload_offset, frame.payload_length, &count);
+            }
+
           /* The security accounting runs first, and without the error gate,
            * because a protected frame whose integrity check failed is one of
            * the readings it exists to collect.
@@ -26785,6 +27034,18 @@ static int k1_rtl8852bs_runtime_resident_window(
    * dropped, which is the first thing to look at when mpdu stays zero.  Like
    * dhcp-reply these are reported and not required, because what they read on
    * hardware is exactly what is not yet known.
+   *
+   * The txrpt fields close the gap those counters leave.  mpdu says the frame
+   * left the MAC; a transmit report says whether anything answered it.
+   * txrpt-self is how many reports carried this port's MACID, txrpt-ok how
+   * many of those reported a transmit state of zero -- the vendor's own test
+   * for an acknowledged transmission -- and the txrpt-dat trio is the same
+   * split for the reports that arrived after the Discover was written.  So
+   * txrpt-dat-ok above zero means the access point's MAC acknowledged the
+   * encrypted frame and any remaining fault is above the MAC, while
+   * txrpt-dat-fail says the retries ran out with no acknowledgement, which
+   * points instead at rate, power or addressing.  txrpt-short counts packets
+   * of the report type that were too small to decode, and it should be zero.
    */
 
   k1_early_puts("K1 Wi-Fi GPL: resident window data tx sent=");
@@ -26810,7 +27071,40 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.data_tx_cck);
   k1_early_puts(" block=");
   k1_early_puthex(count.data_tx_block);
+  k1_early_puts(" txrpt=");
+  k1_early_puthex(count.txrpt);
+  k1_early_puts(" txrpt-self=");
+  k1_early_puthex(count.txrpt_self);
+  k1_early_puts(" txrpt-ok=");
+  k1_early_puthex(count.txrpt_ok);
+  k1_early_puts(" txrpt-fail=");
+  k1_early_puthex(count.txrpt_fail);
+  k1_early_puts(" txrpt-dat=");
+  k1_early_puthex(count.txrpt_data);
+  k1_early_puts(" txrpt-dat-ok=");
+  k1_early_puthex(count.txrpt_data_ok);
+  k1_early_puts(" txrpt-dat-fail=");
+  k1_early_puthex(count.txrpt_data_fail);
+  k1_early_puts(" txrpt-short=");
+  k1_early_puthex(count.txrpt_short);
   k1_early_puts("\r\n");
+
+  /* The reports themselves, once the window is closed.  The first one is the
+   * calibration: it belongs to a management frame the access point answered
+   * within this same window, so its transmit state has to read zero for the
+   * decode to be trustworthy at all.  The second belongs to the protected
+   * data frame, and it is the reading this increment exists for.
+   */
+
+  if (count.txrpt_first_valid)
+    {
+      k1_rtl8852bs_runtime_txrpt_log("first", count.txrpt_first);
+    }
+
+  if (count.txrpt_data_first_valid)
+    {
+      k1_rtl8852bs_runtime_txrpt_log("data", count.txrpt_data_first);
+    }
 
   /* The verdict names the earliest thing that was wrong, so a run reads as
    * one cause rather than as a list.  A register that moved comes first

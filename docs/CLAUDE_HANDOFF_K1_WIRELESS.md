@@ -641,12 +641,48 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   （含「run 42 那份日志过不了新判据」这条负例）。两个配置（驻留诊断开／关）`-fsyntax-only` 干净。
   镜像：带密钥 `ffd8bd0b…`（run 43 跑的就是它，`--no-key` 来回切后重建同哈希）、
   `--no-key` `f4696d5c…`。
-  **下一步优先级**：(1) **TX report（C2H `0x0c`）——把「MAC 发出去了」和「对端收到了」分开**。
+- **已写好未上板（增量 3l）：把驻留窗口里一直被丢掉的 TX report 解出来。**
+  机制先更正：TX report **不是 C2H `0x0c`**，而是接收路径上自己的一种包类型 —— rpkt type 6
+  （mainline `enum rtw89_core_rx_type` 的 `TX_REPORT=6`；本 port 早就在解这个 4 位字段，只认
+  0 和 10）。报文体是原厂 `mac_8852b/mac_txccxrpt.h` 的六个 dword，语义按 `fwofld.c` 的
+  `mac_ccxrpt_parsing()` / `get_ccxrpt_event()`：**`tx_state == 0` 就是原厂自己的「对端 ACK
+  了」**。同样更正：**不要**置 `AX_TXD_SPE_RPT`，本 port 已经把 `R_AX_PTCLRPT_FULL_HDL` 的
+  `SPE_RPT_PATH` 配成 `WLCPU`，请求 special report 只会把它送去固件。
+  run 43 的日志本身就是「硬件一直在报、是我们在丢」的证据：扫描窗口的类型直方图在本端发过管理帧
+  的三个窗口里数到 **22／5／27** 个 type 6，其余十个窗口全 0，而驻留窗口的排空只对
+  `packet_type == 0` 做事。
+  这一步**不改任何发送行为**：新增类型 6 常量与 `K1_RTL8852BS_TXRPT_*` 字段表、驻留计数结构里
+  八个计数、`k1_rtl8852bs_runtime_resident_observe_txrpt()`（排空里只计数，不足 24 字节的只记
+  `txrpt_short` 不解码），打印全部推到关窗之后（窗口里一行 150 字符约 13 ms）：
+  `resident window txrpt first …` 与 `… data …`，每组先六个原始 dword 再打解码字段，
+  汇总行 `resident window data tx …` 行尾追加
+  ` txrpt= txrpt-self= txrpt-ok= txrpt-fail= txrpt-dat= txrpt-dat-ok= txrpt-dat-fail=
+  txrpt-short=`。归属两道限制：`macid` 必须是本端 MACID 0（两条发送路径都用它），`txrpt-dat*`
+  只统计 Discover 写出去之后到的报文。
+  **自校准**：`first` 那一份属于本窗口的定向 Probe Request，而判据本来就要求收到 Probe
+  Response，所以它的 `tx-state` 必须是 0；不是 0 就说明字段表对不上，而不是发送失败
+  （`qsel` 应当是 `0x12` B0MG，数据帧那份应当是 0 B0BE）。
+  判据数仍是 **37**（新检查挂在 `--require-runtime-data-secure-tx` 里面，只卡「八个 txrpt 字段
+  都在」＝仪器跑了；数值只在 stderr 打印）。正则自测：合成汇总行匹配、8 个捕获组正确，3k 的两条
+  仍匹配，**截掉 ` txrpt=` 之后的旧行匹配不到新判据**；真实日志 run 43 上 3k 两条过、新的这条
+  不过（那份镜像还没有这些字段），正是应该的。两个配置 `-fsyntax-only` 干净。
+  镜像：带密钥 `ad957aef…`（`--no-key` 来回切后重建同哈希）、`--no-key` `03c8236d…`。
+  **下一步就是上板 run 44**：先确认 `first` 的 `tx-state=0`，再读 `data` 那一份。
+  **下一步优先级**：(1) **TX report ——把「MAC 发出去了」和「对端收到了」分开**（增量 3l）。
   run 43 之后缺口只剩这一段：帧离开了 MAC，但 ACK、重传次数、最终速率都还看不到，而这三个读数
-  在 TX report 里。做法是给这两帧的描述符置上「要 TX report」的位（原厂 `mac_ax_tx_desc` 的
-  `spe_rpt`/`tx_status` 那一路），并在 C2H 分发里认 `0x0c`，把 `tx_state`／`retry_cnt`／
-  `data_rate` 打出来。拿到 `tx_state=0`（成功）就等于「AP ACK 了这一帧」，那时才第一次有
-  「本端发的保护帧被对端收下」的证据；拿到失败 ＋ 重传耗尽，问题就落回 AP 侧或速率/功率。
+  在 TX report 里。**这里原来写的机制是错的，读了原厂之后已更正**：TX report 不是 C2H
+  `0x0c`，而是接收路径上自己的一种包类型 —— rpkt type 6（mainline
+  `enum rtw89_core_rx_type` 的 `RTW89_CORE_RX_TYPE_TX_REPORT`），报文体就是原厂
+  `mac_8852b/mac_txccxrpt.h` 那六个 dword，`fwofld.c` 的 `mac_ccxrpt_parsing()` /
+  `get_ccxrpt_event()` 读的是 word0（`tx_state`／`sw_define`／`macid`）和 word3（两个包
+  计数），并且以 `tx_state == 0` 作为「对端 ACK 了」的判据。同样地，**不要**去置
+  `AX_TXD_SPE_RPT`：本 port 已经把 `R_AX_PTCLRPT_FULL_HDL` 的 `SPE_RPT_PATH` 配成
+  `WLCPU`，请求 special report 只会把它送去固件而不是主机。更要紧的是 run 43 的日志本身就
+  证明**这些报文一直在来**：扫描窗口的分类型直方图在本端发过管理帧的那三个窗口里分别数到
+  22／5／27 个 type 6，其他窗口一个都没有，也就是说硬件一直在报告本端自己的发送，而驻留窗口
+  的接收排空一直把它们丢掉。所以这一步不需要新开任何硬件机制，只要停止丢弃。拿到
+  `tx_state=0` 就等于「AP ACK 了这一帧」，那时才第一次有「本端发的保护帧被对端收下」的证据；
+  拿到失败 ＋ 重传耗尽，问题就落回 AP 侧或速率/功率。
   发送这一路的代码本身已经全部写完并上板：帧、48 字节描述符、PN 计数器、回应匹配器、驻留窗口里
   的两次发送；描述符的安全字段与 CCMP 头在 run 40 确认过，RX 侧那一半在 run 39（单播 PTK）与
   run 42（13 帧组播 GTK，`hw-dec=0xd icv=0x0`）证明过。密钥在硬件里（3f）、port 使能（3g）、
@@ -791,13 +827,14 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是 TX report（C2H `0x0c`）：把「MAC 发出去了」和「对端收到了」分开**——密钥已经在
+**当前实际下一步是 TX report（接收包类型 6）：把「MAC 发出去了」和「对端收到了」分开**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
 描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 43 更进一步证明
 **MAC 真的把那两个 CCMP 保护帧发出去了**（增量 3k：`mpdu=0x2 cck=0x2 block=0x0`，每次写
 `delta-mactx-mpdu=0x1 delta-mactx-dma=0x1`）。但**发出去不等于对端收到了，更不等于 AP 解开了**
 （`dhcp-reply=0x0`），所以到目前为止仍然没有「本端发出的 CCMP 帧被对端收下／解开」的证据；
-ACK 与重传次数只有 TX report 能给。
+ACK 与重传次数只有 TX report 能给。**增量 3l 的代码已经写好**（解接收路径上的 rpkt type 6，
+不是 C2H），还没上板，所以下一件事就是 run 44。
 反过来，**接收侧的 CCMP 解密在真实空口上已经成立**：run 39 是单播 PTK、run 42 是 13 帧组播 GTK
 （`hw-dec=0xd icv=0x0 crc=0x0`）。增量 3h 本身（不跑扫描的驻留收发窗口）
 已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题
