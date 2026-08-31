@@ -329,7 +329,9 @@ def parse_args() -> argparse.Namespace:
         help=("fail unless the reader that decides whether a frame came back "
               "out of MAC loopback as ciphertext or as the plaintext that was "
               "submitted agrees with its offline model, and the resident "
-              "window reports what its own looped frame carried"),
+              "window reports what its own looped frame carried, both for the "
+              "frame it sends to the access point and for the from-DS frame "
+              "it addresses to itself"),
     )
     parser.add_argument(
         "--require-runtime-wpa-msg1", action="store_true",
@@ -2576,6 +2578,106 @@ def main() -> int:
                             "key produces, so the key bytes going into the "
                             "security CAM, or the engine's nonce and "
                             "authenticated data, are the next place to look",
+                            file=sys.stderr)
+
+            # And increment 3t's second frame, which is the same frame with
+            # address 1 changed to this station's own MAC.  Required to be
+            # present, because the window either sent it or stopped before it,
+            # and reported rather than asserted, because a from-DS frame that
+            # never comes back is one of the two readings it was sent to take.
+            downlink_result = re.search(
+                rb"K1 Wi-Fi GPL: resident loopback downlink "
+                rb"sent=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* seen=(?:0x)?([0-9a-fA-F]+)"
+                rb" frame=(?:0x)?([0-9a-fA-F]+)"
+                rb" len=(?:0x)?([0-9a-fA-F]+)"
+                rb" fc=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* llc=(?:0x)?([0-9a-fA-F]+)"
+                rb" diff-bytes=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* verdict=(?:0x)?([0-9a-fA-F]+)"
+                rb" pn=(?:0x)?([0-9a-fA-F]+)"
+                rb" prot=(?:0x)?([0-9a-fA-F]+)"
+                rb" hw-dec=(?:0x)?([0-9a-fA-F]+)"
+                rb" sw-dec=(?:0x)?([0-9a-fA-F]+)"
+                rb" a1-match=(?:0x)?([0-9a-fA-F]+)"
+                rb" icv=(?:0x)?([0-9a-fA-F]+)"
+                rb" sec-type=(?:0x)?([0-9a-fA-F]+)"
+                rb" sec-cam=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* stage=(?:0x)?([0-9a-fA-F]+)"
+                rb" status=(?:0x)?([0-9a-fA-F]+)",
+                started,
+            )
+            if downlink_result is None:
+                missing.append(
+                    "RTL8852BS2 resident window from-DS loopback probe")
+            else:
+                (dl_sent, dl_seen, dl_frame, dl_length, dl_fc, dl_llc_at,
+                 dl_diff_bytes, dl_verdict, dl_pn, dl_prot, dl_hw_dec,
+                 dl_sw_dec, dl_a1_match, dl_icv, dl_sec_type, dl_sec_cam,
+                 dl_stage, dl_status) = (
+                     int(group, 16) for group in downlink_result.groups())
+
+                print(
+                    "[serial] from-DS loopback probe: sent={0} seen={1} "
+                    "frame={2} len={3} fc={4:#06x} stage={5} status={6}"
+                    .format(dl_sent, dl_seen, dl_frame, dl_length, dl_fc,
+                            dl_stage, dl_status),
+                    file=sys.stderr)
+                if not dl_sent:
+                    print(
+                        "[serial] the from-DS frame was never submitted, so "
+                        "this window says nothing about the receive path: "
+                        "status={0}".format(dl_status),
+                        file=sys.stderr)
+                elif not dl_frame:
+                    print(
+                        "[serial] the from-DS frame did not come back around "
+                        "the MAC at all, which is itself a receive-path "
+                        "reading: the frame the access point would send is "
+                        "the frame this port does not see",
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] from-DS reception: a1-match={0} hw-dec={1} "
+                        "sw-dec={2} icv={3} sec-type={4} sec-cam={5} "
+                        "llc-at={6} diff-bytes={7} pn-kept={8} verdict={9}"
+                        .format(
+                            dl_a1_match, dl_hw_dec, dl_sw_dec, dl_icv,
+                            dl_sec_type, dl_sec_cam,
+                            "nowhere" if dl_llc_at == 0xff else dl_llc_at,
+                            dl_diff_bytes, dl_pn, dl_verdict),
+                        file=sys.stderr)
+                    if not dl_a1_match:
+                        print(
+                            "[serial] from-DS verdict: address 1 was this "
+                            "station's own MAC and the receive path did not "
+                            "recognise it, so the address CAM's self address "
+                            "is where to look -- and that alone explains a "
+                            "port whose probes go out and are never answered",
+                            file=sys.stderr)
+                    elif not dl_hw_dec or dl_icv:
+                        print(
+                            "[serial] from-DS verdict: address 1 was "
+                            "recognised but the security engine did not "
+                            "decrypt the frame, so the pairwise key is "
+                            "reachable on transmit and not on receive: the "
+                            "address CAM's key mapping is where to look",
+                            file=sys.stderr)
+                    elif dl_sec_cam != 0:
+                        print(
+                            "[serial] from-DS verdict: the frame was "
+                            "decrypted with key table entry {0} rather than "
+                            "the pairwise entry, so a unicast frame is being "
+                            "given the group key".format(dl_sec_cam),
+                            file=sys.stderr)
+                    else:
+                        print(
+                            "[serial] from-DS verdict: the receive path "
+                            "recognised a frame addressed to this station and "
+                            "the security engine decrypted it with the "
+                            "pairwise key, so this port can receive what the "
+                            "access point would send and the access point's "
+                            "forwarding is what remains",
                             file=sys.stderr)
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(

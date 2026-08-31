@@ -543,6 +543,7 @@ extern void k1_early_puthex(uintreg_t value);
  */
 
 #define K1_RTL8852BS_DATA_TODS_PROT_FC       0x4108u
+#define K1_RTL8852BS_DATA_FROMDS_PROT_FC     0x4208u
 #define K1_RTL8852BS_IPV4_HEADER_SIZE        20u
 #define K1_RTL8852BS_IPV4_VERSION_IHL        0x45u
 #define K1_RTL8852BS_IPV4_TTL                64u
@@ -21776,6 +21777,18 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
  *   makes both the frame the distribution system delivers to one station and
  *   the frame it delivers to all of them.
  *
+ *   With downlink set, the two addresses swap and the frame control says
+ *   from-DS instead: address 1 this host, address 2 the access point.  That is
+ *   the shape of every frame the access point sends to this station, and the
+ *   only reason to build one here is to put it through the MAC's own loopback
+ *   and watch what the receive path makes of it -- whether address 1 is
+ *   recognised as this host at all, and whether the security engine then finds
+ *   the pairwise key.  The body does not change, which leaves the sender
+ *   hardware address inside the ARP claiming this host while the 802.11 source
+ *   address is address 3; a frame in this form is never delivered anywhere, so
+ *   that inconsistency costs nothing and holding the body still is what makes
+ *   the two directions comparable.
+ *
  * Input Parameters:
  *   frame         - where the frame goes
  *   frame_size    - how much room frame has
@@ -21783,6 +21796,7 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
  *                   address
  *   bssid         - the access point, which is address 1
  *   target_mac    - address 3, the destination inside the distribution system
+ *   downlink      - build the from-DS form, address 1 this host, instead
  *   target_ip     - the address being asked about, host byte order
  *   sequence      - the twelve-bit sequence number
  *   packet_number - the CCMP packet number
@@ -21796,9 +21810,9 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
 
 static int k1_rtl8852bs_runtime_arp_probe_build(
   FAR uint8_t *frame, size_t frame_size, FAR const uint8_t *self_mac,
-  FAR const uint8_t *bssid, FAR const uint8_t *target_mac, uint32_t target_ip,
-  uint16_t sequence, uint64_t packet_number, FAR size_t *frame_length,
-  FAR uint8_t *header_length)
+  FAR const uint8_t *bssid, FAR const uint8_t *target_mac, bool downlink,
+  uint32_t target_ip, uint16_t sequence, uint64_t packet_number,
+  FAR size_t *frame_length, FAR uint8_t *header_length)
 {
   static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
     {
@@ -21828,9 +21842,19 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
 
   memset(frame, 0, required);
 
-  k1_rtl8852bs_write_le16(frame, K1_RTL8852BS_DATA_TODS_PROT_FC);
-  memcpy(frame + 4, bssid, 6);
-  memcpy(frame + 10, self_mac, 6);
+  if (downlink)
+    {
+      k1_rtl8852bs_write_le16(frame, K1_RTL8852BS_DATA_FROMDS_PROT_FC);
+      memcpy(frame + 4, self_mac, 6);
+      memcpy(frame + 10, bssid, 6);
+    }
+  else
+    {
+      k1_rtl8852bs_write_le16(frame, K1_RTL8852BS_DATA_TODS_PROT_FC);
+      memcpy(frame + 4, bssid, 6);
+      memcpy(frame + 10, self_mac, 6);
+    }
+
   memcpy(frame + 16, target_mac, 6);
   k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
   offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
@@ -22463,6 +22487,8 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   uint64_t first_pn;
   uint64_t second_pn;
   size_t arp_length = 0;
+  size_t dl_length = 0;
+  uint16_t dl_fc = 0;
   uint8_t arp_header = 0;
 
   /* The source line of the check that refused the model, so a failure on the
@@ -22950,7 +22976,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
    */
 
   ret = k1_rtl8852bs_runtime_arp_probe_build(
-    reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
+    reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, false,
     0xc0a80101u, 0x321u, 3ull, &arp_length, &arp_header);
   if (ret < 0)
     {
@@ -22996,18 +23022,60 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
    */
 
   if (k1_rtl8852bs_runtime_arp_probe_build(
-        reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, 0u,
+        reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
+        false, 0u, 0x321u, 3ull, &arp_length, &arp_header) != -EINVAL ||
+      k1_rtl8852bs_runtime_arp_probe_build(
+        reply, arp_length - 1u, self, bssid, peer, false, 0xc0a80101u,
         0x321u, 3ull, &arp_length, &arp_header) != -EINVAL ||
       k1_rtl8852bs_runtime_arp_probe_build(
-        reply, arp_length - 1u, self, bssid, peer, 0xc0a80101u, 0x321u, 3ull,
-        &arp_length, &arp_header) != -EINVAL ||
-      k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
-        0xc0a80101u, K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK + 1u, 3ull,
+        false, 0xc0a80101u, K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK + 1u, 3ull,
         &arp_length, &arp_header) != -EINVAL ||
       k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, NULL,
-        0xc0a80101u, 0x321u, 3ull, &arp_length, &arp_header) != -EINVAL)
+        false, 0xc0a80101u, 0x321u, 3ull, &arp_length,
+        &arp_header) != -EINVAL)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* And the from-DS form, which is the frame the loopback probe sends: the
+   * frame control has to say from-DS, address 1 has to be this host and
+   * address 2 the access point, because the whole reading that probe produces
+   * is a statement about those three fields.  Checked here, off the air, where
+   * a mistake costs a compile instead of a run.
+   */
+
+  if (k1_rtl8852bs_runtime_arp_probe_build(
+        reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, true,
+        0xc0a80101u, 0x321u, 3ull, &dl_length, &arp_header) < 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  dl_fc = k1_rtl8852bs_read_le16(reply);
+  if (dl_fc != K1_RTL8852BS_DATA_FROMDS_PROT_FC ||
+      dl_length != arp_length ||
+      memcmp(reply + 4, self, 6) != 0 ||
+      memcmp(reply + 10, bssid, 6) != 0 ||
+      memcmp(reply + 16, peer, 6) != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* Put the to-DS form back: that is the frame the rest of this diagnostic
+   * describes, transmits and compares against its expected head.
+   */
+
+  if (k1_rtl8852bs_runtime_arp_probe_build(
+        reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, false,
+        0xc0a80101u, 0x321u, 3ull, &arp_length, &arp_header) < 0)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -23076,6 +23144,8 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   k1_early_puthex(arp_layout.required_ple_pages);
   k1_early_puts(" arp-wde=");
   k1_early_puthex(arp_layout.required_wde_pages);
+  k1_early_puts(" dl-fc=");
+  k1_early_puthex(dl_fc);
   k1_early_puts(" arp-tpa=");
   k1_early_puthex(k1_rtl8852bs_read_be32(
     reply + K1_RTL8852BS_IEEE80211_HEADER_SIZE +
@@ -27779,6 +27849,7 @@ struct k1_rtl8852bs_loopback_readback_s
   uint32_t diff_bytes;          /* bytes of the cipher's span that changed */
   uint32_t sw_diff;             /* the same span against software CCMP */
   uint32_t sw_stage;            /* where the software comparison stopped */
+  uint32_t probe_stage;         /* where a from-DS probe stopped, if used */
   uint8_t header_length;
   uint8_t llc_at;               /* 0, 8, or nowhere */
   uint8_t diff_first;
@@ -27798,6 +27869,7 @@ struct k1_rtl8852bs_loopback_readback_s
   bool a1_match;
   bool icv_error;
   bool frame_valid;
+  bool probe_sent;              /* a from-DS probe reached the transmit FIFO */
   int tx_status;
   int status;
 };
@@ -27975,8 +28047,8 @@ static int k1_rtl8852bs_runtime_loopback_selftest(void)
   memset(&probe, 0, sizeof(probe));
 
   ret = k1_rtl8852bs_runtime_arp_probe_build(
-    plain, K1_RTL8852BS_RESIDENT_FRAME_MAX, self, bssid, peer, 0xc0a80101u,
-    0x222u, 5ull, &plain_length, &header_length);
+    plain, K1_RTL8852BS_RESIDENT_FRAME_MAX, self, bssid, peer, false,
+    0xc0a80101u, 0x222u, 5ull, &plain_length, &header_length);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -28988,7 +29060,7 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid,
-    broadcast_form ? broadcast : target_mac, target_ip, sequence,
+    broadcast_form ? broadcast : target_mac, false, target_ip, sequence,
     packet_number, &frame_length, &header_length);
   if (ret < 0)
     {
@@ -29069,10 +29141,16 @@ done:
  *   ones, so that a stage that never got as far as a frame is distinguishable
  *   from one that got a frame and read plaintext in it.
  *
+ *   A second line for the from-DS probe, when there was one, with the same
+ *   readings under a dl- prefix.  It is a separate line rather than more
+ *   fields on the first because the two say different things: the first is
+ *   about the transmit path, the second about the receive path.
+ *
  ****************************************************************************/
 
 static void k1_rtl8852bs_runtime_loopback_report(
-  FAR const struct k1_rtl8852bs_loopback_readback_s *out, uint32_t cleared,
+  FAR const struct k1_rtl8852bs_loopback_readback_s *out,
+  FAR const struct k1_rtl8852bs_loopback_readback_s *dl, uint32_t cleared,
   int stage, int status)
 {
   size_t index;
@@ -29150,6 +29228,72 @@ static void k1_rtl8852bs_runtime_loopback_report(
   k1_early_puthex((uintreg_t)stage);
   k1_early_puts(" status=");
   k1_early_puthex((uintreg_t)(status < 0 ? -status : 0));
+  k1_early_puts("\r\n");
+
+  if (dl == NULL)
+    {
+      return;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: resident loopback downlink sent=");
+  k1_early_puthex(dl->probe_sent ? 1 : 0);
+  k1_early_puts(" reads=");
+  k1_early_puthex(dl->rx_reads);
+  k1_early_puts(" seen=");
+  k1_early_puthex(dl->self_frames);
+  k1_early_puts(" frame=");
+  k1_early_puthex(dl->frame_valid ? 1 : 0);
+  k1_early_puts(" len=");
+  k1_early_puthex(dl->frame_length);
+  k1_early_puts(" fc=");
+  k1_early_puthex(dl->frame_control);
+  k1_early_puts(" seq=");
+  k1_early_puthex(dl->sequence);
+  k1_early_puts(" hdr=");
+  k1_early_puthex(dl->header_length);
+  k1_early_puts(" llc=");
+  k1_early_puthex(dl->llc_at);
+  k1_early_puts(" diff-bytes=");
+  k1_early_puthex(dl->diff_bytes);
+  k1_early_puts(" diff-first=");
+  k1_early_puthex(dl->diff_first);
+  k1_early_puts(" verdict=");
+  k1_early_puthex(dl->verdict);
+  k1_early_puts(" pn=");
+  k1_early_puthex(dl->pn_match ? 1 : 0);
+  k1_early_puts(" prot=");
+  k1_early_puthex(dl->protected_frame ? 1 : 0);
+  k1_early_puts(" hw-dec=");
+  k1_early_puthex(dl->hw_dec ? 1 : 0);
+  k1_early_puts(" sw-dec=");
+  k1_early_puthex(dl->sw_dec ? 1 : 0);
+  k1_early_puts(" a1-match=");
+  k1_early_puthex(dl->a1_match ? 1 : 0);
+  k1_early_puts(" icv=");
+  k1_early_puthex(dl->icv_error ? 1 : 0);
+  k1_early_puts(" sec-type=");
+  k1_early_puthex(dl->sec_type);
+  k1_early_puts(" sec-cam=");
+  k1_early_puthex(dl->sec_cam_index);
+  k1_early_puts(" body=");
+  if (dl->body_valid)
+    {
+      for (index = 0; index < sizeof(dl->body); index++)
+        {
+          k1_early_puthex(dl->body[index]);
+        }
+    }
+  else
+    {
+      k1_early_puthex(0);
+    }
+
+  k1_early_puts(" tx=");
+  k1_early_puthex((uintreg_t)(dl->tx_status < 0 ? -dl->tx_status : 0));
+  k1_early_puts(" stage=");
+  k1_early_puthex(dl->probe_stage);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(dl->status < 0 ? -dl->status : 0));
   k1_early_puts("\r\n");
 }
 
@@ -29269,6 +29413,260 @@ static void k1_rtl8852bs_runtime_loopback_ccmp_compare(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_loopback_downlink_probe
+ *
+ * Description:
+ *   The second frame of the loopback window, and the reading increment 3t
+ *   exists for.  It is the first frame with one thing changed: the frame
+ *   control says from-DS and address 1 is this host's own MAC, which is the
+ *   shape of every frame an access point sends to one of its stations.
+ *
+ *   What it measures is the receive path, not the transmit path.  Since
+ *   association this port has never once received a frame addressed to
+ *   itself: a1-match has read zero every time, and every frame the security
+ *   engine decrypted for it was group addressed and decrypted with the group
+ *   key on the group key table entry.  The pairwise entry has never been hit
+ *   in the receive direction at all.  That leaves two explanations for a
+ *   probe that goes out and is never answered -- the access point does not
+ *   forward the answer, or this port cannot receive it -- and on air the two
+ *   look exactly alike, because an ARP reply and a DHCP offer are both
+ *   addressed to this station and nothing else would be either.
+ *
+ *   This frame separates them without the access point's help.  Both
+ *   directions derive the CCMP nonce from address 2 of the frame in hand, so
+ *   the transmit engine's nonce and the receive engine's nonce agree here for
+ *   the same reason they would agree on air, and the key is the same pairwise
+ *   key both ways.  So a frame that comes back decrypted is a receive path
+ *   that works, and a frame that comes back with a1-match clear, or with the
+ *   group entry named instead of the pairwise one, is the fault this port has
+ *   been looking for -- one that explains "it transmits and nobody answers"
+ *   by itself.
+ *
+ *   The frame is picked out of the receive FIFO by address 1 being this host
+ *   and address 2 the access point.  Inside MAC loopback nothing from the air
+ *   reaches that FIFO, so this is that frame; and if a genuine downlink frame
+ *   ever did turn up there it would carry those same two addresses and answer
+ *   the same question the same way, with pn telling which one was read.
+ *
+ *   Everything reported is a counter, a descriptor field or the eight bytes
+ *   at the header's end, which are either the cipher header or the start of
+ *   the LLC/SNAP header.  No key material and no ciphertext is printed.
+ *
+ * Input Parameters:
+ *   packet   - the transmit staging buffer, descriptor included
+ *   buffer   - the receive staging buffer
+ *   self_mac - the eFuse self MAC, which is address 1 this time
+ *   bssid    - the access point, address 2 and address 3
+ *   security - the same pairwise descriptor the first frame used
+ *   out      - a second readback structure, filled for the dl- fields
+ *
+ * Returned Value:
+ *   OK when a frame came back, a negated errno otherwise.  A failure here is
+ *   a reading, not an error in the window: the caller keeps its own result.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_loopback_downlink_probe(
+  FAR uint8_t *packet, FAR uint8_t *buffer, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid,
+  FAR const struct k1_rtl8852bs_tx_security_s *security,
+  FAR struct k1_rtl8852bs_loopback_readback_s *out)
+{
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_resources_s before_res;
+  struct k1_rtl8852bs_data_tx_resources_s after_res;
+  struct k1_rtl8852bs_rx_frame_s frame;
+  FAR const uint8_t *plain;
+  FAR const uint8_t *payload;
+  size_t frame_length = 0;
+  size_t length;
+  size_t offset;
+  size_t rx_header;
+  unsigned int drained;
+  unsigned int waited;
+  uint16_t frame_control;
+  uint16_t sequence;
+  uint8_t header_length = 0;
+  uint64_t packet_number;
+  int ret;
+
+  memset(out, 0, sizeof(*out));
+  out->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
+  out->llc_at = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  out->diff_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  out->sw_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+
+  plain = packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE;
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+  packet_number = k1_rtl8852bs_runtime_tx_packet_number_next();
+  out->sequence = sequence;
+
+  ret = k1_rtl8852bs_runtime_arp_probe_build(
+    packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, bssid, true,
+    K1_RTL8852BS_LOOPBACK_TARGET_IP, sequence, packet_number, &frame_length,
+    &header_length);
+  if (ret < 0)
+    {
+      out->probe_stage = __LINE__;
+      goto errout;
+    }
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, sequence, header_length,
+    K1_RTL8852BS_TXRPT_TAG_LOOPBACK, security, packet,
+    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      out->probe_stage = __LINE__;
+      goto errout;
+    }
+
+  k1_rtl8852bs_runtime_sch_tx_en_data();
+
+  ret = k1_rtl8852bs_data_tx_resources_read(
+    K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &before_res);
+  if (ret < 0)
+    {
+      out->probe_stage = __LINE__;
+      goto errout;
+    }
+
+  if (before_res.channel_used_pages +
+      layout.required_wde_pages > before_res.channel_max_pages ||
+      before_res.wp_available_pages <
+      layout.required_ple_pages + K1_RTL8852BS_DATA_TX_PLE_RESERVE)
+    {
+      ret = -ENOSPC;
+      out->probe_stage = __LINE__;
+      goto errout;
+    }
+
+  ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
+                           layout.transfer_length);
+  out->tx_status = ret;
+  if (ret < 0)
+    {
+      out->probe_stage = __LINE__;
+      goto errout;
+    }
+
+  out->probe_sent = true;
+
+  for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
+    {
+      if (k1_rtl8852bs_data_tx_resources_read(
+            K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &after_res) != OK ||
+          after_res.channel_used_pages == before_res.channel_used_pages)
+        {
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  /* Bounded the same way the first frame's wait is bounded, and for the same
+   * reason: this runs inside the resident window.
+   */
+
+  for (waited = 0; waited < K1_RTL8852BS_LOOPBACK_WAIT_MSEC &&
+       !out->frame_valid; waited++)
+    {
+      ret = k1_rtl8852bs_runtime_rx_read(
+        buffer, K1_RTL8852BS_SCAN_OFLD_RX_MAX, &length);
+      if (ret == -EAGAIN || ret == -ENOSPC)
+        {
+          up_mdelay(K1_RTL8852BS_RUNTIME_DONE_ACK_POLL_MSEC);
+          continue;
+        }
+
+      if (ret < 0)
+        {
+          out->probe_stage = __LINE__;
+          goto errout;
+        }
+
+      out->rx_reads++;
+      offset = 0;
+      while (offset < length)
+        {
+          ret = k1_rtl8852bs_runtime_rx_parse(buffer, length, offset, &frame);
+          if (ret < 0 || frame.next_offset <= offset)
+            {
+              ret = ret < 0 ? ret : -EPROTO;
+              out->probe_stage = __LINE__;
+              goto errout;
+            }
+
+          offset = frame.next_offset;
+          if (frame.packet_type != K1_RTL8852BS_RXDESC_PACKET_TYPE_WIFI ||
+              frame.payload_length < K1_RTL8852BS_IEEE80211_HEADER_SIZE)
+            {
+              continue;
+            }
+
+          payload = buffer + frame.payload_offset;
+          if (memcmp(payload + 4, self_mac, 6) != 0 ||
+              memcmp(payload + 10, bssid, 6) != 0)
+            {
+              continue;
+            }
+
+          out->self_frames++;
+          frame_control = k1_rtl8852bs_read_le16(payload);
+          if (((frame_control >> 2) & K1_RTL8852BS_IEEE80211_TYPE_MASK) !=
+              K1_RTL8852BS_IEEE80211_TYPE_DATA)
+            {
+              continue;
+            }
+
+          rx_header = k1_rtl8852bs_runtime_resident_header_length(
+            frame_control);
+          out->frame_valid = true;
+          out->frame_control = frame_control;
+          out->frame_length = (uint32_t)frame.payload_length;
+          out->header_length = (uint8_t)rx_header;
+          out->protected_frame = (frame_control & 0x4000u) != 0;
+          out->hw_dec = frame.hw_dec;
+          out->sw_dec = frame.sw_dec;
+          out->a1_match = frame.a1_match;
+          out->icv_error = frame.icv_error;
+          if (frame.descriptor_long)
+            {
+              out->sec_type = frame.sec_type;
+              out->sec_cam_index = frame.sec_cam_index;
+            }
+
+          if (frame.payload_length >= rx_header + sizeof(out->body))
+            {
+              memcpy(out->body, payload + rx_header, sizeof(out->body));
+              out->body_valid = true;
+            }
+
+          k1_rtl8852bs_runtime_loopback_classify(
+            payload, frame.payload_length, plain, frame_length, rx_header,
+            frame.hw_dec, out);
+          break;
+        }
+
+      if (!out->frame_valid)
+        {
+          up_mdelay(K1_RTL8852BS_RUNTIME_DONE_ACK_POLL_MSEC);
+        }
+    }
+
+  ret = out->frame_valid ? OK : -ENODATA;
+  if (!out->frame_valid)
+    {
+      out->probe_stage = __LINE__;
+    }
+
+errout:
+  out->status = ret;
+  return ret;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_secure_loopback_readback
  *
  * Description:
@@ -29337,6 +29735,7 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
   FAR uint8_t *packet;
   FAR uint8_t *buffer;
   FAR struct k1_rtl8852bs_ccmp_work_s *work = NULL;
+  FAR struct k1_rtl8852bs_loopback_readback_s *downlink = NULL;
   FAR const uint8_t *plain;
   FAR const uint8_t *payload;
   size_t frame_length = 0;
@@ -29371,7 +29770,8 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
                       K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
   buffer = kmm_malloc(K1_RTL8852BS_SCAN_OFLD_RX_MAX);
   work = kmm_malloc(sizeof(*work));
-  if (packet == NULL || buffer == NULL || work == NULL)
+  downlink = kmm_malloc(sizeof(*downlink));
+  if (packet == NULL || buffer == NULL || work == NULL || downlink == NULL)
     {
       ret = -ENOMEM;
       stage = __LINE__;
@@ -29382,6 +29782,19 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
                     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
   memset(work, 0, sizeof(*work));
   plain = packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE;
+
+  /* The from-DS probe's own readings, marked as not taken until it takes
+   * them: a window that stopped before the second frame has to say so rather
+   * than print a line of zeroes that reads like a frame full of zeroes.
+   */
+
+  memset(downlink, 0, sizeof(*downlink));
+  downlink->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
+  downlink->llc_at = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  downlink->diff_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  downlink->sw_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  downlink->probe_stage = __LINE__;
+  downlink->status = -EAGAIN;
 
   /* Saved first and restored unconditionally.  The window this runs inside
    * still has to hold the channel afterwards, and a MAC left looped back
@@ -29424,8 +29837,8 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, broadcast,
-    K1_RTL8852BS_LOOPBACK_TARGET_IP, sequence, packet_number, &frame_length,
-    &header_length);
+    false, K1_RTL8852BS_LOOPBACK_TARGET_IP, sequence, packet_number,
+    &frame_length, &header_length);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -29603,6 +30016,18 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
       stage = __LINE__;
     }
 
+  /* And the second frame, sent whether or not the first came back.  Whether
+   * the receive path recognises a frame addressed to this host is a different
+   * question from whether the transmit path emits one, and this window is the
+   * only place both can be asked at once.  Its own result stays in its own
+   * structure: it must not turn a window that read the first frame into a
+   * failed one, because a from-DS frame that never comes back is precisely
+   * the reading it was sent to take.
+   */
+
+  k1_rtl8852bs_runtime_loopback_downlink_probe(packet, buffer, self_mac,
+                                               bssid, &security, downlink);
+
 restore:
   k1_rtl8852bs_mac_read32(K1_RTL8852BS_MAC_LOOPBACK_COUNT, &out->looped);
   out->looped = (out->looped >> K1_RTL8852BS_MAC_LOOPBACK_COUNT_SHIFT) &
@@ -29616,7 +30041,12 @@ restore:
 
 errout:
   out->status = ret;
-  k1_rtl8852bs_runtime_loopback_report(out, cleared, stage, ret);
+  k1_rtl8852bs_runtime_loopback_report(out, downlink, cleared, stage, ret);
+  if (downlink != NULL)
+    {
+      kmm_free(downlink);
+    }
+
   if (work != NULL)
     {
       kmm_free(work);

@@ -987,6 +987,25 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   发一帧 **A1 ＝ 自己 MAC** 的受保护数据帧，看接收侧报不报 `a1-match=1`、安全引擎能不能
   命中**成对**密钥表项（`sec-cam=0`）并硬件解密（`hw-dec=1`）。3r/3s 的仪器已经就位，
   只差把 A1 从 BSSID 换成自己。
+- **已实现、等上板（增量 3t，判据仍为 40）：回环里第二帧，A1 ＝ 自己 MAC。**
+  同一个回环窗口里发第二帧，只把 A1 从 BSSID 换成自己、FC 从 to-DS 换成 from-DS
+  （`0x4108` → `0x4208`，A2 ＝A3 ＝BSSID），正文、密钥、SEC CAM 表项、头部几何全部不变。
+  两个方向的 CCMP nonce 都取「手上这一帧的 A2」，所以收发引擎在这里对得上，跟它们在空口上
+  对得上是同一个理由。
+  实现上只动了一处：`k1_rtl8852bs_runtime_arp_probe_build()` 多一个 `downlink` 参数，其余
+  八个调用点全传 `false`；这个开关先在离线诊断里核对（`runtime protected data TX` 那行新增
+  `dl-fc=`，打印前就查 FC/A1/A2/A3 与长度，不对就 `-EIO` 带行号），核对完再把 to-DS 形态
+  建回去。回读现在打**两行**，第二行是
+  `resident loopback downlink sent= reads= seen= frame= len= fc= seq= hdr= llc= diff-bytes= diff-first= verdict= pn= prot= hw-dec= sw-dec= a1-match= icv= sec-type= sec-cam= body= tx= stage= status=`，
+  `seen=` 是「A1 ＝自己 且 A2 ＝BSSID」的帧数，其余字段与第一行同名同义；这一帧复用 3r 的
+  分类器，`verdict=0x4`（RXDEC）＋`llc=0x8 diff-bytes=0x0` ＝接收引擎解开了它而且解得对。
+  三种读数三个结论：`a1-match=1 hw-dec=1 icv=0 sec-cam=0` ⇒ (B2) 排除、只剩 (B1)；
+  `a1-match=0` ⇒ ADDR_CAM 本机地址那一栏就是问题，它一个人就能解释「发得出去、没人回」；
+  `a1-match=1` 但没解开、或命中 `sec-cam=1` ⇒ ADDR_CAM 的密钥映射问题（发送方向命中成对
+  表项、接收方向不命中）。第二帧的结果放在自己的结构体里（堆上再要一个，常驻窗口里栈是稀缺
+  资源），不会把已经读到第一帧的窗口变成失败窗口；窗口在发第二帧之前就退出时该行打
+  `sent=0x0 status=0xb`（EAGAIN），免得「没跑」被读成「收到一帧全零」。判据数不变，
+  `--require-runtime-loopback-readback` 只多卡一条「这一行必须存在」。
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
