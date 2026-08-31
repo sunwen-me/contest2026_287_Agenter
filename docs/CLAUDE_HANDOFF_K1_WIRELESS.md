@@ -730,7 +730,8 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   必须逐帧请求（增量 3o）。判据本身没变：`tx_state=0` 等于「AP ACK 了这一帧」，
   拿到失败＋重传耗尽则问题落回 AP 侧或速率/功率。
   发送这一路的代码本身已经全部写完并上板：帧、48 字节描述符、PN 计数器、回应匹配器、驻留窗口里
-  的两次发送；描述符的安全字段与 CCMP 头在 run 40 确认过，RX 侧那一半在 run 39（单播 PTK）与
+  的两次发送；描述符的安全字段与 CCMP 头在 run 40 确认过，RX 侧那一半在 run 39（组播 GTK，
+  **不是**单播 PTK：那一轮 `group=0x2 a1-match=0x0 cam=0x1`）与
   run 42（13 帧组播 GTK，`hw-dec=0xd icv=0x0`）证明过。密钥在硬件里（3f）、port 使能（3g）、
   信道驻留（3h 更正一）、调度器队列位本来就是开的（3j 更正）。
   字段位置和取值现在都有出处：WD info dword2（描述符偏移 `24+8`）里 `sec_type` [12:9]、
@@ -915,7 +916,8 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   `a1-match=0x0`，从关联至今**没收到过一个发给自己的单播数据帧**。
   **下一步是增量 3s**：「加了密」≠「加对了密」，见下一条。
 
-- **已构建待上板（增量 3s，判据 39 → 40）：用软件 CCMP 把回环帧逐字节重算一遍，把「加对了密」
+- **已上板并出结论（增量 3s，判据 39 → 40）：软件 CCMP 与硬件逐字节全等——「加对了密」。**
+  用软件 CCMP 把回环帧重算一遍，把「加对了密」
   和「加错了密」分开。** AP 解密后 MIC 失败会静默丢帧，症状与「AP 解开了但不肯转发」完全一致，
   所以 3r 的 `verdict=0x1` 还不够。做法：在回环窗口里用**自己派生的 TK**、**绕回来那一帧自己
   带的 PN 和地址**、**同一份 AAD**，把提交的那 36 字节明文再算一遍 CCMP，和绕回来的密文与 MIC
@@ -957,6 +959,34 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   udp port 68) or arp'` 确认；不等 → 直接指向 TK 进 SEC CAM 的取字节/字序
   （`sec_info_tbl_init` 至今未审）或引擎的 nonce／AAD 构造。**注意 MIC 不等而密文全等
   这一种组合**：那说明 CTR keystream 对、CBC-MAC 不对，只可能是 AAD 或 `B_0`，与 TK 无关。
+  **run 56 的实际读数**（`k1-wpa-20260831T185753Z.log`，四十条判据全过，`RUN_EXIT=0`，
+  一次按 RST 都不用、`--nsh-reboot` 直接送回 U-Boot）：
+  `resident ccmp selftest rfc=0x1 rfc-mic=0x1 aad=0x1 nonce=0x1 frame=0x1 frame-mic=0x1
+  stage=0x0 status=0x0`，然后
+  `verdict=0x1 looped=0x1 reads=0x5d self=0x1 frame=0x1 len=0x50 fc=0x4108 seq=0xf hdr=0x18
+  llc=0xff diff-bytes=0x23 diff-first=0x0 sw-ready=0x1 sw-diff=0x0 sw-first=0xff sw-mic=0x1
+  sw-mic-diff=0x0 sw-stage=0x0 pn=0x1 prot=0x1 hw-dec=0x0 body=05 00 00 20 00 00 00 00
+  status=0x0`。**`sw-diff=0x0`、`sw-mic-diff=0x0`：硬件产出的密文和完整性码，和本移植自己
+  派生的 TK 按同一个 PN、同一份 AAD 算出来的结果一个字节都不差。**于是 TK 进 SEC CAM 的
+  取字节/字序、引擎的 nonce（PN‖A2）、AAD（FC 掩码、A1/A2/A3、SC 掩码）**全部证明正确**，
+  (A) 排除，`sec_info_tbl_init` 也不必再审了（它管的那部分行为已经被读数证明是对的）。
+  `diff-bytes` 这次是 `0x23`＝35 而不是 run 55 的 36：36 字节载荷里恰好有一个字节的密文
+  与明文重合，属于 1/256 的巧合，`sw-diff=0x0` 已经把「是不是没加密」这个问题独立回答掉了。
+  **剩下的分支不止一个**，见下一条。
+
+- **3s 之后剩下的两种可能，其中第二种在本移植自己身上**：AP 能解开、也 ACK 了（3o 的 TX
+  report），却什么都没回来。
+  **(B1) AP 不转发**——客户端隔离，或者要求先拿到 DHCP 地址才放行。这一支要主机权限，在 AP
+  的有线段用上面那条 `tcpdump` 确认。
+  **(B2) 回复真的来了，但本移植收不到发给自己的单播帧。**这一支至今**没有被任何一次上板
+  排除过**：`a1-match` 从关联到现在一直是 `0x0`，本移植**从未收到过一帧 A1 是自己的数据帧**。
+  已经成立的接收侧证据全是**组播**：run 39 的 2 帧、run 42 的 13 帧、run 55 的 7 帧，
+  `group=` 与 `total=` 相等、命中的是 **GTK 那条 CAM 表项（`cam=0x1`）**。而 ARP Reply 的
+  A1 就是本机，DHCP OFFER 在多数 AP 上也是单播——**只要单播接收这条路不通，(B1) 和 (B2)
+  在空口上的症状完全一样**。所以下一个增量应该先把 (B2) 判掉，而它不需要 AP 配合：回环里
+  发一帧 **A1 ＝ 自己 MAC** 的受保护数据帧，看接收侧报不报 `a1-match=1`、安全引擎能不能
+  命中**成对**密钥表项（`sec-cam=0`）并硬件解密（`hw-dec=1`）。3r/3s 的仪器已经就位，
+  只差把 A1 从 BSSID 换成自己。
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
@@ -1059,10 +1089,13 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是把增量 3s 上板：代码已写完、已构建、软件 CCMP 已在主机上用
-RFC 3610 与自制帧型向量独立验过，还差一次板上运行（`tools/run_k1_wpa.sh`，四十条判据，
-需要用户在监听器开口后按 RST）。它把「加对了密（问题在 AP）」和「加错了密（AP 静默
-MIC 失败）」分开。**
+**增量 3s 已在 run 56 上板（40/40，`RUN_EXIT=0`）：`sw-diff=0x0 sw-mic-diff=0x0`，
+硬件 CCMP 与本移植自己派生的 TK 逐字节全等，所以「加错了密」这一支排除。
+当前实际下一步是把剩下两支里在自己身上的那一支判掉：本移植从关联至今
+`a1-match=0x0`，**从未收到过一帧 A1 是自己的数据帧**，已成立的接收侧证据全是组播 GTK。
+所以下一个增量在回环里发一帧 A1 ＝ 自己 MAC 的受保护数据帧，看接收侧能否命中成对密钥
+表项并硬件解密；这一支不需要 AP 配合。另一支「AP 不转发」需要主机权限，在 AP 的有线段
+用 `tcpdump` 确认。**
 增量 3r 已在 run 55 上板（39/39），它把刚发出去的那一帧从 MAC 里绕回来看载荷，
 读到 `verdict=0x1`（密文）：整个 36 字节载荷全变、整帧无明文 LLC、长度按 MIC 长了 8、
 `hw-dec=0x0` 排除回程解密——所以「硬件没加密」这个怀疑排除了。
@@ -1081,7 +1114,8 @@ ACK 与重传次数只有 TX report 能给。**这一段在 run 50（增量 3o�
 就被 AP ACK。所以「本端发的 CCMP 帧到达了 AP」现在有证据了；但 802.11 的 ACK 发生在
 解密之前，**AP 是否解开**仍然没有证据，而 `dhcp-reply=0x0` 说明大概率没解开或回复被丢。
 （增量 3l 的仪器读数为 0 的原因也随之明确：报告从来不以 rpkt type 6 回来。）
-反过来，**接收侧的 CCMP 解密在真实空口上已经成立**：run 39 是单播 PTK、run 42 是 13 帧组播 GTK
+反过来，**接收侧的 CCMP 解密在真实空口上已经成立，但只对组播成立**：run 39 是 2 帧组播 GTK
+（`group=0x2 a1-match=0x0 cam=0x1`——命中的是 GTK 那条表项，不是成对密钥）、run 42 是 13 帧组播 GTK
 （`hw-dec=0xd icv=0x0 crc=0x0`）。增量 3h 本身（不跑扫描的驻留收发窗口）
 已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题
 都已修完）。

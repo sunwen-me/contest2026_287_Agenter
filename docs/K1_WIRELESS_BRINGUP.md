@@ -7547,6 +7547,69 @@ sw-ready= sw-diff= sw-first= sw-mic= sw-mic-diff= sw-stage=
 harness 侧 `run_k1_wireless_smoke.py` 的 `readback` 正则相应多出六个捕获组（共 18 个），
 并按 `sw-ready` 打印一行 `software CCMP: cipher-diff=… first=… mic-match=… mic-diff=…`
 加一句结论，或者在没跑起来时打 `software CCMP comparison did not run: sw-stage=…`。
+#### run 56 的读数：逐字节全等——硬件加对了密
+
+`k1-wpa-20260831T185753Z.log`，**四十条判据全过、`RUN_EXIT=0`**，`--nsh-reboot` 一次就把
+板子送回了 U-Boot（不用按 RST）。两行：
+
+```
+resident ccmp selftest rfc=0x1 rfc-mic=0x1 aad=0x1 nonce=0x1
+  frame=0x1 frame-mic=0x1 stage=0x0 status=0x0
+resident loopback readback verdict=0x1 looped=0x1 count-clr=0x0 reads=0x5d
+  self=0x1 frame=0x1 len=0x50 fc=0x4108 seq=0xf hdr=0x18 llc=0xff
+  diff-bytes=0x23 diff-first=0x0
+  sw-ready=0x1 sw-diff=0x0 sw-first=0xff sw-mic=0x1 sw-mic-diff=0x0 sw-stage=0x0
+  pn=0x1 prot=0x1 hw-dec=0x0 sw-dec=0x1 a1-match=0x0 icv=0x0
+  sec-type=0x0 sec-cam=0x0 body=05 00 00 20 00 00 00 00 tx=0x0 stage=0x0 status=0x0
+```
+
+先看量具自己：六个比较全部为 1、`stage=0x0 status=0x0`，所以 RFC 3610 向量和帧型向量在
+板子上也都复现——AAD 构造器的 22 字节、nonce 构造器的 13 字节、CCM 内核、AES 正向分组，
+四件在这一轮的 RISC-V 上是好的，下面那个读数不是量具坏了得出来的。
+
+再看比较结果：**`sw-diff=0x0`、`sw-first=0xff`（没有一个字节不同）、`sw-mic=0x1`、
+`sw-mic-diff=0x0`。**硬件安全引擎产出的 36 字节密文和 8 字节完整性码，与本移植自己从
+四次握手派生的 TK、按绕回来那一帧自己带的 PN 和地址、按同一份 AAD 在软件里算出来的结果
+**一个字节都不差**。
+
+于是下面这些东西**同时**被证明是对的，不再是嫌疑：
+
+- TK 从 PTK 里取的那 16 个字节，以及它写进 SEC CAM 时的字节序（`sec_info_tbl_init`
+  本地原厂缓存里没有正文，一直挂着「未审」——它管的那部分行为现在已被读数证明正确）。
+- 硬件引擎构造的 nonce：优先级字节、A2、以及 PN 的**大端**顺序。
+- 硬件引擎构造的 AAD：FC 掩码（清 Retry/PM/MoreData ＋ 三个子类型位、置 Protected）、
+  A1/A2/A3、SC 的分片号掩码，以及「不含 Duration」这一条。
+
+**(A)「密钥／nonce／AAD 错」到此排除。**顺便一个细节：`diff-bytes` 这次是 `0x23`＝35，
+而 run 55 是 36。36 字节载荷里恰好有一个字节的密文与明文重合，1/256 的巧合而已；
+`diff-bytes` 本来就只是「像不像密文」的粗判，而 `sw-diff=0x0` 已经用严格的方式回答了
+同一个问题。
+
+#### 3s 之后剩下的不是一支，而是两支——其中一支在本移植自己身上
+
+AP 能解开、也 ACK 了（3o 的 TX report：两帧都在第一次尝试就被 ACK），却什么都没回来。
+剩下的解释有两个：
+
+- **(B1) AP 不转发**：客户端隔离，或者要求先拿到 DHCP 地址才放行。这一支要主机权限，
+  在 AP 的有线段确认：
+  `! sudo tcpdump -i enp6s0 -nn -e -c 50 'ether host 84:fc:14:06:79:7b or (udp port 67 or udp port 68) or arp'`。
+- **(B2) 回复真的来了，但本移植收不到发给自己的单播帧。**这一支**至今没有被任何一次上板
+  排除过**。`a1-match` 从关联到现在一直是 `0x0`：本移植**从未收到过一帧 A1 是自己的数据
+  帧**。已经成立的接收侧证据全部是**组播**——run 39 的 2 帧、run 42 的 13 帧、run 55 的
+  7 帧，每一轮都是 `group=` 与 `total=` 相等、命中 **GTK 那条 CAM 表项（`cam=0x1`）**。
+  成对密钥表项（`cam=0x0`）在接收方向上**一次都没有被命中过**。
+  而 ARP Reply 的 A1 就是本机，DHCP OFFER 在多数 AP 上也是单播——**只要单播接收这条路
+  不通，(B1) 和 (B2) 在空口上的症状完全一样**：帧发出去、被 ACK、没有回应。
+
+（此前文档里有两处把 run 39 写成「单播 PTK」，与它自己的日志行
+`group=0x2 a1-match=0x0 cam=0x1` 矛盾，已改正。这不是措辞问题：它会让人以为单播接收
+已经证明过，从而直接跳到 (B1)。）
+
+先判 (B2)，因为它不需要 AP 配合、不需要主机权限，而且仪器已经就位：在回环窗口里把那一帧的
+**A1 从 BSSID 换成自己的 MAC**，看接收侧报不报 `a1-match=1`、安全引擎能不能命中**成对**
+密钥表项（`sec-cam=0`）并硬件解密（`hw-dec=1`）。收不到或解不开，就是本移植接收路径上的
+真问题，而且它一个人就能解释「发得出去、没人回」。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来
