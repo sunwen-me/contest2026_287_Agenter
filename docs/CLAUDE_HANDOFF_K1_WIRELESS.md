@@ -641,7 +641,7 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   （含「run 42 那份日志过不了新判据」这条负例）。两个配置（驻留诊断开／关）`-fsyntax-only` 干净。
   镜像：带密钥 `ffd8bd0b…`（run 43 跑的就是它，`--no-key` 来回切后重建同哈希）、
   `--no-key` `f4696d5c…`。
-- **已写好未上板（增量 3l）：把驻留窗口里一直被丢掉的 TX report 解出来。**
+- **已提交（`9d0aca7`，增量 3l）：把驻留窗口里一直被丢掉的 TX report 解出来；仪器还没有读数。**
   机制先更正：TX report **不是 C2H `0x0c`**，而是接收路径上自己的一种包类型 —— rpkt type 6
   （mainline `enum rtw89_core_rx_type` 的 `TX_REPORT=6`；本 port 早就在解这个 4 位字段，只认
   0 和 10）。报文体是原厂 `mac_8852b/mac_txccxrpt.h` 的六个 dword，语义按 `fwofld.c` 的
@@ -667,7 +667,42 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   仍匹配，**截掉 ` txrpt=` 之后的旧行匹配不到新判据**；真实日志 run 43 上 3k 两条过、新的这条
   不过（那份镜像还没有这些字段），正是应该的。两个配置 `-fsyntax-only` 干净。
   镜像：带密钥 `ad957aef…`（`--no-key` 来回切后重建同哈希）、`--no-key` `03c8236d…`。
-  **下一步就是上板 run 44**：先确认 `first` 的 `tx-state=0`，再读 `data` 那一份。
+  **run 44／45／46 三次都没走到驻留窗口**（run 44 是 Association Response 在本端 RX 上丢了三次——
+  AP 明明关联了我们，它随后发了 EAPOL msg1；run 45／46 是下面增量 3m 那个寄存器地址错位）。
+  **run 47 是第一次整条链全过的上板**（37 条判据全过，`wlan0` 报 5 个 BSS），但这台仪器
+  **读数全是 0**：`txrpt=0x0 … txrpt-short=0x0`，`total=0`。同一轮的扫描 dwell 直方图里
+  接收包类型 6 在第 8–11 个窗口是 30／6／28／1 份——报告一直在来，只是不来在驻留窗口。
+  这就是下面增量 3n 要测的东西。
+- **已上板验证（增量 3m）：`0xce30` 不是数据帧过滤器，是 `R_AX_ZLENDEL_COUNT`。**
+  改对之后 run 47 第一次把整条链走完；14 个窗口的 `ce20/ce24/ce28/ce2c` 前后一致，
+  而 `ce30` 读到 `0x0`／`0xff00`／`0x8a00` 却不再让任何窗口失败。
+  原厂 `mac_reg_ax.h`：`0xce24` 是 `R_AX_CTRL_FLTR`、`0xce2c` 是 `R_AX_DATA_FLTR`、
+  `0xce30` 是 `R_AX_ZLENDEL_COUNT`（含活计数器 `RXD_DELI_NUM` [15:8]）。本组件后两个错了一格，
+  于是 `k1_rtl8852bs_scan_rx_filter_restore()` 一直在「拿硬件计数器跟自己逐字比较」，
+  只要窗口里收过东西就返回 `-EIO`。run 46 因此把一个**成功的**主动扫描窗口
+  （`probe-rsp=0x1`、`rsp-a1`＝本机 MAC、`rsp-a2`＝目标 BSSID）丢掉，重试落进 loopback
+  诊断，最后 `sweep=0x3d`(ENODATA) → 整轮 `-5`。顺带撤回 run 32 的两个结论：
+  「RMAC 丢掉所有数据帧」和「子类型 4–7 不可写」读的都是那个计数器；真正的数据帧过滤器
+  `0xce2c` 一直是 `0x55555555`。现在 `0xce30` 只读只打印、不写不比较，日志按地址升序多一个
+  `ce24=`。没有新增开关，判据数仍是 **37**，harness 未改。
+- **已改好（增量 3n）：TX report 来在扫描 dwell，不来在驻留窗口，所以先解 dwell 里那一份。**
+  `k1_rtl8852bs_runtime_txrpt_log()` 搬出驻留诊断的 `#ifdef`，前缀改成 `K1 Wi-Fi GPL: txrpt `，
+  第一个参数是阶段名（`dwell`／`resident-first`／`resident-data`）。扫描 dwell 的匹配结构多
+  `txrpt_first[6]`＋`txrpt_first_valid`，抽取循环里抄下第一份 type 6（≥24 字节），
+  **打印放在窗口关闭后**那行 `passive scan rpkt types=` 之后（窗口里 150 字符≈13 ms，付不起）。
+  harness 那三条阶段行改成按三个阶段找，`dwell` 那份在启动段里找；仍是信息行，判据数仍是 **37**。
+  读法：先把 dwell 那份当自校准（期望 `tx-state=0`、`macid=0`、`qsel=0x12` B0MG），
+  再看 `sel=`（`RPT_SEL`）——驻留窗口要拿到报告，就得让自己的发送落进这个机制。
+  排除过的三件事：钩子位置（无条件、计数在长度检查之前）、抽取过滤（同一条 `packet_type` 分支）、
+  报告路径（`B_AX_TX_RPT_PATH` 保持复位值 `FWD_TO_HOST`，只有 `SPE_RPT_PATH` 是 WLCPU，
+  与原厂 `trxcfg.c:726-732` 一致）。带密码镜像
+  `84e3edc4bba530dad73a9845e72ae49a08b8c1c3d3c6bf415266fa2b94be1fcf`。
+  **run 48 没读到**：这轮在主动扫描就 `-61`(ENODATA) 停了，只有 3 个窗口，而 type 6 出现在
+  第 8 个窗口之后。它的失败样子：前两个被动窗口正常（`beacon=0xf`／`0x13`、认出目标 BSSID），
+  主动扫描 13 个 dwell 全部 `beacon=0`、`probe-rsp=0`，22 个 802.11 帧里 13 个是自己发的
+  Probe Request，PPDU status 只有 160（run 47 同位置 454）；三个窗口的过滤器前后一致，
+  **与增量 3m 修的 bug 无关**。驻留窗口之前这一段目前不稳：run 44 丢 Association Response，
+  run 48 主动扫描听不到 Beacon，两者都还没定位。
   **下一步优先级**：(1) **TX report ——把「MAC 发出去了」和「对端收到了」分开**（增量 3l）。
   run 43 之后缺口只剩这一段：帧离开了 MAC，但 ACK、重传次数、最终速率都还看不到，而这三个读数
   在 TX report 里。**这里原来写的机制是错的，读了原厂之后已更正**：TX report 不是 C2H
@@ -827,14 +862,15 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是 TX report（接收包类型 6）：把「MAC 发出去了」和「对端收到了」分开**——密钥已经在
+**当前实际下一步是读出扫描 dwell 里那份 TX report 的 `RPT_SEL`（增量 3n），从而知道驻留窗口要请求哪种报告**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
 描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 43 更进一步证明
 **MAC 真的把那两个 CCMP 保护帧发出去了**（增量 3k：`mpdu=0x2 cck=0x2 block=0x0`，每次写
 `delta-mactx-mpdu=0x1 delta-mactx-dma=0x1`）。但**发出去不等于对端收到了，更不等于 AP 解开了**
 （`dhcp-reply=0x0`），所以到目前为止仍然没有「本端发出的 CCMP 帧被对端收下／解开」的证据；
-ACK 与重传次数只有 TX report 能给。**增量 3l 的代码已经写好**（解接收路径上的 rpkt type 6，
-不是 C2H），还没上板，所以下一件事就是 run 44。
+ACK 与重传次数只有 TX report 能给。**增量 3l 的仪器已经上板（run 47）但读数是 0**：
+报告确实在来，只是来在扫描 dwell 而不是驻留窗口，所以增量 3n 先把 dwell 里那一份解出来看
+`RPT_SEL`。
 反过来，**接收侧的 CCMP 解密在真实空口上已经成立**：run 39 是单播 PTK、run 42 是 13 帧组播 GTK
 （`hw-dec=0xd icv=0x0 crc=0x0`）。增量 3h 本身（不跑扫描的驻留收发窗口）
 已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题

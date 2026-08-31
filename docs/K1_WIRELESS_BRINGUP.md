@@ -5270,6 +5270,12 @@ subtype 8（Beacon）=0x31。**一次请求就被回答**，而 run 30 是六次
 
 #### 卡住四次握手的不是密码学，是接收侧的一个复位值
 
+> **这一节的寄存器地址错了一格，两个结论已在「增量 3m」里撤回。** `0xce30` 是
+> `R_AX_ZLENDEL_COUNT`（含一个活的计数器），不是数据帧过滤器；真正的
+> `R_AX_DATA_FLTR` 是 `0xce2c`，也就是本节称作「控制帧过滤器」的那个。下面
+> 「所有数据帧都被丢了」和「子类型 4–7 硬件不接受写」两段读的都是计数器。
+> 原文保留，是为了让 run 32／33 的日志还能对上。
+
 `R_AX_DATA_FLTR (0xce30)` 在这颗片子上的复位值是 `0x00000000`——16 个数据帧子类型
 每个 2 bit 全为 `0b00` = drop。也就是说 RMAC 把**所有数据帧**都丢了，一帧都不转给
 SDIO 主机。EAPOL-Key 的第一条消息是单播数据帧，所以在补上这个写之前，无论 PMK 派生、
@@ -6751,6 +6757,160 @@ short=…`）和两行解码回显，不作判据**——理由和 3k 的计数�
 （dword9 BIT(10)，即 WD INFO `dword3`）加 `AX_TXD_SW_DEFINE` [3:0] 作标签，**并且**要么把
 `R_AX_PTCLRPT_FULL_HDL` 的 `SPE_RPT_PATH` 从 `WLCPU` 改开，要么在 C2H 分发里认
 cat `0x1`／class `0x9`／func `0x1`。
+
+### 增量 3m：一个错了很久的寄存器地址——`0xce30` 不是数据帧过滤器，是零长分隔符计数器
+
+run 45 和 run 46 都没走到驻留窗口，两次都栽在同一个地方，查下去发现不是偶发，
+而是本组件的寄存器地址表错了一格。原厂 `mac_reg_ax.h` 这一段是：
+
+| 地址 | 原厂名字 | 本组件原来的名字 |
+| --- | --- | --- |
+| `0xce20` | `R_AX_RX_FLTR_OPT` | `RX_FLTR_OPT` ✓ |
+| `0xce24` | `R_AX_CTRL_FLTR` | 没读 |
+| `0xce28` | `R_AX_MGNT_FLTR` | `MGNT_FLTR` ✓ |
+| `0xce2c` | `R_AX_DATA_FLTR` | `CTRL_FLTR` ✗ |
+| `0xce30` | `R_AX_ZLENDEL_COUNT` | `DATA_FLTR` ✗ |
+
+`0xce30` 根本不是过滤器：它是 `RXD_DELI_EN` BIT(0)、`RXD_DELI_UNIT` [2:1]、
+`RXD_DELI_NUM_SEL` [7:4]，加上**一个活的计数器** `RXD_DELI_NUM` [15:8]。
+
+#### 两个撤回的结论
+
+- **「RMAC 把所有数据帧都丢了」是假的。** 那句话来自 run 32 在 `0xce30` 读到
+  `0x00000000`，读的是计数器的复位值。真正的数据帧过滤器 `0xce2c` 在每一次打印它的
+  run 里都是 `0x55555555`——`cmac_init()` 里的 `rx_fltr_init()` 早就把全部数据帧子类型
+  转给主机了。四次握手的 msg1 能收到不是因为我们补了这个写。
+- **「子类型 4–7 硬件不接受写」也是假的。** 那句话来自写 `0x55555555` 回读
+  `0x55550055`：低字节 `0x55` 是我们真的写进了计数器的控制位（把 `RXD_DELI_EN` 打开了），
+  而中间那 `0x00` 是当时的分隔符计数恰好为 0。跟数据帧子类型没有关系。
+
+顺带说明一个副作用：从补这个写开始，每个扫描 dwell 和每个驻留窗口里
+`RXD_DELI_EN` 都被打开、窗口结束又被关回去（还原写的是保存下来的 `0x0`）。现在
+`0xce30` 一个字都不写了，所以如果驻留窗口的接收行为跟以前不一样，这是第一个该看的地方。
+
+#### 它是怎么吃掉两次上板的
+
+`k1_rtl8852bs_scan_rx_filter_restore()` 把保存的三个值写回去，再读一遍逐字比较，
+不一致就返回 `-EIO`。被比较的第三个值是那个计数器，只要窗口里收过东西它就变了，
+所以这个比较**必然**会失败——失败概率随信道上的流量上升。run 46 的三个窗口正好把
+整条链演完（行号是串口日志的行）：
+
+```
+ 629 scan RX filter before … ce30=0x00000000
+ 864 scan RX filter after  … ce30=0x00000000        ← 计数器没动，侥幸通过
+1154 scan RX filter before … ce30=0x00003200        ← 计数 0x32
+1424 scan RX filter after  … ce30=0x00001a00        ← 计数 0x1a，不等于 0x3200
+1425 passive scan-offload error=0x5                 ← -EIO
+1548 active scan probe response error=0x5
+```
+
+第 1154–1424 这个窗口是**成功的**：`probe-rsp=0x1`、`rsp-self=0x1`、
+`rsp-a1` 是本机 MAC、`rsp-a2` 是目标 BSSID `50:4f:3b:e2:e6:d2`——正是主动扫描的判据。
+它被一个「拿硬件计数器跟自己比」的 `-EIO` 丢掉了。丢掉之后重试那一轮走的是
+`k1_rtl8852bs_fwdl_runtime_scanofld_active_diagnostic()` 的 MAC loopback 诊断，
+loopback 下收不到真实空口帧，于是 `bss=0x0` → `sweep=0x3d`（ENODATA）→ 整轮 `-5`。
+run 45 的 `ce30` before=`0x0`／after=`0x3200` 是同一件事的另一个样本。
+
+#### 改了什么
+
+- 地址表改对：`CTRL_FLTR` 0xce24、`DATA_FLTR` 0xce2c，新增
+  `K1_RTL8852BS_ZLENDEL_COUNT` 0xce30。
+- `0xce30` 从此**只读只打印，不写不比较**。它是关于接收路径的免费证据，留着看。
+- 日志多一个键，并按地址升序排：`ce00 ce04 ce20 ce24 ce28 ce2c ce30`。
+- 数据帧过滤器那个写保留在**正确**的地址上。因为 `0xce2c` 本来就是 `0x55555555`，
+  这个写现在是个 no-op；留着是把意图写清楚，不再是「修一个坏掉的复位值」。
+- 回读判据仍然只校验 Data(0) 与 QoS Data(8) 两个子类型。原来的理由（子类型 4–7 不可写）
+  已经撤回，新的理由是：这颗片子上这个寄存器哪些位允许主机写还没验过，
+  一个本组件永远用不到的子类型不该有能力让一整轮上板失败。
+
+没有新增开关，`run_k1_wpa.sh` 带的 `--require-*` 数量仍是 **37**；harness 不解析这几行，
+所以 harness 一个字都没改。两种配置（驻留诊断开／关）都是 `-fsyntax-only` 干净。
+带密码镜像 `6d3ad54b1a1a734794a3fa310f5ebadd512c703df77f9b3299d8ee8deeffeb8a`。
+
+### 增量 3n：TX report 不在驻留窗口里——先把扫描 dwell 里那一份解出来
+
+先记一件事：**run 47 是这轮移植第一次把整条链一次走完的上板**。
+`tools/run_k1_wpa.sh` 带的 37 条 `--require-*` 全过，
+`PASS: K1 wireless RAM image reached NSH`，
+并且 `wlan0` 自己的被动扫描报了 5 个 BSS：
+`38:16:5a:61:18:12` ch11、`48:7d:2e:e0:05:ea` ch11、`58:be:72:f1:74:48` ch11、
+`50:4f:3b:e2:e6:d2` ch1、`56:4f:3b:e2:e6:d2` ch1。
+增量 3m 改对的那个地址是这轮能走完的直接原因：14 个窗口的
+`ce20/ce24/ce28/ce2c` 前后完全一致，而 `ce30` 读到过 `0x0`、`0xff00`、`0x8a00`
+——正是过去会被当成「过滤器被改坏」而返回 `-EIO` 的那种差异，现在它只是个读数。
+
+#### 读数是 0，但 report 并没有不来
+
+同一轮里增量 3l 的仪器全是零：
+
+```
+K1 Wi-Fi GPL: resident window data tx sent=0x2 … txrpt=0x0 txrpt-self=0x0
+  txrpt-ok=0x0 txrpt-fail=0x0 txrpt-dat=0x0 txrpt-dat-ok=0x0 txrpt-dat-fail=0x0
+  txrpt-short=0x0
+[serial] transmit reports: total=0 self=0 ok=0 fail=0 data=0 data-ok=0 data-fail=0 short=0
+```
+
+而**同一轮**的扫描 dwell 直方图（`passive scan rpkt types=`，13 个窗口都打）里，
+接收包类型 6（TX report）在第 8–11 个窗口分别是 `0x1e`(30)、`0x6`、`0x1c`(28)、`0x1`。
+也就是：报告一直在来，只是来在扫描 dwell 的抽取循环里，不来在驻留窗口。
+
+排除掉的三种解释：
+
+- **不是钩子位置。** 驻留抽取里的钩子是无条件的，`count->txrpt++` 在长度检查之前。
+- **不是抽取时把它过滤掉了。** 直方图和计数走的是同一条 `frame.packet_type` 分支。
+- **不是路径设成了 WLCPU。** `R_AX_PTCLRPT_FULL_HDL`(0xC660) 里
+  `B_AX_TX_RPT_PATH`[3:2] 保持复位值（`FWD_TO_HOST = 0`），端口只把
+  `B_AX_SPE_RPT_PATH`[5:4] 设成 `FWD_TO_WLCPU`——这跟原厂 `trxcfg.c:726-732` 一模一样。
+
+剩下的怀疑对象是「谁请求了这份报告」：扫描 offload 的上下文（或者它下发的描述符）
+请求了逐帧报告，而增量 3h 特意让驻留窗口**不带扫描 offload** 跑。要证实这一点，
+最便宜的测量不是猜，而是把 dwell 里那份报告解出来看 `RPT_SEL`——
+它就是「这份报告由哪个机制产生」的字段。
+
+#### 改了什么
+
+- `k1_rtl8852bs_runtime_txrpt_log()` 从 `CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC`
+  的 `#ifdef` 里搬出来（搬到 `k1_rtl8852bs_runtime_put_word()` 之后），
+  前缀由 `resident window txrpt ` 改成 `txrpt `，第一个参数是**阶段名**。
+  它现在有一处静态前向声明，因为第一个调用点在定义之前——文件里本来就有两处同样的写法。
+- 扫描 dwell 的匹配结构多两个字段：`txrpt_first[6]` 与 `txrpt_first_valid`。
+  抽取循环里遇到第一份 type 6 且长度够 24 字节，就整份 6 个 dword 抄下来。
+- 打印放在 dwell 结束后的 `passive scan rpkt types=` 那一行之后。
+  **窗口内一个字都不多打**：115200 波特下 150 字符约 13 ms，dwell 里不能付这个钱。
+- 驻留窗口那两处阶段名改成 `resident-first`、`resident-data`。
+- harness 的那三条阶段行改成按 `dwell` / `resident-first` / `resident-data` 三个阶段找，
+  `dwell` 那份在启动段里找。这三行都是**信息行**（`if decoded is not None`），
+  唯一的判据仍是 `data_secure_txrpt_result` 那八个汇总字段，没有新增 `--require-*`，
+  数量仍是 **37**。
+
+#### 怎么读这份 dwell 报告
+
+顺序跟 3l 一样：**先把它当自校准**。管理帧走的是 B0MG，所以期望
+`tx-state=0`、`macid=0`、`qsel=0x12`；`tx-state` 不是 0 首先怀疑字段表没对上，
+而不是发送失败。然后看 `sel=`（`RPT_SEL`）——驻留窗口要拿到报告，
+就得让它自己的发送也落进这个 `sel` 对应的机制里。
+
+#### run 48：仪器没读到数，因为这轮根本没走到会产生 report 的窗口
+
+带 3n 的第一轮（run 48）在主动扫描就 `-61`（ENODATA）停了，dwell 报告一行都没打——
+因为 type 6 出现在第 8 个窗口之后，而这轮只有 3 个窗口。它失败的样子值得记一笔：
+
+- 前两个被动窗口正常，各 `beacon=0xf`／`0x13`，`bss=0x1`，目标 BSSID 认出来了。
+- 主动扫描扫了 13 个 dwell，`self-preq=0xd`（13 个 Probe Request 都发出去了），
+  但 **13 个 dwell 的 `beacon` 全是 0**，`probe-rsp=0x0`：22 个 802.11 帧里 13 个
+  是自己发的那些 Probe Request。同一轮前面还在收 15/19 个 Beacon 的接收路径，
+  在主动扫描里像是聋了。直方图里 PPDU status 只有 160（run 47 同一位置是 454）。
+- 三个窗口的 `ce20/ce24/ce28/ce2c` 前后完全一致，所以**不是**过滤器恢复的问题，
+  跟增量 3m 修的那个 bug 没有关系。
+
+所以驻留窗口之前这一段目前还是不稳的：run 44 是三次都丢 Association Response，
+run 48 是主动扫描一个 Beacon 都听不到。两者都还没定位，先如实记下来。
+
+#### 构建
+
+两种配置（驻留诊断开／关）都是 `-fsyntax-only` 干净；超 79 列的行数仍是 50；
+harness `ast.parse` 干净，正则自测新前缀能匹配、老前缀不再匹配。
+带密码镜像 `84e3edc4bba530dad73a9845e72ae49a08b8c1c3d3c6bf415266fa2b94be1fcf`。
 
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 

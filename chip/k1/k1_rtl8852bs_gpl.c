@@ -704,8 +704,34 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RCR                     0xce00u
 #define K1_RTL8852BS_PLCP_HDR_FLTR           0xce04u
 #define K1_RTL8852BS_MGNT_FLTR               0xce28u
-#define K1_RTL8852BS_CTRL_FLTR               0xce2cu
-#define K1_RTL8852BS_DATA_FLTR               0xce30u
+
+/* The vendor register header (mac_reg_ax.h) names this block
+ * R_AX_RX_FLTR_OPT 0xce20, R_AX_CTRL_FLTR 0xce24, R_AX_MGNT_FLTR 0xce28,
+ * R_AX_DATA_FLTR 0xce2c and R_AX_ZLENDEL_COUNT 0xce30.  The last address
+ * is not a filter at all: it holds RXD_DELI_EN BIT(0), RXD_DELI_UNIT
+ * [2:1], RXD_DELI_NUM_SEL [7:4] and the live delimiter count
+ * RXD_DELI_NUM [15:8].
+ *
+ * This component had the last two entries shifted by one register.  It
+ * read the real data filter under the name of the control filter, and it
+ * read, wrote and compared the delimiter counter under the name of the
+ * data filter.  Two conclusions drawn from that address have to go with
+ * it.  Run 32 read 0x00000000 there and concluded that RMAC was dropping
+ * every data subtype, which cannot have been true: the real data filter
+ * 0xce2c has read 0x55555555 in every run that printed it, so
+ * rx_fltr_init() inside cmac_init() had already forwarded all data
+ * subtypes to the host.  Runs 45 and 46 then failed the restore
+ * read-back with -EIO because RXD_DELI_NUM [15:8] is a live counter --
+ * 0x3200, 0x1a00 and 0x4c00 are delimiter counts of 0x32, 0x1a and 0x4c,
+ * not filter bits -- so writing the saved word back and comparing the
+ * whole word could not succeed whenever RX had happened in between.
+ * The counter is still read and printed, because it is free evidence
+ * about the RX path, but it is never written and never compared.
+ */
+
+#define K1_RTL8852BS_CTRL_FLTR               0xce24u
+#define K1_RTL8852BS_DATA_FLTR               0xce2cu
+#define K1_RTL8852BS_ZLENDEL_COUNT           0xce30u
 #define K1_RTL8852BS_RX_FLTR_OPT             0xce20u
 #define K1_RTL8852BS_ADDR_CAM_CTRL            0xce34u
 #define K1_RTL8852BS_RESPBA_CAM_CTRL         0xce3cu
@@ -12844,6 +12870,7 @@ struct k1_rtl8852bs_scan_rx_filter_state_s
   uint32_t management_filter;
   uint32_t control_filter;
   uint32_t data_filter;
+  uint32_t zlendel_count;
   bool active;
 };
 
@@ -12857,6 +12884,7 @@ static void k1_rtl8852bs_scan_rx_filter_log(
   uint32_t management_filter = 0;
   uint32_t control_filter = 0;
   uint32_t data_filter = 0;
+  uint32_t zlendel_count = 0;
 
   if (state != NULL)
     {
@@ -12866,6 +12894,7 @@ static void k1_rtl8852bs_scan_rx_filter_log(
       management_filter = state->management_filter;
       control_filter = state->control_filter;
       data_filter = state->data_filter;
+      zlendel_count = state->zlendel_count;
     }
 
   k1_early_puts("K1 Wi-Fi GPL: scan RX filter ");
@@ -12876,12 +12905,14 @@ static void k1_rtl8852bs_scan_rx_filter_log(
   k1_early_puthex(plcp_header_filter);
   k1_early_puts(" ce20=");
   k1_early_puthex(rx_filter_option);
+  k1_early_puts(" ce24=");
+  k1_early_puthex(control_filter);
   k1_early_puts(" ce28=");
   k1_early_puthex(management_filter);
   k1_early_puts(" ce2c=");
-  k1_early_puthex(control_filter);
-  k1_early_puts(" ce30=");
   k1_early_puthex(data_filter);
+  k1_early_puts(" ce30=");
+  k1_early_puthex(zlendel_count);
   k1_early_puts("\r\n");
 }
 
@@ -12929,8 +12960,15 @@ static int k1_rtl8852bs_scan_rx_filter_read(
       return ret;
     }
 
-  return k1_rtl8852bs_mac_read32(K1_RTL8852BS_DATA_FLTR,
-                                 &state->data_filter);
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_DATA_FLTR,
+                                &state->data_filter);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  return k1_rtl8852bs_mac_read32(K1_RTL8852BS_ZLENDEL_COUNT,
+                                 &state->zlendel_count);
 }
 
 static int k1_rtl8852bs_scan_rx_filter_restore(
@@ -13031,16 +13069,20 @@ static int k1_rtl8852bs_scan_rx_filter_enable(
    * derivation.  Both registers are read before the dwell and written back
    * afterwards, so the observed value is on the console either way.
    *
-   * Run 32 read this register before writing it and found 0x00000000: every
-   * data subtype was being dropped by RMAC, so no data frame had ever
-   * reached this host, and the four-way handshake could not have worked
-   * whatever the key derivation did.  The same run read the register back
-   * after the write as 0x55550055 rather than 0x55555555, so the write is
-   * only honoured for subtypes 0-3 and 8-15; subtypes 4-7 -- Null, CF-Ack,
-   * CF-Poll, CF-Ack+CF-Poll, none of which carry a body -- stay at drop.
-   * The read-back is therefore checked over the two subtypes that can carry
-   * an EAPOL frame, Data and QoS Data, instead of over the whole register.
-   * Run 32 failed on that exact comparison, which is why it is a mask now.
+   * Up to run 46 this write went to 0xce30, which is R_AX_ZLENDEL_COUNT and
+   * not a filter, so the paragraph that used to stand here -- run 32 read
+   * 0x00000000 and concluded that RMAC dropped every data subtype, and read
+   * 0x55550055 back and concluded that subtypes 4-7 were not writable -- was
+   * describing the delimiter counter, not the data filter.  Neither
+   * conclusion survives: the real data filter at 0xce2c has read 0x55555555
+   * in every run that printed it, which is cmac_init() having already
+   * forwarded all data subtypes, so the write below is expected to be a
+   * no-op and its value is now a statement of intent rather than a repair.
+   * The read-back is still checked over a mask covering only the two
+   * subtypes that can carry an EAPOL frame, Data and QoS Data, because
+   * which bits of this register the hardware lets the host set has not been
+   * established on this chip and a subtype this component never needs must
+   * not be able to fail a run.
    *
    * The control-frame filter is deliberately only logged, never written.
    * Acknowledgements and block-ack traffic are answered by hardware, the
@@ -14729,6 +14771,15 @@ struct k1_rtl8852bs_scanofld_passive_match_s
   uint32_t rx_crc_errors;
   uint32_t rx_icv_errors;
   uint16_t rx_types[16];
+
+  /* The first transmit report of the dwell, kept whole.  run 47 found type 6
+   * arriving only in the dwells that transmitted management frames and never
+   * in the resident window, so this is where the field map can be read off
+   * real hardware output.
+   */
+
+  uint32_t txrpt_first[K1_RTL8852BS_TXRPT_WORDS];
+  bool txrpt_first_valid;
   uint16_t dwell_frames[K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT];
   uint16_t dwell_management[K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT];
   uint16_t dwell_beacons[K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT];
@@ -16056,6 +16107,9 @@ static void k1_rtl8852bs_scanofld_log_bytes(FAR const uint8_t *data,
     }
 }
 
+static void k1_rtl8852bs_runtime_txrpt_log(FAR const char *phase,
+                                           FAR const uint32_t *word);
+
 static void k1_rtl8852bs_scanofld_log_bss_table(
   FAR const struct k1_rtl8852bs_scanofld_passive_match_s *match)
 {
@@ -16108,6 +16162,11 @@ static void k1_rtl8852bs_scanofld_log_bss_table(
     }
 
   k1_early_puts("\r\n");
+
+  if (match->txrpt_first_valid)
+    {
+      k1_rtl8852bs_runtime_txrpt_log("dwell", match->txrpt_first);
+    }
 
   for (index = 0; index < K1_RTL8852BS_SCAN_OFLD_PASSIVE_CHANNEL_COUNT;
        index++)
@@ -16801,6 +16860,75 @@ static void k1_rtl8852bs_runtime_put_word(uint32_t value)
 
   text[8] = '\0';
   k1_early_puts(text);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_txrpt_log
+ *
+ * Description:
+ *   One transmit report, raw and decoded on the same line.  The six words are
+ *   printed alongside the fields taken out of them because the field map is
+ *   read from the vendor header and has not yet been confirmed against this
+ *   hardware: a decode that contradicts its own input is then visible in the
+ *   log instead of believed.  This runs after the window has closed, never
+ *   inside it, because a line this long costs milliseconds of dwell.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_txrpt_log(FAR const char *phase,
+                                           FAR const uint32_t *word)
+{
+  unsigned int index;
+
+  k1_early_puts("K1 Wi-Fi GPL: txrpt ");
+  k1_early_puts(phase);
+  k1_early_puts(" raw=");
+  for (index = 0; index < K1_RTL8852BS_TXRPT_WORDS; index++)
+    {
+      if (index != 0)
+        {
+          k1_early_puts(",");
+        }
+
+      k1_rtl8852bs_runtime_put_word(word[index]);
+    }
+
+  k1_early_puts("\r\n");
+
+  k1_early_puts("K1 Wi-Fi GPL: txrpt ");
+  k1_early_puts(phase);
+  k1_early_puts(" sel=");
+  k1_early_puthex(word[0] & K1_RTL8852BS_TXRPT_RPT_SEL_MASK);
+  k1_early_puts(" polluted=");
+  k1_early_puthex((word[0] & K1_RTL8852BS_TXRPT_POLLUTED) != 0 ? 1 : 0);
+  k1_early_puts(" tx-state=");
+  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_TX_STATE_SHIFT) &
+                  K1_RTL8852BS_TXRPT_TX_STATE_MASK);
+  k1_early_puts(" sw=");
+  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_SW_DEFINE_SHIFT) &
+                  K1_RTL8852BS_TXRPT_SW_DEFINE_MASK);
+  k1_early_puts(" macid=");
+  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_MACID_SHIFT) &
+                  K1_RTL8852BS_TXRPT_MACID_MASK);
+  k1_early_puts(" qsel=");
+  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_QSEL_SHIFT) &
+                  K1_RTL8852BS_TXRPT_QSEL_MASK);
+  k1_early_puts(" qtime=");
+  k1_early_puthex(word[1] & K1_RTL8852BS_TXRPT_QUEUE_TIME_MASK);
+  k1_early_puts(" rate=");
+  k1_early_puthex(word[2] & K1_RTL8852BS_TXRPT_FINAL_RATE_MASK);
+  k1_early_puts(" pkt=");
+  k1_early_puthex(word[3] & K1_RTL8852BS_TXRPT_TOTAL_PKT_NUM_MASK);
+  k1_early_puts(" txcnt=");
+  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_DATA_TX_CNT_SHIFT) &
+                  K1_RTL8852BS_TXRPT_DATA_TX_CNT_MASK);
+  k1_early_puts(" ok=");
+  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_PKT_OK_NUM_SHIFT) &
+                  K1_RTL8852BS_TXRPT_PKT_OK_NUM_MASK);
+  k1_early_puts(" rts=");
+  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_RTS_TX_COUNT_SHIFT) &
+                  K1_RTL8852BS_TXRPT_RTS_TX_COUNT_MASK);
+  k1_early_puts("\r\n");
 }
 
 /****************************************************************************
@@ -18109,6 +18237,26 @@ static int k1_rtl8852bs_runtime_scanofld_passive_wait(
 
           match->rx_frames_total++;
           match->rx_types[frame.packet_type & 0xfu]++;
+
+          /* Keep the dwell's first transmit report whole.  Counting only,
+           * printed after the dwell: the exchange this dwell may be carrying
+           * cannot afford console time in the middle of it.
+           */
+
+          if (frame.packet_type == K1_RTL8852BS_RXDESC_PACKET_TYPE_TXRPT &&
+              !match->txrpt_first_valid &&
+              frame.payload_length >= K1_RTL8852BS_TXRPT_SIZE)
+            {
+              unsigned int word;
+
+              for (word = 0; word < K1_RTL8852BS_TXRPT_WORDS; word++)
+                {
+                  match->txrpt_first[word] = k1_rtl8852bs_read_le32(
+                    buffer + frame.payload_offset + word * 4u);
+                }
+
+              match->txrpt_first_valid = true;
+            }
           if (frame.crc_error)
             {
               match->rx_crc_errors++;
@@ -26123,75 +26271,6 @@ static int k1_rtl8852bs_runtime_sch_tx_en_data(void)
 }
 
 /****************************************************************************
- * Name: k1_rtl8852bs_runtime_txrpt_log
- *
- * Description:
- *   One transmit report, raw and decoded on the same line.  The six words are
- *   printed alongside the fields taken out of them because the field map is
- *   read from the vendor header and has not yet been confirmed against this
- *   hardware: a decode that contradicts its own input is then visible in the
- *   log instead of believed.  This runs after the window has closed, never
- *   inside it, because a line this long costs milliseconds of dwell.
- *
- ****************************************************************************/
-
-static void k1_rtl8852bs_runtime_txrpt_log(FAR const char *phase,
-                                           FAR const uint32_t *word)
-{
-  unsigned int index;
-
-  k1_early_puts("K1 Wi-Fi GPL: resident window txrpt ");
-  k1_early_puts(phase);
-  k1_early_puts(" raw=");
-  for (index = 0; index < K1_RTL8852BS_TXRPT_WORDS; index++)
-    {
-      if (index != 0)
-        {
-          k1_early_puts(",");
-        }
-
-      k1_rtl8852bs_runtime_put_word(word[index]);
-    }
-
-  k1_early_puts("\r\n");
-
-  k1_early_puts("K1 Wi-Fi GPL: resident window txrpt ");
-  k1_early_puts(phase);
-  k1_early_puts(" sel=");
-  k1_early_puthex(word[0] & K1_RTL8852BS_TXRPT_RPT_SEL_MASK);
-  k1_early_puts(" polluted=");
-  k1_early_puthex((word[0] & K1_RTL8852BS_TXRPT_POLLUTED) != 0 ? 1 : 0);
-  k1_early_puts(" tx-state=");
-  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_TX_STATE_SHIFT) &
-                  K1_RTL8852BS_TXRPT_TX_STATE_MASK);
-  k1_early_puts(" sw=");
-  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_SW_DEFINE_SHIFT) &
-                  K1_RTL8852BS_TXRPT_SW_DEFINE_MASK);
-  k1_early_puts(" macid=");
-  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_MACID_SHIFT) &
-                  K1_RTL8852BS_TXRPT_MACID_MASK);
-  k1_early_puts(" qsel=");
-  k1_early_puthex((word[0] >> K1_RTL8852BS_TXRPT_QSEL_SHIFT) &
-                  K1_RTL8852BS_TXRPT_QSEL_MASK);
-  k1_early_puts(" qtime=");
-  k1_early_puthex(word[1] & K1_RTL8852BS_TXRPT_QUEUE_TIME_MASK);
-  k1_early_puts(" rate=");
-  k1_early_puthex(word[2] & K1_RTL8852BS_TXRPT_FINAL_RATE_MASK);
-  k1_early_puts(" pkt=");
-  k1_early_puthex(word[3] & K1_RTL8852BS_TXRPT_TOTAL_PKT_NUM_MASK);
-  k1_early_puts(" txcnt=");
-  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_DATA_TX_CNT_SHIFT) &
-                  K1_RTL8852BS_TXRPT_DATA_TX_CNT_MASK);
-  k1_early_puts(" ok=");
-  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_PKT_OK_NUM_SHIFT) &
-                  K1_RTL8852BS_TXRPT_PKT_OK_NUM_MASK);
-  k1_early_puts(" rts=");
-  k1_early_puthex((word[3] >> K1_RTL8852BS_TXRPT_RTS_TX_COUNT_SHIFT) &
-                  K1_RTL8852BS_TXRPT_RTS_TX_COUNT_MASK);
-  k1_early_puts("\r\n");
-}
-
-/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_observe_txrpt
  *
  * Description:
@@ -27098,12 +27177,13 @@ static int k1_rtl8852bs_runtime_resident_window(
 
   if (count.txrpt_first_valid)
     {
-      k1_rtl8852bs_runtime_txrpt_log("first", count.txrpt_first);
+      k1_rtl8852bs_runtime_txrpt_log("resident-first", count.txrpt_first);
     }
 
   if (count.txrpt_data_first_valid)
     {
-      k1_rtl8852bs_runtime_txrpt_log("data", count.txrpt_data_first);
+      k1_rtl8852bs_runtime_txrpt_log("resident-data",
+                                    count.txrpt_data_first);
     }
 
   /* The verdict names the earliest thing that was wrong, so a run reads as

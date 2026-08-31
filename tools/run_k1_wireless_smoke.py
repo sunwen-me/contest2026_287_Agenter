@@ -2202,11 +2202,19 @@ def main() -> int:
             # window, so a transmit state that is not zero there says the
             # field map is wrong rather than that a transmission failed, and
             # that distinction is worth seeing before the data report is read.
-            for phase in (b"first", b"data"):
+            #
+            # The dwell report is searched over the whole boot rather than the
+            # resident window, because run 47 collected zero reports in the
+            # resident window while the scan dwells that transmitted
+            # management frames collected 30, 6, 28 and 1 of them.  Until that
+            # asymmetry is explained the dwell report is the only place the
+            # field map can be read against real hardware output, so it is
+            # printed whenever the image produced one.
+            for phase in (b"dwell", b"resident-first", b"resident-data"):
                 decoded = re.search(
-                    rb"K1 Wi-Fi GPL: resident window txrpt " + phase +
+                    rb"K1 Wi-Fi GPL: txrpt " + phase +
                     rb" (sel=[^\r\n]*)",
-                    data_secure,
+                    started if phase == b"dwell" else data_secure,
                 )
                 if decoded is not None:
                     print(
