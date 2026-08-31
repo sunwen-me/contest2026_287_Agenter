@@ -317,6 +317,14 @@ def parse_args() -> argparse.Namespace:
               "reports what its protected ARP request did"),
     )
     parser.add_argument(
+        "--require-runtime-ccmp-selftest", action="store_true",
+        help=("fail unless the software CCMP the loopback readback measures "
+              "the hardware against reproduces RFC 3610 packet vector one "
+              "and, for a frame shaped like the one the readback submits, "
+              "the authenticated data, the nonce, the ciphertext and the "
+              "integrity code that the published sample key produces"),
+    )
+    parser.add_argument(
         "--require-runtime-loopback-readback", action="store_true",
         help=("fail unless the reader that decides whether a frame came back "
               "out of MAC loopback as ciphertext or as the plaintext that was "
@@ -2404,6 +2412,39 @@ def main() -> int:
                     "target={2} status={3}: {4}".format(
                         sent, byte_count, dotted(tpa), status, verdict),
                     file=sys.stderr)
+        if args.require_runtime_ccmp_selftest:
+            # Increment 3s compares the hardware's ciphertext against
+            # ciphertext this component computes itself, and that comparison
+            # is only evidence when the software side of it is known to be
+            # right.  So the software side is put in front of two published
+            # vectors first: RFC 3610 packet vector one for the algorithm, and
+            # a frame of the shape the readback submits, under the FIPS 197
+            # sample key, for the two pieces the RFC vector cannot reach - the
+            # authenticated data built out of an 802.11 header and the nonce
+            # built out of a cipher header.
+            #
+            # Unlike the verdict it helps produce, this one is asserted: a
+            # cipher that disagrees with a published vector is broken, not a
+            # finding.  The 0x prefix is mandatory in the last two for the
+            # same reason as below.
+            ccmp_selftest_result = re.search(
+                rb"K1 Wi-Fi GPL: resident ccmp selftest"
+                rb" rfc=(?:0x)?0*1 rfc-mic=(?:0x)?0*1 aad=(?:0x)?0*1"
+                rb" nonce=(?:0x)?0*1 frame=(?:0x)?0*1 frame-mic=(?:0x)?0*1"
+                rb" stage=0x0+(?![0-9a-fA-F])"
+                rb" status=0x0+(?![0-9a-fA-F])",
+                started,
+            )
+            if ccmp_selftest_result is None:
+                missing.append(
+                    "RTL8852BS2 software CCMP known answer selftest")
+            else:
+                print(
+                    "[serial] software CCMP selftest: RFC 3610 vector one and "
+                    "the frame-shaped vector both reproduce, so the "
+                    "authenticated data, the nonce, the counter mode and the "
+                    "integrity code are all right",
+                    file=sys.stderr)
         if args.require_runtime_loopback_readback:
             # The last question the air-side readings left open: the access
             # point acknowledges a frame before it consults any key, so its
@@ -2448,6 +2489,12 @@ def main() -> int:
                 rb"[^\r\n]* llc=(?:0x)?([0-9a-fA-F]+)"
                 rb" diff-bytes=(?:0x)?([0-9a-fA-F]+)"
                 rb" diff-first=(?:0x)?([0-9a-fA-F]+)"
+                rb" sw-ready=(?:0x)?([0-9a-fA-F]+)"
+                rb" sw-diff=(?:0x)?([0-9a-fA-F]+)"
+                rb" sw-first=(?:0x)?([0-9a-fA-F]+)"
+                rb" sw-mic=(?:0x)?([0-9a-fA-F]+)"
+                rb" sw-mic-diff=(?:0x)?([0-9a-fA-F]+)"
+                rb" sw-stage=(?:0x)?([0-9a-fA-F]+)"
                 rb" pn=(?:0x)?([0-9a-fA-F]+)"
                 rb" prot=(?:0x)?([0-9a-fA-F]+)"
                 rb" hw-dec=(?:0x)?([0-9a-fA-F]+)"
@@ -2459,7 +2506,8 @@ def main() -> int:
                     "RTL8852BS2 resident window MAC loopback readback")
             else:
                 (verdict_code, looped, self_frames, frame_valid, frame_length,
-                 llc_at, diff_bytes, diff_first, pn_match, protected_frame,
+                 llc_at, diff_bytes, diff_first, sw_ready, sw_diff, sw_first,
+                 sw_mic, sw_mic_diff, sw_stage, pn_match, protected_frame,
                  hw_dec, loopback_status) = (
                      int(group, 16) for group in loopback_result.groups())
 
@@ -2493,6 +2541,42 @@ def main() -> int:
                         verdict_code,
                         verdicts.get(verdict_code, "unknown")),
                     file=sys.stderr)
+
+                # And increment 3s's reading, which is reported and not
+                # asserted.  "The hardware encrypted" was 3r's answer;
+                # "the hardware encrypted correctly" is this one, and it is
+                # the difference between an access point that silently fails
+                # the integrity check and an access point that decrypts the
+                # frame and declines to forward it.
+                if not sw_ready:
+                    print(
+                        "[serial] software CCMP comparison did not run: "
+                        "sw-stage={0}".format(sw_stage),
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] software CCMP: cipher-diff={0} first={1} "
+                        "mic-match={2} mic-diff={3}".format(
+                            sw_diff,
+                            "none" if sw_first == 0xff else sw_first,
+                            sw_mic, sw_mic_diff),
+                        file=sys.stderr)
+                    if sw_diff == 0 and sw_mic:
+                        print(
+                            "[serial] software CCMP verdict: the ciphertext "
+                            "and the integrity code the hardware produced are "
+                            "exactly what the derived temporal key produces, "
+                            "so the encryption is right and the access "
+                            "point's forwarding is the next place to look",
+                            file=sys.stderr)
+                    else:
+                        print(
+                            "[serial] software CCMP verdict: the hardware's "
+                            "output differs from what the derived temporal "
+                            "key produces, so the key bytes going into the "
+                            "security CAM, or the engine's nonce and "
+                            "authenticated data, are the next place to look",
+                            file=sys.stderr)
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

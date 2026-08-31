@@ -4131,10 +4131,13 @@ static void k1_rtl8852bs_pbkdf2_sha1(FAR const char *passphrase,
  * A wrong key encryption key therefore fails loudly rather than yielding a
  * plausible group key, which is the property that makes this safe to trust.
  *
- * Only the inverse cipher is implemented.  Wrapping is the access point's
- * side of the exchange, and the pairwise key never travels over the air, so
- * the forward cipher has no caller here.  Frame encryption is the hardware's
- * job once the keys are in the security CAM.
+ * Unwrapping needs only the inverse cipher: wrapping is the access point's
+ * side of the exchange and the pairwise key never travels over the air.  The
+ * forward cipher below has a different caller, added by increment 3s: it is
+ * not here to encrypt traffic, which stays the hardware's job once the keys
+ * are in the security CAM, but to recompute in software what the hardware
+ * produced for one frame and compare.  A cipher used as a measuring
+ * instrument rather than as a protection mechanism.
  ****************************************************************************/
 
 #define K1_RTL8852BS_AES_BLOCK_SIZE           16u
@@ -4401,6 +4404,89 @@ static void k1_rtl8852bs_aes128_decrypt_block(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_aes128_encrypt_block
+ *
+ * Description:
+ *   The forward cipher of FIPS 197 section 5.1 on one sixteen byte block, the
+ *   mirror of the inverse above.  State byte r + 4c is row r of column c, so
+ *   the row shift reads column (c + r) mod 4 where the inverse read
+ *   (c - r) mod 4, and the column mix uses the forward coefficients.  Input
+ *   and output may be the same buffer.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_aes128_encrypt_block(
+  FAR const struct k1_rtl8852bs_aes128_s *aes,
+  FAR const uint8_t *input, FAR uint8_t *output)
+{
+  uint8_t state[K1_RTL8852BS_AES_BLOCK_SIZE];
+  uint8_t stage[K1_RTL8852BS_AES_BLOCK_SIZE];
+  unsigned int index;
+  unsigned int column;
+  int round;
+
+  for (index = 0; index < K1_RTL8852BS_AES_BLOCK_SIZE; index++)
+    {
+      state[index] = (uint8_t)(input[index] ^ aes->schedule[index]);
+    }
+
+  for (round = 1; round <= K1_RTL8852BS_AES128_ROUNDS; round++)
+    {
+      for (index = 0; index < K1_RTL8852BS_AES_BLOCK_SIZE; index++)
+        {
+          unsigned int row = index % 4u;
+          unsigned int source = row + 4u * (((index / 4u) + row) % 4u);
+
+          stage[index] = g_k1_rtl8852bs_aes_sbox[state[source]];
+        }
+
+      if (round == K1_RTL8852BS_AES128_ROUNDS)
+        {
+          for (index = 0; index < K1_RTL8852BS_AES_BLOCK_SIZE; index++)
+            {
+              state[index] =
+                (uint8_t)(stage[index] ^
+                          aes->schedule[(unsigned int)round *
+                                        K1_RTL8852BS_AES_BLOCK_SIZE + index]);
+            }
+
+          break;
+        }
+
+      for (column = 0; column < 4u; column++)
+        {
+          uint8_t a0 = stage[4u * column];
+          uint8_t a1 = stage[4u * column + 1u];
+          uint8_t a2 = stage[4u * column + 2u];
+          uint8_t a3 = stage[4u * column + 3u];
+
+          state[4u * column] =
+            (uint8_t)(k1_rtl8852bs_aes_multiply(a0, 2u) ^
+                      k1_rtl8852bs_aes_multiply(a1, 3u) ^ a2 ^ a3);
+          state[4u * column + 1u] =
+            (uint8_t)(a0 ^ k1_rtl8852bs_aes_multiply(a1, 2u) ^
+                      k1_rtl8852bs_aes_multiply(a2, 3u) ^ a3);
+          state[4u * column + 2u] =
+            (uint8_t)(a0 ^ a1 ^ k1_rtl8852bs_aes_multiply(a2, 2u) ^
+                      k1_rtl8852bs_aes_multiply(a3, 3u));
+          state[4u * column + 3u] =
+            (uint8_t)(k1_rtl8852bs_aes_multiply(a0, 3u) ^ a1 ^ a2 ^
+                      k1_rtl8852bs_aes_multiply(a3, 2u));
+        }
+
+      for (index = 0; index < K1_RTL8852BS_AES_BLOCK_SIZE; index++)
+        {
+          state[index] =
+            (uint8_t)(state[index] ^
+                      aes->schedule[(unsigned int)round *
+                                    K1_RTL8852BS_AES_BLOCK_SIZE + index]);
+        }
+    }
+
+  memcpy(output, state, sizeof(state));
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_aes_key_unwrap
  *
  * Description:
@@ -4475,6 +4561,537 @@ static int k1_rtl8852bs_aes_key_unwrap(FAR const uint8_t *kek,
 
   *output_length = blocks * 8u;
   return OK;
+}
+
+/****************************************************************************
+ * Software CCMP, used as a measuring instrument
+ *
+ * Traffic encryption stays the hardware's job: once the temporal key is in
+ * the security content addressable memory the engine encrypts every data
+ * frame on the way out, and nothing below takes that over.  What is below
+ * exists because increment 3r answered "did the transmit path encrypt" with
+ * yes and left the next question open: encrypted how.  An access point that
+ * decrypts a frame and finds the integrity code wrong drops it without a
+ * word, which from here looks exactly like an access point that decrypted the
+ * frame fine and chose not to forward it.
+ *
+ * So this recomputes in software, from the same temporal key, what the engine
+ * should have produced for one frame, and the caller compares.  The frame is
+ * the one that came back out of MAC loopback, and both the additional
+ * authenticated data and the nonce are read out of that frame's own header
+ * rather than out of the driver's intent: the hardware assigns the sequence
+ * number, so a comparison against what the driver meant to send could fail
+ * for reasons that have nothing to do with the cipher.
+ *
+ * CCMP is CCM (NIST SP 800-38C) with M = 8 and L = 2 over AES-128:
+ *
+ *   - B_0 is the flags octet 0x59 (Adata, M' = 3, L' = 1), the thirteen byte
+ *     nonce, and the plaintext length in two big endian octets.
+ *   - the authenticated data is prefixed with its own length in two big
+ *     endian octets and zero padded to a block boundary; the plaintext is
+ *     zero padded the same way.  The cipher block chaining message
+ *     authentication code runs over B_0 and then over all of those blocks.
+ *   - A_i is the flags octet 0x01, the nonce, and i in two big endian
+ *     octets.  E(A_0) masks the code down to the eight byte integrity check
+ *     value, and E(A_1), E(A_2), ... are the counter mode key stream.
+ *
+ * Nothing here prints a cipher byte or a key byte.  These functions write
+ * their output into a caller owned work area, and the caller reports counted
+ * differences.
+ ****************************************************************************/
+
+#define K1_RTL8852BS_CCM_NONCE_SIZE           13u
+#define K1_RTL8852BS_CCM_AAD_MAX              32u
+#define K1_RTL8852BS_CCM_AAD_STAGE            48u
+#define K1_RTL8852BS_CCM_PLAIN_MAX            128u
+#define K1_RTL8852BS_CCM_LENGTH_SIZE          2u
+#define K1_RTL8852BS_CCM_B0_FLAGS             0x59u
+#define K1_RTL8852BS_CCM_AI_FLAGS             0x01u
+#define K1_RTL8852BS_CCM_AAD_BASE             22u
+
+/* The frame control masking the additional authenticated data applies, from
+ * IEEE 802.11-2016 12.5.3.3.3: retry, power management and more-data are
+ * volatile and come out zero, the three subtype bits of a data frame come out
+ * zero, and the protected bit comes out set.
+ */
+
+#define K1_RTL8852BS_CCM_FC_VOLATILE          0x3800u
+#define K1_RTL8852BS_CCM_FC_SUBTYPE           0x0070u
+#define K1_RTL8852BS_CCM_FC_PROTECTED         0x4000u
+#define K1_RTL8852BS_CCM_FC_QOS               0x0080u
+#define K1_RTL8852BS_CCM_FC_TO_DS             0x0100u
+#define K1_RTL8852BS_CCM_FC_FROM_DS           0x0200u
+#define K1_RTL8852BS_CCM_SC_FRAGMENT          0x0fu
+
+/* Big enough for one loopback frame and for the published test vectors, and
+ * put on the heap by every caller: the readback this serves runs inside the
+ * resident window, where the stack has been the scarce resource before.
+ */
+
+struct k1_rtl8852bs_ccmp_work_s
+{
+  struct k1_rtl8852bs_aes128_s aes;
+  uint8_t mac[K1_RTL8852BS_AES_BLOCK_SIZE];
+  uint8_t block[K1_RTL8852BS_AES_BLOCK_SIZE];
+  uint8_t stream[K1_RTL8852BS_AES_BLOCK_SIZE];
+  uint8_t staging[K1_RTL8852BS_CCM_AAD_STAGE];
+  uint8_t nonce[K1_RTL8852BS_CCM_NONCE_SIZE];
+  uint8_t aad[K1_RTL8852BS_CCM_AAD_MAX];
+  size_t aad_length;
+  uint8_t cipher[K1_RTL8852BS_CCM_PLAIN_MAX];
+  uint8_t mic[K1_RTL8852BS_CCMP_MIC_SIZE];
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_ccm_mac_block
+ *
+ * Description:
+ *   One cipher block chaining step: exclusive-or the block into the running
+ *   message authentication code and encrypt that in place.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_ccm_mac_block(
+  FAR struct k1_rtl8852bs_ccmp_work_s *work, FAR const uint8_t *block)
+{
+  unsigned int index;
+
+  for (index = 0; index < K1_RTL8852BS_AES_BLOCK_SIZE; index++)
+    {
+      work->mac[index] = (uint8_t)(work->mac[index] ^ block[index]);
+    }
+
+  k1_rtl8852bs_aes128_encrypt_block(&work->aes, work->mac, work->mac);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_ccm_encrypt
+ *
+ * Description:
+ *   Counter with cipher block chaining message authentication code, in the
+ *   profile CCMP uses: M = 8, L = 2, AES-128.  The ciphertext lands in
+ *   work->cipher and the integrity check value in work->mic.
+ *
+ * Input Parameters:
+ *   work         - scratch and output, owned by the caller
+ *   key          - the sixteen byte temporal key
+ *   nonce        - thirteen bytes
+ *   aad          - the additional authenticated data
+ *   aad_length   - its length, at least one octet and at most the cap
+ *   plain        - the plaintext
+ *   plain_length - its length, at most the cap
+ *
+ * Returned Value:
+ *   OK, or -EINVAL when an argument is missing or a length is out of range.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_ccm_encrypt(
+  FAR struct k1_rtl8852bs_ccmp_work_s *work, FAR const uint8_t *key,
+  FAR const uint8_t *nonce, FAR const uint8_t *aad, size_t aad_length,
+  FAR const uint8_t *plain, size_t plain_length)
+{
+  size_t staged;
+  size_t offset;
+  size_t chunk;
+  size_t counter;
+  size_t blocks;
+  size_t index;
+
+  if (work == NULL || key == NULL || nonce == NULL || aad == NULL ||
+      plain == NULL || aad_length == 0u ||
+      aad_length > K1_RTL8852BS_CCM_AAD_MAX ||
+      plain_length == 0u || plain_length > K1_RTL8852BS_CCM_PLAIN_MAX)
+    {
+      return -EINVAL;
+    }
+
+  k1_rtl8852bs_aes128_schedule(&work->aes, key);
+
+  /* B_0, and the chaining code it starts.  L is two, so the length field is
+   * two octets wide and the cap above keeps it representable.
+   */
+
+  memset(work->block, 0, sizeof(work->block));
+  work->block[0] = K1_RTL8852BS_CCM_B0_FLAGS;
+  memcpy(work->block + 1, nonce, K1_RTL8852BS_CCM_NONCE_SIZE);
+  work->block[14] = (uint8_t)((plain_length >> 8) & 0xffu);
+  work->block[15] = (uint8_t)(plain_length & 0xffu);
+  k1_rtl8852bs_aes128_encrypt_block(&work->aes, work->block, work->mac);
+
+  /* The authenticated data: its own length, the data, zero padding. */
+
+  memset(work->staging, 0, sizeof(work->staging));
+  work->staging[0] = (uint8_t)((aad_length >> 8) & 0xffu);
+  work->staging[1] = (uint8_t)(aad_length & 0xffu);
+  memcpy(work->staging + K1_RTL8852BS_CCM_LENGTH_SIZE, aad, aad_length);
+  staged = aad_length + K1_RTL8852BS_CCM_LENGTH_SIZE;
+  staged = (staged + K1_RTL8852BS_AES_BLOCK_SIZE - 1u) &
+           ~(size_t)(K1_RTL8852BS_AES_BLOCK_SIZE - 1u);
+  for (offset = 0; offset < staged; offset += K1_RTL8852BS_AES_BLOCK_SIZE)
+    {
+      k1_rtl8852bs_ccm_mac_block(work, work->staging + offset);
+    }
+
+  /* The plaintext, the last block zero padded. */
+
+  for (offset = 0; offset < plain_length;
+       offset += K1_RTL8852BS_AES_BLOCK_SIZE)
+    {
+      chunk = plain_length - offset;
+      if (chunk > K1_RTL8852BS_AES_BLOCK_SIZE)
+        {
+          chunk = K1_RTL8852BS_AES_BLOCK_SIZE;
+        }
+
+      memset(work->block, 0, sizeof(work->block));
+      memcpy(work->block, plain + offset, chunk);
+      k1_rtl8852bs_ccm_mac_block(work, work->block);
+    }
+
+  /* A_0 masks the code down to the integrity check value; A_1 onwards is the
+   * key stream the plaintext is exclusive-ored with.
+   */
+
+  blocks = (plain_length + K1_RTL8852BS_AES_BLOCK_SIZE - 1u) /
+           K1_RTL8852BS_AES_BLOCK_SIZE;
+  for (counter = 0; counter <= blocks; counter++)
+    {
+      memset(work->block, 0, sizeof(work->block));
+      work->block[0] = K1_RTL8852BS_CCM_AI_FLAGS;
+      memcpy(work->block + 1, nonce, K1_RTL8852BS_CCM_NONCE_SIZE);
+      work->block[14] = (uint8_t)((counter >> 8) & 0xffu);
+      work->block[15] = (uint8_t)(counter & 0xffu);
+      k1_rtl8852bs_aes128_encrypt_block(&work->aes, work->block,
+                                        work->stream);
+
+      if (counter == 0u)
+        {
+          for (index = 0; index < K1_RTL8852BS_CCMP_MIC_SIZE; index++)
+            {
+              work->mic[index] =
+                (uint8_t)(work->mac[index] ^ work->stream[index]);
+            }
+
+          continue;
+        }
+
+      offset = (counter - 1u) * K1_RTL8852BS_AES_BLOCK_SIZE;
+      chunk = plain_length - offset;
+      if (chunk > K1_RTL8852BS_AES_BLOCK_SIZE)
+        {
+          chunk = K1_RTL8852BS_AES_BLOCK_SIZE;
+        }
+
+      for (index = 0; index < chunk; index++)
+        {
+          work->cipher[offset + index] =
+            (uint8_t)(plain[offset + index] ^ work->stream[index]);
+        }
+    }
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_ccmp_aad_build
+ *
+ * Description:
+ *   The additional authenticated data for a three address, non-QoS data
+ *   frame: the masked frame control field, the three addresses, and the
+ *   sequence control field with the sequence number masked away and the
+ *   fragment number kept.  Twenty two octets.
+ *
+ *   Address four and a QoS control field would each lengthen the span, and
+ *   the frame this is used on has neither, so a frame that carries one is
+ *   refused rather than authenticated over the wrong span.
+ *
+ * Returned Value:
+ *   OK, -EINVAL for a missing argument or too small a buffer, or -ENOTSUP
+ *   for a frame shape this does not cover.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_ccmp_aad_build(FAR const uint8_t *header,
+                                       FAR uint8_t *aad, size_t capacity,
+                                       FAR size_t *length)
+{
+  uint16_t frame_control;
+  uint16_t masked;
+
+  if (header == NULL || aad == NULL || length == NULL ||
+      capacity < K1_RTL8852BS_CCM_AAD_BASE)
+    {
+      return -EINVAL;
+    }
+
+  frame_control = k1_rtl8852bs_read_le16(header);
+  if ((frame_control & K1_RTL8852BS_CCM_FC_QOS) != 0u ||
+      ((frame_control & K1_RTL8852BS_CCM_FC_TO_DS) != 0u &&
+       (frame_control & K1_RTL8852BS_CCM_FC_FROM_DS) != 0u))
+    {
+      return -ENOTSUP;
+    }
+
+  masked = (uint16_t)((frame_control &
+                       (uint16_t)~(K1_RTL8852BS_CCM_FC_VOLATILE |
+                                   K1_RTL8852BS_CCM_FC_SUBTYPE)) |
+                      K1_RTL8852BS_CCM_FC_PROTECTED);
+
+  /* The header is frame control, duration, address one at offset four,
+   * address two at ten, address three at sixteen, sequence control at
+   * twenty two.  Duration is left out; it is not authenticated.
+   */
+
+  aad[0] = (uint8_t)(masked & 0xffu);
+  aad[1] = (uint8_t)((masked >> 8) & 0xffu);
+  memcpy(aad + 2, header + 4, 18);
+  aad[20] = (uint8_t)(header[22] & K1_RTL8852BS_CCM_SC_FRAGMENT);
+  aad[21] = 0;
+  *length = K1_RTL8852BS_CCM_AAD_BASE;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_ccmp_nonce_build
+ *
+ * Description:
+ *   The thirteen octet nonce: a flags octet, address two, and the packet
+ *   number most significant octet first.  Priority is zero and the frame is
+ *   neither a QoS nor a management frame, so the flags octet is zero.
+ *
+ *   The cipher header carries the packet number as PN0, PN1, a reserved
+ *   octet, the key identifier octet, then PN2 to PN5, so the nonce reads it
+ *   back out in the opposite order.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_ccmp_nonce_build(FAR const uint8_t *header,
+                                         FAR const uint8_t *cipher_header,
+                                         FAR uint8_t *nonce, size_t capacity)
+{
+  if (header == NULL || cipher_header == NULL || nonce == NULL ||
+      capacity < K1_RTL8852BS_CCM_NONCE_SIZE)
+    {
+      return -EINVAL;
+    }
+
+  nonce[0] = 0;
+  memcpy(nonce + 1, header + 10, 6);
+  nonce[7] = cipher_header[7];
+  nonce[8] = cipher_header[6];
+  nonce[9] = cipher_header[5];
+  nonce[10] = cipher_header[4];
+  nonce[11] = cipher_header[1];
+  nonce[12] = cipher_header[0];
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_ccmp_selftest
+ *
+ * Description:
+ *   Two known answer tests, in memory, before the part is asked anything: a
+ *   byte for byte comparison against the hardware is only evidence when the
+ *   software side of it has been shown to be right.
+ *
+ *     - RFC 3610 packet vector one, which exercises the generic core: the
+ *       chaining, the two kinds of padding, the counter, and the masking of
+ *       the integrity check value.
+ *     - a frame shaped like the one the loopback stage submits, which
+ *       exercises the two pieces the RFC vector cannot reach: the
+ *       authenticated data built out of an 802.11 header, and the nonce built
+ *       out of a cipher header.
+ *
+ *   Both keys are published test data - the RFC's own key and the FIPS 197
+ *   sample key - so no secret appears here, and the derived key this file
+ *   really uses is not involved.
+ *
+ * Returned Value:
+ *   OK when every comparison agrees, -EFAULT when one does not, or the error
+ *   from the step that could not run.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_ccmp_selftest(void)
+{
+  static const uint8_t rfc_key[K1_RTL8852BS_AES128_KEY_SIZE] =
+    {
+      0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7,
+      0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf
+    };
+
+  static const uint8_t rfc_nonce[K1_RTL8852BS_CCM_NONCE_SIZE] =
+    {
+      0x00, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00,
+      0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5
+    };
+
+  static const uint8_t rfc_aad[8] =
+    {
+      0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07
+    };
+
+  static const uint8_t rfc_plain[23] =
+    {
+      0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+      0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+      0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e
+    };
+
+  static const uint8_t rfc_cipher[23] =
+    {
+      0x58, 0x8c, 0x97, 0x9a, 0x61, 0xc6, 0x63, 0xd2,
+      0xf0, 0x66, 0xd0, 0xc2, 0xc0, 0xf9, 0x89, 0x80,
+      0x6d, 0x5f, 0x6b, 0x61, 0xda, 0xc3, 0x84
+    };
+
+  static const uint8_t rfc_mic[K1_RTL8852BS_CCMP_MIC_SIZE] =
+    {
+      0x17, 0xe8, 0xd1, 0x2c, 0xfd, 0xf9, 0x26, 0xe0
+    };
+
+  /* The FIPS 197 sample key, and a frame of the shape the loopback stage
+   * submits: a twenty four octet header to a broadcast address three through
+   * an access point, the cipher header for packet number 0x0a0b0c under key
+   * identifier zero, and an ARP request for 192.168.1.1 behind an LLC/SNAP
+   * header.  Sixty eight octets, of which thirty six are encrypted.
+   */
+
+  static const uint8_t frame_key[K1_RTL8852BS_AES128_KEY_SIZE] =
+    {
+      0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+      0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c
+    };
+
+  static const uint8_t frame[68] =
+    {
+      0x08, 0x41, 0x00, 0x00, 0x06, 0xaa, 0xbb, 0xcc,
+      0xdd, 0xee, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55,
+      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x30, 0x12,
+      0x0c, 0x0b, 0x00, 0x20, 0x0a, 0x00, 0x00, 0x00,
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06,
+      0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+      0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0xc0, 0xa8, 0x01, 0x01
+    };
+
+  static const uint8_t frame_aad[K1_RTL8852BS_CCM_AAD_BASE] =
+    {
+      0x08, 0x41, 0x06, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+      0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0xff, 0xff,
+      0xff, 0xff, 0xff, 0xff, 0x00, 0x00
+    };
+
+  static const uint8_t frame_nonce[K1_RTL8852BS_CCM_NONCE_SIZE] =
+    {
+      0x00, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55,
+      0x00, 0x00, 0x00, 0x0a, 0x0b, 0x0c
+    };
+
+  static const uint8_t frame_cipher[36] =
+    {
+      0x08, 0x82, 0x2a, 0xca, 0xee, 0x41, 0x15, 0x24,
+      0xf5, 0xea, 0x0a, 0xed, 0x51, 0xdb, 0x1d, 0x7e,
+      0x86, 0xac, 0x2b, 0x65, 0xf0, 0x14, 0xa9, 0xb2,
+      0xf0, 0xad, 0x96, 0x1f, 0xb5, 0xd7, 0x86, 0x74,
+      0x5b, 0x23, 0xa1, 0xbc
+    };
+
+  static const uint8_t frame_mic[K1_RTL8852BS_CCMP_MIC_SIZE] =
+    {
+      0x1f, 0xd3, 0x2f, 0x9f, 0x61, 0x21, 0x34, 0xf7
+    };
+
+  FAR struct k1_rtl8852bs_ccmp_work_s *work;
+  size_t body = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+                K1_RTL8852BS_CCMP_HEADER_SIZE;
+  bool rfc_ok = false;
+  bool rfc_mic_ok = false;
+  bool aad_ok = false;
+  bool nonce_ok = false;
+  bool frame_ok = false;
+  bool frame_mic_ok = false;
+  int stage = 0;
+  int ret;
+
+  work = kmm_malloc(sizeof(*work));
+  if (work == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  memset(work, 0, sizeof(*work));
+
+  ret = k1_rtl8852bs_ccm_encrypt(work, rfc_key, rfc_nonce, rfc_aad,
+                                 sizeof(rfc_aad), rfc_plain,
+                                 sizeof(rfc_plain));
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto errout;
+    }
+
+  rfc_ok = memcmp(work->cipher, rfc_cipher, sizeof(rfc_cipher)) == 0;
+  rfc_mic_ok = memcmp(work->mic, rfc_mic, sizeof(rfc_mic)) == 0;
+
+  ret = k1_rtl8852bs_ccmp_aad_build(frame, work->aad, sizeof(work->aad),
+                                    &work->aad_length);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto errout;
+    }
+
+  aad_ok = work->aad_length == sizeof(frame_aad) &&
+           memcmp(work->aad, frame_aad, sizeof(frame_aad)) == 0;
+
+  ret = k1_rtl8852bs_ccmp_nonce_build(
+    frame, frame + K1_RTL8852BS_IEEE80211_HEADER_SIZE, work->nonce,
+    sizeof(work->nonce));
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto errout;
+    }
+
+  nonce_ok = memcmp(work->nonce, frame_nonce, sizeof(frame_nonce)) == 0;
+
+  ret = k1_rtl8852bs_ccm_encrypt(work, frame_key, work->nonce, work->aad,
+                                 work->aad_length, frame + body,
+                                 sizeof(frame) - body);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto errout;
+    }
+
+  frame_ok = memcmp(work->cipher, frame_cipher, sizeof(frame_cipher)) == 0;
+  frame_mic_ok = memcmp(work->mic, frame_mic, sizeof(frame_mic)) == 0;
+  ret = (rfc_ok && rfc_mic_ok && aad_ok && nonce_ok && frame_ok &&
+         frame_mic_ok) ? OK : -EFAULT;
+
+errout:
+  k1_early_puts("K1 Wi-Fi GPL: resident ccmp selftest rfc=");
+  k1_early_puthex(rfc_ok ? 1 : 0);
+  k1_early_puts(" rfc-mic=");
+  k1_early_puthex(rfc_mic_ok ? 1 : 0);
+  k1_early_puts(" aad=");
+  k1_early_puthex(aad_ok ? 1 : 0);
+  k1_early_puts(" nonce=");
+  k1_early_puthex(nonce_ok ? 1 : 0);
+  k1_early_puts(" frame=");
+  k1_early_puthex(frame_ok ? 1 : 0);
+  k1_early_puts(" frame-mic=");
+  k1_early_puthex(frame_mic_ok ? 1 : 0);
+  k1_early_puts(" stage=");
+  k1_early_puthex((uintreg_t)stage);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+  kmm_free(work);
+  return ret;
 }
 
 /****************************************************************************
@@ -27160,14 +27777,20 @@ struct k1_rtl8852bs_loopback_readback_s
   uint32_t frame_control;
   uint32_t sequence;
   uint32_t diff_bytes;          /* bytes of the cipher's span that changed */
+  uint32_t sw_diff;             /* the same span against software CCMP */
+  uint32_t sw_stage;            /* where the software comparison stopped */
   uint8_t header_length;
   uint8_t llc_at;               /* 0, 8, or nowhere */
   uint8_t diff_first;
+  uint8_t sw_first;
+  uint8_t sw_mic_diff;
   uint8_t verdict;
   uint8_t sec_type;
   uint8_t sec_cam_index;
   uint8_t body[K1_RTL8852BS_CCMP_HEADER_SIZE];
   bool body_valid;
+  bool sw_ready;                /* the software comparison ran at all */
+  bool sw_mic_match;
   bool pn_match;
   bool protected_frame;
   bool hw_dec;
@@ -28480,6 +29103,18 @@ static void k1_rtl8852bs_runtime_loopback_report(
   k1_early_puthex(out->diff_bytes);
   k1_early_puts(" diff-first=");
   k1_early_puthex(out->diff_first);
+  k1_early_puts(" sw-ready=");
+  k1_early_puthex(out->sw_ready ? 1 : 0);
+  k1_early_puts(" sw-diff=");
+  k1_early_puthex(out->sw_diff);
+  k1_early_puts(" sw-first=");
+  k1_early_puthex(out->sw_first);
+  k1_early_puts(" sw-mic=");
+  k1_early_puthex(out->sw_mic_match ? 1 : 0);
+  k1_early_puts(" sw-mic-diff=");
+  k1_early_puthex(out->sw_mic_diff);
+  k1_early_puts(" sw-stage=");
+  k1_early_puthex(out->sw_stage);
   k1_early_puts(" pn=");
   k1_early_puthex(out->pn_match ? 1 : 0);
   k1_early_puts(" prot=");
@@ -28516,6 +29151,121 @@ static void k1_rtl8852bs_runtime_loopback_report(
   k1_early_puts(" status=");
   k1_early_puthex((uintreg_t)(status < 0 ? -status : 0));
   k1_early_puts("\r\n");
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_loopback_ccmp_compare
+ *
+ * Description:
+ *   Encrypt the submitted frame's body in software, with the temporal key
+ *   this run derived and with the packet number and addresses the looped
+ *   frame itself carries, and count how many octets of the result differ from
+ *   what came back.  This separates "encrypted correctly" from "encrypted",
+ *   which is the whole of increment 3s: an access point that decrypts a frame
+ *   and fails its integrity check drops it in silence, so a wrong temporal
+ *   key and a faultless transmit path look the same from here.
+ *
+ *   The reading is reported and not asserted.  A mismatch is a finding about
+ *   the key path or about the engine's nonce and authenticated data, not a
+ *   reason to fail the window, and the counters are the only output: no
+ *   ciphertext octet and no key octet is printed.
+ *
+ *   The authenticated data and the nonce come out of the looped frame rather
+ *   than out of the frame that was submitted, because the hardware assigns
+ *   the sequence number and the comparison has to be against what the engine
+ *   actually saw.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_loopback_ccmp_compare(
+  FAR struct k1_rtl8852bs_ccmp_work_s *work, FAR const uint8_t *looped,
+  size_t looped_length, FAR const uint8_t *plain, size_t plain_length,
+  size_t header_length, FAR struct k1_rtl8852bs_loopback_readback_s *out)
+{
+  FAR const uint8_t *cipher;
+  FAR const uint8_t *mic;
+  size_t body;
+  size_t span;
+  size_t index;
+  int ret;
+
+  out->sw_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  if (work == NULL || !g_k1_rtl8852bs_wpa_action.ptk_valid)
+    {
+      out->sw_stage = __LINE__;
+      return;
+    }
+
+  /* The looped frame is the submitted frame plus the integrity check value
+   * plus the frame check sequence, so anything shorter than that was not the
+   * frame this is about.
+   */
+
+  body = header_length + K1_RTL8852BS_CCMP_HEADER_SIZE;
+  if (plain_length <= body ||
+      looped_length < plain_length + K1_RTL8852BS_CCMP_MIC_SIZE ||
+      plain_length - body > K1_RTL8852BS_CCM_PLAIN_MAX)
+    {
+      out->sw_stage = __LINE__;
+      return;
+    }
+
+  span = plain_length - body;
+  ret = k1_rtl8852bs_ccmp_aad_build(looped, work->aad, sizeof(work->aad),
+                                    &work->aad_length);
+  if (ret < 0)
+    {
+      out->sw_stage = __LINE__;
+      return;
+    }
+
+  ret = k1_rtl8852bs_ccmp_nonce_build(looped, looped + header_length,
+                                      work->nonce, sizeof(work->nonce));
+  if (ret < 0)
+    {
+      out->sw_stage = __LINE__;
+      return;
+    }
+
+  ret = k1_rtl8852bs_ccm_encrypt(
+    work, g_k1_rtl8852bs_wpa_action.ptk + K1_RTL8852BS_WPA_TK_OFFSET,
+    work->nonce, work->aad, work->aad_length, plain + body, span);
+  if (ret < 0)
+    {
+      out->sw_stage = __LINE__;
+      return;
+    }
+
+  cipher = looped + body;
+  mic = cipher + span;
+  for (index = 0; index < span; index++)
+    {
+      if (work->cipher[index] != cipher[index])
+        {
+          out->sw_diff++;
+          if (out->sw_first == K1_RTL8852BS_LOOPBACK_LLC_NOWHERE)
+            {
+              out->sw_first = (uint8_t)index;
+            }
+        }
+    }
+
+  for (index = 0; index < K1_RTL8852BS_CCMP_MIC_SIZE; index++)
+    {
+      if (work->mic[index] != mic[index])
+        {
+          out->sw_mic_diff++;
+        }
+    }
+
+  out->sw_mic_match = out->sw_mic_diff == 0;
+  out->sw_ready = true;
+
+  /* The work area held the temporal key's schedule and one frame's
+   * ciphertext.  Neither outlives the comparison.
+   */
+
+  memset(work, 0, sizeof(*work));
 }
 
 /****************************************************************************
@@ -28586,6 +29336,7 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
   FAR struct k1_rtl8852bs_loopback_readback_s *out = &readback;
   FAR uint8_t *packet;
   FAR uint8_t *buffer;
+  FAR struct k1_rtl8852bs_ccmp_work_s *work = NULL;
   FAR const uint8_t *plain;
   FAR const uint8_t *payload;
   size_t frame_length = 0;
@@ -28609,11 +29360,18 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
   out->verdict = K1_RTL8852BS_LOOPBACK_VERDICT_NONE;
   out->llc_at = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
   out->diff_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+  out->sw_first = K1_RTL8852BS_LOOPBACK_LLC_NOWHERE;
+
+  /* The software CCMP work area is a quarter of a kilobyte and this runs
+   * inside the resident window, where the stack is the scarce resource, so it
+   * goes on the heap with the two buffers.
+   */
 
   packet = kmm_malloc(K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
                       K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
   buffer = kmm_malloc(K1_RTL8852BS_SCAN_OFLD_RX_MAX);
-  if (packet == NULL || buffer == NULL)
+  work = kmm_malloc(sizeof(*work));
+  if (packet == NULL || buffer == NULL || work == NULL)
     {
       ret = -ENOMEM;
       stage = __LINE__;
@@ -28622,6 +29380,7 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
 
   memset(packet, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
                     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+  memset(work, 0, sizeof(*work));
   plain = packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE;
 
   /* Saved first and restored unconditionally.  The window this runs inside
@@ -28820,6 +29579,15 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
           k1_rtl8852bs_runtime_loopback_classify(
             payload, frame.payload_length, plain, frame_length, rx_header,
             frame.hw_dec, out);
+
+          /* And the reading increment 3s adds: the same span recomputed in
+           * software, which is what separates a frame the engine encrypted
+           * correctly from a frame it encrypted with the wrong key.
+           */
+
+          k1_rtl8852bs_runtime_loopback_ccmp_compare(
+            work, payload, frame.payload_length, plain, frame_length,
+            rx_header, out);
           break;
         }
 
@@ -28849,6 +29617,11 @@ restore:
 errout:
   out->status = ret;
   k1_rtl8852bs_runtime_loopback_report(out, cleared, stage, ret);
+  if (work != NULL)
+    {
+      kmm_free(work);
+    }
+
   if (buffer != NULL)
     {
       kmm_free(buffer);
@@ -28975,6 +29748,21 @@ static int k1_rtl8852bs_runtime_resident_window(
   if (ret < 0)
     {
       k1_early_puts("K1 Wi-Fi GPL: resident loopback selftest error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+    }
+
+  /* And the software cipher the readback measures the hardware against.  A
+   * byte for byte comparison is only evidence when both sides are known, so
+   * the software side is put in front of two published test vectors first:
+   * one for the generic algorithm and one for the frame shape this uses it
+   * on.  This one is asserted, unlike the verdict it helps produce.
+   */
+
+  ret = k1_rtl8852bs_ccmp_selftest();
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident ccmp selftest error=");
       k1_early_puthex((uintreg_t)-ret);
       k1_early_puts("\r\n");
     }

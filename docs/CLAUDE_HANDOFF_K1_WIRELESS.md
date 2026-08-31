@@ -913,14 +913,50 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   同一轮的独立佐证：`data sec total=0x7 group=0x7 prot=0x7 hw-dec=0x7 icv=0x0`、
   `sec-type=0x6 cam=0x1`——**GTK 表项（`gtk-ent=0x1`）和接收侧引擎都是好的**；而
   `a1-match=0x0`，从关联至今**没收到过一个发给自己的单播数据帧**。
-  **下一步（增量 3s）**：「加了密」≠「加对了密」——AP 解密后 MIC 失败会静默丢帧，症状与现在
-  完全一致。用软件 CCMP 在回环窗口里把同一份明文用自己派生的 TK、同一个 PN、同一份 AAD 算一遍，
-  和绕回来的帧逐字节比，只报「密文差异字节数」和「MIC 是否一致」，不打印任何密文或密钥字节。
-  全等 → 硬件 CCMP 无误，转去查 AP 的转发/隔离（客户端隔离、或要求先有 DHCP 地址），
-  可用主机侧 `tcpdump` 在 AP 的有线段确认；不等 → 直接指向 TK 进 SEC CAM 的取字节/字序，
-  或引擎的 nonce（PN‖A2）／AAD（FC 掩码、A1/A2/A3、SC 掩码）。缺的零件只有一个：
-  文件里现在只有 AES-128 **解密**分组（`chip/k1/k1_rtl8852bs_gpl.c:4333`，给 GTK 的
-  AES key unwrap 用），CCMP 要**正向**分组加密 ＋ CTR ＋ CBC-MAC。
+  **下一步是增量 3s**：「加了密」≠「加对了密」，见下一条。
+
+- **已构建待上板（增量 3s，判据 39 → 40）：用软件 CCMP 把回环帧逐字节重算一遍，把「加对了密」
+  和「加错了密」分开。** AP 解密后 MIC 失败会静默丢帧，症状与「AP 解开了但不肯转发」完全一致，
+  所以 3r 的 `verdict=0x1` 还不够。做法：在回环窗口里用**自己派生的 TK**、**绕回来那一帧自己
+  带的 PN 和地址**、**同一份 AAD**，把提交的那 36 字节明文再算一遍 CCMP，和绕回来的密文与 MIC
+  逐字节比。
+  **新增的软件密码学**（`chip/k1/k1_rtl8852bs_gpl.c` 的「Software CCMP, used as a measuring
+  instrument」一节，紧跟在 AES key unwrap 之后）：文件里原先只有 AES-128 **解密**分组
+  （给 GTK 的 key unwrap 用），3s 补上**正向**分组加密（`k1_rtl8852bs_aes128_encrypt_block`
+  已在 3r 之前就位）之上的 CCM——`k1_rtl8852bs_ccm_encrypt()` 是 NIST SP 800-38C 的 CCM，
+  M=8、L=2：`B_0` 标志 `0x59` ‖ 13 字节 nonce ‖ 2 字节大端明文长度，AAD 前置 2 字节大端长度并
+  补零到 16，CBC-MAC 走 `B_0` → AAD 块 → 补零明文块，`A_i` 标志 `0x01` ‖ nonce ‖ 2 字节大端 i，
+  `MIC = X_final[0..7] XOR S_0[0..7]`，CTR 从 i=1 起。
+  **两个 CCMP 专有的坑都按 IEEE 802.11-2016 12.5.3.3.3 处理**（与 Linux `ccmp_special_blocks`
+  一致）：AAD 的 FC 要掩码 `masked_fc = (fc & ~(0x3800 | 0x0070)) | 0x4000`——清 Retry/PM/
+  MoreData 和三个数据子类型位、置 Protected；非 QoS 三地址帧的 AAD 是**22 字节**（掩码 FC 小端
+  ‖ A1 ‖ A2 ‖ A3 ‖ (SC & 0x0f) ‖ 0x00，**不含 Duration**）。nonce 是 13 字节：标志字节 0
+  （优先级 0、非 QoS、非管理帧）‖ A2 ‖ **大端** PN5..PN0，而 CCMP 头的字节序是 PN0, PN1,
+  保留, `keyid<<6|0x20`, PN2..PN5，所以 nonce 是**倒着**读回来的。QoS 帧或四地址帧返回
+  `-ENOTSUP`，不猜。
+  **唯一新增硬判据是内存已知答案自校验** `--require-runtime-ccmp-selftest`，要求这一行：
+  `resident ccmp selftest rfc=0x1 rfc-mic=0x1 aad=0x1 nonce=0x1 frame=0x1 frame-mic=0x1
+  stage=0x0 status=0x0`。它跑两组**公开发表**的向量：RFC 3610 packet vector #1（连 AAD 和
+  MIC 一起对），以及一组按本移植真实帧型手算的 CCMP 向量（密钥用 FIPS-197 的样例密钥
+  `2b7e1516…`，68 字节帧，PN `0x0a0b0c`）——后者同时校验 `aad_build` 出来的 22 字节和
+  `nonce_build` 出来的 13 字节，所以 AAD 掩码和 nonce 字节序错了会在板上第一时间失败，
+  不会把错的比较结果当成结论。**这两组向量在上板之前已经在主机上跑过**：把驻留文件里
+  4143–5095 行原样抽出来用 gcc 编译，`k1_rtl8852bs_ccmp_selftest()` 本体打出全 1、
+  `stage=0x0 status=0x0`、返回 0；同一份构造在 Python 里也和 `cryptography` 的
+  `AESCCM(key, tag_length=8)` 独立对上过。
+  **比较级** `k1_rtl8852bs_runtime_loopback_ccmp_compare()` 挂在 3r 的回读之后，
+  工作区 429 字节走 `kmm_malloc` **放堆上**（回读跑在驻留窗口里，那里的栈增长以前咬过人），
+  比完 `memset` 清零，密钥编排不活过这次比较。它是**报告级、不是判据**：不等是关于密钥通路的
+  发现，不是窗口失败的理由。`readback` 行新增六个字段
+  `sw-ready= sw-diff= sw-first= sw-mic= sw-mic-diff= sw-stage=`（插在 `diff-first=` 和 `pn=`
+  之间），**仍然只报计数，不打印任何密文或密钥字节**——本帧明文已知，打出密文等于公开一段密钥流。
+  `sw-stage=` 是没跑起来时的 `__LINE__`（PTK 未派生、长度不对、QoS/四地址帧）。
+  **读数怎么用**：全等（`sw-diff=0x0 sw-mic=0x1`）→ 硬件 CCMP 与自己派生的 TK 完全一致，
+  嫌疑全部转到 AP 侧的转发/隔离（客户端隔离、或要求先有 DHCP 地址），可在 AP 的有线段用
+  `! sudo tcpdump -i enp6s0 -nn -e -c 50 'ether host 84:fc:14:06:79:7b or (udp port 67 or
+  udp port 68) or arp'` 确认；不等 → 直接指向 TK 进 SEC CAM 的取字节/字序
+  （`sec_info_tbl_init` 至今未审）或引擎的 nonce／AAD 构造。**注意 MIC 不等而密文全等
+  这一种组合**：那说明 CTR keystream 对、CBC-MAC 不对，只可能是 AAD 或 `B_0`，与 TK 无关。
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
@@ -1023,9 +1059,10 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是增量 3s：3r 已上板，`verdict=0x1` 说明发送路径确实在加密，
-所以要用软件 CCMP 把回环帧逐字节对一遍，把「加对了密（问题在 AP）」和
-「加错了密（AP 静默 MIC 失败）」分开。**
+**当前实际下一步是把增量 3s 上板：代码已写完、已构建、软件 CCMP 已在主机上用
+RFC 3610 与自制帧型向量独立验过，还差一次板上运行（`tools/run_k1_wpa.sh`，四十条判据，
+需要用户在监听器开口后按 RST）。它把「加对了密（问题在 AP）」和「加错了密（AP 静默
+MIC 失败）」分开。**
 增量 3r 已在 run 55 上板（39/39），它把刚发出去的那一帧从 MAC 里绕回来看载荷，
 读到 `verdict=0x1`（密文）：整个 36 字节载荷全变、整帧无明文 LLC、长度按 MIC 长了 8、
 `hw-dec=0x0` 排除回程解密——所以「硬件没加密」这个怀疑排除了。

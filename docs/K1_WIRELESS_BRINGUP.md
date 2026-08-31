@@ -7414,7 +7414,7 @@ group=0x7 hw-dec=0x7 sw-dec=0x0 icv=0x0`，`data sec first ... sec-type=0x6 cam=
 数据帧全部硬件解密成功、零 ICV 错。而 `a1-match=0x0`——从关联到现在，**一个发给我们
 自己的单播数据帧都没收到过**。
 
-#### 下一个增量（3s）：把回环密文和软件 CCMP 算出来的密文逐字节对一遍
+#### 为什么 `verdict=0x1` 还不够：剩下的 (A) 与 (B)
 
 「加了密」不等于「加对了密」。AP 如果解密后 MIC 校验失败，会**静默丢帧**，表现和现在
 一模一样：帧发得出去、firmware 报 TX OK、对端不回。剩下两种可能只有一步之隔：
@@ -7424,13 +7424,129 @@ group=0x7 hw-dec=0x7 sw-dec=0x0 icv=0x0`，`data sec first ... sec-type=0x6 cam=
 - **(B) 密文完全正确，是 AP 不转发**——客户端隔离、或者要求先拿到 DHCP 地址。
 
 3s 用软件 CCMP 把 (A) 判掉，不需要 AP 配合、不需要主机权限：回环窗口里把同一份明文用
-自己派生的 TK、同一个 PN、同一份 AAD 在栈上算一遍，和绕回来的那一帧逐字节比，只报
+自己派生的 TK、同一个 PN、同一份 AAD 算一遍，和绕回来的那一帧逐字节比，只报
 「密文差异字节数」和「MIC 是否一致」两个计数，**不打印任何密文或密钥字节**。全等就说明
 硬件 CCMP 一点问题没有，问题不在本移植，下一步转去查 (B)；不等就直接指到出错的那一段。
 
-缺的零件只有一个：文件里现在只有 AES-128 的**解密**分组（`k1_rtl8852bs_gpl.c:4333`，
-给 GTK 的 AES key unwrap 用），CCMP 要的是**正向**分组加密，外加 CTR ＋ CBC-MAC。
+### 增量 3s：软件 CCMP 当量具——把「加对了密」和「加错了密」分开
 
+回环（3r）能回答「加没加密」，但回答不了「加得对不对」，而这两者在空口上的症状完全一样：
+AP 收到帧、ACK 了（ACK 发生在解密之前）、解密后 MIC 校验失败、**静默丢帧**。所以 3s 在
+回环窗口里放一台**量具**：用本次运行自己派生的 TK、用绕回来那一帧**自己带的** PN 与地址、
+用同一份 AAD，把提交出去的那 36 字节明文在软件里重算一遍 CCMP，再和绕回来的密文与 MIC
+逐字节比。
+
+**流量加密仍然是硬件的活。**这段软件密码学只做量具，不进数据通路。
+
+#### 补上的零件：AES-128 正向分组 ＋ CCM（M=8, L=2）
+
+文件里原先只有 AES-128 的**解密**分组（给 GTK 的 AES key unwrap 用）。CCMP 要的是**正向**
+分组加密，外加 CTR 与 CBC-MAC。新增的一节叫「Software CCMP, used as a measuring
+instrument」，紧跟在 `k1_rtl8852bs_aes_key_unwrap` 之后。
+
+`k1_rtl8852bs_ccm_encrypt()` 是 NIST SP 800-38C 的 CCM，参数按 IEEE 802.11 的 CCMP 取
+**M=8、L=2**：
+
+- `B_0` ＝ 标志字节 `0x59`（Adata ｜ M'=3 ｜ L'=1）‖ 13 字节 nonce ‖ 2 字节**大端**明文长度。
+- AAD 前面加 2 字节**大端**长度，然后补零到 16 的整数倍。
+- CBC-MAC 依次走 `B_0` → 各 AAD 块 → 补零后的明文块，每块与 `mac` 异或后原地加密。
+- `A_i` ＝ 标志字节 `0x01` ‖ nonce ‖ 2 字节**大端** i；`S_0 = E(A_0)`，
+  `MIC = X_final[0..7] XOR S_0[0..7]`；CTR keystream 从 i=1 起，逐块异或明文。
+
+工作区 `struct k1_rtl8852bs_ccmp_work_s` 429 字节，包含 AES 编排、`mac`/`block`/`stream`
+三个分组缓冲、48 字节 AAD 暂存、13 字节 nonce、32 字节 AAD、128 字节密文和 8 字节 MIC。
+**它走 `kmm_malloc` 放堆上**，不放驻留窗口的栈——读回本身就跑在那个窗口里，那里的栈增长
+以前咬过人（`role-cam-stack-fix`）。比完立刻 `memset` 清零，密钥编排不活过这一次比较。
+
+#### 两个 CCMP 专有的坑：AAD 的 FC 掩码，nonce 的 PN 字节序
+
+按 IEEE 802.11-2016 12.5.3.3.3（与 Linux `ccmp_special_blocks` 一致）：
+
+- **AAD 的 Frame Control 要掩码**：`masked_fc = (fc & ~(0x3800 | 0x0070)) | 0x4000`
+  ——清掉 Retry / Power Management / More Data 和三个**数据子类型**位，置上 Protected。
+  这些位在空口上会被中途改写，所以不能进被认证的数据。
+- **非 QoS 三地址帧的 AAD 是 22 字节**：掩码 FC（小端两字节）‖ A1 ‖ A2 ‖ A3 ‖
+  `(SC & 0x0f)` ‖ `0x00`。**Duration 不在里面**，Sequence Control 只留分片号。
+  QoS 帧和四地址帧的 AAD 不是这个长度，`k1_rtl8852bs_ccmp_aad_build()` 对它们返回
+  `-ENOTSUP` 而不是猜。
+- **nonce 13 字节**：标志字节 `0`（优先级 0、非 QoS、非管理帧）‖ A2（6 字节）‖
+  **大端** PN5..PN0。而 CCMP 头在帧里的字节序是 PN0, PN1, 保留, `keyid<<6|0x20`,
+  PN2, PN3, PN4, PN5——所以 `k1_rtl8852bs_ccmp_nonce_build()` 是**倒着**把它读回来的。
+  这一处写错的话，密文会全错而 AAD 看不出问题，正是 3s 要区分的那类故障。
+
+**AAD 和 nonce 取自绕回来的那一帧，不是取自提交的那一帧**——序列号是硬件填的，比较必须
+对着引擎真正看到的头。明文则取自提交的帧体。
+
+#### 唯一新增的硬判据：内存已知答案自校验（39 → 40）
+
+比较结果本身是**报告**不是判据（不等是关于密钥通路的发现，不是窗口失败的理由）。但一台
+量具在给出读数之前必须先证明自己没坏，所以 3s 新增的唯一 `--require-*` 是
+`--require-runtime-ccmp-selftest`，卡这一行固定读数：
+
+```
+resident ccmp selftest rfc=0x1 rfc-mic=0x1 aad=0x1 nonce=0x1
+  frame=0x1 frame-mic=0x1 stage=0x0 status=0x0
+```
+
+`k1_rtl8852bs_ccmp_selftest()` 跑两组向量，**都是公开发表的测试数据**，不是本网络的任何
+密钥材料：
+
+1. **RFC 3610 packet vector #1**：密钥 `c0..cf`、nonce `00 00 00 03 02 01 00 a0 a1 a2 a3
+   a4 a5`、8 字节 AAD、23 字节明文，密文与 8 字节 MIC 都对。这一组证明 CCM 内核（`B_0`、
+   AAD 分块、CBC-MAC、CTR、MIC 截断异或）无误。
+2. **一组按本移植真实帧型手算的 CCMP 向量**：密钥用 FIPS-197 的样例密钥 `2b7e1516…`，
+   68 字节帧（24 字节 802.11 头 ＋ 8 字节 CCMP 头 ＋ 8 字节 LLC/SNAP ＋ 28 字节 ARP），
+   PN `0x0a0b0c`。它**先**把帧头喂给 `aad_build` 和 `nonce_build`，对上 22 字节 AAD 和
+   13 字节 nonce，**再**算密文和 MIC。所以 FC 掩码写错、AAD 少了 Duration 之外的字段、
+   或者 nonce 的 PN 字节序反了，都会在板子上第一时间失败，而不会把一个错的比较结果
+   当成结论拿去改代码。
+
+**这两组在上板之前已经在主机上跑过**，两条独立路径：
+
+- 把驻留文件的第 4143–5095 行原样抽出来（`sed`），配一个只补 `FAR`、`kmm_malloc`、
+  `k1_early_puthex` 等桩的 `host.c`，用 gcc 编译并调用**驱动自己的**
+  `k1_rtl8852bs_ccmp_selftest()`，打出 `rfc=0x1 rfc-mic=0x1 aad=0x1 nonce=0x1
+  frame=0x1 frame-mic=0x1 stage=0x0 status=0x0`，返回 0。
+- 同一份构造在 Python 里手写一遍，与 `cryptography` 的 `AESCCM(key, tag_length=8)`
+  在 RFC 3610 向量和这组 CCMP 型向量上都独立对上。
+
+也就是说 AES 正向分组、CCM 内核、AAD 构造器、nonce 构造器四件在板子跑之前就已经是
+证明过的了；板上那条自校验行是防止**编译/移植**层面出岔子（大小端、对齐、堆分配失败）。
+
+#### 比较级：只报计数，一个密文字节都不打
+
+`k1_rtl8852bs_runtime_loopback_ccmp_compare()` 挂在 3r 的分类器之后，`readback` 行在
+`diff-first=` 和 `pn=` 之间多出六个字段：
+
+```
+sw-ready= sw-diff= sw-first= sw-mic= sw-mic-diff= sw-stage=
+```
+
+- `sw-ready=0x1` 表示比较真的跑了。跑不起来时它是 `0x0`，`sw-stage=` 给出退出点的
+  `__LINE__`：PTK 还没派生、长度不成立（绕回来的帧必须 ≥ 明文 ＋ 8 字节 MIC）、
+  跨度超过 128 字节、或者帧是 QoS／四地址。
+- `sw-diff=` 是密文差异**字节数**，`sw-first=` 是第一个不同的偏移（`0xff` ＝ 没有不同）。
+- `sw-mic=0x1` 表示 8 字节 MIC 完全一致，`sw-mic-diff=` 是 MIC 里不同的字节数。
+
+**仍然一个密文字节都不打印，一个密钥字节都不打印。**这一帧的明文是已知的，把密文打出来
+等于公开一段密钥流；`body=` 那 8 字节维持 3r 的规则（要么是 CCMP 头的 PN/KeyID，要么是
+明文 LLC/SNAP 头，两者都不是密钥材料）。
+
+#### 读数怎么用
+
+- **`sw-diff=0x0 sw-mic=0x1`（全等）** → 硬件 CCMP 引擎和自己派生的 TK 完全一致，
+  连 nonce 和 AAD 都一致。(A) 排除，嫌疑全部转到 AP 侧：客户端隔离，或者要求先拿到
+  DHCP 地址才转发。可以在 AP 的有线段确认：
+  `! sudo tcpdump -i enp6s0 -nn -e -c 50 'ether host 84:fc:14:06:79:7b or (udp port 67 or udp port 68) or arp'`。
+- **`sw-diff` 不为 0** → 指向 TK 进 SEC CAM 的取字节/字序（`sec_info_tbl_init` 至今未审），
+  或引擎的 nonce／AAD 构造。
+- **MIC 不等而密文全等**这一种组合要单独记住：说明 CTR keystream 是对的（于是 TK 和
+  nonce 都对），只有 CBC-MAC 不对，那就只可能是 AAD 或 `B_0`，与密钥无关。这是 3s
+  相比「只看密文」多出来的分辨力。
+
+harness 侧 `run_k1_wireless_smoke.py` 的 `readback` 正则相应多出六个捕获组（共 18 个），
+并按 `sw-ready` 打印一行 `software CCMP: cipher-diff=… first=… mic-match=… mic-diff=…`
+加一句结论，或者在没跑起来时打 `software CCMP comparison did not run: sw-stage=…`。
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来
