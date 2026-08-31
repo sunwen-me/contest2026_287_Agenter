@@ -525,7 +525,7 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `.config` 时才配置，所以同一个构建目录里加 `--no-key` 时配置不会重新生成，**会把带密钥的
   镜像增量重建一遍并把它的哈希报成 no-key 的**；现在把上次用的 defconfig 记在
   `${BUILD_DIR}/.k1-wpa-config-source`，来源一变就强制 `--clean`（两个方向都验过）。
-- **已实现、待上板 run 40（增量 3i 后半）：发送侧的安全字段与 CCMP 头，全在内存里，一帧不发。**
+- **已上板通过 run 40（增量 3i 后半）：发送侧的安全字段与 CCMP 头，全在内存里，一帧不发。**
   没有新的 Kconfig 符号（挂在已有的 `CONFIG_K1_RTL8852BS2_RUNTIME_DATA_TX_DIAGNOSTIC` 下，
   同样是纯内存操作），但**有**新判据 `--require-runtime-tx-security`（内存断言不看 AP 的心情，
   和 3i 前半那个组播计数不同，所以可以做判据），`tools/run_k1_scanofld_active.sh` 里也加上了。
@@ -547,11 +547,19 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   （原厂 `security_cam.c:476`），本移植 TK 槽 0 → 安全 CAM 0、GTK 槽 2 → CAM 1，**正是
   run 39 的接收描述符回读出来的 `cam=0x1`，收发两侧的编号体系因此已被硬件校对过一次**。
   镜像：带密钥 `e2c099e6…`，`--no-key` `43aa3c70…`。
+  **上板读数（run 40，`out/k1-serial/k1-wpa-20260831T010437Z.log`，36 条 `--require-*` 全过）**：
+  `info2-tk=0xd00 info2-gtk=0xd01 info2-plain=0x0 sec-type=0x6 hdr=0x8 mic=0x8 len=0x40`、
+  `ccmp=98ba00a0dcfe0000`——三种 dword2 形态、cipher 编号、8 字节头／8 字节 MIC／`0x40 = 24+8+32`
+  的「帧长不含 MIC」，以及 PN 在 CCMP 头里的那个不连续摆法，全部与写死的字面量逐位相同。
+  `sec-type=0x6` 与 `cam=0x1` 和 run 39 从**接收**描述符读出来的两个值是同一套编号。
+  同一次 run 的驻留窗口给了另一组接收样本：`total=0x4 prot=0x4 group=0x4 hw-dec=0x3 sw-dec=0x1
+  icv=0x0 crc=0x0 sec-type-mask=0x41 cam-mask=0x3`——四帧保护组播里一帧没解，是附近另一个 BSS
+  的组播落进嗅探口（密钥不在硬件里），被解的三帧仍然是 `cam=0x1`，不是回归。
   还差的是数据队列那一路真的发（增量 3j）：把 CCMP 头拼进帧、帧长按「不含 MIC」算、走数据
   DMA 通道提交、观察 AP 回应（候选首帧 DHCP Discover，驻留窗口已经在数
   `data_frames_to_self`），以及每密钥的单调 PN 计数器——现在 PN 还只是函数参数。
 - **下一步优先级**：(1) 真的发出一帧被 CCMP 保护的数据帧（增量 3j）——**描述符的安全字段与
-  CCMP 头这两块砖已经写完并逐字段验过，待上板 run 40**（见上一条），RX 侧那一半也已经在
+  CCMP 头这两块砖已经写完、逐字段验过并在 run 40 上板确认**（见上一条），RX 侧那一半也已经在
   run 39 上板证明了。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
   信道本来就是驻留的（增量 3h 的更正一），所以挡在「密钥装好」和「能收发数据」之间的
   只剩这一条——描述符不引用安全 CAM index，硬件就不会去加密。
@@ -704,12 +712,17 @@ Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手�
 
 ```bash
 tools/build_k1_wpa.sh             # profile board/k1/muse_pi_pro/configs/wireless_wpa_diag
+tools/run_k1_wpa.sh               # 上板：36 条 --require-*，K1_RESET_MODE 选复位方式
 ```
 
-板上验收现在是 35 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
-＋ `--require-runtime-port-init` ＋ 增量 3h 新增的 `--require-runtime-resident`；
-run 35 跑的是其中 34 条，那时还没有最后这条），run 35 一条没失败、以
-`PASS: K1 wireless RAM image reached NSH` 收尾，日志
+板上验收现在是 36 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
+＋ `--require-runtime-port-init` ＋ 增量 3h 的 `--require-runtime-resident`
+＋ 增量 3i 后半的 `--require-runtime-tx-security`），不用再手抄那条长命令：
+`tools/run_k1_wpa.sh` 把这 36 条固定下来，复位方式用环境变量
+`K1_RESET_MODE`（默认 `--nsh-reboot`，板子不在 `nsh>` 时设成 `--manual-reset` 再按 RST），
+额外参数原样透传。**它不接受也不打印任何口令**。run 40 用它跑，36 条一条没失败，日志
+`out/k1-serial/k1-wpa-20260831T010437Z.log`；run 35 跑的是其中 34 条（那时还没有最后两条）、
+一条没失败、以 `PASS: K1 wireless RAM image reached NSH` 收尾，日志
 `out/k1-serial/k1-wpa-20260830T194339Z.log`（run 34 是其中 33 条，日志
 `out/k1-serial/k1-wpa-20260830T174332Z.log`；run 33 是 31 条，日志
 `out/k1-serial/k1-wpa-20260830T145145Z.log`）。跟踪的 profile defconfig **不含**

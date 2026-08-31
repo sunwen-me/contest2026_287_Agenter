@@ -6220,7 +6220,7 @@ profile 切到提交的 profile（也就是加 `--no-key`）时，配置根本�
 
 ### 增量 3i（后半）：发送侧的安全字段与 CCMP 头——只在内存里，一帧不发
 
-（**待上板：run 40**）
+（**run 40 已上板：两行读数与写死的字面量逐位相同，读数见下面「上板读数」**）
 
 run 39 已经证明硬件拿着装进去的 GTK 在解 AP 的组播帧。反过来那一半——本端发一帧被 CCMP 保护
 的帧——缺的东西只有两样：发送描述符里引用安全 CAM 的那一个 dword，和 802.11 头之后那 8 字节
@@ -6279,6 +6279,38 @@ CCMP 头。这一步把这两样都实现出来并逐字段验证，但**不发�
 `0xd00` 就是 `6 << 9 | BIT(8)`：cipher 6 落在 [12:9]、硬件加密位 8、CAM index 在低字节。
 `sec_type = 0` 被拒是有意的——「不加密」这件事要用 `security = NULL` 表达，不能用一个零 cipher
 混在保护路径里；`sec_type = 16` 被拒是因为它会溢出 [12:9] 去改掉旁边的 lifetime selector。
+
+#### 上板读数（run 40）
+
+`out/k1-serial/k1-wpa-20260831T010437Z.log`，36 条 `--require-*` 判据全过，
+`PASS: K1 wireless RAM image reached NSH`：
+
+```
+K1 Wi-Fi GPL: runtime TX security info2-tk=0x0000000000000d00 info2-gtk=0x0000000000000d01 info2-plain=0x0000000000000000 sec-type=0x0000000000000006 hdr=0x0000000000000008 mic=0x0000000000000008 len=0x0000000000000040
+K1 Wi-Fi GPL: runtime TX security ccmp=98ba00a0dcfe0000
+K1 Wi-Fi GPL: RTL8852BS2 runtime TX security fields complete
+```
+
+- `info2-tk=0xd00`、`info2-gtk=0xd01`、`info2-plain=0x0`：描述符 dword2 的三种形态和上面
+  那张表里的字面量逐位相同。`0xd00 = 6 << 9 | BIT(8) | 0`，`0xd01` 只差低字节的 CAM index，
+  不保护的帧写零——也就是说 cipher 落在 [12:9]、硬件加密位在 8、CAM index 在低字节这三件事
+  在真机上编出来的确实是这三个数，不是主机端算错又自己对上。
+- `sec-type=0x6`：写进描述符的 cipher 编号是 `mac_ax_enc_alg` 的 CCMP-128，与 run 39 从
+  **接收**描述符 DW7 读出来的 `sec-type=0x6` 是同一个编号；`cam=0x1` 也和 run 39 的接收读数
+  对上。发送侧引用安全 CAM 的方式因此不只是「按原厂抄的」，而是被硬件自己的回读校对过。
+- `hdr=0x8`、`mic=0x8`、`len=0x40`：CCMP 头 8 字节由主机拼、MIC 8 字节由硬件追加、描述符里
+  的帧长 `0x40 = 64 = 24 + 8 + 32` **不含** MIC——8852B 的 `hw_sec_hdr = false` 这条约定在
+  代码里落成了这三个数。
+- `ccmp=98ba00a0dcfe0000`：PN `0x0000fedcba98`、key id 2 的 CCMP 头。低两字节 `98 ba` 在
+  最前，然后是保留字节 `00` 和 `KeyID<<6 | ExtIV = 2<<6 | 0x20 = 0xa0`，最后才是高四字节
+  `dc fe 00 00`。这一行就是「PN 不是连续六字节」这件事的现场证据。
+
+同一次 run 的驻留窗口顺手又给了一组接收侧读数，和 run 39 的四帧样本不同：
+`total=0x4 prot=0x4 group=0x4 hw-dec=0x3 sw-dec=0x1 icv=0x0 crc=0x0`、
+`sec-type-mask=0x41 cam-mask=0x3`。四帧保护组播里有三帧硬件解了、一帧被交上来没解
+（`sw-dec`，`sec-type=0`／`cam=0`），说明这一帧的密钥硬件手里没有——附近另一个 BSS 的组播落进
+了嗅探模式的收包口。这不是回归：`sec-type-mask` 里除了 CCMP-128 的 bit 6 只多了「无加密」的
+bit 0，被解的那三帧仍然是 `cam=0x1`（GTK 那一项）。
 
 #### 还没做的
 
