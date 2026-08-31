@@ -300,7 +300,9 @@ def parse_args() -> argparse.Namespace:
         help=("fail unless the associated channel is held with no sweep "
               "running: a Beacon from the target and its Probe Response back "
               "inside one bounded receive window, every sampled channel "
-              "register unchanged across it, and the receive filter restored"),
+              "register unchanged across it, the receive filter restored, and "
+              "the target's traffic indication map read for this station's "
+              "AID"),
     )
     parser.add_argument(
         "--require-runtime-data-secure-tx", action="store_true",
@@ -2050,6 +2052,81 @@ def main() -> int:
                 missing.append(
                     "RTL8852BS2 Beacon from the associated access point with "
                     "no sweep running")
+
+            # What the access point's Beacons say is waiting for this station.
+            # The line is required to exist and no value in it is required:
+            # both readings are conclusions.  A set AID bit means the answer to
+            # this window's probes exists and was never collected, which is the
+            # one explanation a silent window cannot otherwise be told apart
+            # from an access point that produced no answer at all.
+            resident_tim_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window tim aid=(?:0x)?"
+                rb"([0-9a-fA-F]+) seen=(?:0x)?([0-9a-fA-F]+)"
+                rb" aid-set=(?:0x)?([0-9a-fA-F]+)"
+                rb" bcast-set=(?:0x)?([0-9a-fA-F]+)"
+                rb" absent=(?:0x)?([0-9a-fA-F]+)"
+                rb" short=(?:0x)?([0-9a-fA-F]+)"
+                rb" out-of-range=(?:0x)?([0-9a-fA-F]+)"
+                rb" dtim-count=(?:0x)?([0-9a-fA-F]+)"
+                rb" dtim-period=(?:0x)?([0-9a-fA-F]+)"
+                rb" ctl=(?:0x)?([0-9a-fA-F]+)"
+                rb" bmap-len=(?:0x)?([0-9a-fA-F]+)"
+                rb" head=([0-9a-fA-F]*)",
+                resident,
+            )
+            if resident_tim_result is None:
+                missing.append(
+                    "RTL8852BS2 traffic indication map from the associated "
+                    "access point")
+            else:
+                (tim_aid, tim_seen, tim_aid_set, tim_bcast_set, tim_absent,
+                 tim_short, tim_range, tim_dtim_count, tim_dtim_period,
+                 tim_control, tim_bitmap) = (
+                     int(group, 16)
+                     for group in resident_tim_result.groups()[:11])
+                tim_head = resident_tim_result.group(12).decode("ascii")
+
+                print(
+                    "[serial] traffic indication map: aid={0} seen={1} "
+                    "aid-set={2} bcast-set={3} absent={4} short={5} "
+                    "out-of-range={6} dtim={7}/{8} ctl={9:#04x} "
+                    "bitmap={10} head={11}"
+                    .format(tim_aid, tim_seen, tim_aid_set, tim_bcast_set,
+                            tim_absent, tim_short, tim_range, tim_dtim_count,
+                            tim_dtim_period, tim_control, tim_bitmap,
+                            tim_head or "none"),
+                    file=sys.stderr)
+                if tim_aid == 0:
+                    print(
+                        "[serial] this station holds no association "
+                        "identifier, so no bit in the map belongs to it: "
+                        "the reading is void, not negative",
+                        file=sys.stderr)
+                elif tim_seen == 0:
+                    print(
+                        "[serial] no Beacon from the access point carried a "
+                        "map, so this window says nothing about buffered "
+                        "traffic",
+                        file=sys.stderr)
+                elif tim_aid_set:
+                    print(
+                        "[serial] the access point is holding a frame for "
+                        "this station in {0} of {1} maps: the answer to the "
+                        "window's probes exists and was never collected, so "
+                        "what is missing is on this side -- the access point "
+                        "believes this station is asleep"
+                        .format(tim_aid_set, tim_seen),
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no map in {0} Beacons had this station's "
+                        "bit set -- {1} of them left out the octet it lives "
+                        "in, which clause 9.4.2.6 defines as a clear bit -- "
+                        "so the access point had nothing buffered for it: "
+                        "the reply was never produced, which is the access "
+                        "point's own forwarding to answer for"
+                        .format(tim_seen, tim_range),
+                        file=sys.stderr)
 
             # The transmit half.  The status of the Probe Request separates a
             # frame the hardware accepted from one the builder or the queue

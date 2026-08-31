@@ -26386,6 +26386,17 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 
 #define K1_RTL8852BS_RESIDENT_SEC_HEAD          32u
 
+/* The traffic indication map, clause 9.4.2.5, and how much of it is kept.
+ * Element number five; three fixed bytes -- a DTIM count, a DTIM period and a
+ * bitmap control byte -- followed by the partial virtual bitmap.  Eight bytes
+ * of it cover the fixed part and the first five bitmap bytes, which is every
+ * AID an access point with a handful of clients will ever have handed out.
+ */
+
+#define K1_RTL8852BS_IEEE80211_EID_TIM          5u
+#define K1_RTL8852BS_RESIDENT_TIM_FIXED         3u
+#define K1_RTL8852BS_RESIDENT_TIM_HEAD          8u
+
 /* The channel-defining registers of the three layers, as the vendor names
  * them.  cfg_mac_bw() owns the first two, halbb_ctrl_bw_ch_8852b() the
  * baseband set, and halrf_ctrl_ch_8852b() the radio's 0x18.
@@ -26663,6 +26674,45 @@ struct k1_rtl8852bs_resident_count_s
   bool arp_peer_valid;
   bool ipv4_peer_valid;
   bool arp_reply_valid;
+
+  /* What the access point's own Beacons say is waiting for this station.
+   * This reading costs no transmitted frame: the window already receives the
+   * target's Beacons, and the traffic indication map is the one field in them
+   * that is about this station in particular.
+   *
+   * An access point holding a unicast frame for an associated station sets the
+   * bit for that station's AID in the partial virtual bitmap, and it keeps
+   * setting it in every Beacon until the station collects the frame.  So
+   * tim_aid_set separates the two explanations a silent window cannot
+   * otherwise tell apart: an answer that was never produced, and an answer
+   * that exists and is waiting because the access point believes this station
+   * is asleep.  A station that never retrieves buffered traffic sees the bit
+   * set and stays silent, which on air looks exactly like an access point that
+   * dropped the request.
+   *
+   * Bit 0 of the bitmap control byte is the same indication for
+   * group-addressed traffic and bits 1 to 7 are the bitmap offset in units of
+   * two bytes, so the byte holding an AID's bit has to be found relative to
+   * that offset; an AID outside the range the element actually carries is
+   * counted in tim_out_of_range rather than read out of whatever byte sits
+   * beside the bitmap.  tim_absent counts the target's Beacons that carried no
+   * map at all, so a zero aid-set with a zero seen is never read as a map that
+   * said nothing.
+   */
+
+  uint32_t tim_seen;
+  uint32_t tim_aid_set;
+  uint32_t tim_bcast_set;
+  uint32_t tim_short;
+  uint32_t tim_out_of_range;
+  uint32_t tim_absent;
+  uint16_t tim_aid;
+  uint8_t tim_dtim_count;
+  uint8_t tim_dtim_period;
+  uint8_t tim_bitmap_control;
+  uint8_t tim_bitmap_length;
+  uint8_t tim_first[K1_RTL8852BS_RESIDENT_TIM_HEAD];
+  uint8_t tim_first_length;
 
   /* And the transmit half of it.  arp_tx_target_ip is the address the probe
    * asked about, so the reply's sender address can be checked against the
@@ -28227,6 +28277,124 @@ static void k1_rtl8852bs_runtime_resident_keep_other(
   count->first_other_length = (uint8_t)length;
 }
 
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_tim_read
+ *
+ * Description:
+ *   Find the traffic indication map in a Beacon from the associated access
+ *   point and record what it says about this station's AID.
+ *
+ *   The element list begins after the fixed fields clause 9.3.3.3 puts in
+ *   front of it -- a timestamp, a beacon interval and a capability field,
+ *   twelve bytes -- and every element is a one-byte identifier, a one-byte
+ *   length and that many bytes.  An element whose length runs past the end of
+ *   what was received ends the walk instead of being read, because a
+ *   truncated element's length byte says nothing about how many bytes are
+ *   really there.
+ *
+ *   Nothing here is transmitted and nothing is written to the hardware.
+ *
+ * Input Parameters:
+ *   payload        - the received frame, from its frame control onwards
+ *   payload_length - how many bytes of it were received
+ *   header_length  - the length of its 802.11 header
+ *   aid            - the association identifier to look for
+ *   count          - where the reading is recorded
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_resident_tim_read(
+  FAR const uint8_t *payload, size_t payload_length, size_t header_length,
+  uint16_t aid, FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  size_t offset = header_length + 12u;
+  size_t offset_bytes;
+  size_t byte_index;
+  size_t length;
+  size_t take;
+
+  count->tim_aid = aid;
+
+  while (offset + 2u <= payload_length)
+    {
+      length = payload[offset + 1];
+
+      if (offset + 2u + length > payload_length)
+        {
+          break;
+        }
+
+      if (payload[offset] != K1_RTL8852BS_IEEE80211_EID_TIM)
+        {
+          offset += 2u + length;
+          continue;
+        }
+
+      /* Three fixed bytes and at least one bitmap byte, which is the shortest
+       * form the standard allows.  Anything shorter is counted and not
+       * decoded.
+       */
+
+      if (length < K1_RTL8852BS_RESIDENT_TIM_FIXED + 1u)
+        {
+          count->tim_short++;
+          return;
+        }
+
+      count->tim_seen++;
+      count->tim_dtim_count = payload[offset + 2];
+      count->tim_dtim_period = payload[offset + 3];
+      count->tim_bitmap_control = payload[offset + 4];
+      count->tim_bitmap_length =
+        (uint8_t)(length - K1_RTL8852BS_RESIDENT_TIM_FIXED);
+
+      if (count->tim_first_length == 0)
+        {
+          take = length;
+          if (take > K1_RTL8852BS_RESIDENT_TIM_HEAD)
+            {
+              take = K1_RTL8852BS_RESIDENT_TIM_HEAD;
+            }
+
+          memcpy(count->tim_first, payload + offset + 2, take);
+          count->tim_first_length = (uint8_t)take;
+        }
+
+      if ((count->tim_bitmap_control & 0x01u) != 0)
+        {
+          count->tim_bcast_set++;
+        }
+
+      /* The bitmap offset is in units of two bytes and names the first AID
+       * byte the element carries, so the byte holding this station's bit is
+       * that many bytes further back than its AID alone would say.  An octet
+       * the element leaves out is a clear bit by definition -- clause
+       * 9.4.2.6 omits the leading and trailing all-zero octets -- so it is
+       * counted apart from a bit that was read as zero rather than treated
+       * as unknown.
+       */
+
+      offset_bytes = (size_t)(count->tim_bitmap_control >> 1) * 2u;
+      byte_index = (size_t)(aid / 8u);
+
+      if (byte_index < offset_bytes ||
+          byte_index - offset_bytes >= count->tim_bitmap_length)
+        {
+          count->tim_out_of_range++;
+        }
+      else if ((payload[offset + 2u + K1_RTL8852BS_RESIDENT_TIM_FIXED +
+                        byte_index - offset_bytes] &
+                (1u << (aid % 8u))) != 0)
+        {
+          count->tim_aid_set++;
+        }
+
+      return;
+    }
+
+  count->tim_absent++;
+}
+
 static void k1_rtl8852bs_runtime_resident_observe(
   FAR const uint8_t *payload, size_t payload_length,
   FAR const uint8_t *self_mac, FAR const uint8_t *bssid,
@@ -28363,6 +28531,15 @@ static void k1_rtl8852bs_runtime_resident_observe(
       if (from_target)
         {
           count->beacons_target++;
+
+          /* The one field in a Beacon that is about this station in
+           * particular: whether the access point is holding a frame for it.
+           */
+
+          k1_rtl8852bs_runtime_resident_tim_read(
+            payload, payload_length,
+            k1_rtl8852bs_runtime_resident_header_length(mgmt.frame_control),
+            g_k1_rtl8852bs_assoc_action.response_aid, count);
         }
 
       return;
@@ -30584,6 +30761,44 @@ static int k1_rtl8852bs_runtime_resident_window(
                                       count.first_other_length);
       k1_early_puts("\r\n");
     }
+
+  /* And what the access point's Beacons say is waiting for this station.  A
+   * set AID bit is an answer that exists and was not collected; a window of
+   * Beacons with it clear, with seen equal to the target's Beacon count, is an
+   * answer that was never produced.  head= is the element's own bytes, which
+   * is what makes the bit test checkable rather than trusted.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window tim aid=");
+  k1_early_puthex(count.tim_aid);
+  k1_early_puts(" seen=");
+  k1_early_puthex(count.tim_seen);
+  k1_early_puts(" aid-set=");
+  k1_early_puthex(count.tim_aid_set);
+  k1_early_puts(" bcast-set=");
+  k1_early_puthex(count.tim_bcast_set);
+  k1_early_puts(" absent=");
+  k1_early_puthex(count.tim_absent);
+  k1_early_puts(" short=");
+  k1_early_puthex(count.tim_short);
+  k1_early_puts(" out-of-range=");
+  k1_early_puthex(count.tim_out_of_range);
+  k1_early_puts(" dtim-count=");
+  k1_early_puthex(count.tim_dtim_count);
+  k1_early_puts(" dtim-period=");
+  k1_early_puthex(count.tim_dtim_period);
+  k1_early_puts(" ctl=");
+  k1_early_puthex(count.tim_bitmap_control);
+  k1_early_puts(" bmap-len=");
+  k1_early_puthex(count.tim_bitmap_length);
+  k1_early_puts(" head=");
+  if (count.tim_first_length != 0)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.tim_first,
+                                      count.tim_first_length);
+    }
+
+  k1_early_puts("\r\n");
 
   /* The third and fourth lines are what the keys the handshake installed are
    * actually doing.  Every data frame the window saw is in the total, the ones
