@@ -310,6 +310,13 @@ def parse_args() -> argparse.Namespace:
               "installed"),
     )
     parser.add_argument(
+        "--require-runtime-arp-probe", action="store_true",
+        help=("fail unless the observer that learns a station from decrypted "
+              "group traffic and recognises an ARP reply addressed to this "
+              "host agrees with its offline model, and the resident window "
+              "reports what its protected ARP request did"),
+    )
+    parser.add_argument(
         "--require-runtime-wpa-msg1", action="store_true",
         help=("fail unless a pairwise master key is derived from a configured "
               "passphrase and the access point sends a first EAPOL-Key frame "
@@ -2280,6 +2287,116 @@ def main() -> int:
                         f"{phase.decode()}: "
                         f"{decoded.group(1).decode('ascii', 'replace')}",
                         file=sys.stderr)
+        if args.require_runtime_arp_probe:
+            # A protected ARP request asks a different question than the DHCP
+            # Discover does, and it is the question left after the descriptor
+            # was cleared field by field: whether the hardware really encrypted
+            # the frame it transmitted.  Twenty-eight bytes, no checksum
+            # anywhere in them, no server needed -- any host's kernel answers
+            # one -- and the answer comes back unicast to this host, which is
+            # also the first exercise of the pairwise receive path.
+            #
+            # The observer that reads those answers is required to agree with
+            # its offline model first.  It runs before the window's clock and
+            # its numbers are fixed, so unlike everything else in the window
+            # this one requirement cannot be affected by the air.
+            arp_model_result = re.search(
+                rb"K1 Wi-Fi GPL: resident network selftest net=(?:0x)?0*5"
+                rb" arp=(?:0x)?0*3 ipv4=(?:0x)?0*1 other=(?:0x)?0*1"
+                rb" other-type=(?:0x)?0*86dd arp-req=(?:0x)?0*1"
+                rb" replies=(?:0x)?0*1 reply-ip=(?:0x)?0*c0a80109"
+                rb" peer-ip=(?:0x)?0*c0a80101 peer-tpa=(?:0x)?0*c0a8017b"
+                rb" ip-peer-ip=(?:0x)?0*c0a80105 stage=(?:0x)?0*"
+                rb"(?![0-9a-fA-F]) status=(?:0x)?0+(?![0-9a-fA-F])",
+                started,
+            )
+            if arp_model_result is None:
+                missing.append(
+                    "RTL8852BS2 decrypted-payload observer model")
+
+            arp_begin_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window enter channel="
+                rb"(?:0x)?0*[1-9a-fA-F][0-9a-fA-F]*",
+                started,
+            )
+            arp_window = (started if arp_begin_result is None
+                          else started[arp_begin_result.end():])
+
+            # And the window's own summary, required to be present and not to
+            # carry any particular value.  status is EADDRNOTAVAIL when the
+            # window heard no network payload to learn a station from, which is
+            # a statement about the traffic on that network and not about this
+            # port, and replies is zero on exactly the run this experiment
+            # exists to produce.
+            arp_summary_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window arp "
+                rb"sent=(?:0x)?([0-9a-fA-F]+)"
+                rb" bytes=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* tpa=(?:0x)?([0-9a-fA-F]+)"
+                rb" status=(?:0x)?([0-9a-fA-F]+)"
+                rb" replies=(?:0x)?([0-9a-fA-F]+)"
+                rb" reply-ip=(?:0x)?([0-9a-fA-F]+)"
+                rb" net=(?:0x)?([0-9a-fA-F]+)"
+                rb" arp=(?:0x)?([0-9a-fA-F]+)"
+                rb" ipv4=(?:0x)?([0-9a-fA-F]+)"
+                rb" other=(?:0x)?([0-9a-fA-F]+)"
+                rb" other-type=(?:0x)?([0-9a-fA-F]+)"
+                rb" arp-req=(?:0x)?([0-9a-fA-F]+)"
+                rb" peer-ip=(?:0x)?([0-9a-fA-F]+)"
+                rb" peer-tpa=(?:0x)?([0-9a-fA-F]+)"
+                rb" ip-peer-ip=(?:0x)?([0-9a-fA-F]+)",
+                arp_window,
+            )
+            if arp_summary_result is None:
+                missing.append(
+                    "RTL8852BS2 resident window protected ARP request "
+                    "summary")
+            else:
+                (sent, byte_count, tpa, status, replies, reply_ip, net,
+                 arp_frames, ipv4_frames, other_frames, other_type,
+                 requests, peer_ip, peer_tpa,
+                 ipv4_peer_ip) = (int(group, 16)
+                                  for group in arp_summary_result.groups())
+
+                def dotted(value):
+                    return "{0}.{1}.{2}.{3}".format(
+                        (value >> 24) & 0xff, (value >> 16) & 0xff,
+                        (value >> 8) & 0xff, value & 0xff)
+
+                print(
+                    "[serial] decrypted payloads: {0} with an LLC/SNAP "
+                    "header, {1} ARP ({2} requests), {3} IPv4, {4} other"
+                    "{5}".format(
+                        net, arp_frames, requests, ipv4_frames, other_frames,
+                        f" (first ethertype 0x{other_type:04x})"
+                        if other_type else ""),
+                    file=sys.stderr)
+                if peer_ip:
+                    print(
+                        "[serial] learned station {0} asking about {1}".format(
+                            dotted(peer_ip), dotted(peer_tpa)),
+                        file=sys.stderr)
+                elif ipv4_peer_ip:
+                    print(
+                        "[serial] learned station {0} from an IPv4 "
+                        "datagram".format(dotted(ipv4_peer_ip)),
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no station learned: the window heard no "
+                        "decrypted network payload to aim a request at",
+                        file=sys.stderr)
+
+                verdict = (
+                    f"{replies} answered, from {dotted(reply_ip)}"
+                    if replies else
+                    "no answer, so the encryption itself is the next place "
+                    "to look")
+                print(
+                    "[serial] protected ARP request: sent={0} bytes={1} "
+                    "target={2} status={3}: {4}".format(
+                        sent, byte_count, dotted(tpa), status, verdict),
+                    file=sys.stderr)
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

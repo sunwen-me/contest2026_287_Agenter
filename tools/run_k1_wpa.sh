@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Run the RTL8852BS WPA2-PSK four-way handshake diagnostic image on the MUSE Pi
-# Pro K1 over U-Boot loadx + go, with the thirty-six acceptance requirements the
-# handshake board runs use.  Nothing here is persistent: the payload is loaded
-# into RAM and started, there is no saveenv and no eMMC, SPI or eFuse write.
+# Pro K1 over U-Boot loadx + go, with the thirty-eight acceptance requirements
+# the handshake board runs use.  Nothing here is persistent: the payload is
+# loaded into RAM and started, there is no saveenv and no eMMC, SPI or eFuse
+# write.
 #
 # The image comes from tools/build_k1_wpa.sh, so it carries the passphrase in
 # its read-only data.  Do not publish out/k1-wpa.  No credential is passed on
@@ -51,4 +52,5 @@ exec python3 "${SCRIPT_DIR}/run_k1_wireless_smoke.py" \
   --require-runtime-wpa --require-runtime-wpa-msg1 \
   --require-runtime-wpa-mic --require-runtime-wpa-keys \
   --require-runtime-resident --require-runtime-data-secure-tx \
+  --require-runtime-arp-probe \
   "$@"

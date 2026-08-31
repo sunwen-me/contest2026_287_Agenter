@@ -558,6 +558,26 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_BOOTP_BROADCAST_FLAG    0x8000u
 #define K1_RTL8852BS_BOOTP_REQUEST           1u
 #define K1_RTL8852BS_BOOTP_REPLY             2u
+
+/* The ARP request this port sends to learn whether the hardware really
+ * encrypted a frame, and the two ethertypes the window's decrypted payloads
+ * are classified by.  The request is an RFC 5227 probe -- sender protocol
+ * address zero, because this host has no address to claim -- which is exactly
+ * what a station without a lease may ask, and which Linux answers for any
+ * address it owns.  Twenty-eight bytes, no checksum anywhere in it: the whole
+ * point is a protected frame whose body cannot be wrong.
+ */
+
+#define K1_RTL8852BS_ETHERTYPE_IPV4          0x0800u
+#define K1_RTL8852BS_ETHERTYPE_ARP           0x0806u
+#define K1_RTL8852BS_ARP_PAYLOAD_SIZE        28u
+#define K1_RTL8852BS_ARP_HW_ETHERNET         1u
+#define K1_RTL8852BS_ARP_OP_REQUEST          1u
+#define K1_RTL8852BS_ARP_OP_REPLY            2u
+#define K1_RTL8852BS_ARP_SENDER_HW_OFFSET    8u
+#define K1_RTL8852BS_ARP_SENDER_IP_OFFSET    14u
+#define K1_RTL8852BS_ARP_TARGET_HW_OFFSET    18u
+#define K1_RTL8852BS_ARP_TARGET_IP_OFFSET    24u
 #define K1_RTL8852BS_DHCP_OPTIONS_SIZE       22u
 #define K1_RTL8852BS_DHCP_DISCOVER_SIZE      326u
 
@@ -1573,6 +1593,8 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_TXRPT_TAG_NONE             0xffu
 #define K1_RTL8852BS_TXRPT_TAG_DATA             0x1u
 #define K1_RTL8852BS_TXRPT_TAG_DATA_MAINLINE    0x2u
+#define K1_RTL8852BS_TXRPT_TAG_ARP              0x3u
+#define K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST    0x4u
 #define K1_RTL8852BS_RXDESC_PACKET_TYPE_C2H     10u
 #define K1_RTL8852BS_CCXRPT_C2H_CATEGORY        1u
 #define K1_RTL8852BS_CCXRPT_C2H_CLASS           0x9u
@@ -4728,6 +4750,20 @@ static void k1_rtl8852bs_write_be16(FAR uint8_t *buffer, uint16_t value)
 static uint16_t k1_rtl8852bs_read_be16(FAR const uint8_t *buffer)
 {
   return (uint16_t)((uint16_t)buffer[0] << 8 | (uint16_t)buffer[1]);
+}
+
+static void k1_rtl8852bs_write_be32(FAR uint8_t *buffer, uint32_t value)
+{
+  buffer[0] = (uint8_t)(value >> 24);
+  buffer[1] = (uint8_t)(value >> 16);
+  buffer[2] = (uint8_t)(value >> 8);
+  buffer[3] = (uint8_t)value;
+}
+
+static uint32_t k1_rtl8852bs_read_be32(FAR const uint8_t *buffer)
+{
+  return (uint32_t)buffer[0] << 24 | (uint32_t)buffer[1] << 16 |
+         (uint32_t)buffer[2] << 8 | (uint32_t)buffer[3];
 }
 
 /****************************************************************************
@@ -21093,6 +21129,134 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_arp_probe_build
+ *
+ * Description:
+ *   Build one CCMP-protected ARP request, in 802.11 form, asking who holds
+ *   target_ip.
+ *
+ *   This frame exists because of what the DHCP Discover cannot decide.  A
+ *   Discover carries an IPv4 header, a UDP header, two checksums and a BOOTP
+ *   body, is answered by software on a host that may or may not be there, and
+ *   is addressed to everybody; when it goes unanswered, the frame body, the
+ *   server and the encryption are all still suspects.  An ARP request has
+ *   twenty-eight bytes, no checksum in any of them, is answered by the kernel
+ *   of any host that owns the address, and can be aimed at one station whose
+ *   hardware address the window has just watched send traffic.  So an answer
+ *   to this frame says the access point decrypted it -- and silence, after a
+ *   Discover has also gone unanswered, says the fault is not in the body.
+ *
+ *   The sender protocol address is zero.  That is RFC 5227's probe form, which
+ *   is what a station without a lease is allowed to send, and Linux answers it
+ *   for any address the receiving host owns; a made-up sender address would
+ *   instead poison the peer's neighbour table.
+ *
+ *   Everything above the payload is what the Discover builder writes: a to-DS
+ *   protected data frame, address 1 the access point, address 2 this host, and
+ *   the caller's CCMP header with key identifier zero, which is where a
+ *   pairwise key always lives.  Address 3 is the caller's, so the same builder
+ *   makes both the frame the distribution system delivers to one station and
+ *   the frame it delivers to all of them.
+ *
+ * Input Parameters:
+ *   frame         - where the frame goes
+ *   frame_size    - how much room frame has
+ *   self_mac      - the eFuse self MAC: address 2 and the sender hardware
+ *                   address
+ *   bssid         - the access point, which is address 1
+ *   target_mac    - address 3, the destination inside the distribution system
+ *   target_ip     - the address being asked about, host byte order
+ *   sequence      - the twelve-bit sequence number
+ *   packet_number - the CCMP packet number
+ *   frame_length  - the frame's length on success
+ *   header_length - its 802.11 header length on success
+ *
+ * Returned Value:
+ *   OK on success, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_arp_probe_build(
+  FAR uint8_t *frame, size_t frame_size, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid, FAR const uint8_t *target_mac, uint32_t target_ip,
+  uint16_t sequence, uint64_t packet_number, FAR size_t *frame_length,
+  FAR uint8_t *header_length)
+{
+  static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
+    {
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06
+    };
+
+  size_t required;
+  size_t offset;
+  size_t arp_offset;
+  int ret;
+
+  required = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+             K1_RTL8852BS_CCMP_HEADER_SIZE +
+             K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+             K1_RTL8852BS_ARP_PAYLOAD_SIZE;
+
+  if (frame == NULL || frame_length == NULL || header_length == NULL ||
+      self_mac == NULL || bssid == NULL || target_mac == NULL ||
+      target_ip == 0 ||
+      !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(bssid) ||
+      sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK ||
+      frame_size < required)
+    {
+      return -EINVAL;
+    }
+
+  memset(frame, 0, required);
+
+  k1_rtl8852bs_write_le16(frame, K1_RTL8852BS_DATA_TODS_PROT_FC);
+  memcpy(frame + 4, bssid, 6);
+  memcpy(frame + 10, self_mac, 6);
+  memcpy(frame + 16, target_mac, 6);
+  k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
+  offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+  ret = k1_rtl8852bs_runtime_ccmp_header_build(
+    packet_number, 0u, frame + offset, K1_RTL8852BS_CCMP_HEADER_SIZE);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  offset += K1_RTL8852BS_CCMP_HEADER_SIZE;
+
+  memcpy(frame + offset, llc_snap, sizeof(llc_snap));
+  offset += sizeof(llc_snap);
+
+  /* Ethernet hardware, IPv4 protocol, six and four byte addresses, a request.
+   * The sender hardware address is this host's, the sender protocol address
+   * stays zero, the target hardware address stays zero because that is what is
+   * being asked for, and the target protocol address is the question.
+   */
+
+  arp_offset = offset;
+  k1_rtl8852bs_write_be16(frame + offset, K1_RTL8852BS_ARP_HW_ETHERNET);
+  k1_rtl8852bs_write_be16(frame + offset + 2, K1_RTL8852BS_ETHERTYPE_IPV4);
+  frame[offset + 4] = 6u;
+  frame[offset + 5] = 4u;
+  k1_rtl8852bs_write_be16(frame + offset + 6, K1_RTL8852BS_ARP_OP_REQUEST);
+  memcpy(frame + offset + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, self_mac, 6);
+  k1_rtl8852bs_write_be32(frame + offset + K1_RTL8852BS_ARP_TARGET_IP_OFFSET,
+                          target_ip);
+  offset = arp_offset + K1_RTL8852BS_ARP_PAYLOAD_SIZE;
+
+  if (offset != required)
+    {
+      return -EIO;
+    }
+
+  *frame_length = required;
+  *header_length = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+  return OK;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_dhcp_reply_match
  *
  * Description:
@@ -21606,6 +21770,51 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
       0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00
     };
 
+  /* The station a protected ARP request is aimed at in this model, and the
+   * address it is asked about.  Both are made up here; on the board they come
+   * from a plaintext the security engine already decrypted.
+   */
+
+  static const uint8_t peer[6] =
+    {
+      0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f
+    };
+
+  /* The first 32 bytes of that request: the same to-DS protected frame
+   * control, the access point as the first address so the frame is protected
+   * with the pairwise key, this host as the second, the station being asked
+   * about as the third, sequence 0x321, and the CCMP header for packet
+   * number 3.
+   */
+
+  static const uint8_t expect_arp_head[32] =
+    {
+      0x08, 0x41, 0x00, 0x00, 0x06, 0xaa, 0xbb, 0xcc,
+      0xdd, 0xee, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55,
+      0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x10, 0x32,
+      0x03, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00
+    };
+
+  static const uint8_t expect_arp_llc[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
+    {
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06
+    };
+
+  /* And its 28 payload bytes: Ethernet hardware, IPv4 protocol, six and four
+   * byte addresses, a request, this host as the sender hardware address, a
+   * zero sender protocol address as RFC 5227 asks of a probe, a zero target
+   * hardware address because that is the question, and 192.168.1.1 as the
+   * target protocol address.
+   */
+
+  static const uint8_t expect_arp[K1_RTL8852BS_ARP_PAYLOAD_SIZE] =
+    {
+      0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01,
+      0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0xc0, 0xa8, 0x01, 0x01
+    };
+
   struct k1_rtl8852bs_tx_security_s pairwise =
     {
       .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
@@ -21613,6 +21822,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
     };
 
   struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_layout_s arp_layout;
   FAR uint8_t *buffer;
   FAR uint8_t *frame;
   FAR uint8_t *reply;
@@ -21634,6 +21844,8 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   uint32_t offered = 0;
   uint64_t first_pn;
   uint64_t second_pn;
+  size_t arp_length = 0;
+  uint8_t arp_header = 0;
 
   /* The source line of the check that refused the model, so a failure on the
    * board names one assertion instead of one errno shared by twenty of them.
@@ -22108,6 +22320,97 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
       goto error;
     }
 
+  /* The protected ARP request the resident window aims at a station it learned
+   * from decrypted group traffic.  It is checked here for the same reason the
+   * Discover is: 68 bytes whose every field agrees with numbers computed away
+   * from this code cannot have been laid out by a builder that shifts a field
+   * into the wrong place.  What it adds over the Discover is that it has no
+   * checksum and no server -- so if the access point answers it, the answer
+   * can only mean the hardware really did encrypt what it was asked to.
+   *
+   * The scratch buffer is the synthetic reply's, whose own checks are done.
+   */
+
+  ret = k1_rtl8852bs_runtime_arp_probe_build(
+    reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
+    0xc0a80101u, 0x321u, 3ull, &arp_length, &arp_header);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto error;
+    }
+
+  offset = (size_t)arp_header + K1_RTL8852BS_CCMP_HEADER_SIZE;
+  if (arp_length != K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+                    K1_RTL8852BS_CCMP_HEADER_SIZE +
+                    K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+                    K1_RTL8852BS_ARP_PAYLOAD_SIZE ||
+      arp_header != K1_RTL8852BS_IEEE80211_HEADER_SIZE ||
+      memcmp(reply, expect_arp_head, sizeof(expect_arp_head)) != 0 ||
+      memcmp(reply + offset, expect_arp_llc, sizeof(expect_arp_llc)) != 0 ||
+      memcmp(reply + offset + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE,
+             expect_arp, sizeof(expect_arp)) != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* And the address it asks about, read back the way the wire orders it, which
+   * is the reader the observer uses on the answer.
+   */
+
+  offset += K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+  if (k1_rtl8852bs_read_be32(reply + offset +
+                             K1_RTL8852BS_ARP_TARGET_IP_OFFSET) !=
+      0xc0a80101u ||
+      k1_rtl8852bs_read_be16(reply + offset + 6) !=
+      K1_RTL8852BS_ARP_OP_REQUEST)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* A request with nothing to ask about, one with no room for its own bytes,
+   * one whose sequence does not fit the field, and one with no station to aim
+   * at must all be refused rather than half-built.
+   */
+
+  if (k1_rtl8852bs_runtime_arp_probe_build(
+        reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, 0u,
+        0x321u, 3ull, &arp_length, &arp_header) != -EINVAL ||
+      k1_rtl8852bs_runtime_arp_probe_build(
+        reply, arp_length - 1u, self, bssid, peer, 0xc0a80101u, 0x321u, 3ull,
+        &arp_length, &arp_header) != -EINVAL ||
+      k1_rtl8852bs_runtime_arp_probe_build(
+        reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
+        0xc0a80101u, K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK + 1u, 3ull,
+        &arp_length, &arp_header) != -EINVAL ||
+      k1_rtl8852bs_runtime_arp_probe_build(
+        reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, NULL,
+        0xc0a80101u, 0x321u, 3ull, &arp_length, &arp_header) != -EINVAL)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* The descriptor that carries it is the same builder the Discover used, with
+   * the ARP report tag so a transmit report can be told apart from the
+   * Discover's, and the length is the frame as built because the hardware
+   * appends the eight MIC bytes itself.
+   */
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    arp_length, 0x321u, arp_header, K1_RTL8852BS_TXRPT_TAG_ARP, &pairwise,
+    descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &arp_layout);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto error;
+    }
+
   k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX len=");
   k1_early_puthex(frame_length);
   k1_early_puts(" hdr=");
@@ -22144,6 +22447,25 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   k1_early_puts("\r\n");
   k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX head=");
   k1_rtl8852bs_scanofld_log_bytes(frame, sizeof(expect_head));
+  k1_early_puts("\r\n");
+  k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX arp-len=");
+  k1_early_puthex(arp_length);
+  k1_early_puts(" arp-hdr=");
+  k1_early_puthex(arp_header);
+  k1_early_puts(" arp-xfer=");
+  k1_early_puthex(arp_layout.transfer_length);
+  k1_early_puts(" arp-ple=");
+  k1_early_puthex(arp_layout.required_ple_pages);
+  k1_early_puts(" arp-wde=");
+  k1_early_puthex(arp_layout.required_wde_pages);
+  k1_early_puts(" arp-tpa=");
+  k1_early_puthex(k1_rtl8852bs_read_be32(
+    reply + K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+    K1_RTL8852BS_CCMP_HEADER_SIZE + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+    K1_RTL8852BS_ARP_TARGET_IP_OFFSET));
+  k1_early_puts("\r\n");
+  k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX arp-head=");
+  k1_rtl8852bs_scanofld_log_bytes(reply, sizeof(expect_arp_head));
   k1_early_puts("\r\n");
   k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 runtime protected data TX "
                 "complete\r\n");
@@ -25331,6 +25653,17 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_RESIDENT_DATA_GAP_MSEC     1000u
 #define K1_RTL8852BS_RESIDENT_DATA_ATTEMPTS     2u
 
+/* And when the protected ARP probe goes out.  Later than the Discover, because
+ * it cannot be built until the window has learned an address to ask about, and
+ * that address comes out of the access point's own group traffic; the second
+ * attempt differs from the first only in whether the distribution system is
+ * asked to deliver it to one station or to all of them.
+ */
+
+#define K1_RTL8852BS_RESIDENT_ARP_DELAY_MSEC    1100u
+#define K1_RTL8852BS_RESIDENT_ARP_GAP_MSEC      800u
+#define K1_RTL8852BS_RESIDENT_ARP_ATTEMPTS      2u
+
 /* How much of the first protected data frame is kept.  Thirty-two bytes reach
  * past the longest header a QoS data frame from an access point can have and
  * past the eight-byte CCMP header behind it, so the dump shows the header, the
@@ -25575,6 +25908,60 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t ccxrpt_tagged_first[K1_RTL8852BS_TXRPT_WORDS];
   bool ccxrpt_first_valid;
   bool ccxrpt_tagged_first_valid;
+
+  /* What the decrypted group payloads actually carried, and the one address
+   * the window learned out of them.
+   *
+   * The receive side has been reporting how many frames the engine decrypted
+   * and never what was inside them, which is the difference between "the keys
+   * work" and "here is a station that is alive on this network".  net_frames
+   * counts the payloads a plaintext LLC/SNAP header was found in, and the
+   * three counters beside it split them by ethertype, with net_other_type
+   * keeping the first ethertype none of the named cases claimed so a large
+   * other count can be identified rather than guessed at.
+   *
+   * arp_peer is the address a protected ARP probe can be aimed at: the sender
+   * of an ARP frame is by definition alive, holds the address it is sending
+   * from and answers a request for it.  ipv4_peer is the weaker fallback --
+   * the source of an IPv4 datagram, whose hardware address has to be taken
+   * from the frame's third address rather than from the payload -- and it is
+   * only used when no ARP frame was seen at all.
+   *
+   * arp_replies counts the answers to this window's own probe: an ARP reply
+   * whose target hardware address is this host's.  It is the first unicast
+   * frame this port will ever have received, and because an access point only
+   * forwards it after decrypting the request that caused it, one is proof that
+   * the hardware encrypted that request with the key the access point holds.
+   */
+
+  uint32_t net_frames;
+  uint32_t net_arp;
+  uint32_t net_ipv4;
+  uint32_t net_other;
+  uint32_t net_other_type;
+  uint32_t arp_requests;
+  uint32_t arp_replies;
+  uint32_t arp_peer_ip;
+  uint32_t arp_peer_target_ip;
+  uint32_t ipv4_peer_ip;
+  uint32_t arp_reply_ip;
+  uint8_t arp_peer_mac[6];
+  uint8_t ipv4_peer_mac[6];
+  uint8_t arp_reply_mac[6];
+  bool arp_peer_valid;
+  bool ipv4_peer_valid;
+  bool arp_reply_valid;
+
+  /* And the transmit half of it.  arp_tx_target_ip is the address the probe
+   * asked about, so the reply's sender address can be checked against the
+   * question rather than only against the reply's own shape.
+   */
+
+  uint32_t arp_tx_sent;
+  uint32_t arp_tx_bytes;
+  uint32_t arp_tx_target_ip;
+  uint16_t arp_tx_sequence;
+  int arp_tx_status;
   uint16_t data_tx_sequence;
   int data_tx_status;
 };
@@ -26290,6 +26677,450 @@ static void k1_rtl8852bs_runtime_resident_observe_security(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_observe_network
+ *
+ * Description:
+ *   Read what is inside one data frame's plaintext, and record the two things
+ *   the window needs out of it: an address that is demonstrably alive on this
+ *   network, and whether an answer to this window's own ARP probe came back.
+ *
+ *   Until now the receive side has counted how many frames the security engine
+ *   decrypted and never looked at what they contained.  Twenty clean group
+ *   plaintexts say the group key is right; they also carry, for free, the
+ *   addresses of the stations that sent them, and one such address is what
+ *   turns "the hardware may not be encrypting" from an argument into an
+ *   experiment -- a protected ARP request aimed at a host that is known to
+ *   answer.
+ *
+ *   The plaintext is looked for at both offsets, exactly as the DHCP matcher
+ *   does it: a decrypted frame keeps its cipher header, so its LLC/SNAP header
+ *   sits eight bytes behind the 802.11 header, and an unprotected frame has it
+ *   at the header itself.  Ciphertext matches neither and is not read.
+ *
+ *   An ARP sender is preferred over an IPv4 source for two reasons: its
+ *   hardware address is in the payload rather than inferred from the frame's
+ *   third address, and a host that sends ARP for an address is a host that
+ *   answers ARP for it.  Its own request's target address is kept too, because
+ *   on a network whose router is doing the asking, that is the address of a
+ *   station the router is trying to reach.
+ *
+ * Input Parameters:
+ *   payload        - the 802.11 frame
+ *   payload_length - its length
+ *   header_length  - its 802.11 header's length
+ *   self_mac       - the eFuse self MAC, which an answer has to name
+ *   count          - the window's accounting, updated in place
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_resident_observe_network(
+  FAR const uint8_t *payload, size_t payload_length, size_t header_length,
+  FAR const uint8_t *self_mac,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  static const uint8_t llc_snap[6] =
+  {
+    0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00
+  };
+
+  size_t offset;
+  uint32_t sender_ip;
+  uint16_t ethertype;
+  uint16_t operation;
+
+  offset = header_length + K1_RTL8852BS_CCMP_HEADER_SIZE;
+  if (payload_length < offset + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE ||
+      memcmp(payload + offset, llc_snap, sizeof(llc_snap)) != 0)
+    {
+      offset = header_length;
+      if (payload_length < offset + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE ||
+          memcmp(payload + offset, llc_snap, sizeof(llc_snap)) != 0)
+        {
+          return;
+        }
+    }
+
+  ethertype = k1_rtl8852bs_read_be16(payload + offset + sizeof(llc_snap));
+  offset += K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+  count->net_frames++;
+
+  if (ethertype == K1_RTL8852BS_ETHERTYPE_IPV4)
+    {
+      count->net_ipv4++;
+      if (payload_length < offset + K1_RTL8852BS_IPV4_HEADER_SIZE)
+        {
+          return;
+        }
+
+      /* The weaker candidate, kept only until an ARP frame supplies a better
+       * one.  A from-DS frame carries the original source in its third
+       * address, which is where the hardware address has to come from because
+       * an IPv4 header holds none.
+       */
+
+      sender_ip = k1_rtl8852bs_read_be32(payload + offset + 12);
+      if (!count->ipv4_peer_valid && sender_ip != 0 &&
+          k1_rtl8852bs_addr_cam_mac_valid(payload + 16) &&
+          memcmp(payload + 16, self_mac, 6) != 0)
+        {
+          memcpy(count->ipv4_peer_mac, payload + 16, 6);
+          count->ipv4_peer_ip = sender_ip;
+          count->ipv4_peer_valid = true;
+        }
+
+      return;
+    }
+
+  if (ethertype != K1_RTL8852BS_ETHERTYPE_ARP)
+    {
+      count->net_other++;
+      if (count->net_other_type == 0)
+        {
+          count->net_other_type = ethertype;
+        }
+
+      return;
+    }
+
+  count->net_arp++;
+  if (payload_length < offset + K1_RTL8852BS_ARP_PAYLOAD_SIZE ||
+      k1_rtl8852bs_read_be16(payload + offset) !=
+      K1_RTL8852BS_ARP_HW_ETHERNET ||
+      k1_rtl8852bs_read_be16(payload + offset + 2) !=
+      K1_RTL8852BS_ETHERTYPE_IPV4 ||
+      payload[offset + 4] != 6u || payload[offset + 5] != 4u)
+    {
+      return;
+    }
+
+  operation = k1_rtl8852bs_read_be16(payload + offset + 6);
+  sender_ip = k1_rtl8852bs_read_be32(payload + offset +
+                                     K1_RTL8852BS_ARP_SENDER_IP_OFFSET);
+
+  if (operation == K1_RTL8852BS_ARP_OP_REQUEST)
+    {
+      count->arp_requests++;
+    }
+
+  /* The answer to this window's own probe.  The probe went out with a sender
+   * protocol address of zero, so the reply comes back with its target
+   * protocol address zero and its target hardware address this host's, which
+   * is what is checked -- the sender address is then the address that was
+   * asked about, and it is recorded so the answer can be matched to the
+   * question rather than only recognised as an answer.
+   */
+
+  if (operation == K1_RTL8852BS_ARP_OP_REPLY &&
+      memcmp(payload + offset + K1_RTL8852BS_ARP_TARGET_HW_OFFSET,
+             self_mac, 6) == 0)
+    {
+      count->arp_replies++;
+      if (!count->arp_reply_valid)
+        {
+          memcpy(count->arp_reply_mac,
+                 payload + offset + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, 6);
+          count->arp_reply_ip = sender_ip;
+          count->arp_reply_valid = true;
+        }
+    }
+
+  if (!count->arp_peer_valid && sender_ip != 0 &&
+      k1_rtl8852bs_addr_cam_mac_valid(payload + offset +
+                                      K1_RTL8852BS_ARP_SENDER_HW_OFFSET) &&
+      memcmp(payload + offset + K1_RTL8852BS_ARP_SENDER_HW_OFFSET,
+             self_mac, 6) != 0)
+    {
+      memcpy(count->arp_peer_mac,
+             payload + offset + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, 6);
+      count->arp_peer_ip = sender_ip;
+      count->arp_peer_target_ip =
+        k1_rtl8852bs_read_be32(payload + offset +
+                               K1_RTL8852BS_ARP_TARGET_IP_OFFSET);
+      count->arp_peer_valid = true;
+    }
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_network_selftest
+ *
+ * Description:
+ *   Check the network observer in memory, before the window hands it a frame
+ *   off the air, against six payloads built here.
+ *
+ *   The observer is what decides which station a protected ARP request is
+ *   aimed at and whether an answer came back, so a mistake in it would either
+ *   aim the request at nothing or read silence as an answer -- and the second
+ *   would be a false claim about the very question this increment exists to
+ *   settle.  Feeding it payloads whose right answers are written out here is
+ *   the only way to tell those apart without an access point.
+ *
+ *   The six are: a request from a station, a reply addressed back to this
+ *   host, an IPv4 datagram, a payload with an ethertype the observer does not
+ *   claim, a payload with no LLC/SNAP header at all, and a reply addressed to
+ *   somebody else.  The fifth must not be counted at all, the sixth must be
+ *   counted as traffic but must not be counted as an answer, and the first
+ *   must keep its place as the learned station even though the second and the
+ *   third arrive after it.
+ *
+ * Returned Value:
+ *   OK when every counter matched, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_network_selftest(void)
+{
+  static const uint8_t self[6] =
+    {
+      0x02, 0x11, 0x22, 0x33, 0x44, 0x55
+    };
+
+  static const uint8_t bssid[6] =
+    {
+      0x06, 0xaa, 0xbb, 0xcc, 0xdd, 0xee
+    };
+
+  static const uint8_t peer[6] =
+    {
+      0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f
+    };
+
+  static const uint8_t other[6] =
+    {
+      0x0e, 0x21, 0x32, 0x43, 0x54, 0x65
+    };
+
+  static const uint8_t llc_arp[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
+    {
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06
+    };
+
+  FAR struct k1_rtl8852bs_resident_count_s *count;
+  FAR uint8_t *payload;
+  FAR uint8_t *arp;
+  size_t body;
+  size_t length;
+  int stage = 0;
+  int ret;
+
+  payload = kmm_malloc(K1_RTL8852BS_RESIDENT_FRAME_MAX + sizeof(*count));
+  if (payload == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  count = (FAR struct k1_rtl8852bs_resident_count_s *)
+          (payload + K1_RTL8852BS_RESIDENT_FRAME_MAX);
+  memset(payload, 0, K1_RTL8852BS_RESIDENT_FRAME_MAX + sizeof(*count));
+
+  /* A from-DS protected data frame, which is what the access point sends and
+   * therefore the only shape the observer will ever be handed: this host is
+   * the first address, the access point the second, and the station that
+   * originated the payload the third -- the last is where an IPv4 datagram's
+   * hardware address has to come from, because an IPv4 header holds none.
+   */
+
+  k1_rtl8852bs_write_le16(payload, 0x4208u);
+  memcpy(payload + 4, self, 6);
+  memcpy(payload + 10, bssid, 6);
+  memcpy(payload + 16, peer, 6);
+  k1_rtl8852bs_write_le16(payload + 22, (uint16_t)(0x111u << 4));
+
+  ret = k1_rtl8852bs_runtime_ccmp_header_build(
+    7ull, 0u, payload + K1_RTL8852BS_IEEE80211_HEADER_SIZE,
+    K1_RTL8852BS_CCMP_HEADER_SIZE);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto errout;
+    }
+
+  body = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+         K1_RTL8852BS_CCMP_HEADER_SIZE;
+  memcpy(payload + body, llc_arp, sizeof(llc_arp));
+  arp = payload + body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+  length = body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+           K1_RTL8852BS_ARP_PAYLOAD_SIZE;
+
+  /* One: a request from that station, asking about a third address.  On a home
+   * network the asker is usually the router, and what it is asking about is a
+   * station it wants to reach.
+   */
+
+  k1_rtl8852bs_write_be16(arp, K1_RTL8852BS_ARP_HW_ETHERNET);
+  k1_rtl8852bs_write_be16(arp + 2, K1_RTL8852BS_ETHERTYPE_IPV4);
+  arp[4] = 6u;
+  arp[5] = 4u;
+  k1_rtl8852bs_write_be16(arp + 6, K1_RTL8852BS_ARP_OP_REQUEST);
+  memcpy(arp + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, peer, 6);
+  k1_rtl8852bs_write_be32(arp + K1_RTL8852BS_ARP_SENDER_IP_OFFSET,
+                          0xc0a80101u);
+  k1_rtl8852bs_write_be32(arp + K1_RTL8852BS_ARP_TARGET_IP_OFFSET,
+                          0xc0a8017bu);
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, count);
+
+  if (count->net_frames != 1 || count->net_arp != 1 ||
+      count->arp_requests != 1 || count->arp_replies != 0 ||
+      !count->arp_peer_valid ||
+      count->arp_peer_ip != 0xc0a80101u ||
+      count->arp_peer_target_ip != 0xc0a8017bu ||
+      memcmp(count->arp_peer_mac, peer, 6) != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Two: the answer to this host's own probe, which is a reply whose target
+   * hardware address is this host's.  The sender is a different station, so
+   * this also has to leave the station learned above in place.
+   */
+
+  k1_rtl8852bs_write_be16(arp + 6, K1_RTL8852BS_ARP_OP_REPLY);
+  memcpy(arp + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, other, 6);
+  k1_rtl8852bs_write_be32(arp + K1_RTL8852BS_ARP_SENDER_IP_OFFSET,
+                          0xc0a80109u);
+  memcpy(arp + K1_RTL8852BS_ARP_TARGET_HW_OFFSET, self, 6);
+  k1_rtl8852bs_write_be32(arp + K1_RTL8852BS_ARP_TARGET_IP_OFFSET, 0u);
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, count);
+
+  if (count->net_frames != 2 || count->net_arp != 2 ||
+      count->arp_requests != 1 || count->arp_replies != 1 ||
+      !count->arp_reply_valid ||
+      count->arp_reply_ip != 0xc0a80109u ||
+      memcmp(count->arp_reply_mac, other, 6) != 0 ||
+      count->arp_peer_ip != 0xc0a80101u ||
+      memcmp(count->arp_peer_mac, peer, 6) != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Three: an IPv4 datagram, whose source address is the weaker candidate the
+   * window falls back to when no ARP frame was heard.
+   */
+
+  memset(payload + body, 0, K1_RTL8852BS_RESIDENT_FRAME_MAX - body);
+  memcpy(payload + body, llc_arp, sizeof(llc_arp));
+  k1_rtl8852bs_write_be16(payload + body + 6, K1_RTL8852BS_ETHERTYPE_IPV4);
+  arp = payload + body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+  arp[0] = K1_RTL8852BS_IPV4_VERSION_IHL;
+  arp[9] = K1_RTL8852BS_IPV4_PROTO_UDP;
+  k1_rtl8852bs_write_be32(arp + 12, 0xc0a80105u);
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+    K1_RTL8852BS_IPV4_HEADER_SIZE, K1_RTL8852BS_IEEE80211_HEADER_SIZE,
+    self, count);
+
+  if (count->net_frames != 3 || count->net_ipv4 != 1 ||
+      !count->ipv4_peer_valid ||
+      count->ipv4_peer_ip != 0xc0a80105u ||
+      memcmp(count->ipv4_peer_mac, peer, 6) != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Four: an ethertype the observer does not claim, which has to be counted
+   * and named rather than silently dropped -- a window that heard nothing but
+   * these would otherwise look like a window that heard nothing.
+   */
+
+  k1_rtl8852bs_write_be16(payload + body + 6, 0x86ddu);
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+    K1_RTL8852BS_IPV4_HEADER_SIZE, K1_RTL8852BS_IEEE80211_HEADER_SIZE,
+    self, count);
+
+  if (count->net_frames != 4 || count->net_other != 1 ||
+      count->net_other_type != 0x86ddu || count->net_ipv4 != 1)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Five: a payload with no LLC/SNAP header at either of the two places one
+   * can be, which is what ciphertext looks like.  It must be counted nowhere,
+   * because reading a field out of ciphertext is reading a random number.
+   */
+
+  payload[body] = 0x00;
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, count);
+
+  if (count->net_frames != 4)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Six: a reply to a different station, which is traffic and is not an
+   * answer.  This is the check that keeps another station's ARP exchange from
+   * being reported as proof that this port's frame was decrypted.
+   */
+
+  memcpy(payload + body, llc_arp, sizeof(llc_arp));
+  arp = payload + body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+  k1_rtl8852bs_write_be16(arp, K1_RTL8852BS_ARP_HW_ETHERNET);
+  k1_rtl8852bs_write_be16(arp + 2, K1_RTL8852BS_ETHERTYPE_IPV4);
+  arp[4] = 6u;
+  arp[5] = 4u;
+  k1_rtl8852bs_write_be16(arp + 6, K1_RTL8852BS_ARP_OP_REPLY);
+  memcpy(arp + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, other, 6);
+  k1_rtl8852bs_write_be32(arp + K1_RTL8852BS_ARP_SENDER_IP_OFFSET,
+                          0xc0a8010au);
+  memcpy(arp + K1_RTL8852BS_ARP_TARGET_HW_OFFSET, other, 6);
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, count);
+
+  if (count->net_frames != 5 || count->net_arp != 3 ||
+      count->arp_replies != 1 || count->arp_reply_ip != 0xc0a80109u)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  ret = OK;
+
+errout:
+  k1_early_puts("K1 Wi-Fi GPL: resident network selftest net=");
+  k1_early_puthex(count->net_frames);
+  k1_early_puts(" arp=");
+  k1_early_puthex(count->net_arp);
+  k1_early_puts(" ipv4=");
+  k1_early_puthex(count->net_ipv4);
+  k1_early_puts(" other=");
+  k1_early_puthex(count->net_other);
+  k1_early_puts(" other-type=");
+  k1_early_puthex(count->net_other_type);
+  k1_early_puts(" arp-req=");
+  k1_early_puthex(count->arp_requests);
+  k1_early_puts(" replies=");
+  k1_early_puthex(count->arp_replies);
+  k1_early_puts(" reply-ip=");
+  k1_early_puthex(count->arp_reply_ip);
+  k1_early_puts(" peer-ip=");
+  k1_early_puthex(count->arp_peer_ip);
+  k1_early_puts(" peer-tpa=");
+  k1_early_puthex(count->arp_peer_target_ip);
+  k1_early_puts(" ip-peer-ip=");
+  k1_early_puthex(count->ipv4_peer_ip);
+  k1_early_puts(" stage=");
+  k1_early_puthex((uintreg_t)stage);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+  kmm_free(payload);
+  return ret;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_observe
  *
  * Description:
@@ -26387,6 +27218,18 @@ static void k1_rtl8852bs_runtime_resident_observe(
           if (from_target)
             {
               count->data_frames_target++;
+
+              /* What was inside it.  This runs before the DHCP question
+               * because it is the more general one: it classifies every
+               * plaintext the window decrypted, learns an address to aim a
+               * protected ARP request at, and recognises the answer to one.
+               */
+
+              k1_rtl8852bs_runtime_resident_observe_network(
+                payload, payload_length,
+                k1_rtl8852bs_runtime_resident_header_length(
+                  mgmt.frame_control),
+                self_mac, count);
 
               /* And whether this is the answer to the Discover this window
                * transmitted.  It is asked only of a frame from the access
@@ -26725,7 +27568,9 @@ static void k1_rtl8852bs_runtime_resident_observe_c2h(
   tag = (word[0] >> K1_RTL8852BS_TXRPT_SW_DEFINE_SHIFT) &
         K1_RTL8852BS_TXRPT_SW_DEFINE_MASK;
   if (tag != K1_RTL8852BS_TXRPT_TAG_DATA &&
-      tag != K1_RTL8852BS_TXRPT_TAG_DATA_MAINLINE)
+      tag != K1_RTL8852BS_TXRPT_TAG_DATA_MAINLINE &&
+      tag != K1_RTL8852BS_TXRPT_TAG_ARP &&
+      tag != K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST)
     {
       return;
     }
@@ -27028,6 +27873,198 @@ done:
   kmm_free(packet);
   return ret;
 }
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_arp_tx
+ *
+ * Description:
+ *   Transmit one CCMP-protected ARP request at an address the window learned
+ *   out of the access point's own group traffic, on the same queue and through
+ *   the same submitter as the Discover.
+ *
+ *   This exists to answer the one question the Discover cannot.  A Discover
+ *   that goes unanswered leaves three suspects standing: the frame body, the
+ *   DHCP server, and whether the hardware encrypted the frame at all.  An ARP
+ *   request removes the first two -- twenty-eight bytes with no checksum in
+ *   them, answered by the kernel of any host that owns the address, aimed at a
+ *   station this window has just watched transmit -- so a reply says the
+ *   access point decrypted a frame this port asked the hardware to encrypt,
+ *   and continued silence says the encryption itself is where to look next.
+ *
+ *   It is also the first frame ever sent that asks for a unicast answer.
+ *   Every frame this port has received so far has been a Beacon, a management
+ *   response or a group-addressed data frame; an ARP reply comes back to this
+ *   host's own address, so it exercises the pairwise receive path and the
+ *   address-CAM match that the window's a1-match counter has never once seen.
+ *
+ *   The two attempts differ in one thing only: the third address, which is
+ *   where the distribution system is told to deliver the frame.  The first
+ *   names the learned station, so the access point bridges it to exactly that
+ *   host; the second is broadcast, which is how a station with no neighbour
+ *   table entry normally asks, and which also reaches a host the access point
+ *   would not otherwise forward to.  Both carry address 1 -- the access
+ *   point -- so both are protected with the pairwise key, and each asks for a
+ *   transmit report under a tag of its own.
+ *
+ * Input Parameters:
+ *   self_mac - the eFuse self MAC: address 2 and the sender hardware address
+ *   bssid    - the access point, which is address 1
+ *   attempt  - which of the window's attempts this is.  Even attempts address
+ *              the learned station under report tag three, odd ones the
+ *              broadcast address under report tag four
+ *   count    - the window's counters, which hold the learned address and
+ *              record what was transmitted
+ *
+ * Returned Value:
+ *   OK when the frame was written into the queue, a negated errno otherwise.
+ *   -EADDRNOTAVAIL when the window has learned no address to ask about, which
+ *   is not a failure of anything this function does.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_arp_tx(
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid, unsigned int attempt,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  static const uint8_t broadcast[6] =
+  {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+  };
+
+  struct k1_rtl8852bs_tx_security_s security =
+    {
+      .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+      .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE
+    };
+
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_resources_s before_res;
+  struct k1_rtl8852bs_data_tx_resources_s after_res;
+  FAR const uint8_t *target_mac;
+  FAR uint8_t *packet;
+  size_t frame_length = 0;
+  unsigned int drained;
+  uint16_t sequence;
+  uint8_t header_length = 0;
+  uint8_t report_tag;
+  uint64_t packet_number;
+  uint32_t target_ip;
+  bool broadcast_form;
+  int ret;
+
+  /* The address to ask about.  An ARP sender is preferred over an IPv4 source
+   * because it is known to answer ARP; without either there is nothing to ask
+   * and the caller is told so rather than a made-up address being probed.
+   */
+
+  if (count->arp_peer_valid)
+    {
+      target_mac = count->arp_peer_mac;
+      target_ip = count->arp_peer_ip;
+    }
+  else if (count->ipv4_peer_valid)
+    {
+      target_mac = count->ipv4_peer_mac;
+      target_ip = count->ipv4_peer_ip;
+    }
+  else
+    {
+      return -EADDRNOTAVAIL;
+    }
+
+  broadcast_form = (attempt & 1u) != 0;
+  report_tag = broadcast_form ? K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST :
+                                K1_RTL8852BS_TXRPT_TAG_ARP;
+
+  packet = kmm_malloc(K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                      K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+  if (packet == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  memset(packet, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+  packet_number = k1_rtl8852bs_runtime_tx_packet_number_next();
+
+  ret = k1_rtl8852bs_runtime_arp_probe_build(
+    packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid,
+    broadcast_form ? broadcast : target_mac, target_ip, sequence,
+    packet_number, &frame_length, &header_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, sequence, header_length, report_tag,
+    &security, packet, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  k1_rtl8852bs_runtime_sch_tx_en_data();
+
+  ret = k1_rtl8852bs_data_tx_resources_read(
+    K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &before_res);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  if (before_res.channel_used_pages +
+      layout.required_wde_pages > before_res.channel_max_pages ||
+      before_res.wp_available_pages <
+      layout.required_ple_pages + K1_RTL8852BS_DATA_TX_PLE_RESERVE)
+    {
+      ret = -ENOSPC;
+      goto done;
+    }
+
+  ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
+                           layout.transfer_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  count->arp_tx_sent++;
+  count->arp_tx_bytes = (uint32_t)frame_length;
+  count->arp_tx_sequence = sequence;
+  count->arp_tx_target_ip = target_ip;
+
+  /* The same drain poll the Discover's submitter makes, for the same reason:
+   * it is what says the dispatcher took the frame out of the queue rather than
+   * that the queue merely accepted the write.  The transmit-state sampling is
+   * not repeated -- the Discover in the same window already reports it, and
+   * every line printed inside the window is time the receive FIFO is not being
+   * drained in, which for a frame whose answer arrives in milliseconds matters
+   * more here than there.
+   */
+
+  for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
+    {
+      if (k1_rtl8852bs_data_tx_resources_read(
+            K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &after_res) != OK ||
+          after_res.channel_used_pages == before_res.channel_used_pages)
+        {
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  ret = OK;
+
+done:
+  kmm_free(packet);
+  return ret;
+}
+
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_window
  *
@@ -27078,7 +28115,9 @@ static int k1_rtl8852bs_runtime_resident_window(
   clock_t deadline;
   clock_t probe_deadline;
   clock_t data_deadline;
+  clock_t arp_deadline;
   unsigned int data_attempts = 0;
+  unsigned int arp_attempts = 0;
   size_t probe_length;
   size_t length;
   size_t offset;
@@ -27102,6 +28141,7 @@ static int k1_rtl8852bs_runtime_resident_window(
   memset(&count, 0, sizeof(count));
   count.probe_status = -ENODATA;
   count.data_tx_status = -ENODATA;
+  count.arp_tx_status = -ENODATA;
 
   k1_early_puts("K1 Wi-Fi GPL: resident window enter channel=");
   k1_early_puthex(channel);
@@ -27110,6 +28150,22 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puts(" window-ms=");
   k1_early_puthex(K1_RTL8852BS_RESIDENT_WINDOW_MSEC);
   k1_early_puts("\r\n");
+
+  /* The observer that reads network payloads is checked here, against payloads
+   * built in memory, before it is handed one off the air.  It runs before the
+   * window's clock starts because it costs no window time, and its own line
+   * carries the verdict: the window keeps going either way, but an answer this
+   * window reports about a protected ARP request is only worth reading when
+   * the reader that produced it agreed with numbers written down away from it.
+   */
+
+  ret = k1_rtl8852bs_runtime_resident_network_selftest();
+  if (ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident network selftest error=");
+      k1_early_puthex((uintreg_t)-ret);
+      k1_early_puts("\r\n");
+    }
 
   buffer = kmm_malloc(K1_RTL8852BS_SCAN_OFLD_RX_MAX);
   if (buffer == NULL)
@@ -27180,6 +28236,8 @@ static int k1_rtl8852bs_runtime_resident_window(
                    MSEC2TICK(K1_RTL8852BS_RESIDENT_PROBE_DELAY_MSEC);
   data_deadline = clock_systime_ticks() +
                   MSEC2TICK(K1_RTL8852BS_RESIDENT_DATA_DELAY_MSEC);
+  arp_deadline = clock_systime_ticks() +
+                 MSEC2TICK(K1_RTL8852BS_RESIDENT_ARP_DELAY_MSEC);
 
   while ((sclock_t)(clock_systime_ticks() - deadline) < 0)
     {
@@ -27267,6 +28325,50 @@ static int k1_rtl8852bs_runtime_resident_window(
           k1_early_puthex(count.data_tx_cck);
           k1_early_puts("\r\n");
           data_attempts++;
+        }
+
+      /* And the protected ARP request, which asks a question whose answer
+       * cannot depend on a frame body or on a server.  It waits for two things
+       * the Discover does not need: a pairwise key, and an address to ask
+       * about, which the window learns out of the plaintext of the access
+       * point's own group traffic.  Without an address nothing is transmitted
+       * and no attempt is spent, so a window that heard no network payload at
+       * all still reports why rather than reporting a failure.
+       */
+
+      if (g_k1_rtl8852bs_key_install.tk_installed &&
+          count.beacons_target > 0 && count.arp_replies == 0 &&
+          (count.arp_peer_valid || count.ipv4_peer_valid) &&
+          arp_attempts < K1_RTL8852BS_RESIDENT_ARP_ATTEMPTS &&
+          (sclock_t)(clock_systime_ticks() - arp_deadline) >= 0)
+        {
+          ret = k1_rtl8852bs_runtime_resident_arp_tx(self_mac, bssid,
+                                                    arp_attempts, &count);
+          count.arp_tx_status = ret;
+          arp_deadline = clock_systime_ticks() +
+                         MSEC2TICK(K1_RTL8852BS_RESIDENT_ARP_GAP_MSEC);
+
+          k1_early_puts("K1 Wi-Fi GPL: resident arp tx sn=");
+          k1_early_puthex(count.arp_tx_sequence);
+          k1_early_puts(" bytes=");
+          k1_early_puthex(count.arp_tx_bytes);
+          k1_early_puts(" tag=");
+          k1_early_puthex((arp_attempts & 1u) != 0 ?
+                          K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST :
+                          K1_RTL8852BS_TXRPT_TAG_ARP);
+          k1_early_puts(" a3=");
+          k1_early_puthex((arp_attempts & 1u) != 0 ? 0xffffffffu :
+                          k1_rtl8852bs_read_be32(count.arp_peer_valid ?
+                                                 count.arp_peer_mac + 2 :
+                                                 count.ipv4_peer_mac + 2));
+          k1_early_puts(" tpa=");
+          k1_early_puthex(count.arp_tx_target_ip);
+          k1_early_puts(" pn=");
+          k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
+          k1_early_puts(" status=");
+          k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts("\r\n");
+          arp_attempts++;
         }
 
       ret = k1_rtl8852bs_runtime_rx_read(
@@ -27666,6 +28768,93 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puts(" ccxrpt-tag-seen=");
   k1_early_puthex(count.ccxrpt_tag_seen);
   k1_early_puts("\r\n");
+
+  /* The protected ARP request, and everything the window learned to aim it
+   * with.  This line is the one that can separate "the access point rejected
+   * our ciphertext" from "the frame body or the DHCP server was the problem",
+   * because an ARP request has no checksum, no server and no options: replies
+   * above zero means the access point decrypted a frame this port asked the
+   * hardware to encrypt, and it is also the first unicast frame this port has
+   * ever received.
+   *
+   * net is how many decrypted payloads carried a plaintext LLC/SNAP header,
+   * split by ethertype into arp, ipv4 and other, with other-type naming the
+   * first ethertype none of them claimed.  peer-ip is the address a protected
+   * request was aimed at and peer-tpa the address that station was itself
+   * asking about, which on a network whose router does the asking is a station
+   * the router wants to reach.  status is the submitter's own return, and
+   * EADDRNOTAVAIL there means the window heard no network payload to learn an
+   * address from -- which is a statement about the traffic, not about the
+   * keys.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window arp sent=");
+  k1_early_puthex(count.arp_tx_sent);
+  k1_early_puts(" bytes=");
+  k1_early_puthex(count.arp_tx_bytes);
+  k1_early_puts(" sn=");
+  k1_early_puthex(count.arp_tx_sequence);
+  k1_early_puts(" tpa=");
+  k1_early_puthex(count.arp_tx_target_ip);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(count.arp_tx_status < 0 ?
+                              -count.arp_tx_status : 0));
+  k1_early_puts(" replies=");
+  k1_early_puthex(count.arp_replies);
+  k1_early_puts(" reply-ip=");
+  k1_early_puthex(count.arp_reply_ip);
+  k1_early_puts(" net=");
+  k1_early_puthex(count.net_frames);
+  k1_early_puts(" arp=");
+  k1_early_puthex(count.net_arp);
+  k1_early_puts(" ipv4=");
+  k1_early_puthex(count.net_ipv4);
+  k1_early_puts(" other=");
+  k1_early_puthex(count.net_other);
+  k1_early_puts(" other-type=");
+  k1_early_puthex(count.net_other_type);
+  k1_early_puts(" arp-req=");
+  k1_early_puthex(count.arp_requests);
+  k1_early_puts(" peer-ip=");
+  k1_early_puthex(count.arp_peer_ip);
+  k1_early_puts(" peer-tpa=");
+  k1_early_puthex(count.arp_peer_target_ip);
+  k1_early_puts(" ip-peer-ip=");
+  k1_early_puthex(count.ipv4_peer_ip);
+  k1_early_puts("\r\n");
+
+  /* And the hardware addresses behind those three, each on its own line and
+   * only when one was learned, so a line that is printed always carries six
+   * bytes rather than six zeroes.  A station's hardware address is not a
+   * credential.
+   */
+
+  if (count.arp_peer_valid)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident window arp peer mac=");
+      k1_rtl8852bs_scanofld_log_bytes(count.arp_peer_mac, 6);
+      k1_early_puts(" ip=");
+      k1_early_puthex(count.arp_peer_ip);
+      k1_early_puts("\r\n");
+    }
+
+  if (count.ipv4_peer_valid)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident window arp ip-peer mac=");
+      k1_rtl8852bs_scanofld_log_bytes(count.ipv4_peer_mac, 6);
+      k1_early_puts(" ip=");
+      k1_early_puthex(count.ipv4_peer_ip);
+      k1_early_puts("\r\n");
+    }
+
+  if (count.arp_reply_valid)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident window arp reply mac=");
+      k1_rtl8852bs_scanofld_log_bytes(count.arp_reply_mac, 6);
+      k1_early_puts(" ip=");
+      k1_early_puthex(count.arp_reply_ip);
+      k1_early_puts("\r\n");
+    }
 
   /* The reports themselves, once the window is closed.  The first one is the
    * calibration: it belongs to a management frame the access point answered

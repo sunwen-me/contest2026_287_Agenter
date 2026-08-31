@@ -7133,6 +7133,119 @@ resident window data sec llc-iv=0x14 llc-plain=0x0 short=0x0
 单播——发一帧受保护的**单播** ARP Request 给从组播明文里学到的网关，
 ARP Reply 是单播回来的，一次同时测发送加密和单播接收）。
 
+### 增量 3q：换一帧没有校验和、也不需要服务器的帧——受保护的单播 ARP Request
+
+3p 之后，发送描述符这条线上已经没有候选了：安全引擎是开的（`sec-eng ctrl … after=0x8000273f`）、
+`mpdu-proc after=0x3`、PN 从 1 开始、CCMP/ExtIV 的字节布局对得上、326 字节帧体逐字段审过、
+`HDR_LLC_LEN` 两种填法都被 ACK 也都没换来回答。剩下的怀疑对象只有两个，而它们都不在描述符里：
+
+1. **硬件其实没有加密**，把明文发了出去。AP 会照样回 ACK（ACK 在任何解密之前生成），
+   然后按 RSN 规则丢掉一个来自已关联站点的未受保护数据帧——现象和现在一模一样。
+2. **帧体或者对端**有问题：DHCP 校验和错、这个 AP 后面根本没有 DHCP 服务器、
+   或者服务器不理一个它没见过的客户端。
+
+DHCP Discover 分不开这两个，因为它同时依赖「加密对」和「有服务器且愿意回」。所以这一增量换一帧
+来问：**受保护的单播 ARP Request**。
+
+#### 为什么是 ARP，而且是 RFC 5227 的探测形式
+
+- **28 字节，全帧没有任何校验和。** ARP 报文里没有 checksum 字段，也不套 IP/UDP。
+  「帧体算错了」这个嫌疑人直接从名单上消失。
+- **不需要服务器。** ARP Request 由任何一台主机的内核回答，不需要 dhcpd、不需要租约、
+  不需要这台 AP 上跑着什么服务。「AP 后面没有 DHCP 服务器」这个嫌疑人也消失。
+- **回答是单播回来的。** 到今天为止本移植收到的每一帧都是 Beacon、管理帧响应或者组播寻址的
+  数据帧——`a1-match` 至今是 `0x0`，从未收到过一帧 A1 是自己的帧。ARP Reply 的 A1 就是本机，
+  所以这一帧同时第一次驱动**成对密钥接收路径**和**地址 CAM 的 A1 匹配**。
+- **sender protocol address 填 0。** 这是 RFC 5227 的 probe 形式，正是一台还没有地址的站点
+  被允许发的东西；Linux 会回答它，而且因为 spa 是 0，对端不会把它写进自己的 ARP 缓存。
+  副作用最小的问法。
+
+一句话：如果 AP 回了这一帧，那**只能**说明硬件真的把我们要求加密的帧加密了；
+如果连它也不回，那嫌疑就压到加密本身上，下一步就是回环把自己发出去的帧读回来看载荷。
+
+#### 打给谁：从已经解出来的组播明文里学一个活着的邻居
+
+窗口里已经有 20 帧被硬件解密的组播数据帧，全部以 LLC/SNAP 开头（3p 的读数）。
+`k1_rtl8852bs_runtime_resident_observe_network()` 就在这些明文上做一次普查，**从不读密文**：
+先在 `header_length + 8`（安全引擎解密后保留密码头）找 LLC/SNAP，找不到再退到 `header_length`
+（未受保护帧），两处都不是就直接返回。认出来之后按 ethertype 分三路计数
+（`ether-arp` / `ether-ipv4` / `ether-other`，另记第一个没被认领的 ethertype）。
+
+学地址有两个来源，强弱分明：
+
+- **ARP 帧（首选）**：sender hardware address 和 sender protocol address 就在报文里，
+  两者天然配对。家用网络上发问的通常是网关，它问的那个地址（`peer-tpa`）也顺手记下来。
+- **IPv4 数据报（备用）**：IP 头里没有硬件地址，所以硬件地址只能取该帧的**第三个地址**
+  （from-DS 帧里 A3 是原始源站），IP 取源地址。这条弱一些，只在整个窗口没听到一帧 ARP 时才用。
+
+两者都只记第一个非本机的候选，后来的不覆盖前面的——这样同一轮里 tpa 是稳定的。
+
+#### 帧长什么样，以及两次尝试之间只差一个字段
+
+`k1_rtl8852bs_runtime_arp_probe_build()` 造 24 + 8 + 8 + 28 = **68 字节**：to-DS 且置了
+Protected 的帧控制、**A1 恒为 BSSID**（所以这一帧一定走成对密钥，而不是组密钥）、A2 是本机、
+A3 是目标、序号、PN 走和数据帧同一个计数器、LLC/SNAP 的 ethertype 是 `0x0806`，
+然后是 htype=1 / ptype=0x0800 / hlen=6 / plen=4 / oper=1 / sha=本机 / spa=0 / tha=0 / tpa=学到的地址。
+
+窗口里发两次，**只差第三个地址**：
+
+| 尝试 | A3 | 报告 tag | 想问的事 |
+| --- | --- | --- | --- |
+| 0 | 学到的那台站点 | `0x3` | 正常的到-DS 单播转发 |
+| 1 | 广播 | `0x4` | AP 是不是只肯转发它自己认识的目标 |
+
+A1 两次都是 BSSID，所以两次都是成对密钥保护的；tag 不同，发送报告就能对上是哪一次。
+时序上排在数据帧之后（1100 ms 和 1900 ms，窗口 3000 ms，数据帧在 600/1600 ms），
+并且只在 `tk_installed`、听到过目标 Beacon、还没收到回答、且已经学到地址时才发。
+
+#### 上板之前先在内存里把观察器判错的可能排掉
+
+`k1_rtl8852bs_runtime_resident_network_selftest()` 在窗口计时开始之前跑，喂给观察器 6 个自己造的
+载荷，每一个的正确答案都写死在代码里：一帧来自邻居的 request、一帧**寻址回本机**的 reply、
+一帧 IPv4 数据报、一帧 ethertype 不被认领的（`0x86dd`）、一帧两处都没有 LLC/SNAP 的
+（密文长这样，必须一处都不计）、以及**一帧寻址给别人的 reply**（要算流量，但绝不能算成答案）。
+最后一条是关键：没有它，别人家的 ARP 交换就可能被当成「我们的帧被解密了」的证据。
+
+这条线的读数是固定的，所以它是这一增量新增的**唯一**判据（37 → 38，
+`--require-runtime-arp-probe`）：
+
+```
+resident network selftest net=0x5 arp=0x3 ipv4=0x1 other=0x1 other-type=0x86dd
+  arp-req=0x1 replies=0x1 reply-ip=0xc0a80109 peer-ip=0xc0a80101
+  peer-tpa=0xc0a8017b ip-peer-ip=0xc0a80105 stage=0x0 status=0x0
+```
+
+帧构造本身则并入原有的 `runtime protected data TX` 自检（68 字节、头 32 字节、LLC/SNAP、
+28 字节 ARP 报文逐字节对照，外加 tpa=0、缓冲不够、序号越界、没有目标四个必须被拒绝的输入），
+所以那条线上多了 `arp-len=`／`arp-hdr=`／`arp-xfer=`／`arp-tpa=`／`arp-head=`。
+
+#### 窗口会无条件打印它做了什么，包括「什么都没学到」
+
+```
+resident window arp sent= bytes= sn= tpa= status= replies= reply-ip=
+  net= arp= ipv4= other= other-type= arp-req= peer-ip= peer-tpa= ip-peer-ip=
+```
+
+这一行永远打印，所以它也是「这台仪器跑过了」的证据。其中 `status` 是提交函数自己的返回值，
+`EADDRNOTAVAIL` 在这里的含义很具体：**窗口里没听到任何可以学地址的网络载荷**——
+这是在说那张网上的流量，不是在说本移植的密钥。学到了地址的话，另外三条按需打印（学到才打），
+分别带 ARP 学到的、IPv4 学到的、以及回答者的硬件地址。站点的硬件地址、IP、SSID、BSSID
+都不是凭证，可以打；PSK/PMK/PTK/KCK/KEK/TK/GTK 一律不打。
+
+判据只要求这一行存在，不要求它的任何取值：`replies=0x0` 恰恰是这个实验存在的意义之一，
+把它写成判据就会让「实验产生了结论」变成「运行失败」。
+
+#### 三种可能的读数，以及各自的下一步
+
+| 读数 | 结论 | 下一步 |
+| --- | --- | --- |
+| `sent>0` 且 `replies>0` | 硬件真的加密了；发送加密和单播接收都通了 | 回到 DHCP：问题在帧体或者服务器侧 |
+| `sent>0`、报告 `tag-ok` 有、`replies=0x0` | AP 收到了却不解；加密本身是最后的怀疑对象 | MAC 回环把自己发的帧读回来，看载荷是密文还是明文 |
+| `status=EADDRNOTAVAIL` | 这一轮组播里没有 ARP 也没有 IPv4 可学 | 延长窗口或换一个更热闹的时段再跑，不动代码 |
+
+镜像：`6dd86abd22b37c7739cc3648dc8d8a7db6844387b98a0fb04e5f1fafdf829337`，
+新增判据 `--require-runtime-arp-probe`，判据总数 **38**。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

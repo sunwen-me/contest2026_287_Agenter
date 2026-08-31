@@ -821,6 +821,44 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   A/B 是**只报告**的（一个窗口若第一次尝试就被回答，第二次根本不会发出，要求两条都出现会把
   唯一成功的那一轮判失败），所以 3p 也不新增 `--require-*`，判据数仍是 **37**，
   日志 `out/k1-serial/k1-wpa-20260831T111750Z.log`（板子停在 `nsh>`，默认 `--nsh-reboot`，没按 RST）。
+- **已实现待上板（增量 3q）：换一帧没有校验和、也不需要服务器的帧——受保护的单播 ARP
+  Request，为的是把「硬件到底有没有真的加密」单独拎出来问。** 3p 之后描述符侧的候选一条也不剩，
+  剩下的怀疑只有两个，而它们都不在描述符里：**（a）硬件没加密，把明文发了出去**（AP 照样先回
+  ACK——ACK 在任何解密之前生成——再按 RSN 丢掉一个未受保护的数据帧，现象和现在完全一样）；
+  **（b）帧体或者对端**（校验和、AP 后面没有 DHCP 服务器、服务器不理生客）。DHCP Discover
+  同时依赖这两件事，所以分不开；ARP Request 能分：**28 字节、全帧没有任何校验和**（(b) 的
+  「帧体」一半消失）、**任何主机内核都回**（(b) 的「服务器」一半消失）、而且**回答是单播回来的**
+  ——`a1-match` 至今是 `0x0`，本移植从未收过一帧 A1 是自己的帧，这一帧同时第一次驱动成对密钥
+  接收路径和地址 CAM 的 A1 匹配。sender protocol address 填 0，是 RFC 5227 的 probe 形式：
+  一台还没有地址的站点被允许发，Linux 会回，而且对端不会把它写进 ARP 缓存。
+  **打给谁**：`k1_rtl8852bs_runtime_resident_observe_network()` 在窗口里**已经被硬件解开的**
+  组播明文上做 ethertype 普查（先看 `header_length + 8`，退到 `header_length`，两处都不是就返回，
+  **从不读密文**），ARP 帧里的 sender 是首选（硬件地址和 IP 天然配对，顺手记下它在问的
+  `peer-tpa`），IPv4 数据报是备用（IP 头里没有硬件地址，只能取 from-DS 帧的 A3）；两者都只留
+  第一个非本机候选。**帧**：`k1_rtl8852bs_runtime_arp_probe_build()` 造 24+8+8+28 = **68 字节**，
+  **A1 恒为 BSSID**（所以一定走成对密钥而不是组密钥），A2 本机，PN 与数据帧共用同一个计数器；
+  窗口里发两次，**只差第三个地址**——尝试 0 是学到的那台站点（tag `0x3`），尝试 1 是广播
+  （tag `0x4`），用来看 AP 是不是只肯转发自己认识的目标；时序 1100/1900 ms（窗口 3000 ms，
+  数据帧在 600/1600 ms），且只在 `tk_installed`、听到过目标 Beacon、还没收到回答、已经学到地址时才发。
+  **上板前先在内存里排掉观察器判错**：`k1_rtl8852bs_runtime_resident_network_selftest()` 在窗口
+  计时之前喂 6 个自造载荷——邻居的 request、寻址回本机的 reply、IPv4、不被认领的 ethertype
+  (`0x86dd`)、两处都没有 LLC/SNAP 的（密文长这样，一处都不能计）、**以及一帧寻址给别人的 reply**
+  （要算流量，绝不能算成答案；没有这一条，别人家的 ARP 交换就能冒充「我们的帧被解密了」）。
+  这条线读数固定，所以它是本增量**唯一**新增判据 `--require-runtime-arp-probe`，判据数 37 → **38**：
+  `resident network selftest net=0x5 arp=0x3 ipv4=0x1 other=0x1 other-type=0x86dd arp-req=0x1
+  replies=0x1 reply-ip=0xc0a80109 peer-ip=0xc0a80101 peer-tpa=0xc0a8017b ip-peer-ip=0xc0a80105
+  stage=0x0 status=0x0`。帧构造并入原有 `runtime protected data TX` 自检（68 字节、头 32 字节、
+  LLC/SNAP、28 字节报文逐字节，外加 tpa=0／缓冲不够／序号越界／没有目标四个必须被拒的输入），
+  那条线多了 `arp-len= arp-hdr= arp-xfer= arp-tpa= arp-head=`。窗口另有一条**无条件**打印的
+  `resident window arp sent= bytes= sn= tpa= status= replies= reply-ip= net= arp= ipv4= other=
+  other-type= arp-req= peer-ip= peer-tpa= ip-peer-ip=`，只要求存在、不要求取值
+  （`replies=0x0` 恰是这个实验的一种结论，卡它会把「实验出了结论」判成「运行失败」），
+  其中 `status=EADDRNOTAVAIL` 的含义很具体：**这一轮没听到可以学地址的网络载荷**，
+  是在说那张网的流量，不是在说密钥。**三种读数各自的下一步**：`replies>0` → 硬件真的加密了，
+  回头查 DHCP 的帧体或服务器侧；`sent>0`、报告 `tag-ok` 有、`replies=0x0` → AP 收到不解，
+  加密本身成为最后的怀疑对象，下一步 MAC 回环读回自己发的帧看是密文还是明文；
+  `status=EADDRNOTAVAIL` → 换个热闹时段再跑，不动代码。
+  带密码镜像 `6dd86abd22b37c7739cc3648dc8d8a7db6844387b98a0fb04e5f1fafdf829337`。
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
@@ -923,8 +961,9 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是证明硬件到底有没有真的加密本移植发出去的那一帧：先用 MAC loopback 把刚发的帧读回来看载荷
-是密文还是明文，再向组播明文里学到的网关发一帧受保护的单播 ARP Request**——密钥已经在
+**当前实际下一步是把增量 3q 的镜像跑上板：向组播明文里学到的邻居发一帧受保护的单播 ARP
+Request，用它来判「硬件到底有没有真的加密本移植发出去的那一帧」；同一问题的第二个独立判别
+手段——MAC loopback 把刚发的帧读回来看载荷是密文还是明文——排在它后面**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
 描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 43 更进一步证明
 **MAC 真的把那两个 CCMP 保护帧发出去了**（增量 3k：`mpdu=0x2 cck=0x2 block=0x0`，每次写
@@ -950,10 +989,12 @@ PN 从 1 开始、CCMP 头含 ExtIV 的排布对；326 字节帧体（LLC/SNAP �
 `a1-match=0x0` 说明本移植**从来没有收过一帧单播**，接收侧那条 PTK 路径至今没有被真实空口检验过。
 于是只剩一个从没有任何直接证据的问题：**帧到底是密文还是明文发出去的**。一帧明文数据帧从
 一个已 RSN 关联的 STA 发出，会先被 ACK（ACK 在任何解密检查之前），然后被 AP 丢掉——
-与现在观测到的一模一样。两个不需要特权就能做的判别手段：(1) 按原厂做法开 MAC loopback，
-把本端刚发的帧读回来，直接看载荷是密文还是明文；(2) 从已经解开的组播明文里学到子网与网关的
-MAC／IP，然后发一帧受保护的**单播** ARP Request——ARP Reply 会以单播回来，那同时也是本移植
-第一次真正走通单播接收（`a1-match` 至今为 0）。
+与现在观测到的一模一样。两个不需要特权就能做的判别手段：(1) 从已经解开的组播明文里学到邻居的
+MAC／IP，然后发一帧受保护的**单播** ARP Request——28 字节、全帧没有校验和、任何主机内核都回，
+所以它把「帧体错了」和「没有 DHCP 服务器」两个嫌疑一次剔掉；ARP Reply 还会以单播回来，
+那同时也是本移植第一次真正走通单播接收（`a1-match` 至今为 0）。**这一条已经实现（增量 3q，
+判据 37 → 38，镜像 `6dd86abd22b37c7739cc3648dc8d8a7db6844387b98a0fb04e5f1fafdf829337`），
+等一次上板。**(2) 按原厂做法开 MAC loopback，把本端刚发的帧读回来，直接看载荷是密文还是明文。
 线侧抓包仍然被权限挡住（`/usr/bin/tcpdump` 无 file capabilities、用户不在 pcap 组、
 `sudo -n true` 报 "sudo: interactive authentication is required"），需要用户自己跑，
 一条命令就能把 (a)「AP 收下但解不开」和 (c)「帧体本身有问题」在一轮里分开。
@@ -961,14 +1002,15 @@ MAC／IP，然后发一帧受保护的**单播** ARP Request——ARP Reply 会�
 
 ```bash
 tools/build_k1_wpa.sh             # profile board/k1/muse_pi_pro/configs/wireless_wpa_diag
-tools/run_k1_wpa.sh               # 上板：37 条 --require-*，K1_RESET_MODE 选复位方式
+tools/run_k1_wpa.sh               # 上板：38 条 --require-*，K1_RESET_MODE 选复位方式
 ```
 
-板上验收现在是 37 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
+板上验收现在是 38 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
 ＋ `--require-runtime-port-init` ＋ 增量 3h 的 `--require-runtime-resident`
 ＋ 增量 3i 后半的 `--require-runtime-tx-security` ＋ 增量 3j 的
-`--require-runtime-data-secure-tx`），不用再手抄那条长命令：
-`tools/run_k1_wpa.sh` 把这 37 条固定下来，复位方式用环境变量
+`--require-runtime-data-secure-tx` ＋ 增量 3q 的 `--require-runtime-arp-probe`），
+不用再手抄那条长命令：
+`tools/run_k1_wpa.sh` 把这 38 条固定下来，复位方式用环境变量
 `K1_RESET_MODE`（默认 `--nsh-reboot`，板子不在 `nsh>` 时设成 `--manual-reset` 再按 RST），
 额外参数原样透传。**它不接受也不打印任何口令**。run 43 用它跑，**37 条一条没失败**，日志
 `out/k1-serial/k1-wpa-20260831T040606Z.log`（这一轮板子停在 `nsh>`，`K1_RESET_MODE` 用默认的
