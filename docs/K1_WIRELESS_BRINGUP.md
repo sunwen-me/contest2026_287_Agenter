@@ -6507,7 +6507,8 @@ required`。原因不是工具链，是**上一次用 ninja 单独编一个文�
 
 ### 增量 3k：把「队列收下了」和「MAC 真的发出去了」分开
 
-（**尚未上板：run 43 待跑。这一节只加读数，不改任何发送行为**）
+（**run 43 已上板：`mpdu=0x2 cck=0x2 block=0x0`，两帧 MPDU 确实离开了 MAC，读数见下面
+「上板读数」。这一节只加读数，不改任何发送行为**）
 
 run 42 之后，上行那两帧只有一句话可说：`status=0x0`，也就是**队列收下了**。队列收下和 MAC 真的
 把 MPDU 送上空口是两件事，之前的读数分不开它们——`sent=` 数的是写进去几次，`status=` 是队列
@@ -6560,20 +6561,49 @@ stderr 上多打一行 `[serial] protected data transmit counters: mpdu=… cck=
 
 #### 上板读数（run 43）
 
+`out/k1-serial/k1-wpa-20260831T040606Z.log`，37 条 `--require-*` 全过。这一轮板子停在 `nsh>`，
+所以用 `--nsh-reboot` 自动复位，没有按 RST。
+
+```
+TX state data-before … mactx-mpdu=0x7 mactx-dma=0x6 macid-sleep=0x0 macid-pause=0x0 cmac-drop=0x0 dmac-drop=0x0
+TX state data-after  … mactx-mpdu=0x8 mactx-dma=0x7 delta-mactx-mpdu=0x1 delta-mactx-dma=0x1
+TX PPDU  data-after  … delta-lcck=0x1 delta-scck=0x0（其余九种 PPDU 类型的增量全是 0）
+resident data tx sn=0xb … pn=0x1 status=0x0 mpdu=0x1 cck=0x1
+resident data tx sn=0xc … pn=0x2 status=0x0 mpdu=0x2 cck=0x2
+resident window data tx sent=0x2 … status=0x0 tk=0x1 dhcp-reply=0x0 offer-ip=0x0 mpdu=0x2 cck=0x2 block=0x0
+```
+
+- **两帧都出去了。** 每一次写之后：MAC 的已发送 MPDU 计数 ＋1、DMA 取帧计数 ＋1、长前导 CCK 的
+  PPDU 计数 ＋1，其余十种 PPDU 类型一个都没动。run 42 留下的那个含混结论现在有答案：不是「写进
+  队列就没动静」，硬件确实把这两个 MPDU 送上去了，速率就是这条路要的 CCK 1M（长前导）。
+- **`delta-mactx-dma=0x1` 是「数到的就是主机排进去的那一帧」的关键一笔。** 硬件自己生成的响应帧
+  （ACK/CTS）不从 DMA 取，所以两个计数同时 ＋1 说明这一笔是从主机内存取出来发的，不是窗口里顺手
+  发的一个 ACK 被算了进来。
+- **`block=0x0`，`data-before` 那一行四个「能不能发」的位全是 0**：MACID 0 既没在睡、没被暂停，
+  也没有在 CMAC 或 DMAC 被丢。
+- **`dhcp-reply=0x0` 照旧，AP 没有回应。** 所以缺口现在被压缩到很窄的一段：帧离开了 MAC，但
+  「AP 有没有收下并 ACK」和「AP 有没有用我们派生的密钥解开」这两件事日志里仍然没有证据。
+  下一步就是 TX report（C2H `0x0c`）——ACK 与重传次数在那里，那是唯一能把「发出去了」和
+  「对端收到了」分开的读数。
+- 同一个窗口 RX 侧：`total=0xe target=0xb prot=0xe group=0xd hw-dec=0xb sw-dec=0x3 icv=0x0
+  crc=0x0 a1-match=0x0`——AP 的组播数据帧继续被硬件用本端装进去的 GTK 解开、零 ICV/CRC 错；
+  `a1-match=0x0` 说明这个窗口里没有一帧是单播给本端的（ACK 不是数据帧，本来也不会出现在这里）。
+
 #### 还没做的
 
-**这一步只增加分辨率，不修任何东西。** 它能把 run 42 那个含混的结论劈成两种情形，每一种都有
-明确的下一步：
+**这一步只增加分辨率，不修任何东西**，而它劈出来的是两种情形里的第一种：
 
-- `mpdu` 有增量：帧确实离开了 MAC。那么问题在更外层——有没有被 ACK（TX report / RTS-CTS）、
-  AP 有没有解开、AP 背后有没有 DHCP 服务器。下一步是 TX report（C2H `0x0c`）。
-- `mpdu` 一直是 0：帧写进了队列却没出去，这就是新的第一号缺陷。`block` 和 `data-before` 那一行
+- `mpdu` 有增量（**run 43 就是这一种**）：帧确实离开了 MAC。那么问题在更外层——有没有被 ACK
+  （TX report）、AP 有没有解开、AP 背后有没有 DHCP 服务器。下一步是 TX report（C2H `0x0c`）。
+- `mpdu` 一直是 0：帧写进了队列却没出去，那会是新的第一号缺陷。`block` 和 `data-before` 那一行
   的 `macid-sleep=` / `macid-pause=` / `cmac-drop=` / `dmac-drop=` 直接说明是不是在提交那一刻
   就被拦住了；如果四个都是 0 而 `mpdu` 还是 0，那要往调度器（`R_AX_CTN_TXEN` 之外的 SCH 使能、
-  BE 队列的 TX-EN token）和描述符的 `ch_dma`/`qsel` 一致性上查。
+  BE 队列的 TX-EN token）和描述符的 `ch_dma`/`qsel` 一致性上查。**run 43 之后这一条不再适用。**
 
-在拿到这个增量之前，run 42 仍然只能说成「队列收下了，且当时装着成对密钥」，不能说成「发出去
-了」。`wlan0` 一个字节没变；这一节没有新增任何由密钥派生的打印——打的是两个 MAC 计数器的增量和
+run 43 之后可以说的是「MAC 把这两个 MPDU 发出去了，速率 CCK 1M，没有在 MACID/CMAC/DMAC 被拦」；
+仍然**不能**说的是「AP 收到了」或「AP 解开了」——`dhcp-reply=0x0`，而 ACK 要等 TX report 才看得到。
+
+`wlan0` 一个字节没变；这一节没有新增任何由密钥派生的打印——打的是两个 MAC 计数器的增量和
 四个「能不能发」的位，都不是凭证。仍然是 RAM-only：eMMC / SPI flash / eFuse / U-Boot 环境一个
 都没写。
 
