@@ -2129,6 +2129,40 @@ def main() -> int:
                 missing.append(
                     "RTL8852BS2 resident window protected data transmit "
                     "summary")
+
+            # Whether the MAC transmitted the frame the queue accepted is a
+            # third question, and neither line above can answer it: status is
+            # the queue's answer and sent counts writes.  The counters that do
+            # answer it are only read if this dump ran, so the dump is required
+            # to exist.  What it says is printed rather than required, for the
+            # same reason the DHCP reply is: a zero transmitted-MPDU delta is
+            # the reading this instrument was added to be able to see, not a
+            # reason to fail the run that produced it.
+            data_secure_state_result = re.search(
+                rb"K1 Wi-Fi GPL: TX state data-after "
+                rb"[^\r\n]* delta-mactx-mpdu=(?:0x)?[0-9a-fA-F]+"
+                rb"[^\r\n]*\r?\n",
+                data_secure,
+            )
+            if data_secure_state_result is None:
+                missing.append(
+                    "RTL8852BS2 transmit-counter sample across a protected "
+                    "data write")
+
+            data_secure_counters = re.search(
+                rb"K1 Wi-Fi GPL: resident window data tx [^\r\n]*"
+                rb" mpdu=(?:0x)?([0-9a-fA-F]+)"
+                rb" cck=(?:0x)?([0-9a-fA-F]+)"
+                rb" block=(?:0x)?([0-9a-fA-F]+)",
+                data_secure,
+            )
+            if data_secure_counters is not None:
+                print(
+                    "[serial] protected data transmit counters: mpdu="
+                    f"{int(data_secure_counters.group(1), 16)} cck="
+                    f"{int(data_secure_counters.group(2), 16)} block="
+                    f"{int(data_secure_counters.group(3), 16)}",
+                    file=sys.stderr)
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

@@ -6476,8 +6476,8 @@ K1 Wi-Fi GPL: resident window data tx sent=0x0000000000000002 bytes=0x0000000000
 判据**，因为一台背后没有 DHCP 服务器的 AP 会把这一帧解得好好的却永远不回。等哪一次 run 真的
 拿到回应，那一行才是「本端发的保护帧被 AP 解开了」的证据，届时再决定要不要升成判据。
 
-**下一件该做的是把「队列收下了」和「MAC 真的发出去了」分开。** run 42 之后这两件事还是并在一起
-的：`status=0x0` 只说明描述符和帧被写进了队列。日志里已经有现成的手段——关联那一段打的
+**下一件该做的是把「队列收下了」和「MAC 真的发出去了」分开——仪表已经做好了，见下面的增量
+3k，等 run 43 的读数。** run 42 之后这两件事还是并在一起的：`status=0x0` 只说明描述符和帧被写进了队列。日志里已经有现成的手段——关联那一段打的
 `TX state …` 里带 `mactx-mpdu` / `mactx-dma` / `cmac-drop` / `dmac-drop`，把同一个 dump 挪到
 数据发送的前后各打一次，`mactx-mpdu` 的增量就能回答「MAC 有没有把这两个 MPDU 送出去」，
 两个 drop 计数能回答「有没有在 CMAC/DMAC 就被丢掉」。再往上才是 TX report（有没有被 ACK）。
@@ -6504,6 +6504,89 @@ required`。原因不是工具链，是**上一次用 ninja 单独编一个文�
 `rv64imac`——F/D 和 zicsr 全丢了。`--clean` 一次就好了，两次带密钥构建哈希相同。教训是：不要
 再用 ninja 直接驱动单个对象规则；要快速语法检查就从 `compile_commands.json` 里取出命令行、
 去掉 ccache 前缀、加 `-fsyntax-only` 自己跑，这样不会碰构建目录的状态。
+
+### 增量 3k：把「队列收下了」和「MAC 真的发出去了」分开
+
+（**尚未上板：run 43 待跑。这一节只加读数，不改任何发送行为**）
+
+run 42 之后，上行那两帧只有一句话可说：`status=0x0`，也就是**队列收下了**。队列收下和 MAC 真的
+把 MPDU 送上空口是两件事，之前的读数分不开它们——`sent=` 数的是写进去几次，`status=` 是队列
+返回的值，两个都不看发送侧。这一步把发送侧的计数器搬到数据发送的前后各读一次，让日志能回答
+「MAC 有没有发」。
+
+#### 出处（先原厂）
+
+- **`R_AX_MACTX_DBG_SEL_CNT`（`0xca20`）**就是原厂 `mac_tx_status_dump()` 用来判断「排进队
+  的帧为什么没出去」的那个寄存器：bit 31:24 是已发送 MPDU 数、bit 23:16 是 DMA 取过的数，两个
+  都是 8 位、会回绕。8852B 这条路**不需要写索引**（原厂 dump 直接把读到的字打出来），所以这一次
+  读不写任何寄存器，是发送侧一个独立的证人——`R_AX_TX_PPDU_CNT` 那条带索引选择的路不是。
+- **`R_AX_TX_PPDU_CNT`（`0xcae0`）**按 11 种 PPDU 类型分别计数，本移植这条路要的是 CCK 1M，
+  所以只把 `lcck` ＋ `scck` 两格的增量加在一起：硬件用长前导还是短前导不是这个读数要问的事。
+  这条路每换一个索引要按原厂等 1 ms，一次采样 11 个索引，所以两次采样一共给发送前后各加了
+  约 11 ms 的 SDIO 流量——落在 3 秒的驻留窗口里可以忽略，而且采样本身不发帧。
+- **四个「这个 MACID 现在能不能发」的寄存器**同样出自 `mac_tx_status_dump()`：
+  `R_AX_MACID_SLEEP_0`（`0xc2c0`）、`R_AX_SS_MACID_PAUSE_0`（`0x9eb0`）、
+  `R_AX_CMAC_MACID_DROP_0`（`0xc2e0`）、`R_AX_DMAC_MACID_DROP_0`（`0x8840`）。本端的 MACID
+  是 0，也就是这四个字的 bit 0。
+
+这些读数本移植早就有了：`k1_rtl8852bs_runtime_tx_state_sample()` /
+`..._tx_state_log()` 从关联那一段起就在打 `TX PPDU <phase> …` 和 `TX state <phase> …`。
+这一步没有新写一套仪表，只是把同一个 dump 挪到数据发送的两侧。
+
+#### 改动（全在 `chip/k1/k1_rtl8852bs_gpl.c`）
+
+- `k1_rtl8852bs_runtime_resident_data_tx()` 在 `k1_sdio_wifi_write()` **之前**尽可能晚地采一次
+  （打 `TX state data-before …`），在排空轮询之后再采一次（打 `TX state data-after …`，带
+  baseline，所以这一行上有 `delta-mactx-mpdu=` / `delta-mactx-dma=`）。两次采样之间除了那一次
+  写，只有读三个资源寄存器的排空轮询，没有任何会发帧的东西。
+- 三个新计数进 `struct k1_rtl8852bs_resident_count_s`：`data_tx_mpdu`（已发送 MPDU 增量之和，
+  按 8 位回绕算）、`data_tx_cck`（`lcck`＋`scck` 增量之和，按 16 位回绕算）、`data_tx_block`
+  （写进去的那一刻本端 MACID 在 sleep/pause/CMAC-drop/DMAC-drop 里任一位为 1 的次数）。
+- 每次尝试那一行末尾加 ` mpdu=` ` cck=`，窗口汇总那一行在 `offer-ip=` 之后加 ` mpdu=`
+  ` cck=` ` block=`。**加在末尾是有意的**：判据正则要求 `status=0x0…` 后面紧跟 ` tk=`，中间
+  不能插东西。
+
+#### 判据（`--require-*` 仍然是 37 个）
+
+`--require-runtime-data-secure-tx` 多卡一条：`TX state data-after …` 这一行**必须存在**（带
+`delta-mactx-mpdu=`）——不然那三个计数根本没被读过。**读出来的值是打印，不是判据**：
+`mpdu=0` 恰恰是这套仪表被加进来要能看见的读数，不是让这一次 run 失败的理由。工具会在
+stderr 上多打一行 `[serial] protected data transmit counters: mpdu=… cck=… block=…`。
+
+用合成日志自测过 11 条：三条老正则（尝试行、汇总行、模型完成）在加了新字段之后仍然命中；
+`data-after` 那条在只有 `data-before` 时不命中、在 run 42 那份日志上不命中（新判据本来就该
+让 3k 之前的日志过不去）；三个计数在 `mpdu=0 cck=0 block=1` 这种读数上也能取出来；
+`status≠0`、`tk=0`、`sent=0` 三种情况仍然让汇总行的判据失败。
+
+#### 上板读数（run 43）
+
+#### 还没做的
+
+**这一步只增加分辨率，不修任何东西。** 它能把 run 42 那个含混的结论劈成两种情形，每一种都有
+明确的下一步：
+
+- `mpdu` 有增量：帧确实离开了 MAC。那么问题在更外层——有没有被 ACK（TX report / RTS-CTS）、
+  AP 有没有解开、AP 背后有没有 DHCP 服务器。下一步是 TX report（C2H `0x0c`）。
+- `mpdu` 一直是 0：帧写进了队列却没出去，这就是新的第一号缺陷。`block` 和 `data-before` 那一行
+  的 `macid-sleep=` / `macid-pause=` / `cmac-drop=` / `dmac-drop=` 直接说明是不是在提交那一刻
+  就被拦住了；如果四个都是 0 而 `mpdu` 还是 0，那要往调度器（`R_AX_CTN_TXEN` 之外的 SCH 使能、
+  BE 队列的 TX-EN token）和描述符的 `ch_dma`/`qsel` 一致性上查。
+
+在拿到这个增量之前，run 42 仍然只能说成「队列收下了，且当时装着成对密钥」，不能说成「发出去
+了」。`wlan0` 一个字节没变；这一节没有新增任何由密钥派生的打印——打的是两个 MAC 计数器的增量和
+四个「能不能发」的位，都不是凭证。仍然是 RAM-only：eMMC / SPI flash / eFuse / U-Boot 环境一个
+都没写。
+
+#### 构建
+
+- 带密钥：`ffd8bd0bc687d8371897242d3a14df565721d09e1dabd16f61f3aba3b48d9aef`
+  （`--no-key` 来回切一次之后重新构建仍是同一个哈希）
+- `--no-key`：`f4696d5cb9e7de7baeb761a9e8b7126bc9db85d7f68ddd722b23826fdf1869c4`
+
+两个配置（驻留诊断开与关）都用 `compile_commands.json` 里的命令行加 `-fsyntax-only` 过了一遍，
+关掉的那一份用的是把 `CONFIG_K1_RTL8852BS2_RUNTIME_RESIDENT_DIAGNOSTIC` 那一行删掉的
+`config.h` 副本（放在一个更早的 `-I` 目录里），两边都没有告警——新加的静态函数调用在关掉诊断
+时也不会留下未使用的东西。
 
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 

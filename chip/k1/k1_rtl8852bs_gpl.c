@@ -25060,6 +25060,19 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t data_tx_xid;
   uint32_t dhcp_replies;
   uint32_t dhcp_offer;
+
+  /* What the transmit-side counters did across the writes.  data_tx_mpdu is
+   * the summed increment of the MAC's transmitted-MPDU counter, data_tx_cck
+   * that of the two CCK PPDU counters -- the rate this path selects -- and
+   * data_tx_block is set when this MACID was sleeping, paused or dropped at
+   * either CMAC or DMAC when a write went in.  A queue that accepted a frame
+   * the MAC never emitted reads sent > 0 with data_tx_mpdu == 0, which is the
+   * one distinction the earlier readings could not make.
+   */
+
+  uint32_t data_tx_mpdu;
+  uint32_t data_tx_cck;
+  uint32_t data_tx_block;
   uint16_t data_tx_sequence;
   int data_tx_status;
 };
@@ -26083,6 +26096,9 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
   struct k1_rtl8852bs_data_tx_layout_s layout;
   struct k1_rtl8852bs_data_tx_resources_s before_res;
   struct k1_rtl8852bs_data_tx_resources_s after_res;
+  struct k1_rtl8852bs_tx_state_s tx_before;
+  struct k1_rtl8852bs_tx_state_s tx_after;
+  bool tx_before_valid;
   FAR uint8_t *packet;
   size_t frame_length = 0;
   unsigned int drained;
@@ -26169,6 +26185,31 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
       goto done;
     }
 
+  /* The transmit-side snapshot the management, scan and loopback paths already
+   * take, taken here for the reason those readings left open: a queue that
+   * accepts a frame and a MAC that emits it are two different events, and only
+   * these counters tell them apart.  Sampled as late as possible, so the write
+   * below is very nearly the only thing between the two samples -- the drain
+   * poll reads three resource registers, none of which transmits anything.
+   */
+
+  tx_before_valid = k1_rtl8852bs_runtime_tx_state_sample(&tx_before) == OK;
+  if (tx_before_valid)
+    {
+      k1_rtl8852bs_runtime_tx_state_log("data-before", &tx_before, NULL);
+
+      /* Bit zero of each of the four is this port's MACID, the one every frame
+       * this port sends uses.  Recorded before the write, because a frame the
+       * MAC refuses for one of these reasons is refused at submission time.
+       */
+
+      if (((tx_before.macid_sleep | tx_before.macid_pause |
+            tx_before.cmac_drop | tx_before.dmac_drop) & 1u) != 0)
+        {
+          count->data_tx_block++;
+        }
+    }
+
   ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
                            layout.transfer_length);
   if (ret < 0)
@@ -26195,6 +26236,26 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
         }
 
       up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  /* Both counters are eight bits wide and wrap, so each delta is taken in
+   * eight-bit arithmetic before it is summed.  The two CCK counters are
+   * summed together: this path asks for CCK 1M, and whether the hardware
+   * frames it with a long or a short preamble is not this reading's question.
+   */
+
+  if (tx_before_valid &&
+      k1_rtl8852bs_runtime_tx_state_sample(&tx_after) == OK)
+    {
+      k1_rtl8852bs_runtime_tx_state_log("data-after", &tx_after, &tx_before);
+
+      count->data_tx_mpdu += (uint32_t)(uint8_t)
+        (((tx_after.mactx_cnt >> K1_RTL8852BS_MACTX_MPDU_CNT_SHIFT) -
+          (tx_before.mactx_cnt >> K1_RTL8852BS_MACTX_MPDU_CNT_SHIFT)) &
+         K1_RTL8852BS_MACTX_CNT_MASK);
+      count->data_tx_cck +=
+        (uint32_t)(uint16_t)(tx_after.ppdu[0] - tx_before.ppdu[0]) +
+        (uint32_t)(uint16_t)(tx_after.ppdu[1] - tx_before.ppdu[1]);
     }
 
   ret = OK;
@@ -26429,6 +26490,10 @@ static int k1_rtl8852bs_runtime_resident_window(
           k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
           k1_early_puts(" status=");
           k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts(" mpdu=");
+          k1_early_puthex(count.data_tx_mpdu);
+          k1_early_puts(" cck=");
+          k1_early_puthex(count.data_tx_cck);
           k1_early_puts("\r\n");
         }
 
@@ -26710,6 +26775,16 @@ static int k1_rtl8852bs_runtime_resident_window(
    * but an access point with no server behind it would never answer a frame it
    * decrypted perfectly well.  offer-ip is the address the answer offered,
    * which is not a credential.
+   *
+   * mpdu and cck are what the MAC's own transmit counters did across the
+   * writes, and they answer the question sent and status cannot: sent counts
+   * frames the queue accepted, mpdu counts frames the MAC emitted.  sent > 0
+   * with mpdu == 0 means the frame sat in the queue and never went out; both
+   * non-zero means it did, at the CCK rate this path asks for.  block is the
+   * number of writes that went in while this MACID was sleeping, paused or
+   * dropped, which is the first thing to look at when mpdu stays zero.  Like
+   * dhcp-reply these are reported and not required, because what they read on
+   * hardware is exactly what is not yet known.
    */
 
   k1_early_puts("K1 Wi-Fi GPL: resident window data tx sent=");
@@ -26729,6 +26804,12 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.dhcp_replies);
   k1_early_puts(" offer-ip=");
   k1_early_puthex(count.dhcp_offer);
+  k1_early_puts(" mpdu=");
+  k1_early_puthex(count.data_tx_mpdu);
+  k1_early_puts(" cck=");
+  k1_early_puthex(count.data_tx_cck);
+  k1_early_puts(" block=");
+  k1_early_puthex(count.data_tx_block);
   k1_early_puts("\r\n");
 
   /* The verdict names the earliest thing that was wrong, so a run reads as

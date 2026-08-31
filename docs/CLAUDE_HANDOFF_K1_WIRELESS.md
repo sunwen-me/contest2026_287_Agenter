@@ -614,14 +614,28 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   （`ccache` 不在那个 shell 的 PATH 上），留下的 `build.ninja` 里 `-march` 退成 `rv64imac`，
   整棵树报 `extension 'zicsr' required`。`--clean` 一次即恢复。以后快速语法检查从
   `compile_commands.json` 取命令行、去掉 ccache 前缀、加 `-fsyntax-only` 自己跑。
-- **下一步优先级**：(1) 增量 3k——**把「队列收下了」和「MAC 真的发出去了」分开**。run 42 之后
-  这两件事仍然并在一起：`status=0x0` 只说明描述符和帧被写进了 band-0 BE 队列，而
-  `dhcp-reply=0x0`，所以「AP 解开了本端发的保护帧」一点证据都没有。现成的手段就在同一份日志里：
-  关联那一段打的 `TX state …` 带 `mactx-mpdu` / `mactx-dma` / `cmac-drop` / `dmac-drop`
-  （还有 `ppdu-sel`、`macid-sleep`、`macid-pause`），把同一个 dump 挪到数据发送前后各打一次，
-  `mactx-mpdu` 的增量回答「MAC 有没有把这两个 MPDU 送出去」，两个 drop 计数回答「有没有在
-  CMAC/DMAC 就被丢掉」，`macid-pause` 回答「这个 MACID 是不是被暂停了」。**先做这个，再考虑
-  TX report（有没有被 ACK）**；在拿到这个读数之前不要把 run 42 说成「发出去了」。
+- **已写完、未上板（增量 3k）：把「队列收下了」和「MAC 真的发出去了」分开。** run 42 那两帧只有
+  `status=0x0`（队列收下了）和 `dhcp-reply=0x0`（AP 没回），中间「MAC 到底有没有把 MPDU 送出去」
+  这一段是空的。这一步不改任何发送行为，只把本移植关联那一段早就在打的
+  `k1_rtl8852bs_runtime_tx_state_sample()` / `..._tx_state_log()` 挪到数据发送两侧各打一次：
+  写之前尽可能晚地打 `TX state data-before …`，排空轮询之后打 `TX state data-after …`（带
+  baseline，所以有 `delta-mactx-mpdu=` / `delta-mactx-dma=`）。三个新计数进驻留窗口的汇总：
+  `mpdu=`（`R_AX_MACTX_DBG_SEL_CNT` bit 31:24 的增量之和，8 位回绕）、`cck=`（`lcck`＋`scck`
+  两格 PPDU 计数的增量之和，16 位回绕）、`block=`（写进去那一刻本端 MACID 在
+  `macid-sleep`/`macid-pause`/`cmac-drop`/`dmac-drop` 里任一位为 1 的次数）。每次尝试那一行也带
+  ` mpdu=` ` cck=`。**新字段一律加在行尾**，因为判据正则要求 `status=0x0…` 后面紧跟 ` tk=`。
+  判据数仍是 **37**：`--require-runtime-data-secure-tx` 多卡一条「`TX state data-after` 这一行
+  必须存在」（不然那三个计数根本没被读过），而**读出来的值是打印不是判据**——`mpdu=0` 恰恰是这套
+  仪表要能看见的读数，工具在 stderr 上多打一行
+  `[serial] protected data transmit counters: mpdu=… cck=… block=…`。合成日志自测 11 条全过
+  （含「run 42 那份日志过不了新判据」这条负例）。两个配置（驻留诊断开／关）`-fsyntax-only` 干净。
+  镜像：带密钥 `ffd8bd0b…`（`--no-key` 来回切后重建同哈希）、`--no-key` `f4696d5c…`。
+  **下一步优先级**：(1) **上板 run 43，只为拿这一个增量**。`mpdu` 有增量 → 帧确实离开了 MAC，
+  问题在更外层（有没有被 ACK、AP 有没有解开、AP 背后有没有 DHCP 服务器），下一步是 TX report
+  （C2H `0x0c`）；`mpdu` 一直是 0 → 这是新的第一号缺陷，先看 `block` 和 `data-before` 那行的四个
+  「能不能发」位，四个都是 0 而 `mpdu` 还是 0 就往调度器（`R_AX_CTN_TXEN` 之外的 SCH 使能、BE
+  队列的 TX-EN token）和描述符 `ch_dma`/`qsel` 一致性查。在拿到这个读数之前不要把 run 42 说成
+  「发出去了」。
   发送这一路的代码本身已经全部写完并上板：帧、48 字节描述符、PN 计数器、回应匹配器、驻留窗口里
   的两次发送；描述符的安全字段与 CCMP 头在 run 40 确认过，RX 侧那一半在 run 39（单播 PTK）与
   run 42（13 帧组播 GTK，`hw-dec=0xd icv=0x0`）证明过。密钥在硬件里（3f）、port 使能（3g）、
@@ -766,11 +780,12 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是数据面的上板验证：增量 3j 的发送路径已经写完，但一次没上过板**——密钥已经在
+**当前实际下一步是上板 run 43，只为拿一个读数：MAC 到底有没有把那两个 MPDU 送出去**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
 描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 42 也确实把两帧保护数据帧
 交给了 band-0 BE 队列并拿到 `status=0x0`，但**队列收下不等于 MAC 发出去，更不等于 AP 解开了**
-（`dhcp-reply=0x0`），所以到目前为止仍然没有「本端发出的 CCMP 帧被对端解开」的证据。
+（`dhcp-reply=0x0`），所以到目前为止仍然没有「本端发出的 CCMP 帧被对端解开」的证据。增量 3k
+（发送前后各读一次 MAC 的发送计数器）已经写完、自检过、镜像也构建好了，就等这一次上板。
 反过来，**接收侧的 CCMP 解密在真实空口上已经成立**：run 39 是单播 PTK、run 42 是 13 帧组播 GTK
 （`hw-dec=0xd icv=0x0 crc=0x0`）。增量 3h 本身（不跑扫描的驻留收发窗口）
 已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题
@@ -789,7 +804,10 @@ tools/run_k1_wpa.sh               # 上板：37 条 --require-*，K1_RESET_MODE 
 `tools/run_k1_wpa.sh` 把这 37 条固定下来，复位方式用环境变量
 `K1_RESET_MODE`（默认 `--nsh-reboot`，板子不在 `nsh>` 时设成 `--manual-reset` 再按 RST），
 额外参数原样透传。**它不接受也不打印任何口令**。run 42 用它跑，**37 条一条没失败**，日志
-`out/k1-serial/k1-wpa-20260831T031058Z.log`；run 40 跑的是其中 36 条（那时还没有最后一条）、
+`out/k1-serial/k1-wpa-20260831T031058Z.log`；增量 3k 没有增加旗标——新加的那条子检查
+（`TX state data-after` 必须存在）挂在已有的 `--require-runtime-data-secure-tx` 里面，所以
+run 43 仍然是这 37 条，**但 run 42 那份日志过不了新的 37 条**（它没有那一行，这是有意的）；
+run 40 跑的是其中 36 条（那时还没有最后一条）、
 一条没失败，日志 `out/k1-serial/k1-wpa-20260831T010437Z.log`；run 35 跑的是其中 34 条（那时还没有最后两条）、
 一条没失败、以 `PASS: K1 wireless RAM image reached NSH` 收尾，日志
 `out/k1-serial/k1-wpa-20260830T194339Z.log`（run 34 是其中 33 条，日志
