@@ -124,10 +124,26 @@ else
   printf 'Passphrase:  none (--no-key); the handshake will report ENOKEY\n'
 fi
 
+# Which defconfig this build directory was last configured from.  The build
+# underneath only runs the configure step when it has no .config yet, so a
+# switch between the generated profile and the committed one is otherwise
+# silently ignored: --no-key would rebuild the keyed image and report its hash,
+# which is exactly the false result this flag exists to rule out.  A changed
+# source therefore forces a clean build.
+STAMP="${BUILD_DIR}/.k1-wpa-config-source"
+
+if [ "${CLEAN}" -eq 0 ] && [ -f "${BUILD_DIR}/.config" ] &&
+   [ "$(cat "${STAMP}" 2>/dev/null || printf '')" != "${CONFIG_PATH}" ]; then
+  printf 'Reconfigure: the build directory was configured from another\n'
+  printf '             defconfig, so this build starts clean\n'
+  CLEAN=1
+fi
+
 ARGS=(--config "${CONFIG_PATH}" --build-dir "${BUILD_DIR}"
       --package --package-dir "${PACKAGE_DIR}" --jobs "${JOBS}")
 if [ "${CLEAN}" -eq 1 ]; then
   ARGS+=(--clean)
 fi
 
-exec "${SCRIPT_DIR}/build_k1.sh" "${ARGS[@]}"
+"${SCRIPT_DIR}/build_k1.sh" "${ARGS[@]}"
+printf '%s\n' "${CONFIG_PATH}" > "${STAMP}"

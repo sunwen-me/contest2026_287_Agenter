@@ -1268,6 +1268,40 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RXDESC_LONG                (1u << 31)
 #define K1_RTL8852BS_RXDESC_CRC_ERROR           (1u << 9)
 #define K1_RTL8852BS_RXDESC_ICV_ERROR           (1u << 10)
+
+/* What the receive descriptor says about the frame's protection.
+ *
+ * The three bits next to the two error bits already decoded above live in the
+ * same dword 3: a1_match bit 0, sw_dec bit 1, hw_dec bit 2, with_llc bit 25
+ * (rtw89_txrx.h RTW89_RXD_A1_MATCH / SW_DEC / HW_DEC / GET_RXINFO_WITH_LLC,
+ * mainline rtw89_core_rx_parse_rxdesc_v0()).  hw_dec says the security engine
+ * decrypted the frame and sw_dec says it handed the frame over for software to
+ * decrypt instead; mainline's own test for a decrypted frame is hw_dec and not
+ * (sw_dec or icv_err), and it sets no flag claiming the header or the trailer
+ * was stripped, so a decrypted frame still carries its eight-byte CCMP header
+ * and its eight-byte MIC.
+ *
+ * Dword 5 carries which key and which address record the frame matched -
+ * sec_cam_idx [7:0], addr_cam [15:8], macid [23:16], addr_cam_vld bit 28 - and
+ * dword 7 carries the cipher the engine used, sec_type [20:17], in the same
+ * mac_ax_enc_alg encoding the security CAM entry's own type field takes, so
+ * CCMP-128 reads back as 6.  Both dwords exist only in the long descriptor
+ * form, the one dword 0 bit 31 announces.
+ */
+
+#define K1_RTL8852BS_RXDESC_A1_MATCH            (1u << 0)
+#define K1_RTL8852BS_RXDESC_SW_DEC              (1u << 1)
+#define K1_RTL8852BS_RXDESC_HW_DEC              (1u << 2)
+#define K1_RTL8852BS_RXDESC_WITH_LLC            (1u << 25)
+#define K1_RTL8852BS_RXDESC_SEC_CAM_IDX_SHIFT   0u
+#define K1_RTL8852BS_RXDESC_SEC_CAM_IDX_MASK    0xffu
+#define K1_RTL8852BS_RXDESC_ADDR_CAM_SHIFT      8u
+#define K1_RTL8852BS_RXDESC_ADDR_CAM_MASK       0xffu
+#define K1_RTL8852BS_RXDESC_MAC_ID_SHIFT        16u
+#define K1_RTL8852BS_RXDESC_MAC_ID_MASK         0xffu
+#define K1_RTL8852BS_RXDESC_ADDR_CAM_VALID      (1u << 28)
+#define K1_RTL8852BS_RXDESC_SEC_TYPE_SHIFT      17u
+#define K1_RTL8852BS_RXDESC_SEC_TYPE_MASK       0xfu
 #define K1_RTL8852BS_IEEE80211_TYPE_MASK        0x3u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_SHIFT    4u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_MASK     0xfu
@@ -7022,6 +7056,8 @@ int k1_rtl8852bs_runtime_rx_parse(FAR const uint8_t *buffer,
 {
   uint32_t descriptor0;
   uint32_t descriptor3 = 0;
+  uint32_t descriptor5 = 0;
+  uint32_t descriptor7 = 0;
   size_t descriptor_length;
   size_t payload_offset;
   size_t payload_end;
@@ -7079,15 +7115,46 @@ int k1_rtl8852bs_runtime_rx_parse(FAR const uint8_t *buffer,
       descriptor3 = k1_rtl8852bs_read_le32(buffer + offset + 12);
     }
 
+  /* Dwords 5 and 7 are read only for a long descriptor, because a short one
+   * does not contain them; the bounds check above has already established
+   * that a long descriptor's whole 32 bytes are inside the transfer.
+   */
+
+  if (descriptor_length >= K1_RTL8852BS_RXDESC_LONG_SIZE)
+    {
+      descriptor5 = k1_rtl8852bs_read_le32(buffer + offset + 20);
+      descriptor7 = k1_rtl8852bs_read_le32(buffer + offset + 28);
+    }
+
   frame->payload_offset = payload_offset;
   frame->next_offset = next_offset;
   frame->descriptor0 = descriptor0;
   frame->descriptor3 = descriptor3;
+  frame->descriptor5 = descriptor5;
+  frame->descriptor7 = descriptor7;
   frame->packet_type =
     (descriptor0 >> K1_RTL8852BS_RXDESC_PACKET_TYPE_SHIFT) &
     K1_RTL8852BS_RXDESC_PACKET_TYPE_MASK;
   frame->crc_error = (descriptor3 & K1_RTL8852BS_RXDESC_CRC_ERROR) != 0;
   frame->icv_error = (descriptor3 & K1_RTL8852BS_RXDESC_ICV_ERROR) != 0;
+  frame->descriptor_long = descriptor_length >=
+                           K1_RTL8852BS_RXDESC_LONG_SIZE;
+  frame->a1_match = (descriptor3 & K1_RTL8852BS_RXDESC_A1_MATCH) != 0;
+  frame->sw_dec = (descriptor3 & K1_RTL8852BS_RXDESC_SW_DEC) != 0;
+  frame->hw_dec = (descriptor3 & K1_RTL8852BS_RXDESC_HW_DEC) != 0;
+  frame->with_llc = (descriptor3 & K1_RTL8852BS_RXDESC_WITH_LLC) != 0;
+  frame->sec_type = (descriptor7 >> K1_RTL8852BS_RXDESC_SEC_TYPE_SHIFT) &
+                    K1_RTL8852BS_RXDESC_SEC_TYPE_MASK;
+  frame->sec_cam_index =
+    (descriptor5 >> K1_RTL8852BS_RXDESC_SEC_CAM_IDX_SHIFT) &
+    K1_RTL8852BS_RXDESC_SEC_CAM_IDX_MASK;
+  frame->addr_cam_index =
+    (descriptor5 >> K1_RTL8852BS_RXDESC_ADDR_CAM_SHIFT) &
+    K1_RTL8852BS_RXDESC_ADDR_CAM_MASK;
+  frame->mac_id = (descriptor5 >> K1_RTL8852BS_RXDESC_MAC_ID_SHIFT) &
+                  K1_RTL8852BS_RXDESC_MAC_ID_MASK;
+  frame->addr_cam_valid = (descriptor5 &
+                           K1_RTL8852BS_RXDESC_ADDR_CAM_VALID) != 0;
   return OK;
 }
 
@@ -23171,6 +23238,16 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_RESIDENT_DEAUTH_BODY       26u
 #define K1_RTL8852BS_RESIDENT_OTHER_HEAD        16u
 
+/* How much of the first protected data frame is kept.  Thirty-two bytes reach
+ * past the longest header a QoS data frame from an access point can have and
+ * past the eight-byte CCMP header behind it, so the dump shows the header, the
+ * packet number, the key identifier and the first bytes of what the security
+ * engine produced, which is what says whether a plaintext LLC/SNAP header is
+ * sitting there.
+ */
+
+#define K1_RTL8852BS_RESIDENT_SEC_HEAD          32u
+
 /* The channel-defining registers of the three layers, as the vendor names
  * them.  cfg_mac_bw() owns the first two, halbb_ctrl_bw_ch_8852b() the
  * baseband set, and halrf_ctrl_ch_8852b() the radio's 0x18.
@@ -23249,6 +23326,58 @@ struct k1_rtl8852bs_resident_count_s
   uint8_t first_other_length;
   uint16_t deauth_reason;
   int probe_status;
+
+  /* What the hardware did with the protection on the data frames the window
+   * received.  Run 38's window counted six data frames, four of them from the
+   * associated access point, by frame header alone -- which says an access
+   * point is sending into this station's BSS and says nothing at all about
+   * whether the keys the handshake installed are being used.  The receive
+   * descriptor says exactly that, and reading it costs no transmitted frame:
+   * hw_dec with no icv_error is mainline's own test for a decrypted frame,
+   * sec_type names the cipher the engine used in the same encoding the
+   * security CAM entry's type field takes, and sec_cam_index names which of
+   * the two installed keys it used.
+   *
+   * These counters are filled before the error gate the rest of the window
+   * runs behind, so a protected frame whose integrity check failed is counted
+   * here rather than dropped unseen -- an icv_error count is a reading about
+   * the keys, not noise to be discarded.
+   *
+   * llc_after_iv and llc_plain are the independent check on the same
+   * question.  A decrypted frame still carries its CCMP header, so its
+   * plaintext LLC/SNAP header begins eight bytes behind the 802.11 header; an
+   * undecrypted one has ciphertext there and its LLC/SNAP header, if the frame
+   * were plaintext, would sit at the 802.11 header itself.  Which of the two
+   * offsets holds aa-aa-03-00-00-00 therefore says what state the payload is
+   * in without trusting the descriptor's own account of it.
+   */
+
+  uint32_t sec_data;
+  uint32_t sec_data_target;
+  uint32_t sec_protected;
+  uint32_t sec_group;
+  uint32_t sec_a1_match;
+  uint32_t sec_hw_dec;
+  uint32_t sec_sw_dec;
+  uint32_t sec_decrypted;
+  uint32_t sec_icv_error;
+  uint32_t sec_crc_error;
+  uint32_t sec_llc_after_iv;
+  uint32_t sec_llc_plain;
+  uint32_t sec_long;
+  uint32_t sec_short;
+  uint32_t sec_type_mask;
+  uint32_t sec_cam_mask;
+  uint32_t sec_short_header;
+  uint32_t first_sec_descriptor3;
+  uint32_t first_sec_descriptor5;
+  uint32_t first_sec_descriptor7;
+  uint16_t first_sec_payload_length;
+  uint8_t first_sec[K1_RTL8852BS_RESIDENT_SEC_HEAD];
+  uint8_t first_sec_length;
+  uint8_t first_sec_header_length;
+  bool first_sec_valid;
+  bool first_sec_protected;
 };
 
 /****************************************************************************
@@ -23723,6 +23852,245 @@ static int k1_rtl8852bs_runtime_resident_probe_build(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_header_length
+ *
+ * Description:
+ *   The length of one received frame's 802.11 header, as its frame control
+ *   field describes it.  Twenty-four bytes is the base; a frame carrying both
+ *   direction bits has a fourth address and is six bytes longer; a QoS data
+ *   subtype adds its two-byte control field; and the order bit adds the
+ *   four-byte HT control field behind that.  The plaintext of a data frame
+ *   begins at this offset, or eight bytes further when the frame is
+ *   protected, because that is where the CCMP header ends.
+ *
+ ****************************************************************************/
+
+static size_t k1_rtl8852bs_runtime_resident_header_length(
+  uint16_t frame_control)
+{
+  size_t length = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+  uint8_t subtype = (uint8_t)((frame_control >>
+                              K1_RTL8852BS_IEEE80211_SUBTYPE_SHIFT) &
+                              K1_RTL8852BS_IEEE80211_SUBTYPE_MASK);
+
+  /* Bit 8 is to-DS and bit 9 is from-DS; both set is the four-address form. */
+
+  if ((frame_control & 0x0300u) == 0x0300u)
+    {
+      length += 6;
+    }
+
+  if ((subtype & 0x8u) != 0)
+    {
+      length += 2;
+      if ((frame_control & 0x8000u) != 0)
+        {
+          length += 4;
+        }
+    }
+
+  return length;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_observe_security
+ *
+ * Description:
+ *   Read what the receive descriptor says the security engine did with one
+ *   data frame, and record it.  This is the whole point of the step: the keys
+ *   the four-way handshake produced were installed into the hardware and
+ *   acknowledged by it, and until now nothing has said whether the hardware
+ *   uses them.  A data frame the associated access point sends into its BSS is
+ *   protected by the group key this host installed, so the descriptor of such
+ *   a frame carries the answer, and reading it requires transmitting nothing
+ *   at all.
+ *
+ *   Called before the window's crc/icv gate on purpose.  A protected frame
+ *   whose integrity check failed is a reading about the installed key -- it
+ *   says the engine tried and got a different code -- so it is counted here
+ *   instead of being discarded as a bad frame.
+ *
+ *   Management and control frames are ignored: the only management frames this
+ *   association exchanges are unprotected by definition, and a control frame
+ *   has no payload to protect.
+ *
+ * Input Parameters:
+ *   frame          - the parsed receive descriptor of this frame
+ *   payload        - the 802.11 frame itself
+ *   payload_length - its length
+ *   bssid          - the access point this run associated with
+ *   count          - the window's accounting, updated in place
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_resident_observe_security(
+  FAR const struct k1_rtl8852bs_rx_frame_s *frame,
+  FAR const uint8_t *payload, size_t payload_length,
+  FAR const uint8_t *bssid,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  static const uint8_t llc_snap[6] =
+  {
+    0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00
+  };
+
+  uint16_t frame_control;
+  size_t header_length;
+  size_t length;
+  bool protected_frame;
+  bool from_target;
+  bool store;
+
+  if (payload_length < K1_RTL8852BS_IEEE80211_HEADER_SIZE)
+    {
+      return;
+    }
+
+  frame_control = k1_rtl8852bs_read_le16(payload);
+  if (((frame_control >> 2) & K1_RTL8852BS_IEEE80211_TYPE_MASK) !=
+      K1_RTL8852BS_IEEE80211_TYPE_DATA)
+    {
+      return;
+    }
+
+  count->sec_data++;
+
+  /* A frame an access point sends carries its own address as transmitter when
+   * the from-DS bit is set and as address 3 otherwise, so both are compared,
+   * the same way the frame classifier does it.
+   */
+
+  from_target = memcmp(payload + 10, bssid, 6) == 0 ||
+                memcmp(payload + 16, bssid, 6) == 0;
+  if (from_target)
+    {
+      count->sec_data_target++;
+    }
+
+  /* Bit 14 of the frame control field is the protected-frame bit, and a
+   * group-addressed first address is what a multicast frame protected by the
+   * group key looks like.
+   */
+
+  protected_frame = (frame_control & 0x4000u) != 0;
+  if (protected_frame)
+    {
+      count->sec_protected++;
+    }
+
+  if ((payload[4] & 0x01u) != 0)
+    {
+      count->sec_group++;
+    }
+
+  if (frame->a1_match)
+    {
+      count->sec_a1_match++;
+    }
+
+  if (frame->hw_dec)
+    {
+      count->sec_hw_dec++;
+    }
+
+  /* Mainline's own test for a frame the hardware decrypted, applied here
+   * verbatim: the engine reports it decrypted the frame, did not hand it over
+   * for software to decrypt, and the integrity check passed.
+   */
+
+  if (frame->hw_dec && !frame->sw_dec && !frame->icv_error)
+    {
+      count->sec_decrypted++;
+    }
+
+  if (frame->sw_dec)
+    {
+      count->sec_sw_dec++;
+    }
+
+  if (frame->icv_error)
+    {
+      count->sec_icv_error++;
+    }
+
+  if (frame->crc_error)
+    {
+      count->sec_crc_error++;
+    }
+
+  /* sec_type and the two CAM indices live in dwords 5 and 7, which a short
+   * descriptor does not carry, so the two forms are counted apart: a masks
+   * reading of zero means something different when no descriptor carried the
+   * field at all.
+   */
+
+  if (frame->descriptor_long)
+    {
+      count->sec_long++;
+      count->sec_type_mask |= 1u << frame->sec_type;
+      if (frame->sec_cam_index < 32u)
+        {
+          count->sec_cam_mask |= 1u << frame->sec_cam_index;
+        }
+    }
+  else
+    {
+      count->sec_short++;
+    }
+
+  header_length = k1_rtl8852bs_runtime_resident_header_length(frame_control);
+  if (payload_length < header_length + 8u + sizeof(llc_snap))
+    {
+      /* Too short for either offset to be read.  Counted so that a zero in
+       * both LLC counters is never mistaken for a payload that was looked at.
+       */
+
+      count->sec_short_header++;
+    }
+  else
+    {
+      if (memcmp(payload + header_length + 8u, llc_snap,
+                 sizeof(llc_snap)) == 0)
+        {
+          count->sec_llc_after_iv++;
+        }
+
+      if (memcmp(payload + header_length, llc_snap, sizeof(llc_snap)) == 0)
+        {
+          count->sec_llc_plain++;
+        }
+    }
+
+  /* The kept sample is the first protected frame from the associated access
+   * point if one arrives, and the first data frame otherwise, so that a window
+   * carrying nothing protected still shows what it did carry.
+   */
+
+  store = !count->first_sec_valid ||
+          (!count->first_sec_protected && protected_frame && from_target);
+  if (!store)
+    {
+      return;
+    }
+
+  length = payload_length;
+  if (length > sizeof(count->first_sec))
+    {
+      length = sizeof(count->first_sec);
+    }
+
+  memcpy(count->first_sec, payload, length);
+  count->first_sec_length = (uint8_t)length;
+  count->first_sec_header_length = (uint8_t)header_length;
+  count->first_sec_payload_length = (uint16_t)payload_length;
+  count->first_sec_descriptor3 = frame->descriptor3;
+  count->first_sec_descriptor5 = frame->descriptor5;
+  count->first_sec_descriptor7 = frame->descriptor7;
+  count->first_sec_protected = protected_frame && from_target;
+  count->first_sec_valid = true;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_observe
  *
  * Description:
@@ -24114,6 +24482,18 @@ static int k1_rtl8852bs_runtime_resident_window(
               break;
             }
 
+          /* The security accounting runs first, and without the error gate,
+           * because a protected frame whose integrity check failed is one of
+           * the readings it exists to collect.
+           */
+
+          if (frame.packet_type == 0)
+            {
+              k1_rtl8852bs_runtime_resident_observe_security(
+                &frame, buffer + frame.payload_offset, frame.payload_length,
+                bssid, &count);
+            }
+
           if (!frame.crc_error && !frame.icv_error && frame.packet_type == 0)
             {
               k1_rtl8852bs_runtime_resident_observe(
@@ -24220,6 +24600,113 @@ static int k1_rtl8852bs_runtime_resident_window(
       k1_early_puts("K1 Wi-Fi GPL: resident window unclassified head=");
       k1_rtl8852bs_scanofld_log_bytes(count.first_other,
                                       count.first_other_length);
+      k1_early_puts("\r\n");
+    }
+
+  /* The third and fourth lines are what the keys the handshake installed are
+   * actually doing.  Every data frame the window saw is in the total, the ones
+   * the associated access point sent are in target, and the rest of the line
+   * is the receive descriptor's own account of each: whether the frame was
+   * protected, whether the security engine decrypted it, and whether its
+   * integrity code checked out.  dec is that account reduced to mainline's own
+   * test, hw-dec with no sw-dec and no icv error.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window data sec total=");
+  k1_early_puthex(count.sec_data);
+  k1_early_puts(" target=");
+  k1_early_puthex(count.sec_data_target);
+  k1_early_puts(" prot=");
+  k1_early_puthex(count.sec_protected);
+  k1_early_puts(" group=");
+  k1_early_puthex(count.sec_group);
+  k1_early_puts(" a1-match=");
+  k1_early_puthex(count.sec_a1_match);
+  k1_early_puts(" hw-dec=");
+  k1_early_puthex(count.sec_hw_dec);
+  k1_early_puts(" sw-dec=");
+  k1_early_puthex(count.sec_sw_dec);
+  k1_early_puts(" icv=");
+  k1_early_puthex(count.sec_icv_error);
+  k1_early_puts(" crc=");
+  k1_early_puthex(count.sec_crc_error);
+  k1_early_puts(" dec=");
+  k1_early_puthex(count.sec_decrypted);
+  k1_early_puts("\r\n");
+
+  /* llc-iv and llc-plain are the check that does not trust the descriptor: a
+   * decrypted frame keeps its CCMP header, so its LLC/SNAP header sits eight
+   * bytes behind the 802.11 header, and a frame still encrypted has
+   * ciphertext at both offsets.  short is how many frames were too short for
+   * either offset to be read, so a pair of zeroes is never read as a payload
+   * that was examined.  The two masks are one bit per cipher and per key slot
+   * the engine named, and they can only be filled by a long descriptor, which
+   * is why the two descriptor forms are counted next to them.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window data sec llc-iv=");
+  k1_early_puthex(count.sec_llc_after_iv);
+  k1_early_puts(" llc-plain=");
+  k1_early_puthex(count.sec_llc_plain);
+  k1_early_puts(" short=");
+  k1_early_puthex(count.sec_short_header);
+  k1_early_puts(" desc-long=");
+  k1_early_puthex(count.sec_long);
+  k1_early_puts(" desc-short=");
+  k1_early_puthex(count.sec_short);
+  k1_early_puts(" sec-type-mask=");
+  k1_early_puthex(count.sec_type_mask);
+  k1_early_puts(" cam-mask=");
+  k1_early_puthex(count.sec_cam_mask);
+  k1_early_puts("\r\n");
+
+  /* One frame in full, because a mask says which values appeared and only a
+   * single frame's four dwords say them together.  The decoded fields are
+   * derived from the printed dwords with the same macros the parser uses, so
+   * the line can be checked against itself.
+   */
+
+  if (count.first_sec_valid)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident window data sec first len=");
+      k1_early_puthex(count.first_sec_payload_length);
+      k1_early_puts(" hdr=");
+      k1_early_puthex(count.first_sec_header_length);
+      k1_early_puts(" prot=");
+      k1_early_puthex(count.first_sec_protected ? 1 : 0);
+      k1_early_puts(" dw3=");
+      k1_early_puthex(count.first_sec_descriptor3);
+      k1_early_puts(" dw5=");
+      k1_early_puthex(count.first_sec_descriptor5);
+      k1_early_puts(" dw7=");
+      k1_early_puthex(count.first_sec_descriptor7);
+      k1_early_puts(" sec-type=");
+      k1_early_puthex((count.first_sec_descriptor7 >>
+                       K1_RTL8852BS_RXDESC_SEC_TYPE_SHIFT) &
+                      K1_RTL8852BS_RXDESC_SEC_TYPE_MASK);
+      k1_early_puts(" cam=");
+      k1_early_puthex((count.first_sec_descriptor5 >>
+                       K1_RTL8852BS_RXDESC_SEC_CAM_IDX_SHIFT) &
+                      K1_RTL8852BS_RXDESC_SEC_CAM_IDX_MASK);
+      k1_early_puts(" addr-cam=");
+      k1_early_puthex((count.first_sec_descriptor5 >>
+                       K1_RTL8852BS_RXDESC_ADDR_CAM_SHIFT) &
+                      K1_RTL8852BS_RXDESC_ADDR_CAM_MASK);
+      k1_early_puts(" macid=");
+      k1_early_puthex((count.first_sec_descriptor5 >>
+                       K1_RTL8852BS_RXDESC_MAC_ID_SHIFT) &
+                      K1_RTL8852BS_RXDESC_MAC_ID_MASK);
+      k1_early_puts(" cam-vld=");
+      k1_early_puthex((count.first_sec_descriptor5 &
+                       K1_RTL8852BS_RXDESC_ADDR_CAM_VALID) != 0 ? 1 : 0);
+      k1_early_puts(" llc=");
+      k1_early_puthex((count.first_sec_descriptor3 &
+                       K1_RTL8852BS_RXDESC_WITH_LLC) != 0 ? 1 : 0);
+      k1_early_puts("\r\n");
+
+      k1_early_puts("K1 Wi-Fi GPL: resident window data sec first head=");
+      k1_rtl8852bs_scanofld_log_bytes(count.first_sec,
+                                      count.first_sec_length);
       k1_early_puts("\r\n");
     }
 

@@ -463,12 +463,46 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `data=0x6` 其中 `data-target=0x4`，关联的 AP 在这三秒里发了 4 帧数据帧过来，本端只数了帧头，
   还没读 RX 描述符的 `HW_DEC`（DW3 BIT(2)）／`ICV_ERR`（DW3 BIT(10)）／`SEC_TYPE`
   （DW7 [20:17]）——读出来就能一帧不发地证明装进去的 GTK 在解组播帧。
-- **下一步优先级**：(1) 先解码 RX 描述符的解密状态位（`HW_DEC` DW3 BIT(2)、`ICV_ERR`
-  DW3 BIT(10)、`SEC_TYPE` DW7 [20:17]、`SEC_CAM_IDX` DW5 [7:0]）：run 38 的驻留窗口已经收到
-  4 帧来自目标 AP 的数据帧，读这四个位就能**一帧不发**地证明装进去的 GTK 真的在解密；本端
-  解析器现在只留了 `descriptor0`／`descriptor3`，`SEC_TYPE` 要长描述符（32 字节）才有。
-  接着才是发送描述符的安全字段（`sec_type`/`sec_cam_idx`）：这是第一次可能
-  有「被 CCMP 保护的数据帧」。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
+- **已实现、待上板 run 39（增量 3i 前半）：读 RX 描述符的解密状态位。**
+  没有新的 Kconfig 符号，也**没有**新的 `--require-*` 开关（见下面「为什么不加判据」），
+  它就长在增量 3h 的驻留窗口里。做的事：`k1_rtl8852bs_runtime_rx_parse()` 在长描述符
+  （32 字节，DW0 BIT(31)）时多读 `+20`（DW5）与 `+28`（DW7），
+  `struct k1_rtl8852bs_rx_frame_s` 多出 `descriptor5`／`descriptor7` 两个原始 dword、
+  `descriptor_long`（这样「字段不存在」永远不会被读成「字段为零」），以及解好的
+  `a1_match`（DW3 BIT(0)）／`sw_dec`（BIT(1)）／`hw_dec`（BIT(2)）／`with_llc`（BIT(25)）／
+  `sec_type`（DW7 [20:17]）／`sec_cam_index`（DW5 [7:0]）／`addr_cam_index`（[15:8]）／
+  `mac_id`（[23:16]）／`addr_cam_valid`（BIT(28)）；出处是原厂 `rtw89_txrx.h:168-221`
+  与 mainline `rtw89_core_rx_parse_rxdesc_v0()`（`core.c:4133-4159`），逐位相同。
+  新增 `..._resident_observe_security()` 只统计数据帧，**放在窗口现有的
+  `!crc_error && !icv_error` 门之前**——一帧被保护的帧 ICV 失败本身就是关于那把钥匙的读数
+  （硬件试了，算出来的码和 AP 的不一样），当坏帧丢掉恰好丢掉了要的证据。
+  「解开了」照抄 mainline 自己的式子（`core.c:4399-4401`）：`hw_dec && !(sw_dec || icv_err)`，
+  打成 `dec=`。另有一条不看描述符的独立旁证：mainline 不设任何「IV/MIC 已剥」的标志，
+  所以解开的帧仍带 8 字节 CCMP 头与尾部 8 字节 MIC，**明文 LLC/SNAP 从 802.11 头 + 8 开始**，
+  于是 `llc-iv=`／`llc-plain=` 数的就是 `aa aa 03 00 00 00` 出现在哪个偏移（头长由
+  `..._resident_header_length()` 按四地址/QoS/HT-control 算，不假定 24）。四条打印：
+  `resident window data sec total= target= prot= group= a1-match= hw-dec= sw-dec= icv= crc= dec=`、
+  `… llc-iv= llc-plain= short= desc-long= desc-short= sec-type-mask= cam-mask=`、
+  `… first len= hdr= prot= dw3= dw5= dw7= sec-type= cam= addr-cam= macid= cam-vld= llc=`，
+  以及首帧前 32 字节的 head dump（优先留「来自目标 AP 且被保护」的那一帧）。
+  **上板读法**（run 38 的窗口收到 4 帧目标 AP 的数据帧，所以这四帧就是样本）：
+  `hw-dec=0x4 sw-dec=0x0 icv=0x0 dec=0x4 sec-type-mask=0x40 cam-mask=0x2 llc-iv=0x4
+  llc-plain=0x0` 是想要的那种——`0x40` 即只出现过 `sec_type=6`（CCMP-128），`cam-mask=0x2`
+  即只用过安全 CAM 第 1 项也就是 GTK（TK 在第 0 项，单播才用）；`sw-dec` 非零说明硬件没把帧
+  和密钥对上，该查 ADDR_CAM 回填的槽号与组密钥项的 `type`／`ext_key`，不是查密钥字节；
+  `hw-dec` 非零而 `icv` 也非零才是「GTK 字节错了／AES key unwrap 解错了」；`prot=0x0` 说明
+  这几帧没被保护，这一轮什么也没证明；`total=0x0` 说明三秒里 AP 一帧组播都没发，不是失败。
+  `a1-match` 不判定任何事（组播帧 A1 是组地址）。**为什么不加判据**：三秒里有没有组播完全
+  由 AP 决定，run 38 恰好有 4 帧，下一次可能是 0 帧，写成 `--require-*` 会让 smoke 变成偶发
+  失败的测试。读数照打，结论按上面五种读法由人读。
+  镜像：带密钥 `3b54762d…`（`--clean` 与增量两次同一个哈希），`--no-key` `db88a807…`。
+  顺带修掉 `tools/build_k1_wpa.sh` 一个会写错哈希的真问题：底层 `build.sh` 只在构建目录还没
+  `.config` 时才配置，所以同一个构建目录里加 `--no-key` 时配置不会重新生成，**会把带密钥的
+  镜像增量重建一遍并把它的哈希报成 no-key 的**；现在把上次用的 defconfig 记在
+  `${BUILD_DIR}/.k1-wpa-config-source`，来源一变就强制 `--clean`（两个方向都验过）。
+- **下一步优先级**：(1) 发送描述符的安全字段（`sec_type`/`sec_cam_idx`）——**RX 侧那一半
+  已经写完，待上板 run 39**（见上一条），剩下的这一半是第一次可能有「被 CCMP 保护的
+  数据帧」。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
   信道本来就是驻留的（增量 3h 的更正一），所以挡在「密钥装好」和「能收发数据」之间的
   只剩这一条——描述符不引用安全 CAM index，硬件就不会去加密。
   字段位置和取值现在都有出处：WD info dword2（描述符偏移 `24+8`）里 `sec_type` [12:9]、

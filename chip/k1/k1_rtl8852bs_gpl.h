@@ -38,10 +38,43 @@ struct k1_rtl8852bs_rx_frame_s
   size_t next_offset;
   uint32_t descriptor0;
   uint32_t descriptor3;
+
+  /* Dwords 5 and 7 exist only in the long descriptor form, the one
+   * descriptor0 bit 31 announces.  They read as zero for a short descriptor,
+   * and descriptor_long says which form arrived, so a consumer never mistakes
+   * an absent field for a zero one.
+   */
+
+  uint32_t descriptor5;
+  uint32_t descriptor7;
   uint16_t payload_length;
   uint8_t packet_type;
   bool crc_error;
   bool icv_error;
+  bool descriptor_long;
+
+  /* The hardware's own account of what it did with the frame's protection.
+   * hw_dec says the security engine decrypted it and icv_error says the
+   * integrity check failed, which together are what mainline turns into
+   * RX_FLAG_DECRYPTED; sw_dec says the hardware handed the frame over
+   * undecrypted instead.  a1_match says the first address matched this
+   * station's own CAM entry rather than arriving through the sniffer filter.
+   */
+
+  bool a1_match;
+  bool sw_dec;
+  bool hw_dec;
+  bool with_llc;
+
+  /* Long descriptor only: which key the security engine used, and which
+   * address CAM record and MACID the frame was matched to.
+   */
+
+  uint8_t sec_type;
+  uint8_t sec_cam_index;
+  uint8_t addr_cam_index;
+  uint8_t mac_id;
+  bool addr_cam_valid;
 };
 
 /* The bounded subset of an 802.11 management frame needed by the scan
