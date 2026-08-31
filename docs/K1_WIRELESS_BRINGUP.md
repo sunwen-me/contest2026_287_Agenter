@@ -7373,6 +7373,64 @@ LLC/SNAP 头的开头，两者都不是密钥材料也不是密文。**密文跨
 （`diff-bytes`/`diff-first`）不报字节**——这一帧的明文是已知的，把密文打出来等于
 公开一段密钥流。
 
+#### run 55 的读数：硬件确实加了密（`verdict=0x1` CIPHER）
+
+run 54 在认证阶段就以 `-61` 停了（认证接收窗口一帧没收到，属于「接收窗口整个空掉」那一族
+既有 flake，与 3r 无关，日志里连一行 `resident loopback` 都没有）。原样重跑的 run 55
+`k1-wpa-20260831T131021Z.log` 三十九条判据全过，两行都拿到了：
+
+```
+resident loopback selftest plain=0x3 cipher=0x1 header=0x2 rxdec=0x4 short=0x5
+  diff=0x24 first=0x0 llc=0x8 pn=0x1 stage=0x0 status=0x0
+resident loopback readback verdict=0x1 looped=0x1 count-clr=0x0 reads=0x4b
+  self=0x1 frame=0x1 len=0x50 fc=0x4108 seq=0x12 hdr=0x18 llc=0xff
+  diff-bytes=0x24 diff-first=0x0 pn=0x1 prot=0x1 hw-dec=0x0 sw-dec=0x1
+  a1-match=0x0 icv=0x0 sec-type=0x0 sec-cam=0x0
+  body=05 00 00 20 00 00 00 00 tx=0x0 stage=0x0 status=0x0
+```
+
+先看内存自校验：五个合成读数全部落到预期档位，所以下面这个判定不是分类器写错了。
+
+再看板上那一帧，**四个证人口径一致**：
+
+- `diff-bytes=0x24`＝36 字节，正好是 LLC/SNAP 8 ＋ ARP 28 ——**整个载荷都变了**；
+  `diff-first=0x0` 说明从头结束处的第一个字节起就不一样。
+- `llc=0xff`（`LLC_NOWHERE`）——整帧里**任何位置**都找不到明文的 `aa aa 03 00 00 00`。
+- `len=0x50`＝80＝明文 68 ＋ CCMP MIC 8 ＋ FCS 4，长度按 MIC 该长的量长了。
+- `body=05 00 00 20 …` 是完好的 CCMP 头：PN0=5（就是发送时给的 PN）、`0x20` 是
+  ExtIV 置位＋KeyID=0（成对密钥），`pn=0x1` 说明头没被改写；`prot=0x1` 是
+  Protected 位。这一项按设计**不算证人**，只用来确认帧是那一帧。
+
+`hw-dec=0x0 sw-dec=0x1` 是关键的排除项：接收引擎**没有**替我们解密（回环帧 A1 是
+BSSID，`a1-match=0x0`，走不到成对密钥查表），所以「密文」不是「解过又看着像明文」的
+反面误判。
+
+**结论：发送路径确实在加密。**3q 留下的怀疑 (a)「硬件到底加没加密」到此排除。
+
+同一轮驻留窗口还顺手给出一条独立佐证：`data sec total=0x7 target=0x7 prot=0x7
+group=0x7 hw-dec=0x7 sw-dec=0x0 icv=0x0`，`data sec first ... sec-type=0x6 cam=0x1`，
+帧头 8 字节是 `41 bd 00 60 4f 00 00 00`（`0x60`＝ExtIV＋KeyID=1）。也就是说
+**GTK 那条 SEC CAM 表项（`gtk-ent=0x1`）和接收侧安全引擎都是好的**：AP 的 7 个组播
+数据帧全部硬件解密成功、零 ICV 错。而 `a1-match=0x0`——从关联到现在，**一个发给我们
+自己的单播数据帧都没收到过**。
+
+#### 下一个增量（3s）：把回环密文和软件 CCMP 算出来的密文逐字节对一遍
+
+「加了密」不等于「加对了密」。AP 如果解密后 MIC 校验失败，会**静默丢帧**，表现和现在
+一模一样：帧发得出去、firmware 报 TX OK、对端不回。剩下两种可能只有一步之隔：
+
+- **(A) 密钥／nonce／AAD 错**——TK 进 SEC CAM 时取错 16 字节或字序反了，或者引擎的
+  nonce（PN‖A2）／AAD（FC 掩码、A1/A2/A3、SC 掩码）与标准不一致。AP 必然 MIC 失败。
+- **(B) 密文完全正确，是 AP 不转发**——客户端隔离、或者要求先拿到 DHCP 地址。
+
+3s 用软件 CCMP 把 (A) 判掉，不需要 AP 配合、不需要主机权限：回环窗口里把同一份明文用
+自己派生的 TK、同一个 PN、同一份 AAD 在栈上算一遍，和绕回来的那一帧逐字节比，只报
+「密文差异字节数」和「MIC 是否一致」两个计数，**不打印任何密文或密钥字节**。全等就说明
+硬件 CCMP 一点问题没有，问题不在本移植，下一步转去查 (B)；不等就直接指到出错的那一段。
+
+缺的零件只有一个：文件里现在只有 AES-128 的**解密**分组（`k1_rtl8852bs_gpl.c:4333`，
+给 GTK 的 AES key unwrap 用），CCMP 要的是**正向**分组加密，外加 CTR ＋ CBC-MAC。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

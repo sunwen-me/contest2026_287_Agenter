@@ -701,8 +701,13 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   第 8 个窗口之后。它的失败样子：前两个被动窗口正常（`beacon=0xf`／`0x13`、认出目标 BSSID），
   主动扫描 13 个 dwell 全部 `beacon=0`、`probe-rsp=0`，22 个 802.11 帧里 13 个是自己发的
   Probe Request，PPDU status 只有 160（run 47 同位置 454）；三个窗口的过滤器前后一致，
-  **与增量 3m 修的 bug 无关**。驻留窗口之前这一段目前不稳：run 44 丢 Association Response，
-  run 48 主动扫描听不到 Beacon，两者都还没定位。
+  **与增量 3m 修的 bug 无关**。驻留窗口之前这一段目前不稳，而且到 run 54 已经攒出**同一族三种
+  面孔**：run 44 丢 Association Response（三次），run 48／52 主动扫描收不到 Probe Response
+  （run 52 第一次尝试还听到 6 个目标 Beacon 并认出 BSSID），run 54 丢 Authentication Response
+  ——`auth req=0x3 req-sn=0x2 tx-status=0x0 frames=0x0 rsp-self=0x0` → `error=0x3d`，
+  三帧请求都发成功了，而认证接收窗口里**一帧都没有**（此前每一轮成功的运行都是
+  `frames=0x1 rsp-self=0x1`）。共同点是**某个接收窗口整个空掉**而发送侧一切正常，
+  都还没定位，都是原样重跑即通。
   **run 49／50 读到了**：dwell 里那四个 type 6 是 `sel=0x06`、`qsel=0x0`、MACID 与全部
   计数器都是 0——**不是**关于本移植任何一帧的报告（本移植的管理帧走 `qsel=0x12`）。
   也就是说驻留窗口不是「把报告丢了」，而是从来没有报告可丢。这直接引出增量 3o。
@@ -875,8 +880,8 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   并认出 BSSID，第二次连 Beacon 归零；过滤器寄存器前后一致，与 3m 无关），是 run 48 那个
   未定位偶发的第二次出现，原样重跑即通。
 
-- **已写完待上板（增量 3r，判据 38 → 39）：把刚发出去的那一帧从 MAC 里绕回来，直接看载荷是密文
-  还是明文。** 3q 之后只剩一个怀疑对象，而它靠 AP 已经问不出来：ACK 在解密之前发出。
+- **已上板并出结论（增量 3r，判据 38 → 39）：把刚发出去的那一帧从 MAC 里绕回来，直接看载荷是密文
+  还是明文。读数是 `verdict=0x1` CIPHER——硬件确实加了密。** 3q 之后只剩一个怀疑对象，而它靠 AP 已经问不出来：ACK 在解密之前发出。
   **为什么回环能回答**：回环开关 `0xcc20`（`B_AX_MACLBK_EN`）是 CMAC 侧寄存器，安全引擎
   `R_AX_SEC_ENG_CTRL` 是 DMAC 侧的块，抽头在加密**之后**，所以绕回来的帧上引擎该做的事已经做完。
   三个互相独立的证人：**帧体**（与提交明文逐字节相同 = 没人加密过它）、**长度**（CCMP 追加
@@ -898,10 +903,24 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   只要求存在、不要求取值。`body=` 打的是 802.11 头结束处 8 字节（引擎跑了就是 CCMP 头的
   PN/KeyID，没跑就是 LLC/SNAP 头开头，都不是密钥材料）；**密文跨度只报计数
   `diff-bytes`/`diff-first`，不打字节**——本帧明文已知，打出密文等于公开一段密钥流。
-  **三种读数的下一步**：`verdict=0x1`（密文）→ 加密没问题，回头查 AP 的转发/隔离策略；
-  `verdict=0x3`（明文）→ SEC CAM／发送描述符里的加密指示没真正生效，去查
-  `sec_info_tbl_init` 与描述符的 SEC 字段；`verdict=0x4`（回程解密）→ 换用长描述符字段
-  `sec_type`/`sec_cam_idx` 复核，或把回程解密关掉再跑。
+  **run 55 的实际读数**（`k1-wpa-20260831T131021Z.log`，三十九条判据全过；run 54 在认证阶段
+  就被「接收窗口整个空掉」那族 flake 停在 `-61`，日志里连一行 3r 输出都没有，原样重跑即通）：
+  `verdict=0x1 looped=0x1 reads=0x4b self=0x1 frame=0x1 len=0x50 fc=0x4108 hdr=0x18 llc=0xff
+  diff-bytes=0x24 diff-first=0x0 pn=0x1 prot=0x1 hw-dec=0x0 sw-dec=0x1 icv=0x0
+  body=05 00 00 20 00 00 00 00 status=0x0`，自校验行也完全对上。四个证人一致：整个 36 字节
+  载荷（LLC/SNAP 8 ＋ ARP 28）全变、整帧找不到明文 `aa aa 03`、长度按 MIC 长了 8（再加 4 字节
+  FCS＝80）、`hw-dec=0x0` 排除「回程解开了」。**(a)「硬件到底加没加密」到此排除。**
+  同一轮的独立佐证：`data sec total=0x7 group=0x7 prot=0x7 hw-dec=0x7 icv=0x0`、
+  `sec-type=0x6 cam=0x1`——**GTK 表项（`gtk-ent=0x1`）和接收侧引擎都是好的**；而
+  `a1-match=0x0`，从关联至今**没收到过一个发给自己的单播数据帧**。
+  **下一步（增量 3s）**：「加了密」≠「加对了密」——AP 解密后 MIC 失败会静默丢帧，症状与现在
+  完全一致。用软件 CCMP 在回环窗口里把同一份明文用自己派生的 TK、同一个 PN、同一份 AAD 算一遍，
+  和绕回来的帧逐字节比，只报「密文差异字节数」和「MIC 是否一致」，不打印任何密文或密钥字节。
+  全等 → 硬件 CCMP 无误，转去查 AP 的转发/隔离（客户端隔离、或要求先有 DHCP 地址），
+  可用主机侧 `tcpdump` 在 AP 的有线段确认；不等 → 直接指向 TK 进 SEC CAM 的取字节/字序，
+  或引擎的 nonce（PN‖A2）／AAD（FC 掩码、A1/A2/A3、SC 掩码）。缺的零件只有一个：
+  文件里现在只有 AES-128 **解密**分组（`chip/k1/k1_rtl8852bs_gpl.c:4333`，给 GTK 的
+  AES key unwrap 用），CCMP 要**正向**分组加密 ＋ CTR ＋ CBC-MAC。
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
@@ -1004,11 +1023,16 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是把增量 3r 跑上板：MAC loopback 已经写完并编译通过，等一次上板读数。**
-它把本移植刚发出去的那一帧从 MAC 里绕回来直接看载荷是密文还是明文。
+**当前实际下一步是增量 3s：3r 已上板，`verdict=0x1` 说明发送路径确实在加密，
+所以要用软件 CCMP 把回环帧逐字节对一遍，把「加对了密（问题在 AP）」和
+「加错了密（AP 静默 MIC 失败）」分开。**
+增量 3r 已在 run 55 上板（39/39），它把刚发出去的那一帧从 MAC 里绕回来看载荷，
+读到 `verdict=0x1`（密文）：整个 36 字节载荷全变、整帧无明文 LLC、长度按 MIC 长了 8、
+`hw-dec=0x0` 排除回程解密——所以「硬件没加密」这个怀疑排除了。
 增量 3q 已在 run 53 上板（38/38），读数是「两帧受保护单播 ARP
 Request 都发出去了、固件都报 OK、零回答」，其中第二帧的 A3 还是广播，所以「帧体错了」和
-「AP 后面没有 DHCP 服务器」两个嫌疑都不成立；**剩下的唯一怀疑就是硬件到底有没有真的加密**——密钥已经在
+「AP 后面没有 DHCP 服务器」两个嫌疑都不成立；当时剩下的唯一怀疑是硬件到底有没有真的加密，
+**3r 已把它排除（run 55 `verdict=0x1`），于是问题收窄成「加得对不对」**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
 描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 43 更进一步证明
 **MAC 真的把那两个 CCMP 保护帧发出去了**（增量 3k：`mpdu=0x2 cck=0x2 block=0x0`，每次写
