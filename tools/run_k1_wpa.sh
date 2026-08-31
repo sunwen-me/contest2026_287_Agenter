@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Run the RTL8852BS WPA2-PSK four-way handshake diagnostic image on the MUSE Pi
-# Pro K1 over U-Boot loadx + go, with the thirty-eight acceptance requirements
+# Pro K1 over U-Boot loadx + go, with the thirty-nine acceptance requirements
 # the handshake board runs use.  Nothing here is persistent: the payload is
 # loaded into RAM and started, there is no saveenv and no eMMC, SPI or eFuse
 # write.
