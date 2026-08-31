@@ -281,6 +281,18 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   （`run_k1_wireless_smoke.py:526 halt_at_uboot_from_nsh()`）走 NSH `reboot` → U-Boot
   `reset` 两段恢复，全程 RAM-only、无 `saveenv`。注意 `--manual-reset` 与 `--nsh-reboot`
   是 argparse 互斥组，不能往现成 wrapper 后面追加参数，要另写一条带绝对路径的调用。
+- **手动 RST 为什么常常停不进 U-Boot，已查清并修好。** 这块板的 U-Boot 环境从 SPI flash 读，
+  `bootdelay = 0`：**每一份**日志里都是 `Autoboot in 0 seconds`（包括成功停住的那些），它不
+  给可以瞄准的窗口，只在「看的那一瞬间输入缓冲里已经有字节」时才放弃 autoboot；成功的特征是
+  紧接下一行就是 `=> `。加上 CH340 复位时重新枚举（`ttyUSB1 → ttyUSB0`）后内核一次性交付一
+  大串缓冲输出，**主机读到的位置可能落后板子几百毫秒**，所以任何「看到 marker 就发一个字节」
+  的做法都可能把字节送到 autoboot 检查之后（run 39b 就是：`In: serial` 在板上 2.610，写了一个
+  `s`，板子仍在 3.002 跑了 `Try to boot from mmc2`）。修法不是更准的时机而是**不要有时机**：
+  `halt_at_uboot_from_serial()` 现在从 SPL banner 起持续写 `s`（≤20 秒）直到读到 `=>`，写失败
+  吞 `OSError`／`XmodemError`（USB 节点会在复位中途消失，下一轮顺着 `/dev/serial/by-id` 重开），
+  读到提示符后先排空并发 `\x15\r` 清行、确认提示符后面真的为空（最多三次）——否则还在飞行的
+  `s` 会变成下一条命令的前缀。窗口错过也不再致命：手动复位下看到 `Try to boot` 只丢掉这一次
+  尝试并继续听，**再按一次 RST** 就是新窗口，不必重启工具。改完 run 39c 第一次按就停住了。
 - 从原厂排除、不要照 mainline 再追的两条：`init_cctl_info`/`mac_upd_dctl_info` 在原厂
   `#if 0`、`mac_port_init()` 从不置 `B_AX_PORT_FUNC_EN`；
   **原来这里的第三条「STA 角色不发 JOININFO」写得过头了，已修正**：`role.c:595` 那个
@@ -463,7 +475,8 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `data=0x6` 其中 `data-target=0x4`，关联的 AP 在这三秒里发了 4 帧数据帧过来，本端只数了帧头，
   还没读 RX 描述符的 `HW_DEC`（DW3 BIT(2)）／`ICV_ERR`（DW3 BIT(10)）／`SEC_TYPE`
   （DW7 [20:17]）——读出来就能一帧不发地证明装进去的 GTK 在解组播帧。
-- **已实现、待上板 run 39（增量 3i 前半）：读 RX 描述符的解密状态位。**
+- **已上板通过 run 39（增量 3i 前半）：读 RX 描述符的解密状态位——装进去的 GTK 确实在硬件里
+  解 AP 的组播帧。**
   没有新的 Kconfig 符号，也**没有**新的 `--require-*` 开关（见下面「为什么不加判据」），
   它就长在增量 3h 的驻留窗口里。做的事：`k1_rtl8852bs_runtime_rx_parse()` 在长描述符
   （32 字节，DW0 BIT(31)）时多读 `+20`（DW5）与 `+28`（DW7），
@@ -485,10 +498,22 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `… llc-iv= llc-plain= short= desc-long= desc-short= sec-type-mask= cam-mask=`、
   `… first len= hdr= prot= dw3= dw5= dw7= sec-type= cam= addr-cam= macid= cam-vld= llc=`，
   以及首帧前 32 字节的 head dump（优先留「来自目标 AP 且被保护」的那一帧）。
-  **上板读法**（run 38 的窗口收到 4 帧目标 AP 的数据帧，所以这四帧就是样本）：
-  `hw-dec=0x4 sw-dec=0x0 icv=0x0 dec=0x4 sec-type-mask=0x40 cam-mask=0x2 llc-iv=0x4
-  llc-plain=0x0` 是想要的那种——`0x40` 即只出现过 `sec_type=6`（CCMP-128），`cam-mask=0x2`
-  即只用过安全 CAM 第 1 项也就是 GTK（TK 在第 0 项，单播才用）；`sw-dec` 非零说明硬件没把帧
+  **run 39 的读数**（这一轮的窗口里 AP 发了 2 帧组播，不是 run 38 的 4 帧）：
+  `total=0x2 target=0x2 prot=0x2 group=0x2 a1-match=0x0 hw-dec=0x2 sw-dec=0x0 icv=0x0
+  crc=0x0 dec=0x2`、`llc-iv=0x2 llc-plain=0x0 short=0x0 desc-long=0x2 desc-short=0x0
+  sec-type-mask=0x40 cam-mask=0x2`、`first len=0x1a0 hdr=0x18 prot=0x1 dw3=0x00200004
+  dw5=0x10000001 dw7=0x000c7b79 sec-type=0x6 cam=0x1 addr-cam=0x0 macid=0x0 cam-vld=0x1
+  llc=0x0`、`first head=0842000001005e7f0001504f3be2e6d224a3f050081f506662a900604f000000`。
+  **就是想要的那一种**：两帧都由硬件解开（`hw-dec=2`，`sw-dec=0`，`icv=0`，`crc=0`，
+  `dec=2`），cipher 只出现过 CCMP-128（`sec-type-mask=0x40`／`first sec-type=0x6`），用到的
+  安全 CAM 只有第 1 项即 GTK 那一项（`cam-mask=0x2`／`first cam=0x1 cam-vld=0x1`），命中的
+  ADDR_CAM 是关联时建的第 0 项（`addr-cam=0x0 macid=0x0`），而且**不看描述符**的旁证一致：
+  两帧的 `aa aa 03 00 00 00` 都在头 + 8（`llc-iv=0x2 llc-plain=0x0 short=0x0`）。首帧自证是
+  真实下行组播：`0842`（数据、Protected、FromDS），A1 `01:00:5e:7f:00:01`（IPv4 组播），
+  A2 `50:4f:3b:e2:e6:d2`（AP）。一次读数同时证明了 AES key unwrap 出来的 GTK 16 字节、安全
+  CAM 第 1 项那 32 字节、ADDR_CAM 回填的 `sec_ent_mode` 与组密钥槽号（槽 2 → CAM 1）、以及
+  硬件安全引擎按这套配置在工作。
+  **读数为别的样子时怎么查**（保留下来备用）：`sw-dec` 非零说明硬件没把帧
   和密钥对上，该查 ADDR_CAM 回填的槽号与组密钥项的 `type`／`ext_key`，不是查密钥字节；
   `hw-dec` 非零而 `icv` 也非零才是「GTK 字节错了／AES key unwrap 解错了」；`prot=0x0` 说明
   这几帧没被保护，这一轮什么也没证明；`total=0x0` 说明三秒里 AP 一帧组播都没发，不是失败。
@@ -500,9 +525,34 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `.config` 时才配置，所以同一个构建目录里加 `--no-key` 时配置不会重新生成，**会把带密钥的
   镜像增量重建一遍并把它的哈希报成 no-key 的**；现在把上次用的 defconfig 记在
   `${BUILD_DIR}/.k1-wpa-config-source`，来源一变就强制 `--clean`（两个方向都验过）。
-- **下一步优先级**：(1) 发送描述符的安全字段（`sec_type`/`sec_cam_idx`）——**RX 侧那一半
-  已经写完，待上板 run 39**（见上一条），剩下的这一半是第一次可能有「被 CCMP 保护的
-  数据帧」。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
+- **已实现、待上板 run 40（增量 3i 后半）：发送侧的安全字段与 CCMP 头，全在内存里，一帧不发。**
+  没有新的 Kconfig 符号（挂在已有的 `CONFIG_K1_RTL8852BS2_RUNTIME_DATA_TX_DIAGNOSTIC` 下，
+  同样是纯内存操作），但**有**新判据 `--require-runtime-tx-security`（内存断言不看 AP 的心情，
+  和 3i 前半那个组播计数不同，所以可以做判据），`tools/run_k1_scanofld_active.sh` 里也加上了。
+  做的事：(a) `k1_rtl8852bs_runtime_ccmp_header_build()` 按 802.11-2016 §12.5.3.2 拼 8 字节
+  CCMP 头——PN0、PN1、Rsvd、`KeyID<<6|0x20`、PN2..PN5，**PN 在头里不是连续六字节**，低两字节
+  在最前、高四字节在后，中间隔着保留字节和 KeyID 字节；拒绝 PN 0（CCMP 从 1 起算）、
+  超过 2^48−1 的 PN、大于 3 的 key id、不足 8 字节的缓冲和 NULL。
+  (b) `k1_rtl8852bs_runtime_mgmt_tx_build()` 多一个 `security` 参数，为 NULL 时 WD info
+  dword2（描述符偏移 `24+8`）写零，非 NULL 时写 `(sec_type << 9) | BIT(8) | sec_cam_idx` 并
+  按位读回；现有两处管理帧调用都传 NULL——本移植发出去的管理帧至今都是不保护的，这个 dword
+  必须保持为零。(c) 新诊断 `k1_rtl8852bs_fwdl_runtime_tx_security_diagnostic()`，期望值全部
+  写成字面量：PN 1／key 0 → `01 00 00 20 00 00 00 00`，PN `0x0000fedcba98`／key 2 →
+  `98 ba 00 a0 dc fe 00 00`，`{CCMP128, CAM 0}`（TK）→ dword2 `0x00000d00`，
+  `{CCMP128, CAM 1}`（GTK）→ `0x00000d01`，`security=NULL` → `0`，`sec_type` 为 0 或 16 →
+  `-EINVAL`（0 要用 NULL 表达「不加密」，16 会溢出 [12:9] 改掉旁边的 lifetime selector）。
+  出处：原厂 `trx_desc_8852b.c:293-299` ＋ `txdesc.h:131-140`
+  （`AX_TXD_SEC_CAM_IDX_SH 0/MSK 0xff`、`AX_TXD_SEC_HW_ENC BIT(8)`、
+  `AX_TXD_SECTYPE_SH 9/MSK 0xf`），`sec_cam_idx` 取的是 ADDR_CAM 那一项密钥槽里存的值
+  （原厂 `security_cam.c:476`），本移植 TK 槽 0 → 安全 CAM 0、GTK 槽 2 → CAM 1，**正是
+  run 39 的接收描述符回读出来的 `cam=0x1`，收发两侧的编号体系因此已被硬件校对过一次**。
+  镜像：带密钥 `e2c099e6…`，`--no-key` `43aa3c70…`。
+  还差的是数据队列那一路真的发（增量 3j）：把 CCMP 头拼进帧、帧长按「不含 MIC」算、走数据
+  DMA 通道提交、观察 AP 回应（候选首帧 DHCP Discover，驻留窗口已经在数
+  `data_frames_to_self`），以及每密钥的单调 PN 计数器——现在 PN 还只是函数参数。
+- **下一步优先级**：(1) 真的发出一帧被 CCMP 保护的数据帧（增量 3j）——**描述符的安全字段与
+  CCMP 头这两块砖已经写完并逐字段验过，待上板 run 40**（见上一条），RX 侧那一半也已经在
+  run 39 上板证明了。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
   信道本来就是驻留的（增量 3h 的更正一），所以挡在「密钥装好」和「能收发数据」之间的
   只剩这一条——描述符不引用安全 CAM index，硬件就不会去加密。
   字段位置和取值现在都有出处：WD info dword2（描述符偏移 `24+8`）里 `sec_type` [12:9]、

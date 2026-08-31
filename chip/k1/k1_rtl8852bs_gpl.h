@@ -414,6 +414,7 @@ int k1_rtl8852bs_runtime_data_tx_preflight(
   FAR struct k1_rtl8852bs_data_tx_layout_s *layout,
   FAR struct k1_rtl8852bs_data_tx_resources_s *resources);
 int k1_rtl8852bs_fwdl_runtime_data_tx_diagnostic(void);
+int k1_rtl8852bs_fwdl_runtime_tx_security_diagnostic(void);
 int k1_rtl8852bs_runtime_mac_core_init(void);
 int k1_rtl8852bs_fwdl_runtime_mac_core_diagnostic(void);
 int k1_rtl8852bs_runtime_bb_rf_enable(void);

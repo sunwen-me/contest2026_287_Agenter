@@ -897,6 +897,21 @@ int k1_wireless_initialize(void)
                       ret = probe_ret;
                     }
                 }
+
+              /* The protected-transmit descriptor and CCMP header checks
+               * touch memory only, so they share this option rather than
+               * adding one of their own.
+               */
+
+              if (probe_ret >= 0)
+                {
+                  probe_ret =
+                    k1_rtl8852bs_fwdl_runtime_tx_security_diagnostic();
+                  if (probe_ret < 0)
+                    {
+                      ret = probe_ret;
+                    }
+                }
 #  endif
 
 #  ifdef CONFIG_K1_RTL8852BS2_RUNTIME_RX_WORKER_DIAGNOSTIC

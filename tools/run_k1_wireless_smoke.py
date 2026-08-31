@@ -177,6 +177,11 @@ def parse_args() -> argparse.Namespace:
               "TXPG_WP preflight complete without submitting a frame"),
     )
     parser.add_argument(
+        "--require-runtime-tx-security", action="store_true",
+        help=("fail unless the RTL8852BS2 protected-transmit descriptor "
+              "security dword and CCMP header builder check out"),
+    )
+    parser.add_argument(
         "--require-runtime-mac-core", action="store_true",
         help=("fail unless the RTL8852BS2 static runtime MAC-core fields "
               "are initialized and read back"),
@@ -491,16 +496,27 @@ def halt_at_uboot_from_serial(
     saw_uboot_banner = False
     saw_spl_banner = False
     abort_deadline = 0.0
-    abort_send_at = 0.0
     abort_sent = False
     next_wait_notice = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         output = serial.received[start:]
         if b"=>" in output:
-            # Remove any leading interruption bytes before issuing commands.
-            serial.write_text(b"\x15\r")
-            serial.wait_for_text(b"=>", 5.0)
-            return
+            # The stop stream runs until this prompt is read, so part of it can
+            # still be in flight -- and the host can be behind the board, so
+            # what is still in flight is measured in hundreds of milliseconds
+            # rather than in bytes.  Drain the remainder and kill the line
+            # until the prompt is genuinely empty; otherwise the first command
+            # would inherit a leading stop byte and U-Boot would reject it.
+            for _ in range(3):
+                serial.read(0.4)
+                mark = len(serial.received)
+                serial.write_text(b"\x15\r")
+                prompt_at = serial.wait_for_text(b"=>", 5.0, mark)
+                serial.read(0.3)
+                if not bytes(serial.received[prompt_at:]).strip():
+                    return
+
+            raise XmodemError("U-Boot prompt kept receiving stop bytes")
 
         # A late invocation must never continue pushing abort characters into
         # Linux's login prompt or an already-running NuttX shell.
@@ -519,7 +535,6 @@ def halt_at_uboot_from_serial(
             saw_uboot_banner = False
             saw_spl_banner = False
             abort_deadline = 0.0
-            abort_send_at = 0.0
             abort_sent = False
             continue
 
@@ -528,53 +543,76 @@ def halt_at_uboot_from_serial(
             print("[serial] still waiting for a physical RST", file=sys.stderr)
             next_wait_notice = now + 10.0
 
+        # This board's autoboot delay is zero: U-Boot leaves it only when a
+        # byte is already pending the instant it looks, and it announces no
+        # window to aim at.  One byte timed off the main banner is enough only
+        # while the host reads the console in step with the board, which a
+        # USB-TTL re-enumeration burst breaks -- the host can fall several
+        # hundred milliseconds behind, so a byte it sends "before" the autoboot
+        # line has in truth arrived after it.  So every marker that means a
+        # reset is under way starts a continuous stop stream instead, and it is
+        # the stream, not the timing, that covers the window.
         if not saw_spl_banner and b"U-Boot SPL 2022" in output:
             saw_spl_banner = True
-            print("[serial] K1 SPL banner detected; waiting for main U-Boot",
+            if abort_deadline == 0.0:
+                abort_deadline = now + 20.0
+            print("[serial] K1 SPL banner detected; sending the stop stream",
                   file=sys.stderr)
 
         if not saw_uboot_banner and b"U-Boot 2022" in output:
             saw_uboot_banner = True
             if abort_deadline == 0.0:
-                # The K1 accepts console input only after the main U-Boot
-                # initialization has configured its serial port.  This board
-                # reaches the zero-second autoboot point about 2.4 seconds
-                # after its banner; one byte at 2.2 seconds is reliable.
-                abort_send_at = now + 2.2
-                abort_deadline = now + 5.0
+                abort_deadline = now + 20.0
             print("[serial] K1 U-Boot banner detected; waiting for stop window",
                   file=sys.stderr)
 
-        # A USB-TTL adapter can re-enumerate between the U-Boot banner and
-        # the console setup.  In that case the reopened file descriptor sees
-        # the console marker but not the banner.  That marker is already in
-        # U-Boot and precedes the board's zero-second autoboot, so start the
-        # same bounded stop burst immediately.
+        # A USB-TTL adapter can re-enumerate between the U-Boot banner and the
+        # console setup.  The reopened descriptor then sees the console marker
+        # but not the banner, and that marker still precedes the autoboot point.
         if abort_deadline == 0.0 and b"In:    serial" in output:
             saw_uboot_banner = True
-            # The console marker and "Autoboot in 0 seconds" can arrive in
-            # one read after USB re-enumeration.  Submit the first burst in
-            # this iteration; waiting for the next poll can be too late.
-            serial.write_text(b"s")
-            abort_sent = True
-            abort_deadline = now + 5.0
+            abort_deadline = now + 20.0
             print("[serial] K1 U-Boot console detected after re-enumeration",
                   file=sys.stderr)
 
-        # Once U-Boot starts executing its boot command, console input can no
-        # longer stop it.  Process SPL and console markers first because one
-        # USB-TTL read may contain those markers and this text together.
-        if (b"Try to boot" in output or b"Starting kernel" in output) and \
-                abort_deadline == 0.0:
-            raise XmodemError("K1 U-Boot stop window expired")
+        # Once U-Boot runs its boot command, console input can no longer stop
+        # it.  With a physical reset that is not fatal: the next RST press
+        # opens a fresh window, so discard this attempt and keep listening
+        # rather than making the operator restart the tool.
+        if b"Try to boot" in output or b"Starting kernel" in output:
+            if not allow_running_os:
+                raise XmodemError("K1 U-Boot stop window expired")
+
+            print("[serial] missed the autoboot window; press RST again",
+                  file=sys.stderr)
+            start = len(serial.received)
+            saw_uboot_banner = False
+            saw_spl_banner = False
+            abort_deadline = 0.0
+            abort_sent = False
+            continue
 
         if abort_deadline != 0.0:
             if now >= abort_deadline:
-                raise XmodemError("K1 U-Boot stop window expired")
-            if not abort_sent and now >= abort_send_at:
+                # No boot attempt and no prompt followed the marker either, so
+                # it was a stale one.  Stop the stream and wait for a reset.
+                saw_uboot_banner = False
+                saw_spl_banner = False
+                abort_deadline = 0.0
+                abort_sent = False
+                continue
+
+            try:
                 serial.write_text(b"s")
+            except (OSError, XmodemError):
+                # The USB-TTL node can disappear mid-reset; the next polling
+                # pass reopens it through the stable by-id link.
+                pass
+
+            if not abort_sent:
                 abort_sent = True
-                print("[serial] K1 U-Boot stop byte sent", file=sys.stderr)
+                print("[serial] K1 U-Boot stop stream started",
+                      file=sys.stderr)
 
         serial.read(min(0.03, deadline - now))
 
@@ -1190,6 +1228,14 @@ def main() -> int:
             )
             if runtime_data_tx_result is None:
                 missing.append("RTL8852BS2 runtime data TX descriptor preflight")
+        if args.require_runtime_tx_security:
+            runtime_tx_security_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 runtime TX security fields "
+                rb"complete\r?\n",
+                started,
+            )
+            if runtime_tx_security_result is None:
+                missing.append("RTL8852BS2 runtime TX security fields")
         if args.require_runtime_mac_core:
             runtime_mac_core_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 runtime MAC core init "

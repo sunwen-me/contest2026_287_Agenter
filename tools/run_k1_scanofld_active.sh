@@ -36,6 +36,7 @@ exec python3 "${SCRIPT_DIR}/run_k1_wireless_smoke.py" \
   --require-runtime-scanofld-passive \
   --require-runtime-scanofld-rx --require-scan-rf-readback \
   --require-scan-phy-counters --require-runtime-data-tx-descriptor \
+  --require-runtime-tx-security \
   --require-bringup-success --require-wlan0-scan \
   --require-runtime-scanofld-active \
   "$@"

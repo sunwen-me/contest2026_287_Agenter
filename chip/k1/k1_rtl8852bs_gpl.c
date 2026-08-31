@@ -410,6 +410,48 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_MGMT_TXI_DISDATAFB      (1u << 10)
 #define K1_RTL8852BS_MGMT_TXI_BMC            (1u << 11)
 #define K1_RTL8852BS_MGMT_TX_MACID           0u
+
+/* WD INFO dword2 is what tells the security engine to encrypt an outgoing
+ * frame: which cipher, that the hardware and not the host performs it, and
+ * which security CAM entry holds the key.  The two other fields of the same
+ * dword -- the lifetime selector at bits 15:13 and the A-MPDU density at bits
+ * 20:18 -- stay zero, which is what the vendor builder leaves them whenever no
+ * lifetime override and no aggregation is asked for, so nothing here collides
+ * with them.
+ *
+ * Source: vendor trx_desc_8852b.c:293-299 builds the dword from
+ * life_time_sel, sec_type, sec_hw_enc, sec_cam_idx and ampdu_density, and
+ * txdesc.h:131-140 gives the positions (AX_TXD_SEC_CAM_IDX_SH 0 MSK 0xff,
+ * AX_TXD_SEC_HW_ENC BIT(8), AX_TXD_SECTYPE_SH 9 MSK 0xf).  sec_type takes
+ * mac_ax_enc_alg values, the same encoding the security CAM entry's own type
+ * field uses, so CCMP-128 is K1_RTL8852BS_SEC_CAM_ENC_CCMP128 in both places.
+ * The index is likewise the same slot number the address CAM was given:
+ * security_cam.c:476 reads it straight out of a_info.sec_ent[key_index].
+ */
+
+#define K1_RTL8852BS_MGMT_TXI_SEC_CAM_IDX_MASK 0xffu
+#define K1_RTL8852BS_MGMT_TXI_SEC_HW_ENC       (1u << 8)
+#define K1_RTL8852BS_MGMT_TXI_SEC_TYPE_SHIFT   9u
+#define K1_RTL8852BS_MGMT_TXI_SEC_TYPE_MASK    0xfu
+
+/* This part does not build the cipher header itself.  Mainline marks the
+ * 8852B hw_sec_hdr = false (rtw8852b.c:1007), which makes cam.c:523 add
+ * IEEE80211_KEY_FLAG_GENERATE_IV to every key it installs, so the host
+ * supplies the eight-byte CCMP header and the hardware appends the eight-byte
+ * MIC.  The descriptor's frame length therefore counts the CCMP header but not
+ * the MIC.
+ *
+ * The header itself is 802.11-2016 clause 12.5.3.2: the six packet-number
+ * octets in the order PN0 PN1 - KeyID PN2 PN3 PN4 PN5, with the third octet
+ * reserved and the fourth carrying the key identifier in its top two bits
+ * above the mandatory extended-IV bit.
+ */
+
+#define K1_RTL8852BS_CCMP_HEADER_SIZE          8u
+#define K1_RTL8852BS_CCMP_MIC_SIZE             8u
+#define K1_RTL8852BS_CCMP_EXT_IV               0x20u
+#define K1_RTL8852BS_CCMP_KEY_ID_SHIFT         6u
+#define K1_RTL8852BS_CCMP_PN_MAX               0xffffffffffffull
 #define K1_RTL8852BS_MGMT_TX_DRAIN_POLL      20u
 #define K1_RTL8852BS_MGMT_TX_DRAIN_USEC      1000u
 
@@ -19684,6 +19726,71 @@ static void k1_rtl8852bs_runtime_tx_prerequisites_report(void)
 
   k1_rtl8852bs_runtime_medium_access_log("after-sweep");
 }
+
+/* What one frame's hardware encryption needs from the transmit descriptor.
+ * sec_type is a mac_ax_enc_alg value and sec_cam_index the security CAM entry
+ * holding the key, which for this port is entry 0 for the pairwise key and
+ * entry 1 for the group key.  A NULL pointer where one of these is expected
+ * means an unprotected frame, which is what every management frame sent before
+ * the handshake completes must remain.
+ */
+
+struct k1_rtl8852bs_tx_security_s
+{
+  uint8_t sec_type;
+  uint8_t sec_cam_index;
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_ccmp_header_build
+ *
+ * Description:
+ *   Write the eight-byte CCMP header that precedes the payload of a protected
+ *   frame.  The 8852B expects the host to provide it -- see the hw_sec_hdr
+ *   note beside K1_RTL8852BS_CCMP_HEADER_SIZE -- and to leave the eight MIC
+ *   bytes to the hardware.
+ *
+ *   No key material is involved: the header carries only the packet number and
+ *   the key identifier, both of which travel in the clear on the air.
+ *
+ * Input Parameters:
+ *   packet_number - the 48-bit CCMP packet number for this frame, which must
+ *                   never repeat under one key and must increase
+ *   key_id        - the key identifier the receiver looks the key up by, 0 for
+ *                   a pairwise key and what the access point announced for the
+ *                   group key
+ *   header        - where to write the eight bytes
+ *   header_length - how much room header has
+ *
+ * Returned Value:
+ *   OK on success, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_ccmp_header_build(uint64_t packet_number,
+                                                  uint8_t key_id,
+                                                  FAR uint8_t *header,
+                                                  size_t header_length)
+{
+  if (header == NULL || header_length < K1_RTL8852BS_CCMP_HEADER_SIZE ||
+      key_id > 3u || packet_number == 0 ||
+      packet_number > K1_RTL8852BS_CCMP_PN_MAX)
+    {
+      return -EINVAL;
+    }
+
+  header[0] = (uint8_t)(packet_number & 0xffu);
+  header[1] = (uint8_t)((packet_number >> 8) & 0xffu);
+  header[2] = 0u;
+  header[3] = (uint8_t)((uint32_t)key_id << K1_RTL8852BS_CCMP_KEY_ID_SHIFT) |
+              K1_RTL8852BS_CCMP_EXT_IV;
+  header[4] = (uint8_t)((packet_number >> 16) & 0xffu);
+  header[5] = (uint8_t)((packet_number >> 24) & 0xffu);
+  header[6] = (uint8_t)((packet_number >> 32) & 0xffu);
+  header[7] = (uint8_t)((packet_number >> 40) & 0xffu);
+  return OK;
+}
+
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_mgmt_tx_build
  *
@@ -19720,9 +19827,19 @@ static void k1_rtl8852bs_runtime_tx_prerequisites_report(void)
  *                     access point and must not carry it, or the hardware
  *                     would neither wait for that acknowledgement nor retry
  *                     the frame when it is missing.
+ *     WD INFO dword2  the security fields, and only when the caller passes a
+ *                     security description: the cipher, the bit that says the
+ *                     hardware performs the encryption, and the security CAM
+ *                     entry holding the key.  A NULL there leaves the whole
+ *                     dword zero, which is the unprotected frame every
+ *                     management transmit before the handshake needs.  The
+ *                     caller owns the cipher header itself, because this part
+ *                     does not build one -- see K1_RTL8852BS_CCMP_HEADER_SIZE
+ *                     -- and frame_length must count that header but not the
+ *                     MIC the hardware appends.
  *
- *   Everything else is zero: no encryption, no aggregation, no RTS, no
- *   lifetime override and no header conversion.
+ *   Everything else is zero: no aggregation, no RTS, no lifetime override and
+ *   no header conversion.
  *
  * Returned Value:
  *   OK on success, a negated errno otherwise.
@@ -19731,6 +19848,7 @@ static void k1_rtl8852bs_runtime_tx_prerequisites_report(void)
 
 static int k1_rtl8852bs_runtime_mgmt_tx_build(
   size_t frame_length, uint16_t sequence, bool broadcast,
+  FAR const struct k1_rtl8852bs_tx_security_s *security,
   FAR uint8_t *descriptor, size_t descriptor_length,
   FAR struct k1_rtl8852bs_data_tx_layout_s *layout)
 {
@@ -19739,6 +19857,7 @@ static int k1_rtl8852bs_runtime_mgmt_tx_build(
   uint32_t body3;
   uint32_t info0;
   uint32_t info1;
+  uint32_t info2;
   uint32_t length_units;
   uint32_t total_length;
   uint32_t ple_length;
@@ -19748,6 +19867,14 @@ static int k1_rtl8852bs_runtime_mgmt_tx_build(
       frame_length < K1_RTL8852BS_IEEE80211_HEADER_SIZE ||
       frame_length > K1_RTL8852BS_H2C_TXD_LENGTH_MASK ||
       sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK)
+    {
+      return -EINVAL;
+    }
+
+  if (security != NULL &&
+      (security->sec_type > K1_RTL8852BS_MGMT_TXI_SEC_TYPE_MASK ||
+       security->sec_type == 0u ||
+       security->sec_cam_index > K1_RTL8852BS_MGMT_TXI_SEC_CAM_IDX_MASK))
     {
       return -EINVAL;
     }
@@ -19767,6 +19894,14 @@ static int k1_rtl8852bs_runtime_mgmt_tx_build(
            K1_RTL8852BS_MGMT_TXI_DATARATE_SHIFT) |
           K1_RTL8852BS_MGMT_TXI_DISDATAFB;
   info1 = broadcast ? (uint32_t)K1_RTL8852BS_MGMT_TXI_BMC : 0u;
+  info2 = 0u;
+  if (security != NULL)
+    {
+      info2 = ((uint32_t)security->sec_type <<
+               K1_RTL8852BS_MGMT_TXI_SEC_TYPE_SHIFT) |
+              K1_RTL8852BS_MGMT_TXI_SEC_HW_ENC |
+              (uint32_t)security->sec_cam_index;
+    }
 
   memset(descriptor, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE);
   k1_rtl8852bs_write_le32(descriptor, body0);
@@ -19776,6 +19911,8 @@ static int k1_rtl8852bs_runtime_mgmt_tx_build(
                           info0);
   k1_rtl8852bs_write_le32(descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 4,
                           info1);
+  k1_rtl8852bs_write_le32(descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8,
+                          info2);
 
   total_length = K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE + (uint32_t)frame_length;
   length_units = (total_length + K1_RTL8852BS_H2C_TX_UNIT_SIZE - 1u) /
@@ -19804,12 +19941,222 @@ static int k1_rtl8852bs_runtime_mgmt_tx_build(
       k1_rtl8852bs_read_le32(
         descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE) != info0 ||
       k1_rtl8852bs_read_le32(
-        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 4) != info1)
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 4) != info1 ||
+      k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8) != info2)
     {
       return -EIO;
     }
 
   return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_fwdl_runtime_tx_security_diagnostic
+ *
+ * Description:
+ *   Check the two things a protected transmit needs from this port before any
+ *   protected frame is ever sent: that the descriptor's security dword encodes
+ *   the cipher, the hardware-encryption bit and the security CAM index where
+ *   the hardware expects them, and that the CCMP header this port builds is the
+ *   one clause 12.5.3.2 describes.
+ *
+ *   Both are pure memory operations.  Nothing is transmitted, no key material
+ *   is touched, and the expected values are written out literally so a wrong
+ *   shift cannot pass by agreeing with itself.
+ *
+ *   The two index cases are the two this port installs: security CAM entry 0
+ *   holds the pairwise key and entry 1 the group key, which is what
+ *   k1_rtl8852bs_runtime_key_install() programmed and what a received frame's
+ *   descriptor reports back in its own sec_cam_idx field.
+ *
+ * Returned Value:
+ *   OK when every field matched, -EIO otherwise.
+ *
+ ****************************************************************************/
+
+int k1_rtl8852bs_fwdl_runtime_tx_security_diagnostic(void)
+{
+  static const uint8_t expect_first[K1_RTL8852BS_CCMP_HEADER_SIZE] =
+  {
+    0x01, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00
+  };
+
+  static const uint8_t expect_second[K1_RTL8852BS_CCMP_HEADER_SIZE] =
+  {
+    0x98, 0xba, 0x00, 0xa0, 0xdc, 0xfe, 0x00, 0x00
+  };
+
+  struct k1_rtl8852bs_tx_security_s pairwise =
+  {
+    .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+    .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE
+  };
+
+  struct k1_rtl8852bs_tx_security_s group =
+  {
+    .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+    .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_GROUP
+  };
+
+  uint8_t descriptor[K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE];
+  uint8_t header[K1_RTL8852BS_CCMP_HEADER_SIZE];
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  size_t frame_length;
+  uint32_t info2_pairwise;
+  uint32_t info2_group;
+  uint32_t info2_plain;
+  int ret;
+
+  /* A protected data frame of this shape: a 24-byte header, the CCMP header
+   * the host writes, and a small payload.  The length the descriptor carries
+   * counts those but not the MIC, so record what it was given.
+   */
+
+  frame_length = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+                 K1_RTL8852BS_CCMP_HEADER_SIZE + 32u;
+
+  ret = k1_rtl8852bs_runtime_ccmp_header_build(1ull, 0u, header,
+                                              sizeof(header));
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  if (memcmp(header, expect_first, sizeof(expect_first)) != 0)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  ret = k1_rtl8852bs_runtime_ccmp_header_build(0xfedcba98ull, 2u, header,
+                                               sizeof(header));
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  if (memcmp(header, expect_second, sizeof(expect_second)) != 0)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* A packet number of zero, one beyond the 48-bit field, a key identifier
+   * beyond the two bits that carry it, and a buffer too small must all be
+   * refused rather than truncated.
+   */
+
+  if (k1_rtl8852bs_runtime_ccmp_header_build(0ull, 0u, header,
+                                            sizeof(header)) != -EINVAL ||
+      k1_rtl8852bs_runtime_ccmp_header_build(K1_RTL8852BS_CCMP_PN_MAX + 1ull,
+                                            0u, header,
+                                            sizeof(header)) != -EINVAL ||
+      k1_rtl8852bs_runtime_ccmp_header_build(1ull, 4u, header,
+                                            sizeof(header)) != -EINVAL ||
+      k1_rtl8852bs_runtime_ccmp_header_build(
+        1ull, 0u, header, K1_RTL8852BS_CCMP_HEADER_SIZE - 1u) != -EINVAL)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  ret = k1_rtl8852bs_runtime_mgmt_tx_build(frame_length, 0u, false, &pairwise,
+                                           descriptor, sizeof(descriptor),
+                                           &layout);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  info2_pairwise = k1_rtl8852bs_read_le32(
+    descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8);
+
+  ret = k1_rtl8852bs_runtime_mgmt_tx_build(frame_length, 0u, false, &group,
+                                           descriptor, sizeof(descriptor),
+                                           &layout);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  info2_group = k1_rtl8852bs_read_le32(
+    descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8);
+
+  ret = k1_rtl8852bs_runtime_mgmt_tx_build(frame_length, 0u, false, NULL,
+                                           descriptor, sizeof(descriptor),
+                                           &layout);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  info2_plain = k1_rtl8852bs_read_le32(
+    descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8);
+
+  /* CCMP-128 is cipher 6, so the dword is 6 << 9 with the hardware-encryption
+   * bit 8 and the CAM index in the low byte: 0xd00 for entry 0 and 0xd01 for
+   * entry 1.  An unprotected frame leaves the dword zero, which is what every
+   * management frame this port already sends must keep.
+   */
+
+  if (info2_pairwise != 0x00000d00u || info2_group != 0x00000d01u ||
+      info2_plain != 0u)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* A cipher of zero means no cipher, which belongs in a NULL security
+   * pointer rather than in a security description, and one beyond the field
+   * would silently overwrite the lifetime selector next to it.
+   */
+
+  pairwise.sec_type = 0u;
+  if (k1_rtl8852bs_runtime_mgmt_tx_build(frame_length, 0u, false, &pairwise,
+                                        descriptor, sizeof(descriptor),
+                                        &layout) != -EINVAL)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  pairwise.sec_type = (uint8_t)(K1_RTL8852BS_MGMT_TXI_SEC_TYPE_MASK + 1u);
+  if (k1_rtl8852bs_runtime_mgmt_tx_build(frame_length, 0u, false, &pairwise,
+                                        descriptor, sizeof(descriptor),
+                                        &layout) != -EINVAL)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: runtime TX security info2-tk=");
+  k1_early_puthex(info2_pairwise);
+  k1_early_puts(" info2-gtk=");
+  k1_early_puthex(info2_group);
+  k1_early_puts(" info2-plain=");
+  k1_early_puthex(info2_plain);
+  k1_early_puts(" sec-type=");
+  k1_early_puthex(K1_RTL8852BS_SEC_CAM_ENC_CCMP128);
+  k1_early_puts(" hdr=");
+  k1_early_puthex(K1_RTL8852BS_CCMP_HEADER_SIZE);
+  k1_early_puts(" mic=");
+  k1_early_puthex(K1_RTL8852BS_CCMP_MIC_SIZE);
+  k1_early_puts(" len=");
+  k1_early_puthex(frame_length);
+  k1_early_puts("\r\n");
+  k1_early_puts("K1 Wi-Fi GPL: runtime TX security ccmp=");
+  k1_rtl8852bs_scanofld_log_bytes(header, sizeof(header));
+  k1_early_puts("\r\n");
+  k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 runtime TX security fields "
+                "complete\r\n");
+  return OK;
+
+error:
+  k1_early_puts("K1 Wi-Fi GPL: runtime TX security error=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+  return ret < 0 ? ret : -EIO;
 }
 
 /****************************************************************************
@@ -19864,7 +20211,7 @@ static void k1_rtl8852bs_runtime_mgmt_tx_probe(FAR const uint8_t *self_mac)
   if (ret == OK)
     {
       ret = k1_rtl8852bs_runtime_mgmt_tx_build(
-        frame_length, 0u, true, packet, sizeof(packet), &layout);
+        frame_length, 0u, true, NULL, packet, sizeof(packet), &layout);
     }
 
   if (ret < 0)
@@ -20029,7 +20376,8 @@ static int k1_rtl8852bs_runtime_mgmt_tx_frame(FAR const uint8_t *frame,
   memcpy(packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, frame, frame_length);
 
   ret = k1_rtl8852bs_runtime_mgmt_tx_build(frame_length, sequence, broadcast,
-                                           packet, sizeof(packet), &layout);
+                                           NULL, packet, sizeof(packet),
+                                           &layout);
   if (ret < 0)
     {
       return ret;
