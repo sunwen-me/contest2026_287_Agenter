@@ -6817,6 +6817,10 @@ run 45 的 `ce30` before=`0x0`／after=`0x3200` 是同一件事的另一个样�
   `K1_RTL8852BS_ZLENDEL_COUNT` 0xce30。
 - `0xce30` 从此**只读只打印，不写不比较**。它是关于接收路径的免费证据，留着看。
 - 日志多一个键，并按地址升序排：`ce00 ce04 ce20 ce24 ce28 ce2c ce30`。
+- 顺手记下真正的控制帧过滤器 `0xce24` 的读数：run 47 起每一轮都是 `0x00000000`，
+  也就是**所有控制帧子类型都被丢弃**。这不影响本移植：ACK/BA 是硬件自己在
+  SIFS 内答复的，不经过这条过滤器，也不需要软件看到；而本移植也不发 RTS/PS-Poll。
+  记在这里是为了以后如果要在软件里看 BlockAck，知道要先动哪个寄存器。
 - 数据帧过滤器那个写保留在**正确**的地址上。因为 `0xce2c` 本来就是 `0x55555555`，
   这个写现在是个 no-op；留着是把意图写清楚，不再是「修一个坏掉的复位值」。
 - 回读判据仍然只校验 Data(0) 与 QoS Data(8) 两个子类型。原来的理由（子类型 4–7 不可写）
@@ -6911,6 +6915,112 @@ run 48 是主动扫描一个 Beacon 都听不到。两者都还没定位，先�
 两种配置（驻留诊断开／关）都是 `-fsyntax-only` 干净；超 79 列的行数仍是 50；
 harness `ast.parse` 干净，正则自测新前缀能匹配、老前缀不再匹配。
 带密码镜像 `84e3edc4bba530dad73a9845e72ae49a08b8c1c3d3c6bf415266fa2b94be1fcf`。
+
+### 增量 3o：主动向硬件要一份发送报告——TX report 不是没来，是我们没要过
+
+增量 3n 把扫描 dwell 里那唯一一批 type 6 解出来了，读数是 `sel=0x06`、
+`qsel=0x0`、其余全零。run 49 之后可以把话说死：那四个包不是关于本移植任何一帧
+的报告——本移植的管理帧走 `qsel=0x12`，报告里却连 MACID 和计数都没有。而驻留
+窗口（best-effort 队列）连续四轮收到 0 份任何类型的报告。
+
+原因不在接收侧，在发送描述符里：**这份报告是逐帧请求的，不请求就不会有。**
+
+#### 请求写在哪两个 dword 里
+
+`txdesc.h` 的 `AX_TXD_SPE_RPT BIT(10)` 在 dword9，`AX_TXD_SW_DEFINE`
+（`_SH 0 / _MSK 0xf`）在 dword10。WD BODY 是 24 字节 6 个 dword，所以这两个就是
+**WD INFO 的 dword3 和 dword4**；`trx_desc_8852b.c:301-313` 正是这样写的：
+`info->spe_rpt ? AX_TXD_SPE_RPT : 0` 进 `wdi->dword3`，
+`SET_WORD(info->sw_define, AX_TXD_SW_DEFINE)` 进 `wdi->dword4`。
+本移植此前只写 WD INFO 的 dword0/1/2，dword3 和 dword4 一直留空。
+
+#### 答复不是又一个 type 6，而是一条 C2H
+
+原厂和 mainline 都把 `SPE_RPT_PATH` 留在 `FWD_TO_WLCPU`：固件读走这份报告，
+再以 C2H 转给主机。所以要认的是
+`FWCMD_C2H_CAT_MAC 0x1` / `FWCMD_C2H_CL_MISC 0x9` / `FWCMD_C2H_FUNC_CCXRPT 0x1`，
+body 就是 `FWCMD_C2H_CCXRPT_DWORD0..DWORD5`——和本移植已经会解的那六个 dword
+是同一套布局（`fwofld.c` 的 `get_ccxrpt_event()` 读 `content+0` 和 `content+12`，
+mainline `rtw89_mac_c2h_tx_rpt()` 读 `rpt->w2`/`rpt->w5`）。所以 3o 不必写新解码
+器，只要在驻留窗口的接收 drain 里多认一种包类型（rpkt type 10 = C2H），再按
+category/class/function 过滤即可。
+
+#### 标签是「这份报告说的是哪一帧」的唯一依据
+
+没打标签的帧带的 SW_DEFINE 就是 0，所以 0 本身不能作为依据。驻留窗口的 DHCP
+Discover 用 tag `0x1` 提交，回来的报告里 `sw=0x1` 才算对得上。诊断里的无报告变体
+传 `TXRPT_TAG_NONE`，它的 info3/info4 必须都是 0；另有一条负例：
+`report_tag > 0xf` 必须返回 `-EINVAL`，越界的标签不允许悄悄写进描述符。
+
+#### run 50 的读数：帧发出去了，而且 AP ACK 了
+
+描述符先自证请求真的写进去了：
+
+```
+runtime protected data TX ... info0=0x40000400 info2=0x00000d00
+                             info3=0x00000400 info4=0x00000001
+                             plain-body0=0x00408400
+```
+
+`info3=0x400` 就是 `BIT(10)`（SPE_RPT），`info4=0x1` 就是标签。诊断把这两个 dword
+钉成字面值，写错 dword 会在板上失败，而不是变成一帧硬件按别的含义去读的数据。
+
+然后是这轮真正的新读数——两帧受保护数据帧，两份报告：
+
+```
+[serial] firmware transmit reports: c2h=2 ccxrpt=2 short=0 tagged=2
+                                    tag-ok=2 tag-fail=0
+[serial] transmit report resident-c2h-tag: sel=0x2 polluted=0x0 tx-state=0x0
+    sw=0x1 macid=0x0 qsel=0x0 qtime=0x4fee rate=0x0 pkt=0x1 txcnt=0x1
+    ok=0x1 rts=0x0
+```
+
+驻留窗口的汇总行同样是 `mpdu=0x2 cck=0x2 block=0x0`、
+`c2h=0x2 ccxrpt=0x2 ccxrpt-tag=0x2 ccxrpt-tag-ok=0x2 ccxrpt-tag-fail=0x0`，
+而老的 type 6 那一栏仍然是 `txrpt=0x0`——报告确实从来不会以 rpkt type 6 回来，
+这就是 `SPE_RPT_PATH = FWD_TO_WLCPU` 的字面意思。
+
+逐字段读：
+
+- `sw=0x1`＝我们打的标签，`macid=0x0`、`qsel=0x0` 也都和这帧的描述符一致，
+  所以归属没有歧义：这两份报告说的就是驻留窗口发的那两帧。
+- `tx-state=0x0`。原厂 `fwofld.c:1898` 就一句 `if (info->tx_state)`：非零是
+  `MSG_EVT_CCX_REPORT_TX_FAIL`，零是 `MSG_EVT_CCX_REPORT_TX_OK`。
+- `txcnt=0x1`（data_txcnt）＝只发了一次，没有重传；`ok=0x1`（pkt_ok_num）＝
+  有一个 MPDU 被确认；`rts=0x0`＝没走 RTS。
+- `rate=0x0`＝最终速率是 CCK 1M，和描述符里强制的 `USERATE_SEL|CCK1` 对上。
+- `qtime=0x4fee` 是原始排队时间读数，这里不做单位换算。
+
+**结论：本移植的 CCMP 受保护 DHCP Discover 真的发上了空口，并且被 AP 一次确认。**
+到 3o 之前，发送侧最强的证据只是 MAC 计数器加了（3k）和「report 一直在来只是我们
+在丢」的推断（3l）；现在是固件逐帧署名的确认。
+
+#### 这条读数把问题缩到哪里
+
+同一轮里 `dhcp-reply=0x0 offer-ip=0x0`，DHCP 还是没有回应。要点在于
+**802.11 的 ACK 是在解密之前发的**：接收方校验 FCS 和地址匹配就回 ACK，
+所以 ACK 只证明这帧以正确速率完整到达了 AP 并且寻址被接受，**不证明** AP 的
+CCMP 解密通过。于是剩下的嫌疑只有三处：
+
+1. AP 侧 CCMP 解密失败（TK 不对、PN/IV 排布不对、key id 不对、MIC 不匹配）——
+   这种情况 AP 会静默丢弃，空口上看不出区别。
+2. AP 解密正常并回了 DHCP Offer，但本移植的接收路径把它丢了。
+3. 帧体本身有问题（LLC/SNAP、IP/UDP 校验和、DHCP 报文内容）。
+
+注意 `runtime protected data TX ... offer=0xc0a8017b` 那一行里的 `offer=` 不是真
+的分配地址，是 DHCP 回复解析器的内存自测期望值（`192.168.1.123`）；真实读数是
+汇总行里的 `offer-ip=0x0`。
+
+#### 构建与上板
+
+两种配置（驻留诊断开／关）都 `-fsyntax-only` 干净，超 79 列的行数仍是 50，
+harness `ast.parse` 干净，正则自测确认新增 6 个捕获组、`resident-c2h` 不会误匹配
+`resident-c2h-tag`。带密码镜像
+`c8e474433410fe26181fd3785af61d729cc4a31e55ae0bd7933609fdcb4168aa`
+（text 792838 / data 9768 / bss 25296）。run 50 `rc=0`，
+`PASS: K1 wireless RAM image reached NSH`，`wlan0` 被动扫描报 12 个 BSS，
+其中 ch1 的 `50:4f:3b:e2:e6:d2` 是目标 AP。3o 没有新增 `--require-*`，
+仍然只靠 `data_secure_txrpt_result` 这一条门。
 
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 

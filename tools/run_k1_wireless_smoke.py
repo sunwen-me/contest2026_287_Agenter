@@ -2181,7 +2181,13 @@ def main() -> int:
                 rb" txrpt-dat=(?:0x)?([0-9a-fA-F]+)"
                 rb" txrpt-dat-ok=(?:0x)?([0-9a-fA-F]+)"
                 rb" txrpt-dat-fail=(?:0x)?([0-9a-fA-F]+)"
-                rb" txrpt-short=(?:0x)?([0-9a-fA-F]+)",
+                rb" txrpt-short=(?:0x)?([0-9a-fA-F]+)"
+                rb" c2h=(?:0x)?([0-9a-fA-F]+)"
+                rb" ccxrpt=(?:0x)?([0-9a-fA-F]+)"
+                rb" ccxrpt-short=(?:0x)?([0-9a-fA-F]+)"
+                rb" ccxrpt-tag=(?:0x)?([0-9a-fA-F]+)"
+                rb" ccxrpt-tag-ok=(?:0x)?([0-9a-fA-F]+)"
+                rb" ccxrpt-tag-fail=(?:0x)?([0-9a-fA-F]+)",
                 data_secure,
             )
             if data_secure_txrpt_result is None:
@@ -2195,6 +2201,19 @@ def main() -> int:
                     "[serial] transmit reports: total={0} self={1} ok={2} "
                     "fail={3} data={4} data-ok={5} data-fail={6} "
                     "short={7}".format(*values),
+                    file=sys.stderr)
+                # And the same report as the firmware delivers it.  The
+                # descriptor now carries the special-report request and a
+                # four-bit tag, and because the report path stays pointed at
+                # the firmware processor the answer comes back as a C2H, not
+                # as a receive packet.  c2h is every firmware message the
+                # window saw, so a zero ccxrpt with a non-zero c2h means the
+                # firmware was talking and did not report, while both zero
+                # means the drain saw no firmware message at all.
+                print(
+                    "[serial] firmware transmit reports: c2h={8} "
+                    "ccxrpt={9} short={10} tagged={11} tag-ok={12} "
+                    "tag-fail={13}".format(*values),
                     file=sys.stderr)
 
             # The decoded reports themselves.  The first one belongs to a
@@ -2210,7 +2229,8 @@ def main() -> int:
             # asymmetry is explained the dwell report is the only place the
             # field map can be read against real hardware output, so it is
             # printed whenever the image produced one.
-            for phase in (b"dwell", b"resident-first", b"resident-data"):
+            for phase in (b"dwell", b"resident-first", b"resident-data",
+                          b"resident-c2h", b"resident-c2h-tag"):
                 decoded = re.search(
                     rb"K1 Wi-Fi GPL: txrpt " + phase +
                     rb" (sel=[^\r\n]*)",

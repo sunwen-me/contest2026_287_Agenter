@@ -1516,6 +1516,51 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_TXRPT_RTS_TX_COUNT_SHIFT   24u
 #define K1_RTL8852BS_TXRPT_RTS_TX_COUNT_MASK    0x3fu
 
+/* Asking for one of those reports on a frame this port transmits, and
+ * recognising the answer.
+ *
+ * Run 49 is the reading that makes this necessary.  The dwell instrument
+ * decoded its first type-6 packet and every field of it was zero except the
+ * report selector: no MACID, no queue selector, no counts.  A report about a
+ * management frame of this port's would carry queue selector 0x12, the band-0
+ * management queue its descriptor names, so those packets are not reports
+ * about this port's frames at all -- and the resident window, which transmits
+ * on the best-effort queue, has collected none of any kind across four runs.
+ * The port has never asked for one.
+ *
+ * The vendor tree asks per frame, in the descriptor: AX_TXD_SPE_RPT, bit 10
+ * of txdesc.h's dword9, tagged with AX_TXD_SW_DEFINE, the low four bits of
+ * dword10.  With a 24-byte WD BODY those two dwords are WD INFO dword 3 and
+ * dword 4, which is exactly where trx_desc_8852b.c puts them -- info->spe_rpt
+ * into wdi->dword3 and info->sw_define into wdi->dword4 -- and both are
+ * dwords this port has so far left at zero.
+ *
+ * The answer does not come back as another type-6 packet.  Both the vendor
+ * tree and mainline leave the special-report path pointed at the firmware
+ * processor rather than at the host, so the firmware is what reads the report
+ * and it forwards it as a C2H: category MAC, class FWCMD_C2H_CL_MISC,
+ * function FWCMD_C2H_FUNC_CCXRPT, whose content is the six words
+ * FWCMD_C2H_CCXRPT_DWORD0..DWORD5 -- read at c2h->content + 0 and + 12 by
+ * fwofld.c's get_ccxrpt_event(), at buf + 0 and + 12 by its
+ * mac_ccxrpt_parsing(), and as rpt->w2 and rpt->w5 by mainline's
+ * rtw89_mac_c2h_tx_rpt().  The same six words this port already decodes, so
+ * only the delivery has to be recognised.
+ *
+ * The tag is what makes a report attributable.  Zero is what an untagged
+ * frame carries, so the protected data frame carries a non-zero one and the
+ * report that comes back with it is the report about that frame; a report
+ * whose tag is zero belongs to something else.
+ */
+
+#define K1_RTL8852BS_TXD_SPE_RPT                (1u << 10)
+#define K1_RTL8852BS_TXD_SW_DEFINE_MASK         0xfu
+#define K1_RTL8852BS_TXRPT_TAG_NONE             0xffu
+#define K1_RTL8852BS_TXRPT_TAG_DATA             0x1u
+#define K1_RTL8852BS_RXDESC_PACKET_TYPE_C2H     10u
+#define K1_RTL8852BS_CCXRPT_C2H_CATEGORY        1u
+#define K1_RTL8852BS_CCXRPT_C2H_CLASS           0x9u
+#define K1_RTL8852BS_CCXRPT_C2H_FUNCTION        0x1u
+
 #define K1_RTL8852BS_IEEE80211_TYPE_MASK        0x3u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_SHIFT    4u
 #define K1_RTL8852BS_IEEE80211_SUBTYPE_MASK     0xfu
@@ -21224,6 +21269,15 @@ static bool k1_rtl8852bs_runtime_dhcp_reply_match(
  *                     holding the key.  The caller owns the CCMP header, and
  *                     frame_length counts that header but not the eight MIC
  *                     bytes the hardware appends.
+ *     WD INFO dword3  the special-report request, when the caller asked for
+ *                     one.  This is the bit that makes the hardware report
+ *                     back on this particular frame; without it the report
+ *                     path is idle no matter what the report path itself is
+ *                     configured to do, which is what four resident windows
+ *                     collecting zero reports were measuring.
+ *     WD INFO dword4  the four-bit software tag that comes back in the
+ *                     report, so a report can be attributed to the frame it
+ *                     is about rather than to whatever else was in flight.
  *
  *   Everything else is zero: no aggregation, no RTS, no lifetime override, no
  *   header conversion, no A-MSDU and no checksum offload.
@@ -21234,6 +21288,9 @@ static bool k1_rtl8852bs_runtime_dhcp_reply_match(
  *   sequence          - the twelve-bit sequence number the frame carries
  *   header_length     - the frame's 802.11 header length, 24 for the non-QoS
  *                       form this port builds
+ *   report_tag        - the four-bit tag to ask for a transmit report under,
+ *                       or K1_RTL8852BS_TXRPT_TAG_NONE for a frame no report
+ *                       is wanted for
  *   security          - the cipher and key slot, or NULL for an unprotected
  *                       frame
  *   descriptor        - where the forty eight bytes go
@@ -21247,6 +21304,7 @@ static bool k1_rtl8852bs_runtime_dhcp_reply_match(
 
 static int k1_rtl8852bs_runtime_data_secure_tx_build(
   size_t frame_length, uint16_t sequence, uint8_t header_length,
+  uint8_t report_tag,
   FAR const struct k1_rtl8852bs_tx_security_s *security,
   FAR uint8_t *descriptor, size_t descriptor_length,
   FAR struct k1_rtl8852bs_data_tx_layout_s *layout)
@@ -21257,6 +21315,8 @@ static int k1_rtl8852bs_runtime_data_secure_tx_build(
   uint32_t info0;
   uint32_t info1;
   uint32_t info2;
+  uint32_t info3;
+  uint32_t info4;
   uint32_t front;
   uint32_t hdr_llc;
   uint32_t length_units;
@@ -21269,6 +21329,12 @@ static int k1_rtl8852bs_runtime_data_secure_tx_build(
       (header_length & 1u) != 0 ||
       frame_length > K1_RTL8852BS_H2C_TXD_LENGTH_MASK ||
       sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK)
+    {
+      return -EINVAL;
+    }
+
+  if (report_tag != K1_RTL8852BS_TXRPT_TAG_NONE &&
+      report_tag > K1_RTL8852BS_TXD_SW_DEFINE_MASK)
     {
       return -EINVAL;
     }
@@ -21326,6 +21392,14 @@ static int k1_rtl8852bs_runtime_data_secure_tx_build(
               (uint32_t)security->sec_cam_index;
     }
 
+  info3 = 0u;
+  info4 = 0u;
+  if (report_tag != K1_RTL8852BS_TXRPT_TAG_NONE)
+    {
+      info3 = K1_RTL8852BS_TXD_SPE_RPT;
+      info4 = (uint32_t)report_tag;
+    }
+
   memset(descriptor, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE);
   k1_rtl8852bs_write_le32(descriptor, body0);
   k1_rtl8852bs_write_le32(descriptor + 8, body2);
@@ -21336,6 +21410,10 @@ static int k1_rtl8852bs_runtime_data_secure_tx_build(
                           info1);
   k1_rtl8852bs_write_le32(descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8,
                           info2);
+  k1_rtl8852bs_write_le32(descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 12,
+                          info3);
+  k1_rtl8852bs_write_le32(descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 16,
+                          info4);
 
   total_length = K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE + (uint32_t)frame_length;
   length_units = (total_length + K1_RTL8852BS_H2C_TX_UNIT_SIZE - 1u) /
@@ -21376,9 +21454,9 @@ static int k1_rtl8852bs_runtime_data_secure_tx_build(
       k1_rtl8852bs_read_le32(
         descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8) != info2 ||
       k1_rtl8852bs_read_le32(
-        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 12) != 0 ||
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 12) != info3 ||
       k1_rtl8852bs_read_le32(
-        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 16) != 0 ||
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 16) != info4 ||
       k1_rtl8852bs_read_le32(
         descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 20) != 0)
     {
@@ -21486,6 +21564,8 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   uint32_t info0;
   uint32_t info1;
   uint32_t info2;
+  uint32_t info3;
+  uint32_t info4;
   uint32_t offered = 0;
   uint64_t first_pn;
   uint64_t second_pn;
@@ -21575,8 +21655,8 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
    */
 
   ret = k1_rtl8852bs_runtime_data_secure_tx_build(
-    frame_length, 0x123u, header_length, &pairwise, descriptor,
-    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+    frame_length, 0x123u, header_length, K1_RTL8852BS_TXRPT_TAG_DATA,
+    &pairwise, descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -21592,6 +21672,10 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
                                  K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 4);
   info2 = k1_rtl8852bs_read_le32(descriptor +
                                  K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8);
+  info3 = k1_rtl8852bs_read_le32(descriptor +
+                                 K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 12);
+  info4 = k1_rtl8852bs_read_le32(descriptor +
+                                 K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 16);
 
   /* body0: the short-format mode bit, the descriptor-information-present bit,
    * the twenty half-bytes of header the vendor's own arithmetic produces for a
@@ -21599,11 +21683,14 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
    * selector 0 and MAC identifier 0, all of which are zero for this queue.
    * body3: the sequence number with the no-aggregation background bit.  info0:
    * the driver-selected 1M rate with data fallback disabled.  info2: CCMP-128,
-   * hardware encryption, security CAM entry 0.
+   * hardware encryption, security CAM entry 0.  info3: the special-report
+   * request, bit 10 of the dword the vendor calls dword9.  info4: the tag the
+   * report will carry back, in the low four bits of dword10.
    */
 
   if (body0 != 0x0040a400u || body2 != 0x00000146u || body3 != 0x00002123u ||
-      info0 != 0x40000400u || info1 != 0u || info2 != 0x00000d00u)
+      info0 != 0x40000400u || info1 != 0u || info2 != 0x00000d00u ||
+      info3 != 0x00000400u || info4 != 0x00000001u)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -21626,13 +21713,14 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   /* Without a cipher the same frame has no cipher header in front of its
    * payload, so the header field falls from twenty half-bytes to sixteen and
-   * the security dword goes away.  This is the descriptor an unprotected data
-   * frame would use, and it must differ in exactly those two places.
+   * the security dword goes away; asked for no report, the two report dwords
+   * go away with it.  This is the descriptor an unprotected, unreported data
+   * frame would use, and it must differ in exactly those four places.
    */
 
   ret = k1_rtl8852bs_runtime_data_secure_tx_build(
-    frame_length, 0x123u, header_length, NULL, descriptor,
-    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+    frame_length, 0x123u, header_length, K1_RTL8852BS_TXRPT_TAG_NONE, NULL,
+    descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -21642,7 +21730,11 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   body0_plain = k1_rtl8852bs_read_le32(descriptor);
   if (body0_plain != 0x00408400u ||
       k1_rtl8852bs_read_le32(descriptor +
-                             K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8) != 0u)
+                             K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8) != 0u ||
+      k1_rtl8852bs_read_le32(descriptor +
+                             K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 12) != 0u ||
+      k1_rtl8852bs_read_le32(descriptor +
+                             K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 16) != 0u)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -21657,20 +21749,30 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
    */
 
   if (k1_rtl8852bs_runtime_data_secure_tx_build(
-        frame_length, 0x123u, 25u, &pairwise, descriptor,
-        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL ||
+        frame_length, 0x123u, 25u, K1_RTL8852BS_TXRPT_TAG_DATA, &pairwise,
+        descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+        &layout) != -EINVAL ||
       k1_rtl8852bs_runtime_data_secure_tx_build(
-        frame_length, 0x123u, 22u, &pairwise, descriptor,
-        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL ||
+        frame_length, 0x123u, 22u, K1_RTL8852BS_TXRPT_TAG_DATA, &pairwise,
+        descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+        &layout) != -EINVAL ||
       k1_rtl8852bs_runtime_data_secure_tx_build(
-        32u, 0x123u, header_length, &pairwise, descriptor,
-        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL ||
+        32u, 0x123u, header_length, K1_RTL8852BS_TXRPT_TAG_DATA, &pairwise,
+        descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+        &layout) != -EINVAL ||
       k1_rtl8852bs_runtime_data_secure_tx_build(
-        frame_length, 0x1000u, header_length, &pairwise, descriptor,
-        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL ||
+        frame_length, 0x1000u, header_length, K1_RTL8852BS_TXRPT_TAG_DATA,
+        &pairwise, descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+        &layout) != -EINVAL ||
       k1_rtl8852bs_runtime_data_secure_tx_build(
-        frame_length, 0x123u, header_length, &pairwise, descriptor,
-        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE - 1u, &layout) != -EINVAL)
+        frame_length, 0x123u, header_length, K1_RTL8852BS_TXRPT_TAG_DATA,
+        &pairwise, descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE - 1u,
+        &layout) != -EINVAL ||
+      k1_rtl8852bs_runtime_data_secure_tx_build(
+        frame_length, 0x123u, header_length,
+        (uint8_t)(K1_RTL8852BS_TXD_SW_DEFINE_MASK + 1u), &pairwise,
+        descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+        &layout) != -EINVAL)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -21679,8 +21781,9 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   pairwise.sec_type = 0u;
   if (k1_rtl8852bs_runtime_data_secure_tx_build(
-        frame_length, 0x123u, header_length, &pairwise, descriptor,
-        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL)
+        frame_length, 0x123u, header_length, K1_RTL8852BS_TXRPT_TAG_DATA,
+        &pairwise, descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+        &layout) != -EINVAL)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -21689,8 +21792,9 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   pairwise.sec_type = (uint8_t)(K1_RTL8852BS_MGMT_TXI_SEC_TYPE_MASK + 1u);
   if (k1_rtl8852bs_runtime_data_secure_tx_build(
-        frame_length, 0x123u, header_length, &pairwise, descriptor,
-        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL)
+        frame_length, 0x123u, header_length, K1_RTL8852BS_TXRPT_TAG_DATA,
+        &pairwise, descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+        &layout) != -EINVAL)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -21889,6 +21993,10 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   k1_early_puthex(info0);
   k1_early_puts(" info2=");
   k1_early_puthex(info2);
+  k1_early_puts(" info3=");
+  k1_early_puthex(info3);
+  k1_early_puts(" info4=");
+  k1_early_puthex(info4);
   k1_early_puts(" plain-body0=");
   k1_early_puthex(body0_plain);
   k1_early_puts("\r\n");
@@ -25299,6 +25407,35 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t txrpt_data_first[K1_RTL8852BS_TXRPT_WORDS];
   bool txrpt_first_valid;
   bool txrpt_data_first_valid;
+
+  /* And the same report as the firmware delivers it.  The type-6 packets the
+   * counters above see are not reports about this port's frames -- run 49
+   * decoded one and it named neither this port's MACID nor its queue -- and
+   * the reason is that nothing had ever asked for one.  The descriptor now
+   * asks, per frame, and because the special-report path stays pointed at the
+   * firmware processor the answer arrives as a C2H rather than as a receive
+   * packet of its own.
+   *
+   * c2h_packets counts every C2H the window's receive drain saw, so a zero
+   * ccxrpt is distinguishable from a stream that carried no firmware messages
+   * at all.  ccxrpt counts the ones that are transmit reports and
+   * ccxrpt_short those too small to hold six words, which are counted and not
+   * decoded.  ccxrpt_tagged is the subset carrying the tag the protected data
+   * frame was submitted under, split by transmit state into tag_ok and
+   * tag_fail; that tag is what makes the report attributable, because a
+   * report with tag zero belongs to a frame this port did not tag.
+   */
+
+  uint32_t c2h_packets;
+  uint32_t ccxrpt;
+  uint32_t ccxrpt_short;
+  uint32_t ccxrpt_tagged;
+  uint32_t ccxrpt_tag_ok;
+  uint32_t ccxrpt_tag_fail;
+  uint32_t ccxrpt_first[K1_RTL8852BS_TXRPT_WORDS];
+  uint32_t ccxrpt_tagged_first[K1_RTL8852BS_TXRPT_WORDS];
+  bool ccxrpt_first_valid;
+  bool ccxrpt_tagged_first_valid;
   uint16_t data_tx_sequence;
   int data_tx_status;
 };
@@ -26360,6 +26497,100 @@ static void k1_rtl8852bs_runtime_resident_observe_txrpt(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_observe_c2h
+ *
+ * Description:
+ *   Take one C2H packet out of the window's receive stream and, when it is a
+ *   transmit report, decode the six words it carries.
+ *
+ *   This is the delivery half of the same reading the type-6 observer above
+ *   was written for.  A frame whose descriptor carries the special-report
+ *   request is reported on by the firmware, not by the receive path, and the
+ *   firmware forwards its report as category MAC, class MISC, function
+ *   CCXRPT, whose content is the same six words -- the layout fwofld.c reads
+ *   at buf + 0 and buf + 12 and mainline reads as rpt->w2 and rpt->w5.  So
+ *   the words go through the existing decode and only the envelope is new.
+ *
+ *   Every C2H is counted, not only the reports, because the difference
+ *   between a firmware that sent no report and a receive drain that saw no
+ *   firmware message at all is the first thing the next reading needs.
+ *   Counting only: the window is still open and every character printed
+ *   inside it costs dwell.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_resident_observe_c2h(
+              FAR const uint8_t *payload, size_t length,
+              FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  struct k1_rtl8852bs_c2h_s c2h;
+  uint32_t word[K1_RTL8852BS_TXRPT_WORDS];
+  unsigned int index;
+  unsigned int state;
+  unsigned int tag;
+
+  count->c2h_packets++;
+
+  if (payload == NULL ||
+      k1_rtl8852bs_runtime_c2h_parse(payload, length, &c2h) < 0)
+    {
+      return;
+    }
+
+  if (c2h.category != K1_RTL8852BS_CCXRPT_C2H_CATEGORY ||
+      c2h.class_id != K1_RTL8852BS_CCXRPT_C2H_CLASS ||
+      c2h.function != K1_RTL8852BS_CCXRPT_C2H_FUNCTION)
+    {
+      return;
+    }
+
+  count->ccxrpt++;
+
+  if (c2h.content_length < K1_RTL8852BS_TXRPT_SIZE)
+    {
+      count->ccxrpt_short++;
+      return;
+    }
+
+  for (index = 0; index < K1_RTL8852BS_TXRPT_WORDS; index++)
+    {
+      word[index] = k1_rtl8852bs_read_le32(c2h.content + index * 4u);
+    }
+
+  if (!count->ccxrpt_first_valid)
+    {
+      memcpy(count->ccxrpt_first, word, sizeof(word));
+      count->ccxrpt_first_valid = true;
+    }
+
+  tag = (word[0] >> K1_RTL8852BS_TXRPT_SW_DEFINE_SHIFT) &
+        K1_RTL8852BS_TXRPT_SW_DEFINE_MASK;
+  if (tag != K1_RTL8852BS_TXRPT_TAG_DATA)
+    {
+      return;
+    }
+
+  count->ccxrpt_tagged++;
+
+  state = (word[0] >> K1_RTL8852BS_TXRPT_TX_STATE_SHIFT) &
+          K1_RTL8852BS_TXRPT_TX_STATE_MASK;
+  if (state == K1_RTL8852BS_TXRPT_TX_STATE_OK)
+    {
+      count->ccxrpt_tag_ok++;
+    }
+  else
+    {
+      count->ccxrpt_tag_fail++;
+    }
+
+  if (!count->ccxrpt_tagged_first_valid)
+    {
+      memcpy(count->ccxrpt_tagged_first, word, sizeof(word));
+      count->ccxrpt_tagged_first_valid = true;
+    }
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_data_tx
  *
  * Description:
@@ -26470,8 +26701,8 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
     }
 
   ret = k1_rtl8852bs_runtime_data_secure_tx_build(
-    frame_length, sequence, header_length, &security, packet,
-    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+    frame_length, sequence, header_length, K1_RTL8852BS_TXRPT_TAG_DATA,
+    &security, packet, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
   if (ret < 0)
     {
       goto done;
@@ -26862,6 +27093,19 @@ static int k1_rtl8852bs_runtime_resident_window(
                 buffer + frame.payload_offset, frame.payload_length, &count);
             }
 
+          /* And the same reading as the firmware delivers it.  The report
+           * this window asked for in the descriptor comes back through the
+           * firmware, so it arrives as a C2H rather than as a report packet,
+           * and it is taken out here for the same reason: it is about this
+           * port's own transmission, not about what the air carried.
+           */
+
+          if (frame.packet_type == K1_RTL8852BS_RXDESC_PACKET_TYPE_C2H)
+            {
+              k1_rtl8852bs_runtime_resident_observe_c2h(
+                buffer + frame.payload_offset, frame.payload_length, &count);
+            }
+
           /* The security accounting runs first, and without the error gate,
            * because a protected frame whose integrity check failed is one of
            * the readings it exists to collect.
@@ -27166,6 +27410,18 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.txrpt_data_fail);
   k1_early_puts(" txrpt-short=");
   k1_early_puthex(count.txrpt_short);
+  k1_early_puts(" c2h=");
+  k1_early_puthex(count.c2h_packets);
+  k1_early_puts(" ccxrpt=");
+  k1_early_puthex(count.ccxrpt);
+  k1_early_puts(" ccxrpt-short=");
+  k1_early_puthex(count.ccxrpt_short);
+  k1_early_puts(" ccxrpt-tag=");
+  k1_early_puthex(count.ccxrpt_tagged);
+  k1_early_puts(" ccxrpt-tag-ok=");
+  k1_early_puthex(count.ccxrpt_tag_ok);
+  k1_early_puts(" ccxrpt-tag-fail=");
+  k1_early_puthex(count.ccxrpt_tag_fail);
   k1_early_puts("\r\n");
 
   /* The reports themselves, once the window is closed.  The first one is the
@@ -27184,6 +27440,23 @@ static int k1_rtl8852bs_runtime_resident_window(
     {
       k1_rtl8852bs_runtime_txrpt_log("resident-data",
                                     count.txrpt_data_first);
+    }
+
+  /* And the firmware-delivered ones.  The first is whatever report the
+   * firmware forwarded, tagged or not; the second is the one carrying this
+   * window's own tag, which is the report about the protected data frame and
+   * the reading this increment exists for.
+   */
+
+  if (count.ccxrpt_first_valid)
+    {
+      k1_rtl8852bs_runtime_txrpt_log("resident-c2h", count.ccxrpt_first);
+    }
+
+  if (count.ccxrpt_tagged_first_valid)
+    {
+      k1_rtl8852bs_runtime_txrpt_log("resident-c2h-tag",
+                                    count.ccxrpt_tagged_first);
     }
 
   /* The verdict names the earliest thing that was wrong, so a run reads as

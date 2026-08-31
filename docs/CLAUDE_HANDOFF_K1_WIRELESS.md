@@ -685,7 +685,7 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   「RMAC 丢掉所有数据帧」和「子类型 4–7 不可写」读的都是那个计数器；真正的数据帧过滤器
   `0xce2c` 一直是 `0x55555555`。现在 `0xce30` 只读只打印、不写不比较，日志按地址升序多一个
   `ce24=`。没有新增开关，判据数仍是 **37**，harness 未改。
-- **已改好（增量 3n）：TX report 来在扫描 dwell，不来在驻留窗口，所以先解 dwell 里那一份。**
+- **已上板验证（增量 3n，run 49／50）：TX report 来在扫描 dwell，不来在驻留窗口，先解 dwell 里那一份。**
   `k1_rtl8852bs_runtime_txrpt_log()` 搬出驻留诊断的 `#ifdef`，前缀改成 `K1 Wi-Fi GPL: txrpt `，
   第一个参数是阶段名（`dwell`／`resident-first`／`resident-data`）。扫描 dwell 的匹配结构多
   `txrpt_first[6]`＋`txrpt_first_valid`，抽取循环里抄下第一份 type 6（≥24 字节），
@@ -703,6 +703,9 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   Probe Request，PPDU status 只有 160（run 47 同位置 454）；三个窗口的过滤器前后一致，
   **与增量 3m 修的 bug 无关**。驻留窗口之前这一段目前不稳：run 44 丢 Association Response，
   run 48 主动扫描听不到 Beacon，两者都还没定位。
+  **run 49／50 读到了**：dwell 里那四个 type 6 是 `sel=0x06`、`qsel=0x0`、MACID 与全部
+  计数器都是 0——**不是**关于本移植任何一帧的报告（本移植的管理帧走 `qsel=0x12`）。
+  也就是说驻留窗口不是「把报告丢了」，而是从来没有报告可丢。这直接引出增量 3o。
   **下一步优先级**：(1) **TX report ——把「MAC 发出去了」和「对端收到了」分开**（增量 3l）。
   run 43 之后缺口只剩这一段：帧离开了 MAC，但 ACK、重传次数、最终速率都还看不到，而这三个读数
   在 TX report 里。**这里原来写的机制是错的，读了原厂之后已更正**：TX report 不是 C2H
@@ -710,14 +713,17 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   `enum rtw89_core_rx_type` 的 `RTW89_CORE_RX_TYPE_TX_REPORT`），报文体就是原厂
   `mac_8852b/mac_txccxrpt.h` 那六个 dword，`fwofld.c` 的 `mac_ccxrpt_parsing()` /
   `get_ccxrpt_event()` 读的是 word0（`tx_state`／`sw_define`／`macid`）和 word3（两个包
-  计数），并且以 `tx_state == 0` 作为「对端 ACK 了」的判据。同样地，**不要**去置
-  `AX_TXD_SPE_RPT`：本 port 已经把 `R_AX_PTCLRPT_FULL_HDL` 的 `SPE_RPT_PATH` 配成
-  `WLCPU`，请求 special report 只会把它送去固件而不是主机。更要紧的是 run 43 的日志本身就
-  证明**这些报文一直在来**：扫描窗口的分类型直方图在本端发过管理帧的那三个窗口里分别数到
-  22／5／27 个 type 6，其他窗口一个都没有，也就是说硬件一直在报告本端自己的发送，而驻留窗口
-  的接收排空一直把它们丢掉。所以这一步不需要新开任何硬件机制，只要停止丢弃。拿到
-  `tx_state=0` 就等于「AP ACK 了这一帧」，那时才第一次有「本端发的保护帧被对端收下」的证据；
-  拿到失败 ＋ 重传耗尽，问题就落回 AP 侧或速率/功率。
+  计数），并且以 `tx_state == 0` 作为「对端 ACK 了」的判据。同样地，这里原先写着「**不要**去置
+  `AX_TXD_SPE_RPT`，因为 `SPE_RPT_PATH` 是 `WLCPU`，请求只会把报告送去固件而不是主机」
+  ——**这句话是错的，增量 3o 已经证伪**：固件收到之后会再以 CCXRPT C2H 转给主机
+  （`FWCMD_C2H_CAT_MAC 0x1` / `CL_MISC 0x9` / `FUNC_CCXRPT 0x1`），原厂和 mainline 都
+  依赖这条路。逐帧置 `AX_TXD_SPE_RPT` 正是拿到报告的唯一办法，见下面的增量 3o。
+  这里原先还有一句「run 43 的日志证明这些报文一直在来，驻留窗口只是把它们丢了」，
+  依据是扫描窗口的分类型直方图在本端发过管理帧的那三个窗口里数到 22／5／27 个 type 6
+  ——**这个推断被 run 49／50 证伪**：解出来的 type 6 是 `sel=0x06`、`qsel=0x0`、
+  MACID 与全部计数器为 0，不是关于本端任何一帧的报告。所以不是「停止丢弃」就够，
+  必须逐帧请求（增量 3o）。判据本身没变：`tx_state=0` 等于「AP ACK 了这一帧」，
+  拿到失败＋重传耗尽则问题落回 AP 侧或速率/功率。
   发送这一路的代码本身已经全部写完并上板：帧、48 字节描述符、PN 计数器、回应匹配器、驻留窗口里
   的两次发送；描述符的安全字段与 CCMP 头在 run 40 确认过，RX 侧那一半在 run 39（单播 PTK）与
   run 42（13 帧组播 GTK，`hw-dec=0xd icv=0x0`）证明过。密钥在硬件里（3f）、port 使能（3g）、
@@ -761,6 +767,30 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
 
 项目已完成前 5 项的有界版本，普通 packet type 0 RX 已经出现（见上）。第 6 项的
 dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
+- **已上板验证（增量 3o，run 50）：逐帧请求发送报告——本移植的 CCMP 数据帧发上了空口且被 AP ACK。**
+  请求写在描述符里，不是寄存器里：`AX_TXD_SPE_RPT BIT(10)` 在 dword9、`AX_TXD_SW_DEFINE`
+  （`_SH 0 / _MSK 0xf`）在 dword10；WD BODY 24 字节 6 个 dword，所以这两个就是
+  **WD INFO 的 dword3 和 dword4**（原厂 `trx_desc_8852b.c:301-313`）。本移植此前只写
+  WD INFO dword0/1/2。答复不以 rpkt type 6 回来，而是 **CCXRPT C2H**：
+  `FWCMD_C2H_CAT_MAC 0x1` / `FWCMD_C2H_CL_MISC 0x9` / `FWCMD_C2H_FUNC_CCXRPT 0x1`，
+  body 就是 `FWCMD_C2H_CCXRPT_DWORD0..5`——与本移植已有的六 dword 解码器同一布局，
+  所以只需在驻留窗口 drain 里多认 rpkt type 10（C2H）并按 category/class/function 过滤。
+  归属靠标签：驻留窗口的 DHCP Discover 以 `SW_DEFINE=0x1` 提交，回来 `sw=0x1` 才算对上
+  （未打标签的帧带的就是 0，所以 0 不能当依据）；`report_tag > 0xf` 返回 `-EINVAL`。
+  **run 50 读数**：描述符 `info3=0x400 info4=0x1`（诊断把这两个 dword 钉成字面值），
+  `c2h=2 ccxrpt=2 short=0 tagged=2 tag-ok=2 tag-fail=0`，报告内容
+  `sel=0x2 tx-state=0x0 sw=0x1 macid=0x0 qsel=0x0 qtime=0x4fee rate=0x0 pkt=0x1
+  txcnt=0x1 ok=0x1 rts=0x0`——原厂 `fwofld.c:1898` 以 `tx_state` 非零判 TX_FAIL，
+  所以 `tx-state=0` 就是 TX_OK；`txcnt=1` 没有重传，`ok=1` 一个 MPDU 被确认，
+  `rate=0` 是描述符强制的 CCK 1M。老的 type 6 那一栏仍是 `txrpt=0x0`，印证报告只走 C2H。
+  **注意这条读数的边界**：802.11 的 ACK 在解密之前发出，所以它只证明帧完整到达 AP 且寻址
+  被接受，**不证明** AP 的 CCMP 解密通过。同一轮 `dhcp-reply=0x0 offer-ip=0x0`，
+  剩下的嫌疑收缩到三处：(a) AP 侧 CCMP 解密失败（TK／PN 排布／key id／MIC），静默丢弃；
+  (b) AP 回了 Offer 而本移植接收路径丢了；(c) 帧体本身（LLC/SNAP、IP/UDP 校验和、DHCP 内容）。
+  诊断行里的 `offer=0xc0a8017b` 是 DHCP 解析器内存自测的期望值，不是真实分配地址。
+  带密码镜像 `c8e474433410fe26181fd3785af61d729cc4a31e55ae0bd7933609fdcb4168aa`；
+  3o 不新增 `--require-*`，判据数仍是 **37**。
+
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
 - **Association Request 沉默的原因几乎总在请求内容里，不在发送路径里。** run 30 发了 6 次
@@ -862,15 +892,18 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是读出扫描 dwell 里那份 TX report 的 `RPT_SEL`（增量 3n），从而知道驻留窗口要请求哪种报告**——密钥已经在
+**当前实际下一步是查 AP 为什么没有回 DHCP Offer：先排 CCMP 帧体与 TK／PN／key id，再排接收路径**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
 描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 43 更进一步证明
 **MAC 真的把那两个 CCMP 保护帧发出去了**（增量 3k：`mpdu=0x2 cck=0x2 block=0x0`，每次写
 `delta-mactx-mpdu=0x1 delta-mactx-dma=0x1`）。但**发出去不等于对端收到了，更不等于 AP 解开了**
 （`dhcp-reply=0x0`），所以到目前为止仍然没有「本端发出的 CCMP 帧被对端收下／解开」的证据；
-ACK 与重传次数只有 TX report 能给。**增量 3l 的仪器已经上板（run 47）但读数是 0**：
-报告确实在来，只是来在扫描 dwell 而不是驻留窗口，所以增量 3n 先把 dwell 里那一份解出来看
-`RPT_SEL`。
+ACK 与重传次数只有 TX report 能给。**这一段在 run 50（增量 3o）已经拿到了**：
+逐帧置 `AX_TXD_SPE_RPT` 并打 `SW_DEFINE=0x1` 标签之后，固件以 CCXRPT C2H 回了两份
+署名报告——`tx-state=0x0 sw=0x1 txcnt=0x1 ok=0x1 rate=0x0`，即两帧都在第一次尝试
+就被 AP ACK。所以「本端发的 CCMP 帧到达了 AP」现在有证据了；但 802.11 的 ACK 发生在
+解密之前，**AP 是否解开**仍然没有证据，而 `dhcp-reply=0x0` 说明大概率没解开或回复被丢。
+（增量 3l 的仪器读数为 0 的原因也随之明确：报告从来不以 rpkt type 6 回来。）
 反过来，**接收侧的 CCMP 解密在真实空口上已经成立**：run 39 是单播 PTK、run 42 是 13 帧组播 GTK
 （`hw-dec=0xd icv=0x0 crc=0x0`）。增量 3h 本身（不跑扫描的驻留收发窗口）
 已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题
