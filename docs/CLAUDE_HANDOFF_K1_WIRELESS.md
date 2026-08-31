@@ -821,7 +821,7 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   A/B 是**只报告**的（一个窗口若第一次尝试就被回答，第二次根本不会发出，要求两条都出现会把
   唯一成功的那一轮判失败），所以 3p 也不新增 `--require-*`，判据数仍是 **37**，
   日志 `out/k1-serial/k1-wpa-20260831T111750Z.log`（板子停在 `nsh>`，默认 `--nsh-reboot`，没按 RST）。
-- **已实现待上板（增量 3q）：换一帧没有校验和、也不需要服务器的帧——受保护的单播 ARP
+- **已上板通过（增量 3q，run 53，38/38）：换一帧没有校验和、也不需要服务器的帧——受保护的单播 ARP
   Request，为的是把「硬件到底有没有真的加密」单独拎出来问。** 3p 之后描述符侧的候选一条也不剩，
   剩下的怀疑只有两个，而它们都不在描述符里：**（a）硬件没加密，把明文发了出去**（AP 照样先回
   ACK——ACK 在任何解密之前生成——再按 RSN 丢掉一个未受保护的数据帧，现象和现在完全一样）；
@@ -859,6 +859,21 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   加密本身成为最后的怀疑对象，下一步 MAC 回环读回自己发的帧看是密文还是明文；
   `status=EADDRNOTAVAIL` → 换个热闹时段再跑，不动代码。
   带密码镜像 `6dd86abd22b37c7739cc3648dc8d8a7db6844387b98a0fb04e5f1fafdf829337`。
+  **run 53 的读数落在第二行：发出去了，没人回。** 内存自校验一字不差（`net=0x5 … status=0x0`），
+  两次尝试都上了空口且参数正是设计的 A/B——`resident arp tx sn=0xc tag=0x3 a3=b40996b8
+  tpa=0xc0a80102 pn=0x2 status=0x0` 与 `sn=0xe tag=0x4 a3=ffffffff tpa=0xc0a80102 pn=0x4
+  status=0x0`，学到的邻居是 `60:be:b4:09:96:b8` / 192.168.1.2（ARP 路径）、IPv4 兜底另学到
+  `24:a3:f0:50:08:1f` / 192.168.1.166——窗口汇总 `arp sent=0x2 bytes=0x44 tpa=0xc0a80102
+  status=0x0 replies=0x0 net=0xf arp=0x4 ipv4=0x9 other=0x2 arp-req=0x4`。同窗口的另外两行
+  把范围收死：`ccxrpt-tag-seen=0x1e`（bit1..bit4，即两个 DHCP Discover 加两帧 ARP 四帧**全部**
+  拿到署名报告）、`ccxrpt-tag-ok=0x4 ccxrpt-tag-fail=0x0`、`mpdu=0x2 cck=0x2`；
+  `data sec total=0x11 group=0x11 a1-match=0x0 hw-dec=0xf sw-dec=0x2 icv=0x0 crc=0x0`。
+  第二次尝试的 A3 是**广播**：一个来自已关联站点、被逐帧 ACK、固件报告 OK、不含任何校验和、
+  不需要服务器、问的是一台正在说话的主机的广播 ARP Request，两次零回答。至此 (b)「帧体或对端」
+  基本排除，只剩 (a)。日志 `out/k1-serial/k1-wpa-20260831T122233Z.log`；同一镜像的前一轮
+  run 52 停在主动扫描（两次尝试 `probe-rsp=0x0` → `error=0x3d`，第一次还听到 6 个目标 Beacon
+  并认出 BSSID，第二次连 Beacon 归零；过滤器寄存器前后一致，与 3m 无关），是 run 48 那个
+  未定位偶发的第二次出现，原样重跑即通。
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
@@ -961,9 +976,10 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是把增量 3q 的镜像跑上板：向组播明文里学到的邻居发一帧受保护的单播 ARP
-Request，用它来判「硬件到底有没有真的加密本移植发出去的那一帧」；同一问题的第二个独立判别
-手段——MAC loopback 把刚发的帧读回来看载荷是密文还是明文——排在它后面**——密钥已经在
+**当前实际下一步是增量 3r：按原厂做法开 MAC loopback，把本移植刚发出去的那一帧读回来，
+直接看载荷是密文还是明文。** 增量 3q 已在 run 53 上板（38/38），读数是「两帧受保护单播 ARP
+Request 都发出去了、固件都报 OK、零回答」，其中第二帧的 A3 还是广播，所以「帧体错了」和
+「AP 后面没有 DHCP 服务器」两个嫌疑都不成立；**剩下的唯一怀疑就是硬件到底有没有真的加密**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
 描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 43 更进一步证明
 **MAC 真的把那两个 CCMP 保护帧发出去了**（增量 3k：`mpdu=0x2 cck=0x2 block=0x0`，每次写
@@ -992,9 +1008,9 @@ PN 从 1 开始、CCMP 头含 ExtIV 的排布对；326 字节帧体（LLC/SNAP �
 与现在观测到的一模一样。两个不需要特权就能做的判别手段：(1) 从已经解开的组播明文里学到邻居的
 MAC／IP，然后发一帧受保护的**单播** ARP Request——28 字节、全帧没有校验和、任何主机内核都回，
 所以它把「帧体错了」和「没有 DHCP 服务器」两个嫌疑一次剔掉；ARP Reply 还会以单播回来，
-那同时也是本移植第一次真正走通单播接收（`a1-match` 至今为 0）。**这一条已经实现（增量 3q，
-判据 37 → 38，镜像 `6dd86abd22b37c7739cc3648dc8d8a7db6844387b98a0fb04e5f1fafdf829337`），
-等一次上板。**(2) 按原厂做法开 MAC loopback，把本端刚发的帧读回来，直接看载荷是密文还是明文。
+那同时也是本移植第一次真正走通单播接收（`a1-match` 至今为 0）。**这一条已经做完（增量 3q，判据 37 → 38，镜像
+`6dd86abd22b37c7739cc3648dc8d8a7db6844387b98a0fb04e5f1fafdf829337`，run 53）：两帧都发出去、
+固件都报 OK、`replies=0x0`，连 A3 为广播的那一帧也没人回，所以 (b) 出局。**(2) 按原厂做法开 MAC loopback，把本端刚发的帧读回来，直接看载荷是密文还是明文。
 线侧抓包仍然被权限挡住（`/usr/bin/tcpdump` 无 file capabilities、用户不在 pcap 组、
 `sudo -n true` 报 "sudo: interactive authentication is required"），需要用户自己跑，
 一条命令就能把 (a)「AP 收下但解不开」和 (c)「帧体本身有问题」在一轮里分开。

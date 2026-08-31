@@ -7246,6 +7246,56 @@ resident window arp sent= bytes= sn= tpa= status= replies= reply-ip=
 镜像：`6dd86abd22b37c7739cc3648dc8d8a7db6844387b98a0fb04e5f1fafdf829337`，
 新增判据 `--require-runtime-arp-probe`，判据总数 **38**。
 
+#### run 52（没走到窗口）与 run 53：读数落在第二行——「发出去了，没人回」
+
+run 52 停在扫描：两个被动窗口正常（`beacon=0x2a`／`0x6`，`bss=0x1`），主动扫描连发
+13 个 Probe Request，两次尝试都是 `probe-rsp=0x0` → `error=0x3d`（ENODATA），
+整轮 `-61`。这是 run 48 那个未定位偶发的第二次出现，形态比上次清楚一点：
+**先失效的是 Probe Response，不是 Beacon**——第一次尝试还听到 6 个目标 Beacon 并认出
+BSSID，第二次尝试才连 Beacon 都归零。窗口前后 `ce20/ce24/ce28/ce2c` 完全一致，
+与增量 3m 修的过滤器 bug 无关。不动代码，原样重跑就是 run 53。
+
+run 53 三十八条判据全过，三段读数：
+
+- 内存自校验一字不差：`net=0x5 arp=0x3 ipv4=0x1 other=0x1 other-type=0x86dd
+  arp-req=0x1 replies=0x1 reply-ip=0xc0a80109 peer-ip=0xc0a80101
+  peer-tpa=0xc0a8017b ip-peer-ip=0xc0a80105 stage=0x0 status=0x0`。六个载荷里那个
+  「回给别人的 ARP reply」没有被算成回答，所以下面那个 `replies=0x0` 是真的零，
+  不是读者算错。
+- 两次尝试都发出去了，参数正是设计的 A/B：
+  `resident arp tx sn=0xc tag=0x3 a3=b40996b8 tpa=0xc0a80102 pn=0x2 status=0x0`、
+  `resident arp tx sn=0xe tag=0x4 a3=ffffffff tpa=0xc0a80102 pn=0x4 status=0x0`。
+  学到的邻居是 `60:be:b4:09:96:b8` / 192.168.1.2（ARP 路径），IPv4 兜底路径另外学到
+  `24:a3:f0:50:08:1f` / 192.168.1.166。
+- 窗口汇总：`arp sent=0x2 bytes=0x44 sn=0xe tpa=0xc0a80102 status=0x0 replies=0x0
+  reply-ip=0x0 net=0xf arp=0x4 ipv4=0x9 other=0x2 other-type=0x86dd arp-req=0x4`。
+
+同一个窗口另外两行把范围收死了：
+
+- `data tx ... mpdu=0x2 cck=0x2 c2h=0x4 ccxrpt=0x4 ccxrpt-tag=0x4
+  ccxrpt-tag-ok=0x4 ccxrpt-tag-fail=0x0 ccxrpt-tag-seen=0x1e`——`0x1e` 是
+  bit1..bit4，即 tag `0x1/0x2`（两个 DHCP Discover）和 `0x3/0x4`（两次 ARP）
+  四帧**都**拿到了固件的 CCX 报告，四帧**都**报 OK，一帧失败都没有；MAC 的
+  MPDU/CCK 发送计数器同步 +2。
+- `data sec total=0x11 target=0xf prot=0x11 group=0x11 a1-match=0x0 hw-dec=0xf
+  sw-dec=0x2 icv=0x0 crc=0x0`——收到 17 个受保护帧，**全是组播**，ICV 一次没错；
+  `a1-match` 仍然是 `0x0`：到现在为止这张网上没有任何一帧是发给本移植单播地址的。
+
+#### 结论：怀疑对象只剩「发出去的到底是密文还是明文」
+
+第二次尝试的 A3 是广播。一个来自已关联站点、被 AP 逐帧 ACK、固件报告 OK 的广播
+ARP Request，问的是一台正在说话的主机（它自己的 ARP 请求就是我们解出来的那几个），
+既不含任何校验和，也不需要 DHCP 服务器存在，而答案会以单播回到我们地址——两次，
+零回答。3p 留下的两个怀疑对象里，「帧体或对端」这一支到此基本排除。
+
+剩下那一支只能直接测：**硬件到底把明文加密了没有。** ACK 在解密之前发出，所以
+「AP 收到一个来自 RSN 已关联站点的明文数据帧 → 照样 ACK → 密码层静默丢弃」
+与现在的全部观测一致，靠对端行为已经无法再区分。所以下一个增量（3r）用 MAC 回环
+把自己刚发出去的那一帧读回来看载荷：是密文，就说明加密没问题、问题在 AP 的转发或
+隔离策略；是明文，就说明 SEC CAM／发送描述符里的加密指示没有真正生效。这条路
+不需要任何主机特权，也不需要 AP 配合。有线侧抓一次包（`tcpdump` 需要 root，
+用户可以用 `!` 前缀自己跑）能更快地区分同一件事，但它依赖 AP 的有线口可达。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

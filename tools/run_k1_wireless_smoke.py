@@ -2306,8 +2306,8 @@ def main() -> int:
                 rb" other-type=(?:0x)?0*86dd arp-req=(?:0x)?0*1"
                 rb" replies=(?:0x)?0*1 reply-ip=(?:0x)?0*c0a80109"
                 rb" peer-ip=(?:0x)?0*c0a80101 peer-tpa=(?:0x)?0*c0a8017b"
-                rb" ip-peer-ip=(?:0x)?0*c0a80105 stage=(?:0x)?0*"
-                rb"(?![0-9a-fA-F]) status=(?:0x)?0+(?![0-9a-fA-F])",
+                rb" ip-peer-ip=(?:0x)?0*c0a80105 stage=0x0*"
+                rb"(?![0-9a-fA-F]) status=0x0+(?![0-9a-fA-F])",
                 started,
             )
             if arp_model_result is None:
