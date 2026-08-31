@@ -6328,6 +6328,129 @@ CCMP 头拼进帧、把帧长按「不含 MIC」算好、走数据 DMA 通道提
 - `--no-key`：`43aa3c70e9fd3a681a467de74c3ef68d10d5e7336e672fa4bbf0ef9c87a8683a`
   （切回带密钥后哈希回到上面那个，配置来源切换的强制 `--clean` 仍然生效）
 
+### 增量 3j：真的往数据队列发一帧被 CCMP 保护的帧
+
+（**尚未上板**：run 41 待跑。本节所有期望值都是离线的字面量，上板读数一栏留空，别当成硬件结论）
+
+增量 3i 把发送侧的安全字段和 CCMP 头做完了，但一帧没发。这一步补上「发」：把 CCMP 头拼进一帧
+到-DS 的数据帧、按「帧长不含 MIC」算好长度、走 band 0 的 BE 数据队列提交，并在驻留窗口里等
+AP 的回应。
+
+#### 出处（先原厂，mainline 只用来对照）
+
+- **描述符 48 字节，不是 40。** `mac_txdesc_len_8852b()` 只要 `wdinfo_en` 就加
+  `WD_INFO_LEN`，而原厂核心对**每一帧**都置 `mdata->wdinfo_en = 1`，所以 WD BODY 24 ＋
+  WD INFO 24 = 48。本移植管理帧那一路用的也是 48，这里没有例外。
+- **`AX_TXD_HDR_LLC_LEN` 写 20（半字节单位），不是 12。** 原厂 `get_hdr_with_llc()`
+  （`trx_desc.c:53-83`）算的是 `mac_hdr_len + (with_llc ? 8 : 0) + (vlantag ? 4 : 0) +
+  sec_hdr_len` 再 `/= 2`；数据帧原厂核心置 `with_llc = 1`、`sec_hdr_len = iv_len`，于是
+  (24 + 8 + 8) / 2 = 20，字段位置 `_SH 11 _MSK 0x1f`。mainline 写的是
+  `ieee80211_hdrlen(fc) >> 1` = 12。两个值都不影响本移植：这个字段是给 TX checksum offload
+  和硬件头转换用的 L3 偏移，两样本移植都没开（`mac_tcpip_chksum_ofd()` 没调过、
+  `hw_hdr_conv = 0`）。按「先原厂」的规矩写原厂的 20，并把这段理由写在宏的注释里。
+- **`AX_TXD_BK` BIT(13) 要置。** 原厂恰好在 `ampdu_en == FALSE` 时置 `bk = 1`；本移植不聚合，
+  所以 `AGG_EN` BIT(12) 保持零、BK 置一。
+- **band 0 的 BE 队列**：`qsel = 0`、`ch_dma = 0`（ACH0），调度器使能位是 `R_AX_CTN_TXEN`
+  的 BIT(0)（`B_AX_CTN_TXEN_BE_0`）。本移植此前只开过 MGQ `0x100` 和 CPUMGQ `0x400`，
+  数据队列的那一位从来没开过——不开的话描述符再对也不会有帧出去。
+- **速率**沿用管理帧那一路的 `USERATE_SEL | DATARATE=CCK1 | DISDATAFB`：能不能协商到更高的
+  速率是另一件事，这一步要的是「发得出去」。
+- **`pktlen` 含主机拼的 8 字节 CCMP 头、不含硬件追加的 8 字节 MIC**（8852B
+  `hw_sec_hdr = false`，见增量 3i）。
+
+#### 为什么首帧选 DHCP Discover
+
+因为它的回应是**不可伪造的证据**。一个 `op = 2` 的 BOOTP 回应，`xid` 等于我们随机出来的那个、
+`chaddr` 等于本端 eFuse MAC——这种帧只可能在「AP 用我们派生出来的密钥解开了我们这一帧、并把
+它转给了它背后的 DHCP 服务器」之后才存在。相比之下「发出去没报错」只证明硬件收下了描述符。
+驻留窗口本来就在数 `data_frames_to_self`，接收侧不用改。
+
+#### 做了什么
+
+1. 一组数据描述符与 DHCP／IPv4／BOOTP 的宏，注释里逐条写上面的出处。
+2. `g_k1_rtl8852bs_tx_packet_number` ＋ `..._tx_packet_number_next()`：PN 从 1 起算、单调加一，
+   装新密钥时（`..._wpa_arm()`）归零。3i 里 PN 还只是个函数参数。
+3. `..._runtime_inet_sum()` / `..._inet_fold()`：RFC 1071 的和与折叠。折叠返回的是**反码**，
+   所以把一个正确的头连同它自己的校验和再加一遍必然折成 0——这是一条移位错不可能同时满足的
+   离线判据。
+4. `..._runtime_dhcp_discover_build()`：FC `0x4108`（到-DS、Protected）、A1 = BSSID、
+   A2 = 本端、A3 = 广播、seq、主机拼的 CCMP 头（key id 0）、LLC/SNAP `aa aa 03 00 00 00 08 00`、
+   IPv4（0.0.0.0 → 255.255.255.255，TTL 64，proto 17）、UDP 68 → 67、236 字节 BOOTP ＋
+   22 字节选项，共 **326** 字节。A1 是 AP 的单播地址，所以**不置** BMC 位，AP 会 ACK、硬件会重传。
+5. `..._runtime_dhcp_reply_match()`：先试 `header_length + 8` 再试 `header_length` 两个偏移找
+   LLC/SNAP——解密后的帧**保留** CCMP 头，明文帧没有——因此它从不解析密文；然后依次校
+   IPv4 版本 4、`ihl * 4 >= 20`、proto 17、无分片、端口 67 → 68、`op = 2`、四字节 `xid`、
+   `chaddr` 等于本端 MAC，最后把 `yiaddr` 交出去。
+6. `..._runtime_data_secure_tx_build()`：48 字节描述符，`hdr_llc` 按上面那条算，
+   `body3` 置 BK，`info2` 复用 3i 的 `(sec_type << 9) | BIT(8) | sec_cam_idx`（`security`
+   为 NULL 时写零），十二个 dword 全部按位读回。
+7. 新诊断 `k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic()`，仍然挂在已有的
+   `CONFIG_K1_RTL8852BS2_RUNTIME_DATA_TX_DIAGNOSTIC` 下（纯内存），断言见下表。
+8. 驻留窗口里的发送半：`..._runtime_sch_tx_en_data()` 打开 `CTN_TXEN` 的 BE 位并回读，
+   `..._runtime_resident_data_tx()` 取一个新 seq 与新 PN、建帧建描述符、查 TXPG_WP 资源
+   （不足回 `-ENOSPC`，不硬发）、`k1_sdio_wifi_write()` 提交、只有写成功才记计数。窗口在
+   「已装 TK ＋ 已收到目标 AP 的 Beacon ＋ 还没收到 DHCP 回应」时最多发 2 次，重传**沿用第一次
+   的 xid**（真实 DHCP 客户端就是这么做的，两次里哪一次被回应都认得出来）。新增两行打印
+   `resident data tx sn=… bytes=… xid=… pn=… status=…` 与
+   `resident window data tx sent=… status=… tk=… dhcp-reply=… offer-ip=…`。
+9. `tools/run_k1_wireless_smoke.py` 加 `--require-runtime-data-secure-tx`（离线模型那行 ＋
+   驻留窗口切片里的 `status=0x0` ＋ 汇总行 `sent≥1 tk=1`），`tools/run_k1_wpa.sh` 一并加上，
+   判据数 36 → **37**。
+
+#### 断言（期望值都是 python 模型离线算出来的字面量）
+
+| 输入 | 期望 |
+| --- | --- |
+| DHCP Discover 总长 | `326`（`0x146`） |
+| IP total length ／ UDP length | `286`（`0x11e`）／ `266`（`0x10a`） |
+| IP 校验和 ／ UDP 校验和 | `0x79d0` ／ `0x5bdd`，且各自连校验和再加一遍折成 `0` |
+| 帧头前 32 字节（self `02:11:22:33:44:55`，bssid `06:aa:bb:cc:dd:ee`，seq `0x123`，PN 1） | `08 41 00 00 06 aa bb cc dd ee 02 11 22 33 44 55 ff ff ff ff ff ff 30 12 01 00 00 20 00 00 00 00` |
+| IP／UDP 头 28 字节 | `45 00 01 1e 00 00 00 00 40 11 79 d0 00 00 00 00 ff ff ff ff 00 44 00 43 01 0a 5b dd` |
+| 描述符（保护） | `body0=0x0040a400 body2=0x146 body3=0x2123 info0=0x40000400 info1=0 info2=0xd00` |
+| 描述符（不保护） | `body0=0x00408400`，`info2=0` |
+| 布局 | `fifo_address=0x1002f`、`transfer_length=0x178`、8 个 PLE page、1 个 WDE page |
+| 描述符负例 | header 25／header 22／frame 32／seq `0x1000`／缓冲少一字节／`sec_type=0`／`sec_type=16` 各回 `-EINVAL` |
+| 建帧负例 | 缓冲 `326 - 1` 回 `-EINVAL` |
+| PN 计数器 | 连续两次返回 1、2 |
+| 合成回应（FC `0x4208`、192.168.1.1 → 255.255.255.255、67 → 68、`yiaddr = 192.168.1.123`、`chaddr` = 本端） | 在 `header_length` 24 与 40 两个位置都匹配，`offer-ip = 0xc0a8017b` |
+| 匹配器负例 | xid 错一位／chaddr 错／长度截断／我们自己的 Discover／`op = 1`／源端口是客户端口 各不匹配 |
+
+`body0 = 0x0040a400`：`hdr_llc = 20` 落在 [15:11]（`20 << 11 = 0xa000`）、`ch_dma = 0`、
+STF_MODE 与 WDINFO_EN 在低位；`body3 = 0x2123` 是 `seq 0x123 | BK`；`0x146` 就是 326。
+`transfer_length = 0x178 = 376`：374 向上取到 8 字节整数倍。合成回应放在 `header_length` 40
+也匹配，是为了证明「明文帧没有 CCMP 头」那条回退路径也走得通，不是只在解密后的偏移上巧合。
+
+#### 上板读数
+
+留空——run 41 还没跑。上板后要看的是三件事：`resident data scheduler TX enable` 的
+`after=` 里 BE 位真的置上、`resident data tx … status=0x0`（队列收下了这一帧）、以及
+`resident window data tx … dhcp-reply=`。
+
+#### 还没做的
+
+**「队列收下了」不等于「AP 解开了」。** `--require-runtime-data-secure-tx` 只卡到
+「离线模型全对 ＋ 数据队列收下了一帧、且当时确实装着成对密钥」；`dhcp-reply=` 是**报告而不是
+判据**，因为一台背后没有 DHCP 服务器的 AP 会把这一帧解得好好的却永远不回。等哪一次 run 真的
+拿到回应，那一行才是「本端发的保护帧被 AP 解开了」的证据，届时再决定要不要升成判据。
+`wlan0` 的行为一个字节没变，没有 DHCP 客户端、没有联网——这一帧是驻留窗口自己拼出来的，不走
+网络栈。密钥的三层处理照旧（profile 留空、构建脚本从 `~/.config/k1-wifi-psk.env` 读、
+`out/k1-wpa` 不发布）；新增的打印里没有任何由密钥派生的值——打的是描述符的位、帧长、seq、
+一个随机 xid、一个 CCMP PN 和（如果有的话）AP 提供的 IP，这些都不是凭证。仍然是 RAM-only：
+eMMC / SPI flash / eFuse / U-Boot 环境一个都没写。
+
+#### 构建
+
+- 带密钥：`9833e8cdfe16ccc5fceb9c89fa8db03630192b0aec36b40c289afe245b4d0fcf`
+  （`--clean` 与切回来的增量构建同一个哈希）
+- `--no-key`：`095e1663c421d9caf5de62944881e2886c05e5e54cfb1c6b944f253796f0610f`
+
+顺带记一个环境坑：这次第一次构建整棵树都报 `unrecognized opcode 'csrr…', extension 'zicsr'
+required`。原因不是工具链，是**上一次用 ninja 单独编一个文件时触发了一次半途失败的 cmake
+重配**（`ccache` 不在那个 shell 的 PATH 上），留下的 `build.ninja` 里 `-march` 退成了
+`rv64imac`——F/D 和 zicsr 全丢了。`--clean` 一次就好了，两次带密钥构建哈希相同。教训是：不要
+再用 ninja 直接驱动单个对象规则；要快速语法检查就从 `compile_commands.json` 里取出命令行、
+去掉 ccache 前缀、加 `-fsyntax-only` 自己跑，这样不会碰构建目录的状态。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

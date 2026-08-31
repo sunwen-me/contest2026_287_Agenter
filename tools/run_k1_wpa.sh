@@ -50,5 +50,5 @@ exec python3 "${SCRIPT_DIR}/run_k1_wireless_smoke.py" \
   --require-runtime-assoc --require-runtime-assoc-response \
   --require-runtime-wpa --require-runtime-wpa-msg1 \
   --require-runtime-wpa-mic --require-runtime-wpa-keys \
-  --require-runtime-resident \
+  --require-runtime-resident --require-runtime-data-secure-tx \
   "$@"

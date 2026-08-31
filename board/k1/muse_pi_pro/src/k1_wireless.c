@@ -912,6 +912,24 @@ int k1_wireless_initialize(void)
                       ret = probe_ret;
                     }
                 }
+
+              /* And the whole protected data frame the resident window
+               * transmits: the DHCP Discover body, both IPv4/UDP checksums,
+               * the data-queue descriptor and the reply matcher, all checked
+               * against values a python model produced offline.  Memory only
+               * as well, so a failure here means the frame would have been
+               * wrong on the air rather than that the radio misbehaved.
+               */
+
+              if (probe_ret >= 0)
+                {
+                  probe_ret =
+                    k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic();
+                  if (probe_ret < 0)
+                    {
+                      ret = probe_ret;
+                    }
+                }
 #  endif
 
 #  ifdef CONFIG_K1_RTL8852BS2_RUNTIME_RX_WORKER_DIAGNOSTIC

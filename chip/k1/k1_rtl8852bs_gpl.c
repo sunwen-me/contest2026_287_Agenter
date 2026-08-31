@@ -455,6 +455,98 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_MGMT_TX_DRAIN_POLL      20u
 #define K1_RTL8852BS_MGMT_TX_DRAIN_USEC      1000u
 
+/* What the band-0 best-effort data queue needs on top of the fields the
+ * management descriptor already carries, for a protected data frame.
+ *
+ * Source: vendor trx_desc_8852b.c txdes_proc_data_8852b() builds WD BODY
+ * dword0 from the store-and-forward mode, the two hardware sequence
+ * selectors, the header-with-LLC length, the DMA channel and the WD INFO
+ * enable, and its dword3 from the software sequence number, the aggregation
+ * enable and the background bit; txdesc.h gives the positions
+ * (AX_TXD_HDR_LLC_LEN_SH 11 MSK 0x1f, AX_TXD_AGG_EN BIT(12), AX_TXD_BK
+ * BIT(13)).  The queue selector of an ACH0 to ACH3 frame is
+ * (band << 3) | (wmm << 2) | qsel_l[tid], and qsel_l[0] is 0 for the
+ * best-effort access category, so band 0, WMM set 0 and TID 0 is selector 0
+ * on DMA channel 0.
+ *
+ * AX_TXD_HDR_LLC_LEN is a half-byte count of everything in front of the
+ * network-layer payload.  get_hdr_with_llc() (vendor trx_desc.c:53) computes
+ * it for an 802.11-format MSDU as the MAC header, eight more bytes when the
+ * frame carries an LLC/SNAP header, four more for a VLAN tag and the cipher
+ * header's own length, all divided by two -- and the vendor core sets
+ * with_llc for every data frame and sec_hdr_len to the cipher header's length
+ * (fill_txreq_mdata() in the core transmit path).  A non-QoS CCMP data frame
+ * with an LLC/SNAP header is therefore (24 + 8 + 8) / 2 = 20 half-bytes.
+ *
+ * Mainline writes something else for the same frame: ieee80211_hdrlen(fc) >> 1
+ * with neither the LLC nor the cipher term, which is 12
+ * (rtw89_core_tx_update_llc_hdr()).  The field is the layer-3 offset that the
+ * transmit checksum offload and the hardware header conversion consume, and
+ * this port enables neither -- no B_AX_HDT_TCPIP_CHKSUM_EN, no smh_en -- so
+ * both values are inert here.  The vendor's is what this port writes, because
+ * the rest of this descriptor is the vendor's.
+ *
+ * AX_TXD_BK is set exactly when the frame is not aggregated in the vendor
+ * core, and nothing this port transmits is aggregated.
+ */
+
+#define K1_RTL8852BS_DATA_TXD_HDR_LLC_SHIFT  11u
+#define K1_RTL8852BS_DATA_TXD_HDR_LLC_MASK   0x1fu
+#define K1_RTL8852BS_DATA_TXD_AGG_EN         (1u << 12)
+#define K1_RTL8852BS_DATA_TXD_BK             (1u << 13)
+#define K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE    0u
+#define K1_RTL8852BS_DATA_TXD_QSEL_B0BE      0u
+#define K1_RTL8852BS_DATA_TXD_TID_BE         0u
+#define K1_RTL8852BS_LLC_SNAP_HEADER_SIZE    8u
+
+/* The longest frame the protected data path builds, and the room its packet
+ * buffer needs for the descriptor in front of it.  The one frame this port
+ * transmits is a DHCP Discover, which is 326 bytes with its 802.11 header,
+ * CCMP header, LLC/SNAP header, IPv4 and UDP headers and a 258-byte BOOTP
+ * payload.
+ */
+
+#define K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX 384u
+
+/* The one frame this port transmits with the keys the handshake installed, and
+ * the constants of the four headers in front of its payload.
+ *
+ * A DHCP Discover is the choice because of what its answer proves.  The frame
+ * is encrypted by the hardware with the pairwise key, so the access point can
+ * only forward it to its DHCP server if the key it decrypts with is the key
+ * this host derived; the server's answer carries this host's own transaction
+ * identifier and its own hardware address back, so an answer cannot be
+ * mistaken for another station's traffic or for a frame the receiver happened
+ * to see.  Nothing weaker is available: an ARP request would be answered only
+ * if some station owned the address asked about, and an ICMP echo needs an
+ * address this host does not have yet.
+ *
+ * The destination is the broadcast address, as a Discover's must be, and it is
+ * address 3 of a to-DS frame -- the final destination inside the distribution
+ * system.  Address 1 stays the access point's own unicast address, which is
+ * what makes the frame acknowledged and retried, and the pairwise key is what
+ * protects it: the group key belongs to frames the access point sends.
+ */
+
+#define K1_RTL8852BS_DATA_TODS_PROT_FC       0x4108u
+#define K1_RTL8852BS_IPV4_HEADER_SIZE        20u
+#define K1_RTL8852BS_IPV4_VERSION_IHL        0x45u
+#define K1_RTL8852BS_IPV4_TTL                64u
+#define K1_RTL8852BS_IPV4_PROTO_UDP          17u
+#define K1_RTL8852BS_UDP_HEADER_SIZE         8u
+#define K1_RTL8852BS_DHCP_CLIENT_PORT        68u
+#define K1_RTL8852BS_DHCP_SERVER_PORT        67u
+#define K1_RTL8852BS_BOOTP_FIXED_SIZE        236u
+#define K1_RTL8852BS_BOOTP_CHADDR_OFFSET     28u
+#define K1_RTL8852BS_BOOTP_XID_OFFSET        4u
+#define K1_RTL8852BS_BOOTP_FLAGS_OFFSET      10u
+#define K1_RTL8852BS_BOOTP_YIADDR_OFFSET     16u
+#define K1_RTL8852BS_BOOTP_BROADCAST_FLAG    0x8000u
+#define K1_RTL8852BS_BOOTP_REQUEST           1u
+#define K1_RTL8852BS_BOOTP_REPLY             2u
+#define K1_RTL8852BS_DHCP_OPTIONS_SIZE       22u
+#define K1_RTL8852BS_DHCP_DISCOVER_SIZE      326u
+
 /* R_AX_SS_CTRL and the four steps sta_sch_init() performs on it.  The station
  * scheduler is the DMAC block that walks the WDE queues and tells a CMAC
  * scheduler which of them hold a frame; nothing in this port has ever written
@@ -821,6 +913,13 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_CTN_TXEN                0xc348u
 #define K1_RTL8852BS_CTN_TXEN_MGQ            0x00000100u
 #define K1_RTL8852BS_CTN_TXEN_CPUMGQ         0x00000400u
+
+/* The band-0 best-effort contention-transmit enable, B_AX_CTN_TXEN_BE_0, the
+ * one data queue this port ever asks the scheduler to serve.  The frame it
+ * submits goes to ACH0, which is that queue.
+ */
+
+#define K1_RTL8852BS_CTN_TXEN_BE_0           0x00000001u
 #define K1_RTL8852BS_PTCL_COMMON_SETTING_0   0xc600u
 #define K1_RTL8852BS_MACID_SLEEP_0           0xc2c0u
 #define K1_RTL8852BS_SS_MACID_PAUSE_0        0x9eb0u
@@ -7643,6 +7742,43 @@ struct k1_rtl8852bs_key_install_s
 
 static struct k1_rtl8852bs_key_install_s g_k1_rtl8852bs_key_install;
 
+/* The transmit packet number the pairwise key installed by the last handshake
+ * has reached.
+ *
+ * CCMP replay protection is the receiver refusing a packet number it has
+ * already seen under a key, so a number must never repeat while a key is in
+ * use and must increase.  Until now the number was only a parameter of the
+ * header builder, with no counter behind it, which is enough to build one
+ * header and not enough to transmit two frames.
+ *
+ * It is reset when a handshake is armed, together with the key slots above:
+ * an association attempt derives a fresh pairwise key, and a fresh key starts
+ * the sequence over.  The first frame under a key therefore carries packet
+ * number 1, which is what a receiver expects -- zero is not a valid CCMP
+ * packet number and the header builder refuses it.
+ *
+ * No key material is here.  A packet number travels in the clear inside every
+ * protected frame's CCMP header.
+ */
+
+static uint64_t g_k1_rtl8852bs_tx_packet_number;
+
+static uint64_t k1_rtl8852bs_runtime_tx_packet_number_next(void)
+{
+  if (g_k1_rtl8852bs_tx_packet_number >= K1_RTL8852BS_CCMP_PN_MAX)
+    {
+      /* The 48-bit space is exhausted, which under one key means the key has
+       * to be replaced rather than the counter wrapped.  Zero is not a valid
+       * packet number, so returning it refuses the transmit.
+       */
+
+      return 0;
+    }
+
+  g_k1_rtl8852bs_tx_packet_number++;
+  return g_k1_rtl8852bs_tx_packet_number;
+}
+
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_wpa_arm
  *
@@ -7677,6 +7813,12 @@ static void k1_rtl8852bs_runtime_wpa_arm(FAR const uint8_t *bssid,
   g_k1_rtl8852bs_key_install.tk_sec_status = -ENODATA;
   g_k1_rtl8852bs_key_install.gtk_cam_status = -ENODATA;
   g_k1_rtl8852bs_key_install.gtk_sec_status = -ENODATA;
+
+  /* And the transmit packet number belongs to the key this attempt is about to
+   * derive, so it starts over with it.
+   */
+
+  g_k1_rtl8852bs_tx_packet_number = 0;
 
   if (bssid == NULL || pmk == NULL)
     {
@@ -20433,6 +20575,1125 @@ static int k1_rtl8852bs_runtime_mgmt_tx_frame(FAR const uint8_t *frame,
   return OK;
 }
 
+/* An internet checksum, accumulated over as many pieces as a caller has and
+ * folded once at the end.  Both the IPv4 header's checksum and the UDP
+ * checksum over its pseudo header are this same sum, which is why it is a pair
+ * of helpers rather than two functions.
+ *
+ * The sum is of sixteen-bit big-endian words; a trailing odd byte is the high
+ * half of a word whose low half is zero, as RFC 1071 specifies.
+ */
+
+static uint32_t k1_rtl8852bs_runtime_inet_sum(uint32_t sum,
+                                              FAR const uint8_t *data,
+                                              size_t length)
+{
+  size_t index;
+
+  for (index = 0; index + 1u < length; index += 2u)
+    {
+      sum += ((uint32_t)data[index] << 8) | (uint32_t)data[index + 1u];
+    }
+
+  if ((length & 1u) != 0)
+    {
+      sum += (uint32_t)data[length - 1u] << 8;
+    }
+
+  return sum;
+}
+
+static uint16_t k1_rtl8852bs_runtime_inet_fold(uint32_t sum)
+{
+  while ((sum >> 16) != 0)
+    {
+      sum = (sum & 0xffffu) + (sum >> 16);
+    }
+
+  return (uint16_t)(~sum & 0xffffu);
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_dhcp_discover_build
+ *
+ * Description:
+ *   Build the complete protected data frame this port transmits: an 802.11
+ *   to-DS data frame with the protected bit set, the host-written CCMP header
+ *   behind its MAC header, an LLC/SNAP header, and an IPv4 UDP datagram
+ *   carrying a BOOTP DHCP Discover.
+ *
+ *   The plaintext is what goes in.  The hardware encrypts everything from the
+ *   LLC/SNAP header onwards with the key the descriptor names and appends the
+ *   eight MIC bytes itself, so the frame length this returns counts the CCMP
+ *   header and not the MIC -- which is what the descriptor builder is given.
+ *
+ *   Both checksums are computed rather than left zero.  A UDP checksum of zero
+ *   is legal over IPv4 and some clients send one, but a computed pair means a
+ *   server that drops the datagram dropped it for a reason this port can be
+ *   held responsible for, and it makes the frame verifiable offline: the sum
+ *   over a correct header folds to zero.
+ *
+ * Input Parameters:
+ *   frame          - where the frame goes
+ *   frame_size     - how much room frame has
+ *   self_mac       - the eFuse self MAC, transmitter and client identifier
+ *   bssid          - the access point this run associated with, address 1 and
+ *                    address 3's distribution-system peer
+ *   sequence       - the twelve-bit sequence number for the frame
+ *   packet_number  - the CCMP packet number, which must not repeat under the
+ *                    installed key
+ *   transaction_id - the DHCP transaction identifier the answer has to carry
+ *                    back
+ *   frame_length   - the frame's length on return
+ *   header_length  - its 802.11 header's length on return, for the descriptor
+ *
+ * Returned Value:
+ *   OK on success, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_dhcp_discover_build(
+  FAR uint8_t *frame, size_t frame_size, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid, uint16_t sequence, uint64_t packet_number,
+  uint32_t transaction_id, FAR size_t *frame_length,
+  FAR uint8_t *header_length)
+{
+  static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
+    {
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00
+    };
+
+  size_t required;
+  size_t offset;
+  size_t ip_offset;
+  size_t udp_offset;
+  size_t bootp_offset;
+  uint16_t udp_length;
+  uint16_t checksum;
+  uint32_t sum;
+  int ret;
+
+  required = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+             K1_RTL8852BS_CCMP_HEADER_SIZE +
+             K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+             K1_RTL8852BS_IPV4_HEADER_SIZE +
+             K1_RTL8852BS_UDP_HEADER_SIZE +
+             K1_RTL8852BS_BOOTP_FIXED_SIZE +
+             K1_RTL8852BS_DHCP_OPTIONS_SIZE;
+
+  if (frame == NULL || frame_length == NULL || header_length == NULL ||
+      self_mac == NULL || bssid == NULL ||
+      !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(bssid) ||
+      sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK ||
+      frame_size < required)
+    {
+      return -EINVAL;
+    }
+
+  memset(frame, 0, required);
+
+  /* The 802.11 header.  Data frame, to-DS, protected.  Address 1 is the
+   * access point, address 2 this host, address 3 the frame's destination
+   * inside the distribution system, which for a Discover is the broadcast
+   * address.  The duration stays zero for the hardware to fill.
+   */
+
+  k1_rtl8852bs_write_le16(frame, K1_RTL8852BS_DATA_TODS_PROT_FC);
+  memcpy(frame + 4, bssid, 6);
+  memcpy(frame + 10, self_mac, 6);
+  memset(frame + 16, 0xff, 6);
+  k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
+  offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+  /* The cipher header, with key identifier 0, which is where a pairwise key
+   * always lives.
+   */
+
+  ret = k1_rtl8852bs_runtime_ccmp_header_build(
+    packet_number, 0u, frame + offset, K1_RTL8852BS_CCMP_HEADER_SIZE);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  offset += K1_RTL8852BS_CCMP_HEADER_SIZE;
+
+  memcpy(frame + offset, llc_snap, sizeof(llc_snap));
+  offset += sizeof(llc_snap);
+
+  /* The IPv4 header.  Source 0.0.0.0, because this host has no address yet,
+   * and destination 255.255.255.255, which is the only destination a client
+   * without one may use.  No options, so the header length is five words.
+   */
+
+  ip_offset = offset;
+  udp_length = (uint16_t)(K1_RTL8852BS_UDP_HEADER_SIZE +
+                          K1_RTL8852BS_BOOTP_FIXED_SIZE +
+                          K1_RTL8852BS_DHCP_OPTIONS_SIZE);
+  frame[ip_offset] = K1_RTL8852BS_IPV4_VERSION_IHL;
+  k1_rtl8852bs_write_be16(frame + ip_offset + 2,
+                          (uint16_t)(K1_RTL8852BS_IPV4_HEADER_SIZE +
+                                     udp_length));
+  frame[ip_offset + 8] = K1_RTL8852BS_IPV4_TTL;
+  frame[ip_offset + 9] = K1_RTL8852BS_IPV4_PROTO_UDP;
+  memset(frame + ip_offset + 16, 0xff, 4);
+  offset += K1_RTL8852BS_IPV4_HEADER_SIZE;
+
+  udp_offset = offset;
+  k1_rtl8852bs_write_be16(frame + udp_offset, K1_RTL8852BS_DHCP_CLIENT_PORT);
+  k1_rtl8852bs_write_be16(frame + udp_offset + 2,
+                          K1_RTL8852BS_DHCP_SERVER_PORT);
+  k1_rtl8852bs_write_be16(frame + udp_offset + 4, udp_length);
+  offset += K1_RTL8852BS_UDP_HEADER_SIZE;
+
+  /* The BOOTP fixed part.  A request over Ethernet with a six-byte hardware
+   * address, this host's transaction identifier, the broadcast flag set
+   * because a client with no address cannot receive a unicast reply, and this
+   * host's own hardware address in chaddr -- which is the field the answer
+   * has to carry back.  Every address field stays zero, and the server name
+   * and boot file name stay empty.
+   */
+
+  bootp_offset = offset;
+  frame[bootp_offset] = K1_RTL8852BS_BOOTP_REQUEST;
+  frame[bootp_offset + 1] = 1u;
+  frame[bootp_offset + 2] = 6u;
+  frame[bootp_offset + K1_RTL8852BS_BOOTP_XID_OFFSET] =
+    (uint8_t)((transaction_id >> 24) & 0xffu);
+  frame[bootp_offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 1] =
+    (uint8_t)((transaction_id >> 16) & 0xffu);
+  frame[bootp_offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 2] =
+    (uint8_t)((transaction_id >> 8) & 0xffu);
+  frame[bootp_offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 3] =
+    (uint8_t)(transaction_id & 0xffu);
+  k1_rtl8852bs_write_be16(frame + bootp_offset +
+                          K1_RTL8852BS_BOOTP_FLAGS_OFFSET,
+                          K1_RTL8852BS_BOOTP_BROADCAST_FLAG);
+  memcpy(frame + bootp_offset + K1_RTL8852BS_BOOTP_CHADDR_OFFSET,
+         self_mac, 6);
+  offset = bootp_offset + K1_RTL8852BS_BOOTP_FIXED_SIZE;
+
+  /* The options: the magic cookie, the message type, the client identifier
+   * carrying the same hardware address again, a parameter request list asking
+   * for the subnet mask, the router and the domain name servers, and the end
+   * marker.  RFC 2132 option numbers 53, 61 and 55.
+   */
+
+  frame[offset++] = 0x63u;
+  frame[offset++] = 0x82u;
+  frame[offset++] = 0x53u;
+  frame[offset++] = 0x63u;
+  frame[offset++] = 53u;
+  frame[offset++] = 1u;
+  frame[offset++] = 1u;
+  frame[offset++] = 61u;
+  frame[offset++] = 7u;
+  frame[offset++] = 1u;
+  memcpy(frame + offset, self_mac, 6);
+  offset += 6;
+  frame[offset++] = 55u;
+  frame[offset++] = 3u;
+  frame[offset++] = 1u;
+  frame[offset++] = 3u;
+  frame[offset++] = 6u;
+  frame[offset++] = 0xffu;
+
+  if (offset != required)
+    {
+      return -EIO;
+    }
+
+  /* The IPv4 header checksum, over the header with its own field still zero.
+   */
+
+  sum = k1_rtl8852bs_runtime_inet_sum(0, frame + ip_offset,
+                                      K1_RTL8852BS_IPV4_HEADER_SIZE);
+  k1_rtl8852bs_write_be16(frame + ip_offset + 10,
+                          k1_rtl8852bs_runtime_inet_fold(sum));
+
+  /* The UDP checksum, over the pseudo header -- the two addresses, the
+   * protocol and the datagram length -- followed by the datagram itself with
+   * its own field still zero.  A computed zero has to be sent as all ones,
+   * because zero is the value that means no checksum was computed at all.
+   */
+
+  sum = k1_rtl8852bs_runtime_inet_sum(0, frame + ip_offset + 12, 8);
+  sum += K1_RTL8852BS_IPV4_PROTO_UDP;
+  sum += udp_length;
+  sum = k1_rtl8852bs_runtime_inet_sum(sum, frame + udp_offset, udp_length);
+  checksum = k1_rtl8852bs_runtime_inet_fold(sum);
+  if (checksum == 0)
+    {
+      checksum = 0xffffu;
+    }
+
+  k1_rtl8852bs_write_be16(frame + udp_offset + 6, checksum);
+
+  *frame_length = required;
+  *header_length = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_dhcp_reply_match
+ *
+ * Description:
+ *   Decide whether one received 802.11 data frame is the answer to the DHCP
+ *   Discover this port transmitted, and if it is, report the address it
+ *   offers.
+ *
+ *   Three fields have to agree, and together they are what makes the answer
+ *   evidence rather than traffic.  The datagram has to come from the DHCP
+ *   server port and go to the client port; the BOOTP operation has to be a
+ *   reply; and both the transaction identifier this host generated and this
+ *   host's own hardware address have to come back inside it.  Another
+ *   station's DHCP exchange fails the last two, and a frame this receiver
+ *   happened to see with the wide filter fails all of them.
+ *
+ *   The plaintext is looked for at both of the two offsets it can be at.  A
+ *   frame the security engine decrypted keeps its cipher header, so the
+ *   LLC/SNAP header sits eight bytes behind the 802.11 header; an unprotected
+ *   frame has it at the header itself.  Which one holds an LLC/SNAP header
+ *   with the IPv4 ethertype decides, so this reads a decrypted frame and a
+ *   plaintext one and reads neither out of ciphertext.
+ *
+ * Input Parameters:
+ *   payload         - the 802.11 frame
+ *   payload_length  - its length
+ *   header_length   - its 802.11 header's length, as its frame control says
+ *   self_mac        - the eFuse self MAC the reply has to carry back
+ *   transaction_id  - the identifier the Discover was sent with
+ *   offered_address - the offered address on a match, host byte order
+ *
+ * Returned Value:
+ *   true when the frame is this host's own DHCP answer.
+ *
+ ****************************************************************************/
+
+static bool k1_rtl8852bs_runtime_dhcp_reply_match(
+  FAR const uint8_t *payload, size_t payload_length, size_t header_length,
+  FAR const uint8_t *self_mac, uint32_t transaction_id,
+  FAR uint32_t *offered_address)
+{
+  static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
+    {
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00
+    };
+
+  size_t offset;
+  size_t ip_length;
+
+  if (payload == NULL || self_mac == NULL || offered_address == NULL)
+    {
+      return false;
+    }
+
+  offset = header_length + K1_RTL8852BS_CCMP_HEADER_SIZE;
+  if (payload_length < offset + sizeof(llc_snap) ||
+      memcmp(payload + offset, llc_snap, sizeof(llc_snap)) != 0)
+    {
+      offset = header_length;
+      if (payload_length < offset + sizeof(llc_snap) ||
+          memcmp(payload + offset, llc_snap, sizeof(llc_snap)) != 0)
+        {
+          return false;
+        }
+    }
+
+  offset += sizeof(llc_snap);
+  if (payload_length < offset + K1_RTL8852BS_IPV4_HEADER_SIZE ||
+      (payload[offset] >> 4) != 4u)
+    {
+      return false;
+    }
+
+  ip_length = (size_t)(payload[offset] & 0x0fu) * 4u;
+  if (ip_length < K1_RTL8852BS_IPV4_HEADER_SIZE ||
+      payload_length < offset + ip_length + K1_RTL8852BS_UDP_HEADER_SIZE ||
+      payload[offset + 9] != K1_RTL8852BS_IPV4_PROTO_UDP)
+    {
+      return false;
+    }
+
+  /* A datagram split across fragments is not read: only the first fragment
+   * carries the ports, and the offset field says which this is.
+   */
+
+  if ((k1_rtl8852bs_read_be16(payload + offset + 6) & 0x1fffu) != 0)
+    {
+      return false;
+    }
+
+  offset += ip_length;
+  if (k1_rtl8852bs_read_be16(payload + offset) !=
+      K1_RTL8852BS_DHCP_SERVER_PORT ||
+      k1_rtl8852bs_read_be16(payload + offset + 2) !=
+      K1_RTL8852BS_DHCP_CLIENT_PORT)
+    {
+      return false;
+    }
+
+  offset += K1_RTL8852BS_UDP_HEADER_SIZE;
+  if (payload_length < offset + K1_RTL8852BS_BOOTP_FIXED_SIZE ||
+      payload[offset] != K1_RTL8852BS_BOOTP_REPLY)
+    {
+      return false;
+    }
+
+  if (payload[offset + K1_RTL8852BS_BOOTP_XID_OFFSET] !=
+      (uint8_t)((transaction_id >> 24) & 0xffu) ||
+      payload[offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 1] !=
+      (uint8_t)((transaction_id >> 16) & 0xffu) ||
+      payload[offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 2] !=
+      (uint8_t)((transaction_id >> 8) & 0xffu) ||
+      payload[offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 3] !=
+      (uint8_t)(transaction_id & 0xffu))
+    {
+      return false;
+    }
+
+  if (memcmp(payload + offset + K1_RTL8852BS_BOOTP_CHADDR_OFFSET,
+             self_mac, 6) != 0)
+    {
+      return false;
+    }
+
+  *offered_address =
+    ((uint32_t)payload[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET] << 24) |
+    ((uint32_t)payload[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 1] << 16) |
+    ((uint32_t)payload[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 2] << 8) |
+    (uint32_t)payload[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 3];
+  return true;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_data_secure_tx_build
+ *
+ * Description:
+ *   Build the forty eight byte transmit descriptor of one protected data frame
+ *   for the band-0 best-effort queue, and calculate its fixed-address SDIO
+ *   FIFO encoding.  A pure memory operation with a read-back check, the same
+ *   shape as the management builder above it.
+ *
+ *   The existing normal-data builder next to the resource reader is not this:
+ *   it writes the twenty four byte WD BODY alone, with WD INFO, crypto and
+ *   sequence control all clear, which is a descriptor that can carry no key
+ *   and no rate.  It stays as it is, because the preflight that proves the
+ *   TXPG_WP accounting is built on it.
+ *
+ *   The values are those of txdes_proc_data_8852b() with the SDIO variant of
+ *   its store-and-forward decision, cross checked against the mainline rtw89
+ *   data path:
+ *
+ *     WD BODY dword0  store and forward, WD INFO present, the header length in
+ *                     half-bytes up to the network-layer payload, and DMA
+ *                     channel 0, which is ACH0, the band-0 best-effort queue.
+ *                     Both hardware sequence selectors stay zero, so the
+ *                     sequence-control field of the frame itself is what goes
+ *                     on the air and no MAC sequence table has to have been
+ *                     programmed first -- the same decision the management
+ *                     descriptor makes, for the same reason.
+ *     WD BODY dword2  frame length, the band-0 best-effort queue selector,
+ *                     which is zero, and the MACID whose address CAM record
+ *                     this port programs.  There is exactly one such record
+ *                     and every frame this port sends uses it, which is why
+ *                     the constant is shared with the management path.  The
+ *                     TID indicator stays clear: it belongs to the two access
+ *                     categories whose two TIDs share a queue, and TID 0 is
+ *                     not one of them.
+ *     WD BODY dword3  the software sequence number, kept equal to the one in
+ *                     the frame, and the background bit.  The vendor core sets
+ *                     that bit on exactly the frames it does not aggregate,
+ *                     and this one is not aggregated: no A-MPDU has ever been
+ *                     negotiated on this association and the aggregation
+ *                     enable stays clear beside it.
+ *     WD INFO dword0  a fixed rate is selected, that rate is 1 Mbit/s CCK, and
+ *                     data rate fallback is disabled.  The vendor data path
+ *                     instead leaves the rate to the firmware's rate-adaptation
+ *                     table, which this port has never programmed, so a frame
+ *                     that trusted it would be sent at whatever that table
+ *                     holds after reset.  Borrowing the management path's fixed
+ *                     rate makes the transmit depend on nothing but this
+ *                     descriptor.
+ *     WD INFO dword1  zero.  The broadcast/multicast bit is deliberately not
+ *                     set: address 1 of this frame is the access point's own
+ *                     unicast address, so the access point acknowledges it and
+ *                     the hardware retries it when the acknowledgement does not
+ *                     come.  That the frame's final destination is the
+ *                     broadcast address is a property of address 3, which the
+ *                     radio never looks at.
+ *     WD INFO dword2  the security fields, exactly as the management builder
+ *                     writes them: the cipher, the bit that says the hardware
+ *                     performs the encryption, and the security CAM entry
+ *                     holding the key.  The caller owns the CCMP header, and
+ *                     frame_length counts that header but not the eight MIC
+ *                     bytes the hardware appends.
+ *
+ *   Everything else is zero: no aggregation, no RTS, no lifetime override, no
+ *   header conversion, no A-MSDU and no checksum offload.
+ *
+ * Input Parameters:
+ *   frame_length      - the frame's length, counting its 802.11 header, its
+ *                       cipher header and its payload but not the MIC
+ *   sequence          - the twelve-bit sequence number the frame carries
+ *   header_length     - the frame's 802.11 header length, 24 for the non-QoS
+ *                       form this port builds
+ *   security          - the cipher and key slot, or NULL for an unprotected
+ *                       frame
+ *   descriptor        - where the forty eight bytes go
+ *   descriptor_length - how much room descriptor has
+ *   layout            - the FIFO address, transfer length and page counts
+ *
+ * Returned Value:
+ *   OK on success, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_data_secure_tx_build(
+  size_t frame_length, uint16_t sequence, uint8_t header_length,
+  FAR const struct k1_rtl8852bs_tx_security_s *security,
+  FAR uint8_t *descriptor, size_t descriptor_length,
+  FAR struct k1_rtl8852bs_data_tx_layout_s *layout)
+{
+  uint32_t body0;
+  uint32_t body2;
+  uint32_t body3;
+  uint32_t info0;
+  uint32_t info1;
+  uint32_t info2;
+  uint32_t front;
+  uint32_t hdr_llc;
+  uint32_t length_units;
+  uint32_t total_length;
+  uint32_t ple_length;
+
+  if (descriptor == NULL || layout == NULL ||
+      descriptor_length < K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE ||
+      header_length < K1_RTL8852BS_IEEE80211_HEADER_SIZE ||
+      (header_length & 1u) != 0 ||
+      frame_length > K1_RTL8852BS_H2C_TXD_LENGTH_MASK ||
+      sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK)
+    {
+      return -EINVAL;
+    }
+
+  if (security != NULL &&
+      (security->sec_type > K1_RTL8852BS_MGMT_TXI_SEC_TYPE_MASK ||
+       security->sec_type == 0u ||
+       security->sec_cam_index > K1_RTL8852BS_MGMT_TXI_SEC_CAM_IDX_MASK))
+    {
+      return -EINVAL;
+    }
+
+  /* get_hdr_with_llc()'s own sum for an 802.11-format MSDU with an LLC/SNAP
+   * header and no VLAN tag: the MAC header, the LLC/SNAP header and the cipher
+   * header, in half-bytes.  It is also exactly the number of bytes in front of
+   * the network-layer payload, so a frame shorter than it cannot be the frame
+   * this descriptor describes.
+   */
+
+  front = (uint32_t)header_length + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+  if (security != NULL)
+    {
+      front += K1_RTL8852BS_CCMP_HEADER_SIZE;
+    }
+
+  hdr_llc = front / 2u;
+  if (frame_length < front ||
+      hdr_llc > K1_RTL8852BS_DATA_TXD_HDR_LLC_MASK)
+    {
+      return -EINVAL;
+    }
+
+  body0 = K1_RTL8852BS_DATA_TXD_STF_MODE |
+          K1_RTL8852BS_MGMT_TXD_WDINFO_EN |
+          (hdr_llc << K1_RTL8852BS_DATA_TXD_HDR_LLC_SHIFT) |
+          ((uint32_t)K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE <<
+           K1_RTL8852BS_DATA_TXD_CH_DMA_SHIFT);
+  body2 = (uint32_t)frame_length |
+          ((uint32_t)K1_RTL8852BS_DATA_TXD_QSEL_B0BE <<
+           K1_RTL8852BS_DATA_TXD_QSEL_SHIFT) |
+          ((uint32_t)K1_RTL8852BS_MGMT_TX_MACID <<
+           K1_RTL8852BS_DATA_TXD_MACID_SHIFT);
+  body3 = (uint32_t)sequence | K1_RTL8852BS_DATA_TXD_BK;
+  info0 = K1_RTL8852BS_MGMT_TXI_USERATE_SEL |
+          ((uint32_t)K1_RTL8852BS_MGMT_TXI_DATARATE_CCK1 <<
+           K1_RTL8852BS_MGMT_TXI_DATARATE_SHIFT) |
+          K1_RTL8852BS_MGMT_TXI_DISDATAFB;
+  info1 = 0u;
+  info2 = 0u;
+  if (security != NULL)
+    {
+      info2 = ((uint32_t)security->sec_type <<
+               K1_RTL8852BS_MGMT_TXI_SEC_TYPE_SHIFT) |
+              K1_RTL8852BS_MGMT_TXI_SEC_HW_ENC |
+              (uint32_t)security->sec_cam_index;
+    }
+
+  memset(descriptor, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE);
+  k1_rtl8852bs_write_le32(descriptor, body0);
+  k1_rtl8852bs_write_le32(descriptor + 8, body2);
+  k1_rtl8852bs_write_le32(descriptor + 12, body3);
+  k1_rtl8852bs_write_le32(descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE,
+                          info0);
+  k1_rtl8852bs_write_le32(descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 4,
+                          info1);
+  k1_rtl8852bs_write_le32(descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8,
+                          info2);
+
+  total_length = K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE + (uint32_t)frame_length;
+  length_units = (total_length + K1_RTL8852BS_H2C_TX_UNIT_SIZE - 1u) /
+                 K1_RTL8852BS_H2C_TX_UNIT_SIZE;
+  if (length_units == 0 || length_units > K1_RTL8852BS_H2C_TX_UNIT_MASK)
+    {
+      return -E2BIG;
+    }
+
+  ple_length = (uint32_t)frame_length + K1_RTL8852BS_DATA_TX_PLE_RESERVED +
+               K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE;
+  layout->fifo_address = K1_RTL8852BS_H2C_TX_FIFO_BASE |
+                         ((uint32_t)K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE <<
+                          K1_RTL8852BS_H2C_TX_FIFO_SHIFT) |
+                         length_units;
+  layout->transfer_length = length_units * K1_RTL8852BS_H2C_TX_UNIT_SIZE;
+  layout->required_ple_pages =
+    ((ple_length + K1_RTL8852BS_H2C_PLE_PAGE_SIZE - 1u) /
+     K1_RTL8852BS_H2C_PLE_PAGE_SIZE) << 1u;
+  layout->required_wde_pages = K1_RTL8852BS_DATA_TX_WDE_PAGES;
+
+  /* Every dword of the descriptor is read back, the six that carry a value
+   * against that value and the other six against zero, so a byte the builder
+   * put in the wrong place is a failure here rather than a frame the hardware
+   * interprets differently than intended.
+   */
+
+  if (k1_rtl8852bs_read_le32(descriptor) != body0 ||
+      k1_rtl8852bs_read_le32(descriptor + 4) != 0 ||
+      k1_rtl8852bs_read_le32(descriptor + 8) != body2 ||
+      k1_rtl8852bs_read_le32(descriptor + 12) != body3 ||
+      k1_rtl8852bs_read_le32(descriptor + 16) != 0 ||
+      k1_rtl8852bs_read_le32(descriptor + 20) != 0 ||
+      k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE) != info0 ||
+      k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 4) != info1 ||
+      k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8) != info2 ||
+      k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 12) != 0 ||
+      k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 16) != 0 ||
+      k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 20) != 0)
+    {
+      return -EIO;
+    }
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic
+ *
+ * Description:
+ *   Check, in memory and before anything is transmitted, the three pieces a
+ *   protected data frame needs: the frame this port builds, the 48-byte
+ *   descriptor that carries it to a data queue, and the matcher that decides
+ *   whether an answer came back.
+ *
+ *   Every expected value is written out literally.  A frame whose length,
+ *   header bytes, cipher header, LLC/SNAP header, IPv4 header and UDP checksum
+ *   all agree with numbers computed away from this code cannot be built by a
+ *   builder that shifts a field into the wrong place, and both checksums are
+ *   also re-summed over the finished header, which folds to zero only when the
+ *   checksum inside it is the right one.
+ *
+ *   The matcher is checked against a synthetic answer rather than against the
+ *   Discover, because what it has to do on the air is accept this host's own
+ *   reply and reject everything else: an answer to another station's
+ *   transaction, an answer to another station's hardware address, and a frame
+ *   that is not a reply at all are all offered to it here and must be refused.
+ *
+ *   Nothing here touches a register, transmits a frame, or reads key material.
+ *   The transmit itself lives in the resident window, where a key has actually
+ *   been installed.
+ *
+ * Returned Value:
+ *   OK when every field matched, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
+{
+  static const uint8_t self[6] =
+    {
+      0x02, 0x11, 0x22, 0x33, 0x44, 0x55
+    };
+
+  static const uint8_t bssid[6] =
+    {
+      0x06, 0xaa, 0xbb, 0xcc, 0xdd, 0xee
+    };
+
+  /* The first 32 bytes of the frame: the to-DS protected frame control, the
+   * three addresses, the sequence control, and the CCMP header for packet
+   * number 1 with key identifier 0.
+   */
+
+  static const uint8_t expect_head[32] =
+    {
+      0x08, 0x41, 0x00, 0x00, 0x06, 0xaa, 0xbb, 0xcc,
+      0xdd, 0xee, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55,
+      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x30, 0x12,
+      0x01, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00
+    };
+
+  /* The IPv4 and UDP headers that follow the LLC/SNAP header, checksums
+   * included: total length 286, TTL 64, protocol 17, checksum 0x79d0, an
+   * unspecified source, the all-ones destination, ports 68 to 67, length 266
+   * and checksum 0x5bdd.
+   */
+
+  static const uint8_t expect_ip[28] =
+    {
+      0x45, 0x00, 0x01, 0x1e, 0x00, 0x00, 0x00, 0x00,
+      0x40, 0x11, 0x79, 0xd0, 0x00, 0x00, 0x00, 0x00,
+      0xff, 0xff, 0xff, 0xff, 0x00, 0x44, 0x00, 0x43,
+      0x01, 0x0a, 0x5b, 0xdd
+    };
+
+  static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
+    {
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00
+    };
+
+  struct k1_rtl8852bs_tx_security_s pairwise =
+    {
+      .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+      .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE
+    };
+
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  FAR uint8_t *buffer;
+  FAR uint8_t *frame;
+  FAR uint8_t *reply;
+  FAR uint8_t *descriptor;
+  size_t frame_length = 0;
+  size_t reply_length;
+  size_t offset;
+  size_t ip_offset;
+  uint8_t header_length = 0;
+  uint32_t body0;
+  uint32_t body0_plain;
+  uint32_t body2;
+  uint32_t body3;
+  uint32_t info0;
+  uint32_t info1;
+  uint32_t info2;
+  uint32_t offered = 0;
+  uint64_t first_pn;
+  uint64_t second_pn;
+  int ret;
+
+  buffer = kmm_malloc(2u * K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX +
+                      K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE);
+  if (buffer == NULL)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX error=");
+      k1_early_puthex(ENOMEM);
+      k1_early_puts("\r\n");
+      return -ENOMEM;
+    }
+
+  memset(buffer, 0, 2u * K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX +
+                    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE);
+  frame = buffer;
+  reply = buffer + K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX;
+  descriptor = buffer + 2u * K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX;
+
+  ret = k1_rtl8852bs_runtime_dhcp_discover_build(
+    frame, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, 0x123u, 1ull,
+    0x0a0b0c0du, &frame_length, &header_length);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  ip_offset = (size_t)header_length + K1_RTL8852BS_CCMP_HEADER_SIZE +
+              K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+
+  if (frame_length != K1_RTL8852BS_DHCP_DISCOVER_SIZE ||
+      header_length != K1_RTL8852BS_IEEE80211_HEADER_SIZE ||
+      memcmp(frame, expect_head, sizeof(expect_head)) != 0 ||
+      memcmp(frame + header_length + K1_RTL8852BS_CCMP_HEADER_SIZE,
+             llc_snap, sizeof(llc_snap)) != 0 ||
+      memcmp(frame + ip_offset, expect_ip, sizeof(expect_ip)) != 0)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* A header whose checksum is right re-sums to zero, which is the check a
+   * receiver makes and one no shift error in the builder can also satisfy.
+   */
+
+  if (k1_rtl8852bs_runtime_inet_fold(
+        k1_rtl8852bs_runtime_inet_sum(0u, frame + ip_offset,
+                                     K1_RTL8852BS_IPV4_HEADER_SIZE)) != 0)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* And the same for the UDP checksum, whose sum takes in the pseudo header:
+   * the two addresses, the protocol, and the datagram length twice, once from
+   * the pseudo header and once from the datagram itself.
+   */
+
+  offset = ip_offset + K1_RTL8852BS_IPV4_HEADER_SIZE;
+  if (k1_rtl8852bs_runtime_inet_fold(
+        k1_rtl8852bs_runtime_inet_sum(
+          k1_rtl8852bs_runtime_inet_sum(
+            (uint32_t)K1_RTL8852BS_IPV4_PROTO_UDP +
+            (uint32_t)(frame_length - offset),
+            frame + ip_offset + 12, 8u),
+          frame + offset, frame_length - offset)) != 0)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* The descriptor that carries this frame to band-0's best-effort queue.  The
+   * length it reports counts the cipher header and not the eight MIC bytes the
+   * hardware appends, which is why it is the frame length as built.
+   */
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, 0x123u, header_length, &pairwise, descriptor,
+    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  body0 = k1_rtl8852bs_read_le32(descriptor);
+  body2 = k1_rtl8852bs_read_le32(descriptor + 8);
+  body3 = k1_rtl8852bs_read_le32(descriptor + 12);
+  info0 = k1_rtl8852bs_read_le32(descriptor +
+                                 K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE);
+  info1 = k1_rtl8852bs_read_le32(descriptor +
+                                 K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 4);
+  info2 = k1_rtl8852bs_read_le32(descriptor +
+                                 K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8);
+
+  /* body0: the short-format mode bit, the descriptor-information-present bit,
+   * the twenty half-bytes of header the vendor's own arithmetic produces for a
+   * protected data frame, and DMA channel 0.  body2: the frame length, queue
+   * selector 0 and MAC identifier 0, all of which are zero for this queue.
+   * body3: the sequence number with the no-aggregation background bit.  info0:
+   * the driver-selected 1M rate with data fallback disabled.  info2: CCMP-128,
+   * hardware encryption, security CAM entry 0.
+   */
+
+  if (body0 != 0x0040a400u || body2 != 0x00000146u || body3 != 0x00002123u ||
+      info0 != 0x40000400u || info1 != 0u || info2 != 0x00000d00u)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* 374 bytes of descriptor and frame round up to 47 eight-byte units, so the
+   * write is 376 bytes long and its address carries the unit count in its low
+   * half with the queue in its high half.  The frame occupies 8 packet-buffer
+   * pages and one write-descriptor page.
+   */
+
+  if (layout.fifo_address != 0x0001002fu || layout.transfer_length != 0x178u ||
+      layout.required_ple_pages != 8u || layout.required_wde_pages != 1u)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* Without a cipher the same frame has no cipher header in front of its
+   * payload, so the header field falls from twenty half-bytes to sixteen and
+   * the security dword goes away.  This is the descriptor an unprotected data
+   * frame would use, and it must differ in exactly those two places.
+   */
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, 0x123u, header_length, NULL, descriptor,
+    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  body0_plain = k1_rtl8852bs_read_le32(descriptor);
+  if (body0_plain != 0x00408400u ||
+      k1_rtl8852bs_read_le32(descriptor +
+                             K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8) != 0u)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* An 802.11 header can be neither shorter than the four-address minimum this
+   * port builds nor an odd number of bytes, because the field the descriptor
+   * carries is in half-bytes and could not describe it.  A frame shorter than
+   * its own headers, a descriptor with no room, a cipher of zero and a cipher
+   * beyond the field must be refused too.
+   */
+
+  if (k1_rtl8852bs_runtime_data_secure_tx_build(
+        frame_length, 0x123u, 25u, &pairwise, descriptor,
+        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL ||
+      k1_rtl8852bs_runtime_data_secure_tx_build(
+        frame_length, 0x123u, 22u, &pairwise, descriptor,
+        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL ||
+      k1_rtl8852bs_runtime_data_secure_tx_build(
+        32u, 0x123u, header_length, &pairwise, descriptor,
+        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL ||
+      k1_rtl8852bs_runtime_data_secure_tx_build(
+        frame_length, 0x1000u, header_length, &pairwise, descriptor,
+        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL ||
+      k1_rtl8852bs_runtime_data_secure_tx_build(
+        frame_length, 0x123u, header_length, &pairwise, descriptor,
+        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE - 1u, &layout) != -EINVAL)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  pairwise.sec_type = 0u;
+  if (k1_rtl8852bs_runtime_data_secure_tx_build(
+        frame_length, 0x123u, header_length, &pairwise, descriptor,
+        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  pairwise.sec_type = (uint8_t)(K1_RTL8852BS_MGMT_TXI_SEC_TYPE_MASK + 1u);
+  if (k1_rtl8852bs_runtime_data_secure_tx_build(
+        frame_length, 0x123u, header_length, &pairwise, descriptor,
+        K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout) != -EINVAL)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  pairwise.sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128;
+
+  /* A frame builder given less room than the frame needs must refuse rather
+   * than write past the end of it.
+   */
+
+  if (k1_rtl8852bs_runtime_dhcp_discover_build(
+        frame, K1_RTL8852BS_DHCP_DISCOVER_SIZE - 1u, self, bssid, 0x123u,
+        1ull, 0x0a0b0c0du, &frame_length, &header_length) != -EINVAL)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* The per-key packet number starts at one and never repeats.  This runs
+   * before any key is armed and the arm resets the counter, so consuming two
+   * numbers here cannot collide with a number a real frame will carry.
+   */
+
+  first_pn = k1_rtl8852bs_runtime_tx_packet_number_next();
+  second_pn = k1_rtl8852bs_runtime_tx_packet_number_next();
+  if (first_pn != 1ull || second_pn != 2ull)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  g_k1_rtl8852bs_tx_packet_number = 0;
+
+  /* A synthetic answer to that Discover, shaped the way the receiver will hand
+   * one over: a from-DS data frame whose cipher header the security engine
+   * left in place after decrypting it, an IPv4 datagram from the server port
+   * to the client port, and a BOOTP reply carrying back this host's own
+   * transaction identifier and hardware address.  Its UDP checksum is left
+   * zero, which for IPv4 means the sender did not compute one, and the matcher
+   * does not read it.
+   */
+
+  k1_rtl8852bs_write_le16(reply, 0x4208u);
+  memcpy(reply + 4, self, 6);
+  memcpy(reply + 10, bssid, 6);
+  memcpy(reply + 16, bssid, 6);
+  k1_rtl8852bs_write_le16(reply + 22, (uint16_t)(0x321u << 4));
+
+  ret = k1_rtl8852bs_runtime_ccmp_header_build(
+    2ull, 0u, reply + K1_RTL8852BS_IEEE80211_HEADER_SIZE,
+    K1_RTL8852BS_CCMP_HEADER_SIZE);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+           K1_RTL8852BS_CCMP_HEADER_SIZE;
+  memcpy(reply + offset, llc_snap, sizeof(llc_snap));
+  offset += sizeof(llc_snap);
+  ip_offset = offset;
+
+  reply[offset] = K1_RTL8852BS_IPV4_VERSION_IHL;
+  k1_rtl8852bs_write_be16(reply + offset + 2,
+                          (uint16_t)(K1_RTL8852BS_IPV4_HEADER_SIZE +
+                                     K1_RTL8852BS_UDP_HEADER_SIZE +
+                                     K1_RTL8852BS_BOOTP_FIXED_SIZE));
+  reply[offset + 8] = K1_RTL8852BS_IPV4_TTL;
+  reply[offset + 9] = K1_RTL8852BS_IPV4_PROTO_UDP;
+  reply[offset + 12] = 192;
+  reply[offset + 13] = 168;
+  reply[offset + 14] = 1;
+  reply[offset + 15] = 1;
+  memset(reply + offset + 16, 0xff, 4);
+  k1_rtl8852bs_write_be16(
+    reply + offset + 10,
+    k1_rtl8852bs_runtime_inet_fold(
+      k1_rtl8852bs_runtime_inet_sum(0u, reply + offset,
+                                    K1_RTL8852BS_IPV4_HEADER_SIZE)));
+
+  offset += K1_RTL8852BS_IPV4_HEADER_SIZE;
+  k1_rtl8852bs_write_be16(reply + offset, K1_RTL8852BS_DHCP_SERVER_PORT);
+  k1_rtl8852bs_write_be16(reply + offset + 2, K1_RTL8852BS_DHCP_CLIENT_PORT);
+  k1_rtl8852bs_write_be16(reply + offset + 4,
+                          (uint16_t)(K1_RTL8852BS_UDP_HEADER_SIZE +
+                                     K1_RTL8852BS_BOOTP_FIXED_SIZE));
+
+  offset += K1_RTL8852BS_UDP_HEADER_SIZE;
+  reply[offset] = K1_RTL8852BS_BOOTP_REPLY;
+  reply[offset + 1] = 1;
+  reply[offset + 2] = 6;
+  reply[offset + K1_RTL8852BS_BOOTP_XID_OFFSET] = 0x0a;
+  reply[offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 1] = 0x0b;
+  reply[offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 2] = 0x0c;
+  reply[offset + K1_RTL8852BS_BOOTP_XID_OFFSET + 3] = 0x0d;
+  reply[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET] = 192;
+  reply[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 1] = 168;
+  reply[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 2] = 1;
+  reply[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 3] = 123;
+  memcpy(reply + offset + K1_RTL8852BS_BOOTP_CHADDR_OFFSET, self, 6);
+  reply_length = offset + K1_RTL8852BS_BOOTP_FIXED_SIZE;
+
+  if (!k1_rtl8852bs_runtime_dhcp_reply_match(
+        reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
+        0x0a0b0c0du, &offered) || offered != 0xc0a8017bu)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* Reached at the offset an unprotected frame would put its plaintext at,
+   * the same answer must still be read: the cipher header is not there, so the
+   * first placement fails to find an LLC/SNAP header and the second finds it.
+   */
+
+  offered = 0;
+  if (!k1_rtl8852bs_runtime_dhcp_reply_match(
+        reply, reply_length, ip_offset, self, 0x0a0b0c0du, &offered) ||
+      offered != 0xc0a8017bu)
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  /* Another station's transaction, another station's hardware address, a
+   * request rather than a reply, an answer that did not come from the server
+   * port, a frame cut short of its BOOTP fields, and this host's own Discover
+   * must all be refused.  The last is what keeps a transmit from being counted
+   * as its own answer.
+   */
+
+  if (k1_rtl8852bs_runtime_dhcp_reply_match(
+        reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
+        0x0a0b0c0eu, &offered) ||
+      k1_rtl8852bs_runtime_dhcp_reply_match(
+        reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, bssid,
+        0x0a0b0c0du, &offered) ||
+      k1_rtl8852bs_runtime_dhcp_reply_match(
+        reply, reply_length - 1u, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
+        0x0a0b0c0du, &offered) ||
+      k1_rtl8852bs_runtime_dhcp_reply_match(
+        frame, K1_RTL8852BS_DHCP_DISCOVER_SIZE,
+        K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, 0x0a0b0c0du, &offered))
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  reply[offset] = K1_RTL8852BS_BOOTP_REQUEST;
+  if (k1_rtl8852bs_runtime_dhcp_reply_match(
+        reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
+        0x0a0b0c0du, &offered))
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  reply[offset] = K1_RTL8852BS_BOOTP_REPLY;
+  k1_rtl8852bs_write_be16(reply + ip_offset + K1_RTL8852BS_IPV4_HEADER_SIZE,
+                          K1_RTL8852BS_DHCP_CLIENT_PORT);
+  if (k1_rtl8852bs_runtime_dhcp_reply_match(
+        reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
+        0x0a0b0c0du, &offered))
+    {
+      ret = -EIO;
+      goto error;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX len=");
+  k1_early_puthex(frame_length);
+  k1_early_puts(" hdr=");
+  k1_early_puthex(header_length);
+  k1_early_puts(" body0=");
+  k1_early_puthex(body0);
+  k1_early_puts(" body2=");
+  k1_early_puthex(body2);
+  k1_early_puts(" body3=");
+  k1_early_puthex(body3);
+  k1_early_puts(" info0=");
+  k1_early_puthex(info0);
+  k1_early_puts(" info2=");
+  k1_early_puthex(info2);
+  k1_early_puts(" plain-body0=");
+  k1_early_puthex(body0_plain);
+  k1_early_puts("\r\n");
+  k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX fifo=");
+  k1_early_puthex(layout.fifo_address);
+  k1_early_puts(" xfer=");
+  k1_early_puthex(layout.transfer_length);
+  k1_early_puts(" ple=");
+  k1_early_puthex(layout.required_ple_pages);
+  k1_early_puts(" wde=");
+  k1_early_puthex(layout.required_wde_pages);
+  k1_early_puts(" pn=");
+  k1_early_puthex((uintreg_t)second_pn);
+  k1_early_puts(" offer=");
+  k1_early_puthex(offered);
+  k1_early_puts("\r\n");
+  k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX head=");
+  k1_rtl8852bs_scanofld_log_bytes(frame, sizeof(expect_head));
+  k1_early_puts("\r\n");
+  k1_early_puts("K1 Wi-Fi GPL: RTL8852BS2 runtime protected data TX "
+                "complete\r\n");
+  kmm_free(buffer);
+  return OK;
+
+error:
+  kmm_free(buffer);
+  k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX error=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+  return ret < 0 ? ret : -EIO;
+}
+
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_maclbk_probe
  *
@@ -23586,6 +24847,24 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_RESIDENT_DEAUTH_BODY       26u
 #define K1_RTL8852BS_RESIDENT_OTHER_HEAD        16u
 
+/* When the one protected data frame goes out, and how often it is repeated.
+ *
+ * It waits longer than the Probe Request does because it is only worth sending
+ * once a Beacon from the access point has arrived: the Beacon is what says the
+ * receiver is on the right channel and the access point is live, and a frame
+ * sent before that would report nothing about the keys if it were ignored.
+ *
+ * Two attempts, a second apart, with the retransmission keeping the first
+ * one's transaction identifier -- which is what a DHCP client does, and what
+ * keeps a single lost frame from being the whole result.  The gap is long
+ * because a DHCP server is answered by software, not by the access point's
+ * hardware, and an answer can take hundreds of milliseconds.
+ */
+
+#define K1_RTL8852BS_RESIDENT_DATA_DELAY_MSEC   600u
+#define K1_RTL8852BS_RESIDENT_DATA_GAP_MSEC     1000u
+#define K1_RTL8852BS_RESIDENT_DATA_ATTEMPTS     2u
+
 /* How much of the first protected data frame is kept.  Thirty-two bytes reach
  * past the longest header a QoS data frame from an access point can have and
  * past the eight-byte CCMP header behind it, so the dump shows the header, the
@@ -23726,6 +25005,29 @@ struct k1_rtl8852bs_resident_count_s
   uint8_t first_sec_header_length;
   bool first_sec_valid;
   bool first_sec_protected;
+
+  /* The one protected data frame this window transmits, and the answer to it.
+   *
+   * data_tx_status is the submitter's own return: zero means the frame was
+   * written into the queue, and anything else says which step refused it,
+   * which is the difference between a frame the access point ignored and a
+   * frame that never left.  data_tx_xid is the transaction identifier the
+   * Discover carried, and it doubles as the flag that says a Discover was
+   * transmitted at all, because a reply can only be looked for once one was.
+   *
+   * dhcp_replies counts the answers that carried both that identifier and this
+   * host's own hardware address back, so nothing another station's exchange
+   * produced can be counted here, and dhcp_offer keeps the address the first
+   * of them offered.  An offered address is not a credential and is printed.
+   */
+
+  uint32_t data_tx_sent;
+  uint32_t data_tx_bytes;
+  uint32_t data_tx_xid;
+  uint32_t dhcp_replies;
+  uint32_t dhcp_offer;
+  uint16_t data_tx_sequence;
+  int data_tx_status;
 };
 
 /****************************************************************************
@@ -24483,6 +25785,7 @@ static void k1_rtl8852bs_runtime_resident_observe(
   FAR struct k1_rtl8852bs_resident_count_s *count)
 {
   struct k1_rtl8852bs_mgmt_frame_s mgmt;
+  uint32_t offered = 0;
   uint8_t subtype;
   uint8_t type;
   bool from_target;
@@ -24535,6 +25838,30 @@ static void k1_rtl8852bs_runtime_resident_observe(
           if (from_target)
             {
               count->data_frames_target++;
+
+              /* And whether this is the answer to the Discover this window
+               * transmitted.  It is asked only of a frame from the access
+               * point this run associated with, and only once something was
+               * transmitted to answer; the matcher then requires this host's
+               * own transaction identifier and hardware address to come back
+               * inside it, which is what makes an answer proof that the key
+               * the frame was encrypted with is the key the access point
+               * decrypted it with.
+               */
+
+              if (count->data_tx_xid != 0 &&
+                  k1_rtl8852bs_runtime_dhcp_reply_match(
+                    payload, payload_length,
+                    k1_rtl8852bs_runtime_resident_header_length(
+                      mgmt.frame_control),
+                    self_mac, count->data_tx_xid, &offered))
+                {
+                  count->dhcp_replies++;
+                  if (count->dhcp_offer == 0)
+                    {
+                      count->dhcp_offer = offered;
+                    }
+                }
             }
 
           return;
@@ -24607,6 +25934,242 @@ static void k1_rtl8852bs_runtime_resident_observe(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_sch_tx_en_data
+ *
+ * Description:
+ *   Enable contention transmit for band 0's best-effort queue.
+ *
+ *   The management variant of this explains why the register has to be written
+ *   at all: the static cmac_init() subset this component programs leaves
+ *   R_AX_CTN_TXEN at its reset value, and a queue whose bit is clear there is
+ *   never served no matter who filled it.  That variant deliberately enabled
+ *   only the two management queues, because at the time there was no data path
+ *   to serve.  This adds the one data queue that path uses -- B_AX_CTN_TXEN_BE_0,
+ *   which is the queue a to-DS frame with TID 0 lands in -- and adds nothing
+ *   else, so every other data queue stays exactly as it was.
+ *
+ *   The bit is ORed in, so a run that already enabled the management queues
+ *   keeps them.
+ *
+ * Returned Value:
+ *   OK when the bit reads back set, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_sch_tx_en_data(void)
+{
+  const uint32_t wanted = K1_RTL8852BS_CTN_TXEN_BE_0;
+  uint32_t before = 0;
+  uint32_t after = 0;
+  int ret;
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_CTN_TXEN, &before);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_write32(K1_RTL8852BS_CTN_TXEN, before | wanted);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_CTN_TXEN, &after);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: resident data scheduler TX enable before=");
+  k1_early_puthex(before);
+  k1_early_puts(" after=");
+  k1_early_puthex(after);
+  k1_early_puts(" wanted=");
+  k1_early_puthex(wanted);
+  k1_early_puts("\r\n");
+
+  if ((after & wanted) != wanted)
+    {
+      return -EIO;
+    }
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_data_tx
+ *
+ * Description:
+ *   Transmit one CCMP-protected data frame -- a DHCP Discover -- on band 0's
+ *   best-effort queue, and record what was sent so the answer can be
+ *   recognised.
+ *
+ *   This is the first frame this port ever asks the hardware to encrypt.  The
+ *   descriptor names the pairwise key by its security CAM index and the frame
+ *   carries the CCMP header the host builds for it; the hardware supplies the
+ *   ciphertext and the eight MIC bytes, which is why the length the descriptor
+ *   reports counts the CCMP header and not the MIC.
+ *
+ *   Everything else follows the management submitter step for step: enable the
+ *   queue in the scheduler, refuse to write when the queue or the packet
+ *   buffer has no room rather than overrun it, write descriptor and frame in
+ *   one SDIO transfer to the queue's own address, and poll the page counter
+ *   afterwards so the log says whether the dispatcher took the frame.  The
+ *   only differences are the queue -- channel 0 rather than the management
+ *   channel -- and the 48-byte descriptor, which this frame needs because its
+ *   header field and its security field live in the second half of it.
+ *
+ *   The caller has already established that a pairwise key is installed.  A
+ *   frame encrypted with a key the access point does not have would be
+ *   dropped by it silently, and a silent drop is indistinguishable from a
+ *   frame that was never radiated, so this is never transmitted on a run whose
+ *   handshake did not complete.
+ *
+ * Input Parameters:
+ *   self_mac - the eFuse self MAC, which is address 2 and the client address
+ *   bssid    - the access point, which is address 1
+ *   count    - the window's counters, which record what was transmitted
+ *
+ * Returned Value:
+ *   OK when the frame was written into the queue, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_data_tx(
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  struct k1_rtl8852bs_tx_security_s security =
+    {
+      .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+      .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE
+    };
+
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_resources_s before_res;
+  struct k1_rtl8852bs_data_tx_resources_s after_res;
+  FAR uint8_t *packet;
+  size_t frame_length = 0;
+  unsigned int drained;
+  uint16_t sequence;
+  uint8_t header_length = 0;
+  uint64_t packet_number;
+  uint32_t transaction_id;
+  int ret;
+
+  packet = kmm_malloc(K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                      K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+  if (packet == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  memset(packet, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+  packet_number = k1_rtl8852bs_runtime_tx_packet_number_next();
+
+  /* The transaction identifier only has to be one no other exchange on this
+   * network is using and one this run can recognise again.  The tick count
+   * makes it differ between runs, the sequence number between frames of a run,
+   * and the low half of the hardware address between stations; the high bit is
+   * forced so it can never come out zero, which is the value that means no
+   * Discover was transmitted.
+   */
+
+  if (count->data_tx_xid != 0)
+    {
+      /* A retransmission of a Discover that was not answered keeps the first
+       * one's identifier, the way a DHCP client's does, so an answer to either
+       * attempt is recognised.
+       */
+
+      transaction_id = count->data_tx_xid;
+    }
+  else
+    {
+      transaction_id = 0x80000000u |
+                       (((uint32_t)clock_systime_ticks() & 0xffffu) << 12) |
+                       (((uint32_t)self_mac[5] ^ (uint32_t)sequence) & 0xfffu);
+    }
+
+  ret = k1_rtl8852bs_runtime_dhcp_discover_build(
+    packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, sequence,
+    packet_number, transaction_id, &frame_length, &header_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, sequence, header_length, &security, packet,
+    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* Best effort, as in the management submitter: the helper only ORs one bit
+   * in, so a scheduler that was already serving this queue is unaffected and
+   * its failure is not fatal to the transfer.
+   */
+
+  k1_rtl8852bs_runtime_sch_tx_en_data();
+
+  ret = k1_rtl8852bs_data_tx_resources_read(
+    K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &before_res);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  if (before_res.channel_used_pages +
+      layout.required_wde_pages > before_res.channel_max_pages ||
+      before_res.wp_available_pages <
+      layout.required_ple_pages + K1_RTL8852BS_DATA_TX_PLE_RESERVE)
+    {
+      ret = -ENOSPC;
+      goto done;
+    }
+
+  ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
+                           layout.transfer_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* Recorded only once the write succeeded, so a reply is looked for only for
+   * a Discover that actually reached the queue.
+   */
+
+  count->data_tx_sent++;
+  count->data_tx_bytes = (uint32_t)frame_length;
+  count->data_tx_sequence = sequence;
+  count->data_tx_xid = transaction_id;
+
+  for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
+    {
+      if (k1_rtl8852bs_data_tx_resources_read(
+            K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &after_res) != OK ||
+          after_res.channel_used_pages == before_res.channel_used_pages)
+        {
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  ret = OK;
+
+done:
+  kmm_free(packet);
+  return ret;
+}
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_window
  *
  * Description:
@@ -24655,6 +26218,8 @@ static int k1_rtl8852bs_runtime_resident_window(
   FAR uint8_t *buffer;
   clock_t deadline;
   clock_t probe_deadline;
+  clock_t data_deadline;
+  unsigned int data_attempts = 0;
   size_t probe_length;
   size_t length;
   size_t offset;
@@ -24677,6 +26242,7 @@ static int k1_rtl8852bs_runtime_resident_window(
 
   memset(&count, 0, sizeof(count));
   count.probe_status = -ENODATA;
+  count.data_tx_status = -ENODATA;
 
   k1_early_puts("K1 Wi-Fi GPL: resident window enter channel=");
   k1_early_puthex(channel);
@@ -24753,6 +26319,8 @@ static int k1_rtl8852bs_runtime_resident_window(
              MSEC2TICK(K1_RTL8852BS_RESIDENT_WINDOW_MSEC);
   probe_deadline = clock_systime_ticks() +
                    MSEC2TICK(K1_RTL8852BS_RESIDENT_PROBE_DELAY_MSEC);
+  data_deadline = clock_systime_ticks() +
+                  MSEC2TICK(K1_RTL8852BS_RESIDENT_DATA_DELAY_MSEC);
 
   while ((sclock_t)(clock_systime_ticks() - deadline) < 0)
     {
@@ -24788,6 +26356,43 @@ static int k1_rtl8852bs_runtime_resident_window(
           k1_early_puthex(sequence);
           k1_early_puts(" bytes=");
           k1_early_puthex((uintreg_t)probe_length);
+          k1_early_puts(" status=");
+          k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts("\r\n");
+        }
+
+      /* And the one protected data frame, once a Beacon from the access point
+       * has arrived and only when the handshake actually installed a pairwise
+       * key.  Without that key there is nothing to encrypt the frame with that
+       * the access point also holds, and its silence would say nothing about
+       * the keys; with it, an answer says the key this host derived is the key
+       * the access point decrypts with.
+       *
+       * It stops as soon as an answer arrives, and the attempt counter bounds
+       * it whether or not the frame ever reached the queue, so a queue that
+       * refuses the write is retried a fixed number of times rather than for
+       * the rest of the window.
+       */
+
+      if (g_k1_rtl8852bs_key_install.tk_installed &&
+          count.beacons_target > 0 && count.dhcp_replies == 0 &&
+          data_attempts < K1_RTL8852BS_RESIDENT_DATA_ATTEMPTS &&
+          (sclock_t)(clock_systime_ticks() - data_deadline) >= 0)
+        {
+          ret = k1_rtl8852bs_runtime_resident_data_tx(self_mac, bssid, &count);
+          data_attempts++;
+          count.data_tx_status = ret;
+          data_deadline = clock_systime_ticks() +
+                          MSEC2TICK(K1_RTL8852BS_RESIDENT_DATA_GAP_MSEC);
+
+          k1_early_puts("K1 Wi-Fi GPL: resident data tx sn=");
+          k1_early_puthex(count.data_tx_sequence);
+          k1_early_puts(" bytes=");
+          k1_early_puthex(count.data_tx_bytes);
+          k1_early_puts(" xid=");
+          k1_early_puthex(count.data_tx_xid);
+          k1_early_puts(" pn=");
+          k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
           k1_early_puts(" status=");
           k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
           k1_early_puts("\r\n");
@@ -25057,6 +26662,40 @@ static int k1_rtl8852bs_runtime_resident_window(
                                       count.first_sec_length);
       k1_early_puts("\r\n");
     }
+
+  /* The transmit half of the same question.  sent is how many protected data
+   * frames the window wrote into the data queue and status is what the last
+   * attempt returned, so a zero status with sent above zero says the hardware
+   * accepted a frame it had to encrypt itself -- which is what this increment
+   * set out to do.  tk says whether a pairwise key was installed at all, and
+   * without one nothing is transmitted, so a zero there explains a zero sent.
+   *
+   * dhcp-reply is the stronger reading, and it is reported rather than
+   * required: an answer can only exist if the access point decrypted this
+   * frame with the key this host derived and forwarded it to a DHCP server,
+   * but an access point with no server behind it would never answer a frame it
+   * decrypted perfectly well.  offer-ip is the address the answer offered,
+   * which is not a credential.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window data tx sent=");
+  k1_early_puthex(count.data_tx_sent);
+  k1_early_puts(" bytes=");
+  k1_early_puthex(count.data_tx_bytes);
+  k1_early_puts(" sn=");
+  k1_early_puthex(count.data_tx_sequence);
+  k1_early_puts(" xid=");
+  k1_early_puthex(count.data_tx_xid);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(count.data_tx_status < 0 ?
+                              -count.data_tx_status : 0));
+  k1_early_puts(" tk=");
+  k1_early_puthex(g_k1_rtl8852bs_key_install.tk_installed ? 1 : 0);
+  k1_early_puts(" dhcp-reply=");
+  k1_early_puthex(count.dhcp_replies);
+  k1_early_puts(" offer-ip=");
+  k1_early_puthex(count.dhcp_offer);
+  k1_early_puts("\r\n");
 
   /* The verdict names the earliest thing that was wrong, so a run reads as
    * one cause rather than as a list.  A register that moved comes first

@@ -303,6 +303,13 @@ def parse_args() -> argparse.Namespace:
               "register unchanged across it, and the receive filter restored"),
     )
     parser.add_argument(
+        "--require-runtime-data-secure-tx", action="store_true",
+        help=("fail unless the protected data frame this host transmits "
+              "checks out against its offline model and the data queue "
+              "accepts one on the associated channel with a pairwise key "
+              "installed"),
+    )
+    parser.add_argument(
         "--require-runtime-wpa-msg1", action="store_true",
         help=("fail unless a pairwise master key is derived from a configured "
               "passphrase and the access point sends a first EAPOL-Key frame "
@@ -2065,6 +2072,63 @@ def main() -> int:
             )
             if resident_end_result is None:
                 missing.append("RTL8852BS2 resident window completion")
+        if args.require_runtime_data_secure_tx:
+            # The memory-only half first: the DHCP Discover body, both
+            # IPv4/UDP checksums, the data-queue descriptor and the reply
+            # matcher, all against values a python model produced offline.  A
+            # failure here says the frame would have been wrong on the air.
+            data_secure_model_result = re.search(
+                rb"K1 Wi-Fi GPL: RTL8852BS2 runtime protected data TX "
+                rb"complete\r?\n",
+                started,
+            )
+            if data_secure_model_result is None:
+                missing.append("RTL8852BS2 protected data TX frame model")
+
+            # The on-air half, sliced from the resident window's entry line so
+            # nothing printed before the association can satisfy it.  status
+            # is what the queue returned for the last attempt, and a zero
+            # there with the frame built from a live pairwise key is a frame
+            # the hardware took to encrypt itself.
+            data_secure_begin_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window enter channel="
+                rb"(?:0x)?0*[1-9a-fA-F][0-9a-fA-F]*",
+                started,
+            )
+            if data_secure_begin_result is None:
+                missing.append(
+                    "RTL8852BS2 resident window start before a protected "
+                    "data transmit")
+                data_secure = started
+            else:
+                data_secure = started[data_secure_begin_result.end():]
+
+            data_secure_tx_result = re.search(
+                rb"K1 Wi-Fi GPL: resident data tx sn=[^\r\n]*"
+                rb" status=0x0+(?![0-9a-fA-F])",
+                data_secure,
+            )
+            if data_secure_tx_result is None:
+                missing.append(
+                    "RTL8852BS2 protected data frame accepted by a data queue")
+
+            # And the window's own read-back of it, which is what says the
+            # frame counted above was transmitted with a key installed rather
+            # than skipped.  The DHCP reply on the same line is reported by
+            # the firmware and deliberately not required here: an access point
+            # with no DHCP server behind it would decrypt this frame perfectly
+            # well and still never answer.
+            data_secure_report_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window data tx "
+                rb"sent=(?:0x)?0*[1-9a-fA-F][0-9a-fA-F]*"
+                rb"[^\r\n]* status=0x0+(?![0-9a-fA-F])"
+                rb" tk=(?:0x)?0*1(?![0-9a-fA-F])",
+                data_secure,
+            )
+            if data_secure_report_result is None:
+                missing.append(
+                    "RTL8852BS2 resident window protected data transmit "
+                    "summary")
         if args.require_h2c_tx_resource:
             h2c_tx_result = re.search(
                 rb"K1 Wi-Fi GPL: RTL8852BS2 H2C TX resource diagnostic "

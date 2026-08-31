@@ -558,9 +558,52 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   还差的是数据队列那一路真的发（增量 3j）：把 CCMP 头拼进帧、帧长按「不含 MIC」算、走数据
   DMA 通道提交、观察 AP 回应（候选首帧 DHCP Discover，驻留窗口已经在数
   `data_frames_to_self`），以及每密钥的单调 PN 计数器——现在 PN 还只是函数参数。
-- **下一步优先级**：(1) 真的发出一帧被 CCMP 保护的数据帧（增量 3j）——**描述符的安全字段与
-  CCMP 头这两块砖已经写完、逐字段验过并在 run 40 上板确认**（见上一条），RX 侧那一半也已经在
-  run 39 上板证明了。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
+- **代码完成、尚未上板（增量 3j）：真的往数据队列发一帧被 CCMP 保护的数据帧。** run 41 待跑，
+  离线断言全过、`-fsyntax-only` 干净、两个方向的镜像哈希都记下了，但**一次都没上过板，别当成
+  硬件结论**。没有新的 Kconfig 符号（内存那半仍挂在
+  `CONFIG_K1_RTL8852BS2_RUNTIME_DATA_TX_DIAGNOSTIC` 下），新判据
+  `--require-runtime-data-secure-tx`，判据数 36 → **37**。
+  做的事：(a) `..._runtime_dhcp_discover_build()` 拼一帧 **326** 字节的到-DS 保护数据帧——
+  FC `0x4108`、A1 = BSSID、A2 = 本端、A3 = 广播、主机拼的 CCMP 头（key id 0）、LLC/SNAP、
+  IPv4（0.0.0.0 → 255.255.255.255）、UDP 68 → 67、BOOTP DHCP Discover；A1 是 AP 的单播地址，
+  所以**不置 BMC 位**，AP 会 ACK、硬件会重传。(b) `..._runtime_data_secure_tx_build()` 建 48 字节
+  描述符（WD BODY 24 ＋ WD INFO 24，因为原厂核心对每帧都置 `wdinfo_en`），`hdr_llc` 按原厂
+  `get_hdr_with_llc()` 写 **20** 个半字节（`24+8+8`，原厂数据帧 `with_llc=1`、
+  `sec_hdr_len=iv_len`；mainline 写 12，两者都不影响本移植——这个字段只给 TX checksum offload
+  和硬件头转换用，都没开），`AX_TXD_BK` BIT(13) 置一（原厂在 `ampdu_en==FALSE` 时置）、
+  `AGG_EN` 保持零，队列是 band 0 BE（`qsel=0`、`ch_dma=0`），`info2` 复用 3i 的
+  `(sec_type<<9)|BIT(8)|sec_cam_idx`。(c) `..._runtime_sch_tx_en_data()` 打开 `R_AX_CTN_TXEN`
+  的 BIT(0)（`B_AX_CTN_TXEN_BE_0`）——**本移植此前只开过 MGQ `0x100` 与 CPUMGQ `0x400`，
+  数据队列那一位从来没开过**。(d) PN 从函数参数升成真计数器
+  `g_k1_rtl8852bs_tx_packet_number`，从 1 起算、单调加一、装新密钥时归零。
+  (e) `..._runtime_dhcp_reply_match()`：`op==2 && xid==ours && chaddr==self`，先试
+  `header_length+8` 再试 `header_length` 找 LLC/SNAP（解密后的帧**保留** CCMP 头，明文帧没有），
+  因此从不解析密文。(f) 驻留窗口在「已装 TK ＋ 已收到目标 AP 的 Beacon ＋ 还没收到回应」时
+  最多发 2 次，重传**沿用第一次的 xid**；两行新打印
+  `resident data tx sn=… bytes=… xid=… pn=… status=…` 与
+  `resident window data tx sent=… status=… tk=… dhcp-reply=… offer-ip=…`。
+  **为什么首帧是 DHCP Discover**：一个 `op=2`、`xid` 等于我们随机出来的那个、`chaddr` 等于本端
+  eFuse MAC 的 BOOTP 回应，只可能在「AP 用我们派生的密钥解开了这一帧并转给了它的 DHCP 服务器」
+  之后存在——这是不可伪造的证据，而「发出去没报错」只证明硬件收下了描述符。
+  离线字面量（python 模型算的）：帧长 `326`、IP total `0x11e`、UDP len `0x10a`、
+  IP 校验和 `0x79d0`、UDP 校验和 `0x5bdd`（各自连校验和再加一遍折成 0），描述符
+  `body0=0x0040a400 body2=0x146 body3=0x2123 info0=0x40000400 info1=0 info2=0xd00`
+  （不保护时 `body0=0x00408400`、`info2=0`），布局 `fifo=0x1002f transfer=0x178` 8 个 PLE page
+  1 个 WDE page，另有 7 个描述符负例、1 个建帧负例、PN 连续 1／2、一帧合成回应在
+  `header_length` 24 与 40 两处都匹配 ＋ 6 个匹配器负例。
+  **`dhcp-reply=` 是报告不是判据**：一台背后没有 DHCP 服务器的 AP 会把这一帧解得好好的却永远
+  不回，所以判据只卡「离线模型全对 ＋ 数据队列收下了一帧且当时确实装着成对密钥」。
+  镜像：带密钥 `9833e8cd…`（`--clean` 与切回来的增量同一个哈希），`--no-key` `095e1663…`。
+  **上板要看三件事**：`resident data scheduler TX enable` 的 `after=` 里 BE 位真的置上、
+  `resident data tx … status=0x0`、以及 `resident window data tx … dhcp-reply=`。
+  环境坑（这次踩到）：用 ninja 直接编单个对象文件会触发一次半途失败的 cmake 重配
+  （`ccache` 不在那个 shell 的 PATH 上），留下的 `build.ninja` 里 `-march` 退成 `rv64imac`，
+  整棵树报 `extension 'zicsr' required`。`--clean` 一次即恢复。以后快速语法检查从
+  `compile_commands.json` 取命令行、去掉 ccache 前缀、加 `-fsyntax-only` 自己跑。
+- **下一步优先级**：(1) 把增量 3j 跑上板（run 41）——**发送这一路的代码已经全部写完**（见上一
+  条：帧、48 字节描述符、BE 队列的调度器使能位、PN 计数器、回应匹配器、驻留窗口里的两次发送），
+  描述符的安全字段与 CCMP 头在 run 40 上板确认过，RX 侧那一半在 run 39 上板证明过，**唯一还没
+  发生的事是让硬件真的把这一帧发出去**。密钥已经在硬件里（增量 3f）、port 已经使能（增量 3g）、
   信道本来就是驻留的（增量 3h 的更正一），所以挡在「密钥装好」和「能收发数据」之间的
   只剩这一条——描述符不引用安全 CAM index，硬件就不会去加密。
   字段位置和取值现在都有出处：WD info dword2（描述符偏移 `24+8`）里 `sec_type` [12:9]、
@@ -703,22 +746,24 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是数据面：发送描述符的安全字段**——密钥已经在硬件里、port 也已经使能、
-信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），但没有任何一条发送路径去引用
-安全 CAM index，所以仍然一帧 CCMP 都没有。增量 3h 本身（不跑扫描的驻留收发窗口）
+**当前实际下一步是数据面的上板验证：增量 3j 的发送路径已经写完，但一次没上过板**——密钥已经在
+硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
+描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），但**硬件还没有真的按这套
+配置发出过一帧**，所以到目前为止本端仍然一帧 CCMP 都没发过。增量 3h 本身（不跑扫描的驻留收发窗口）
 已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题
 都已修完）。
 做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e/3f/3g/3h 镜像：
 
 ```bash
 tools/build_k1_wpa.sh             # profile board/k1/muse_pi_pro/configs/wireless_wpa_diag
-tools/run_k1_wpa.sh               # 上板：36 条 --require-*，K1_RESET_MODE 选复位方式
+tools/run_k1_wpa.sh               # 上板：37 条 --require-*，K1_RESET_MODE 选复位方式
 ```
 
-板上验收现在是 36 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
+板上验收现在是 37 条 `--require-*`（30 条关联链 ＋ 握手链 ＋ `--require-runtime-wpa-keys`
 ＋ `--require-runtime-port-init` ＋ 增量 3h 的 `--require-runtime-resident`
-＋ 增量 3i 后半的 `--require-runtime-tx-security`），不用再手抄那条长命令：
-`tools/run_k1_wpa.sh` 把这 36 条固定下来，复位方式用环境变量
+＋ 增量 3i 后半的 `--require-runtime-tx-security` ＋ 增量 3j 的
+`--require-runtime-data-secure-tx`），不用再手抄那条长命令：
+`tools/run_k1_wpa.sh` 把这 37 条固定下来，复位方式用环境变量
 `K1_RESET_MODE`（默认 `--nsh-reboot`，板子不在 `nsh>` 时设成 `--manual-reset` 再按 RST），
 额外参数原样透传。**它不接受也不打印任何口令**。run 40 用它跑，36 条一条没失败，日志
 `out/k1-serial/k1-wpa-20260831T010437Z.log`；run 35 跑的是其中 34 条（那时还没有最后两条）、
