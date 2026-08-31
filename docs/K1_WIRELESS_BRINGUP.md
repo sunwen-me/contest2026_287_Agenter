@@ -7022,6 +7022,117 @@ harness `ast.parse` 干净，正则自测确认新增 6 个捕获组、`resident
 其中 ch1 的 `50:4f:3b:e2:e6:d2` 是目标 AP。3o 没有新增 `--require-*`，
 仍然只靠 `data_secure_txrpt_result` 这一条门。
 
+### 增量 3p：把 `HDR_LLC_LEN` 送上 A/B——让 AP 自己说它认哪一个
+
+3o 之后剩下三处嫌疑，本增量先把它们逐个收窄，再对唯一活下来的那一处做一次
+板上对照实验。
+
+#### 先排掉的三处
+
+- **帧体（嫌疑 3）几乎可以排掉。** 把 `dhcp_discover_build()` 产出的 326 字节
+  逐段对着 RFC 数了一遍：24（MAC）+ 8（CCMP）+ 8（LLC/SNAP `aa aa 03 00 00 00
+  08 00`）+ 20（IPv4 `0.0.0.0 → 255.255.255.255`，首部校验和自算）+ 8（UDP
+  68→67，带伪首部的校验和，算出 0 时按规范改写成 `0xffff`）+ 236（BOOTP：
+  `op=1 htype=1 hlen=6`，`flags=0x8000`，`chaddr` 是本机 MAC）+ 22（magic
+  cookie `63 82 53 63`、53/1/1、61/7/1+MAC、55/3/1,3,6、`0xff`）＝ 326，
+  和板上 `bytes=0x146` 完全一致。
+- **安全引擎（嫌疑 1 的第一种机制）不成立。** run 50 的读回是
+  `sec-eng ctrl before=0x0000000080002800 after=0x000000008000273f
+  mpdu-proc before=0x0 after=0x3`：`SEC_TX_ENC`(bit0)、`SEC_RX_DEC`(bit1)、
+  BC/MC/UC-MGMT/BMC-MGMT 解密(bit2-5)、三个 cipher 时钟(bit8-10) 全开，
+  `TX_PARTIAL_MODE`(bit11) 是关的，`APPEND_ICV|APPEND_MIC` 也都写进去了。
+  「硬件根本没加密」这条已经死了。
+- **PN（第二种机制）也不成立。** `tx_packet_number_next()` 是先加再取，所以第一
+  帧带的是 **PN 1** 而不是 0——PN 0 会被任何把重放计数器初始化为 0 的接收方直接
+  丢掉——并且 `ccmp_header_build()` 显式拒绝 0。头部排布
+  `PN0,PN1,0,keyid<<6|ExtIV,PN2..PN5` 也是标准的。
+
+#### 活下来的那一处：`AX_TXD_HDR_LLC_LEN` 到底该填几
+
+本移植照原厂 `trx_desc.c` 的 `get_hdr_with_llc()` 填 **20** 个半字节，也就是
+`(24 + 8 + 8) / 2`——MAC 头 ＋ LLC/SNAP ＋ cipher 头的总和。mainline 的
+`rtw89_core_tx_update_llc_hdr()` 填的是 **12**，即 `ieee80211_hdrlen(fc) >> 1`，
+只算 MAC 头。
+
+本移植原来的注释断言两个值都「无关紧要」，理由是它只服务校验和卸载和头部转换，
+而这两条路本移植都没开。**这个推理是错的**，本增量把它改掉了：mainline 用 12
+能在同一颗芯片上跑硬件 CCMP，只能证明硬件**不需要** 20，证明不了 20 无害。安全
+引擎同样得知道 MAC 头在哪里结束——那正是它要去读 PN 的 cipher 头的起点。如果它
+取的就是这个字段，那么 20 会把它指到 IP 头里面 8 个字节处，而 12 正好指在 cipher
+头上。这种错法的表现和现在看到的现象完全一致：**AP 的硬件 ACK 照发**（ACK 在解
+密之前生成），**MIC 校验静默失败**，于是永远没有 DHCP Offer。
+
+原厂那一侧无法在本地证明：`get_hdr_with_llc()` 依赖 `mac_read_with_llc()` 的硬件
+读数，`info->sec_hdr_len` 的生产者也不在缓存的原厂子集里。所以这不做推导，改做
+实验。
+
+#### 实验怎么做：一个窗口里两帧，只差这一个字段
+
+驻留窗口的第 0 次尝试保持原厂的 20，报告标签 `0x1`，事务 id 的 bit0 = 0；第 1 次
+尝试只把这一个字段改写成 mainline 的 12，报告标签 `0x2`，事务 id 的 bit0 = 1。
+改写走新加的 `data_tx_hdr_llc_mainline()`，在描述符建好之后、写进 SDIO 之前只动
+body0 的 bit15:11——所以两份描述符除这一处以外**逐字节相同是构造出来的，不是看出
+来的**；两帧除事务 id 以外也逐字节相同（帧体、TK、PN 序列、速率、队列、报告请求
+全一致）。收到回复时匹配器两个 id 都试，`offer-attempt` 记下是哪一次被回答：
+1 ＝原厂的 20，2 ＝ mainline 的 12，0 ＝两次都没人理。run 50（两帧都是 20、
+没有 Offer）就是这个实验的阴性对照。
+
+`ccxrpt-tag-seen` 是「见过哪些报告标签」的位图：bit1 和 bit2 都置起来说明两次尝试
+硬件都报告了，只有一个位说明另一次根本没上空口——那会先于 A/B 结论需要解释。
+汇总行里的 `hdr-llc=` 不是重算的，是从刚写下去的那份描述符里读回来的，所以它同时
+在验证改写本身。
+
+顺带记一处**想过但没改**的地方：原厂在 `info->bc || info->mc` 时会置
+`AX_TXD_BMC`，mainline 的 `rtw89_txrx.h` 里干脆没有这个字段。本移植的帧是
+STA→AP、addr3 是广播，但它必须用 **PTK** 加密，提示「BMC」有把引擎推向组密钥的
+风险，所以不置。
+
+#### run 51 的读数：两种填法都被 ACK，两种都没人回答
+
+```
+resident window data tx sent=0x2 bytes=0x146 sn=0xa hdr-llc=0xc
+  xid=0x8cc34072 status=0x0 tk=0x1 dhcp-reply=0x0 offer-ip=0x0
+  mpdu=0x2 cck=0x2 block=0x0 ... c2h=0x2 ccxrpt=0x2 ccxrpt-tag=0x2
+  ccxrpt-tag-ok=0x2 ccxrpt-tag-fail=0x0
+  xid2=0x8d0da071 offer-attempt=0x0 ccxrpt-tag-seen=0x6
+```
+
+- `sent=0x2`、`mpdu=0x2`、`cck=0x2`：两帧都进了队列、都被 MAC 发了出去。
+- `hdr-llc=0xc`＝12，这是从最后写下去的那份描述符里读回来的，所以改写真的落到了
+  硬件手上（第 0 帧是 20，第 1 帧是 12）。
+- `xid=0x8cc34072` 与 `xid2=0x8d0da071`：bit0 一个 0 一个 1，两个 id 按设计分开。
+- `ccxrpt-tag-seen=0x6`＝bit1｜bit2，两次尝试硬件都回了报告；
+  `ccxrpt-tag=0x2 tag-ok=0x2 tag-fail=0x0`，两帧的 `tx-state` 都是 0，
+  也就是**两种填法都被 AP 一次确认**。
+- `offer-attempt=0x0`、`dhcp-reply=0x0`：**两种填法都没有换来 DHCP Offer。**
+
+**结论：`AX_TXD_HDR_LLC_LEN` 不是原因。** 原注释的结论（这个字段对本路径无关紧要）
+是对的，只是它给的理由不成立；现在这条结论有了板上证据，而不是一个无效推理。
+这也把嫌疑 1 的第四种机制消掉了：本移植描述符里已经没有「填错某个字段导致 AP
+解密失败」的候选了。
+
+#### 同一轮里另一条更有分量的读数：组播接收侧是健康的
+
+```
+resident window data sec total=0x18 target=0x14 prot=0x18 group=0x18
+  a1-match=0x0 hw-dec=0x14 sw-dec=0x4 icv=0x0 crc=0x0 dec=0x14
+resident window data sec llc-iv=0x14 llc-plain=0x0 short=0x0
+```
+
+24 帧受保护数据帧全部是组播寻址，其中 20 帧由硬件解密，**ICV 错 0 个**，
+解出来的明文 20 帧全部以 LLC/SNAP 开头（`llc-iv=0x14`、`llc-plain=0x0`）。
+组密钥是在 msg3 里用 KEK 加密送来的，而 KEK 和 TK 出自同一条 PTK，所以
+「解出 20 帧干净的组播明文」这件事本身就是**四次握手的密钥推导正确**的强证据，
+连带把「TK 算错了」压得很低。
+
+于是发送侧只剩一个还没有任何直接证据的问题：**硬件到底有没有真的加密我们那一帧。**
+如果它把明文发了出去，AP 一样会先回 ACK（ACK 在任何解密之前生成），然后按 RSN
+规则丢掉一个未受保护的数据帧——现象和现在看到的一模一样。空口抓不到，就必须从
+芯片内部读：这就是下一步（回环把自己发的帧收回来看它是密文还是明文），
+以及一个不需要任何主机权限的旁证（`a1-match` 至今是 0，本移植还从未收过一帧
+单播——发一帧受保护的**单播** ARP Request 给从组播明文里学到的网关，
+ARP Reply 是单播回来的，一次同时测发送加密和单播接收）。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

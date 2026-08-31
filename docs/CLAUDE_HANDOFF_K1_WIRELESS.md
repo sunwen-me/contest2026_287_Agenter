@@ -790,6 +790,34 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   诊断行里的 `offer=0xc0a8017b` 是 DHCP 解析器内存自测的期望值，不是真实分配地址。
   带密码镜像 `c8e474433410fe26181fd3785af61d729cc4a31e55ae0bd7933609fdcb4168aa`；
   3o 不新增 `--require-*`，判据数仍是 **37**。
+- **已上板验证（增量 3p，run 51）：把 `AX_TXD_HDR_LLC_LEN` 送上 A/B——两种填法都被 ACK，
+  两种都没换来 Offer，所以这个字段不是原因。** 这是一次单窗口对照实验，不是重传：
+  偶数次尝试沿用原厂 `get_hdr_with_llc()` 的 **20 个半字节**（`(24 MAC + 8 LLC/SNAP
+  + 8 CCMP)/2`），奇数次改成 mainline `rtw89_core_tx_update_llc_hdr()` 的
+  **12 个半字节**（`ieee80211_hdrlen(fc) >> 1`）。改写发生在描述符已经写完之后，只动
+  dword0 的 bit 15:11，所以两次尝试的帧字节、TK、PN 序号、速率、队列、报告请求
+  **由构造保证完全一致**；区分只靠两样东西：各自的发送报告标签（`0x1` / `0x2`）与各自的
+  DHCP transaction id——id 的 **bit 0 就编码填法**，于是 AP 回谁，就等于 AP 自己说它认哪一个。
+  **先纠正本移植原来的注释**：它把这两个值都称作「惰性」，理由是只列举了校验和卸载与头部转换
+  两个消费者——这个推理不成立。mainline 用 12 能工作只证明硬件不**需要** 20，不证明 20 无害；
+  如果安全引擎从这个字段取 MAC 头边界，20 会指到 IP 头里 8 字节、12 正好指在密码头上，
+  那么 AP 的 MIC 就会静默失败，而硬件 ACK（在解密之前生成）照样回来——正是观测到的现象。
+  **run 51 读数**：`sent=0x2 mpdu=0x2 cck=0x2 hdr-llc=0xc xid=0x8cc34072
+  xid2=0x8d0da071 ccxrpt-tag=0x2 ccxrpt-tag-ok=0x2 ccxrpt-tag-fail=0x0
+  ccxrpt-tag-seen=0x6 offer-attempt=0x0 dhcp-reply=0x0 offer-ip=0x0`。两种填法都上了空口、
+  都各自回了署名报告（`tag-seen` 的 bit 1 与 bit 2）、都 `tx-state=0`（被 AP ACK），
+  **两种都没有换来 DHCP Offer**。结论：`AX_TXD_HDR_LLC_LEN` 不是原因；老注释的**结论**对，
+  **理由**不对，现在这个结论有板上证据了。同一轮**没有**改 `AX_TXD_BMC`（DHCP Discover 的
+  A1 是广播，原厂本来就置 1），以保证只有一个变量。
+  **同一轮另一条更有分量的读数在接收侧**：`data sec total=0x18 target=0x14 prot=0x18
+  group=0x18 a1-match=0x0 hw-dec=0x14 sw-dec=0x4 icv=0x0 crc=0x0 dec=0x14`，且
+  `llc-iv=0x14 llc-plain=0x0`——20 帧组播被**硬件**解开、**0 个 ICV 错**、每一份明文都以
+  LLC/SNAP 开头。GTK 是在 msg3 里用 KEK 加密送来的，而 KEK 与 TK 出自同一个 PTK，
+  所以组播解密干净是**四次握手的密钥推导正确**的强证据，「TK 是错的」这条嫌疑因此排到很后面。
+  带密码镜像 `4b05e7b5a8f893ffc25a3666f6b4e8fb2d5c460c8d92dd316eb032bc4aa87c93`；
+  A/B 是**只报告**的（一个窗口若第一次尝试就被回答，第二次根本不会发出，要求两条都出现会把
+  唯一成功的那一轮判失败），所以 3p 也不新增 `--require-*`，判据数仍是 **37**，
+  日志 `out/k1-serial/k1-wpa-20260831T111750Z.log`（板子停在 `nsh>`，默认 `--nsh-reboot`，没按 RST）。
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
@@ -892,7 +920,8 @@ text 710768 / data 9568 / bss 24416（含 CMD53 RX 拆分读取修复 ＋ `CONFI
 Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手且 Msg3 的 MIC
 验过（run 33 / 增量 3e）、TK 与 GTK 装进安全 CAM 且固件四条命令全部 ack
 （run 34 / 增量 3f）、CMAC port 0 按原厂顺序配成 INFRA 并使能（run 35 / 增量 3g）。
-**当前实际下一步是查 AP 为什么没有回 DHCP Offer：先排 CCMP 帧体与 TK／PN／key id，再排接收路径**——密钥已经在
+**当前实际下一步是证明硬件到底有没有真的加密本移植发出去的那一帧：先用 MAC loopback 把刚发的帧读回来看载荷
+是密文还是明文，再向组播明文里学到的网关发一帧受保护的单播 ARP Request**——密钥已经在
 硬件里、port 也已经使能、信道本来就是驻留的（增量 3h 更正了「没有驻留信道」这个说法），发送
 描述符现在也会引用安全 CAM index 了（3i 的字段 ＋ 3j 的帧与队列），run 43 更进一步证明
 **MAC 真的把那两个 CCMP 保护帧发出去了**（增量 3k：`mpdu=0x2 cck=0x2 block=0x0`，每次写
@@ -908,6 +937,23 @@ ACK 与重传次数只有 TX report 能给。**这一段在 run 50（增量 3o�
 （`hw-dec=0xd icv=0x0 crc=0x0`）。增量 3h 本身（不跑扫描的驻留收发窗口）
 已经在 **run 38 上板通过**（`--require-runtime-resident`，run 36／run 37 各自暴露的一个问题
 都已修完）。
+
+**为什么下一步变成了「有没有真的加密」**：发送描述符侧的候选已经被逐条打掉了。
+安全引擎不是关着的（`sec-eng ctrl … after=0x8000273f`、`mpdu-proc after=0x3` 是读回来的）；
+PN 从 1 开始、CCMP 头含 ExtIV 的排布对；326 字节帧体（LLC/SNAP → IP → UDP → DHCP，
+含两个校验和）逐字节审过；最后一个还剩争议的字段 `AX_TXD_HDR_LLC_LEN` 也在 run 51
+（增量 3p）以单窗口 A/B 判了死刑——原厂 20 与 mainline 12 都发上了空口、都被 ACK、
+**都没换来 Offer**。也就是说「有个字段我们填错了」这条路已经走完，而
+`a1-match=0x0` 说明本移植**从来没有收过一帧单播**，接收侧那条 PTK 路径至今没有被真实空口检验过。
+于是只剩一个从没有任何直接证据的问题：**帧到底是密文还是明文发出去的**。一帧明文数据帧从
+一个已 RSN 关联的 STA 发出，会先被 ACK（ACK 在任何解密检查之前），然后被 AP 丢掉——
+与现在观测到的一模一样。两个不需要特权就能做的判别手段：(1) 按原厂做法开 MAC loopback，
+把本端刚发的帧读回来，直接看载荷是密文还是明文；(2) 从已经解开的组播明文里学到子网与网关的
+MAC／IP，然后发一帧受保护的**单播** ARP Request——ARP Reply 会以单播回来，那同时也是本移植
+第一次真正走通单播接收（`a1-match` 至今为 0）。
+线侧抓包仍然被权限挡住（`/usr/bin/tcpdump` 无 file capabilities、用户不在 pcap 组、
+`sudo -n true` 报 "sudo: interactive authentication is required"），需要用户自己跑，
+一条命令就能把 (a)「AP 收下但解不开」和 (c)「帧体本身有问题」在一轮里分开。
 做法与欠账见「尚未完成，禁止误报」末尾那条优先级 (1)。复现 3e/3f/3g/3h 镜像：
 
 ```bash

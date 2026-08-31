@@ -2216,6 +2216,44 @@ def main() -> int:
                     "tag-fail={13}".format(*values),
                     file=sys.stderr)
 
+            # The A/B the window runs on the one descriptor field whose value
+            # this port cannot derive from the vendor tree: the first attempt
+            # carries the vendor's header-with-LLC length, twenty half-bytes
+            # over the MAC, LLC/SNAP and cipher headers, and the second
+            # carries mainline's twelve over the MAC header alone.  Each has
+            # its own transaction identifier and its own transmit-report tag,
+            # so offer-attempt names the form the access point answered and
+            # tag-seen says which forms the hardware reported on at all.
+            #
+            # Reported and never required.  A window that is answered on its
+            # first attempt never transmits the second, so requiring both
+            # would fail exactly the run that succeeded, and a window that is
+            # answered on neither is the reading this experiment exists to
+            # produce.
+            data_secure_ab = re.search(
+                rb"K1 Wi-Fi GPL: resident window data tx [^\r\n]*"
+                rb" hdr-llc=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* xid=(?:0x)?([0-9a-fA-F]+)"
+                rb"[^\r\n]* xid2=(?:0x)?([0-9a-fA-F]+)"
+                rb" offer-attempt=(?:0x)?([0-9a-fA-F]+)"
+                rb" ccxrpt-tag-seen=(?:0x)?([0-9a-fA-F]+)",
+                data_secure,
+            )
+            if data_secure_ab is not None:
+                hdr_llc, xid, xid_alt, attempt, tag_seen = (
+                    int(group, 16) for group in data_secure_ab.groups())
+                answered = {
+                    0: "neither form was answered",
+                    1: "the vendor's twenty half-bytes were answered",
+                    2: "mainline's twelve half-bytes were answered",
+                }.get(attempt, f"attempt {attempt} was answered")
+                print(
+                    "[serial] header-with-LLC A/B: last-written="
+                    f"{hdr_llc} half-bytes xid=0x{xid:08x} "
+                    f"xid2=0x{xid_alt:08x} reported-tags=0x{tag_seen:x}: "
+                    f"{answered}",
+                    file=sys.stderr)
+
             # The decoded reports themselves.  The first one belongs to a
             # management frame the access point answered inside the same
             # window, so a transmit state that is not zero there says the

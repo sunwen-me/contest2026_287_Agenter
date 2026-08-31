@@ -480,11 +480,25 @@ extern void k1_early_puthex(uintreg_t value);
  *
  * Mainline writes something else for the same frame: ieee80211_hdrlen(fc) >> 1
  * with neither the LLC nor the cipher term, which is 12
- * (rtw89_core_tx_update_llc_hdr()).  The field is the layer-3 offset that the
- * transmit checksum offload and the hardware header conversion consume, and
- * this port enables neither -- no B_AX_HDT_TCPIP_CHKSUM_EN, no smh_en -- so
- * both values are inert here.  The vendor's is what this port writes, because
- * the rest of this descriptor is the vendor's.
+ * (rtw89_core_tx_update_llc_hdr()).  Both values were called inert here, on
+ * the argument that the field is the layer-3 offset the transmit checksum
+ * offload and the hardware header conversion consume and that this port
+ * enables neither -- no B_AX_HDT_TCPIP_CHKSUM_EN, no smh_en.  That argument is
+ * weaker than it reads: it proves the hardware does not need twenty, not that
+ * twenty is harmless.  The security engine also has to be told where the MAC
+ * header ends, because that is where the cipher header it reads the packet
+ * number out of begins, and if it takes that boundary from this field then
+ * twenty points it eight bytes into the IP header while mainline's twelve
+ * points it exactly at the cipher header.  Mainline's value is the one running
+ * in the field on this chip with hardware CCMP, so it can be no worse than the
+ * vendor's sum, and under that one reading it is the whole difference between
+ * a frame the access point can decrypt and one it cannot.
+ *
+ * So the window transmits its first Discover with the vendor's twenty and its
+ * second with mainline's twelve, each under its own transmit-report tag and
+ * its own transaction identifier, and lets the access point say which of the
+ * two it accepts.  Every other field of the two descriptors, and every byte of
+ * the two frames but that identifier, is the same.
  *
  * AX_TXD_BK is set exactly when the frame is not aggregated in the vendor
  * core, and nothing this port transmits is aggregated.
@@ -1549,13 +1563,16 @@ extern void k1_early_puthex(uintreg_t value);
  * The tag is what makes a report attributable.  Zero is what an untagged
  * frame carries, so the protected data frame carries a non-zero one and the
  * report that comes back with it is the report about that frame; a report
- * whose tag is zero belongs to something else.
+ * whose tag is zero belongs to something else.  The two Discovers of a window
+ * carry two different tags, because they carry two different header-with-LLC
+ * lengths and a report has to say which of the two it is about.
  */
 
 #define K1_RTL8852BS_TXD_SPE_RPT                (1u << 10)
 #define K1_RTL8852BS_TXD_SW_DEFINE_MASK         0xfu
 #define K1_RTL8852BS_TXRPT_TAG_NONE             0xffu
 #define K1_RTL8852BS_TXRPT_TAG_DATA             0x1u
+#define K1_RTL8852BS_TXRPT_TAG_DATA_MAINLINE    0x2u
 #define K1_RTL8852BS_RXDESC_PACKET_TYPE_C2H     10u
 #define K1_RTL8852BS_CCXRPT_C2H_CATEGORY        1u
 #define K1_RTL8852BS_CCXRPT_C2H_CLASS           0x9u
@@ -21208,6 +21225,54 @@ static bool k1_rtl8852bs_runtime_dhcp_reply_match(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_data_tx_hdr_llc_mainline
+ *
+ * Description:
+ *   Rewrite one field of an already-built data descriptor: the header-with-LLC
+ *   length, from the vendor's sum over the MAC header, the LLC/SNAP header and
+ *   the cipher header down to mainline's MAC header alone.
+ *
+ *   Nothing else in the descriptor moves, which is the point.  The frame, the
+ *   key, the rate, the queue and the report request are all the ones the
+ *   window's other Discover carries, so an access point that answers one and
+ *   not the other has answered about this field and about nothing else.
+ *
+ * Input Parameters:
+ *   descriptor        - the forty eight bytes the builder produced
+ *   descriptor_length - how much room descriptor has
+ *   header_length     - the frame's 802.11 header length
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_data_tx_hdr_llc_mainline(
+  FAR uint8_t *descriptor, size_t descriptor_length, uint8_t header_length)
+{
+  uint32_t body0;
+  uint32_t words;
+
+  if (descriptor == NULL ||
+      descriptor_length < K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE ||
+      header_length < K1_RTL8852BS_IEEE80211_HEADER_SIZE ||
+      (header_length & 1u) != 0)
+    {
+      return -EINVAL;
+    }
+
+  words = (uint32_t)header_length / 2u;
+  if (words > K1_RTL8852BS_DATA_TXD_HDR_LLC_MASK)
+    {
+      return -EINVAL;
+    }
+
+  body0 = k1_rtl8852bs_read_le32(descriptor);
+  body0 &= ~((uint32_t)K1_RTL8852BS_DATA_TXD_HDR_LLC_MASK <<
+             K1_RTL8852BS_DATA_TXD_HDR_LLC_SHIFT);
+  body0 |= words << K1_RTL8852BS_DATA_TXD_HDR_LLC_SHIFT;
+  k1_rtl8852bs_write_le32(descriptor, body0);
+  return OK;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_data_secure_tx_build
  *
  * Description:
@@ -21705,6 +21770,70 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (layout.fifo_address != 0x0001002fu || layout.transfer_length != 0x178u ||
       layout.required_ple_pages != 8u || layout.required_wde_pages != 1u)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* Mainline's form of the same descriptor, which is the whole of this
+   * increment's experiment: the header-with-LLC field falls from the vendor's
+   * twenty half-bytes to the twelve of the MAC header alone, and nothing else
+   * in the descriptor moves.  Checked here rather than only on hardware,
+   * because a rewrite that disturbed the queue, the rate or the security dword
+   * would make the two attempts differ in more than the field under test and
+   * the access point's answer would say nothing.
+   */
+
+  ret = k1_rtl8852bs_runtime_data_tx_hdr_llc_mainline(
+    descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, header_length);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto error;
+    }
+
+  if (k1_rtl8852bs_read_le32(descriptor) != 0x00406400u ||
+      k1_rtl8852bs_read_le32(descriptor + 8) != body2 ||
+      k1_rtl8852bs_read_le32(descriptor + 12) != body3)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  if (info0 != k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE) ||
+      info1 != k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 4) ||
+      info2 != k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 8) ||
+      info3 != k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 12) ||
+      info4 != k1_rtl8852bs_read_le32(
+        descriptor + K1_RTL8852BS_MGMT_TX_WD_BODY_SIZE + 16))
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* A header the field cannot describe must be refused rather than truncated,
+   * so a future caller cannot silently transmit a descriptor pointing at the
+   * wrong offset: an odd length, one below the four-address minimum, a
+   * descriptor with no room and no descriptor at all.
+   */
+
+  if (k1_rtl8852bs_runtime_data_tx_hdr_llc_mainline(
+        descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, 25u) != -EINVAL ||
+      k1_rtl8852bs_runtime_data_tx_hdr_llc_mainline(
+        descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, 22u) != -EINVAL ||
+      k1_rtl8852bs_runtime_data_tx_hdr_llc_mainline(
+        descriptor, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE - 1u,
+        header_length) != -EINVAL ||
+      k1_rtl8852bs_runtime_data_tx_hdr_llc_mainline(
+        NULL, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+        header_length) != -EINVAL)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -25356,13 +25485,22 @@ struct k1_rtl8852bs_resident_count_s
    * host's own hardware address back, so nothing another station's exchange
    * produced can be counted here, and dhcp_offer keeps the address the first
    * of them offered.  An offered address is not a credential and is printed.
+   *
+   * data_tx_xid_alt is the second attempt's identifier.  The two attempts are
+   * no longer one frame retransmitted: the second carries mainline's
+   * header-with-LLC length where the first carries the vendor's, so each needs
+   * an identifier of its own, and dhcp_offer_attempt -- one or two, zero for
+   * no answer at all -- records which of the two the access point answered.
    */
 
   uint32_t data_tx_sent;
   uint32_t data_tx_bytes;
+  uint32_t data_tx_hdr_llc;
   uint32_t data_tx_xid;
+  uint32_t data_tx_xid_alt;
   uint32_t dhcp_replies;
   uint32_t dhcp_offer;
+  uint32_t dhcp_offer_attempt;
 
   /* What the transmit-side counters did across the writes.  data_tx_mpdu is
    * the summed increment of the MAC's transmitted-MPDU counter, data_tx_cck
@@ -25430,6 +25568,7 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t ccxrpt;
   uint32_t ccxrpt_short;
   uint32_t ccxrpt_tagged;
+  uint32_t ccxrpt_tag_seen;
   uint32_t ccxrpt_tag_ok;
   uint32_t ccxrpt_tag_fail;
   uint32_t ccxrpt_first[K1_RTL8852BS_TXRPT_WORDS];
@@ -26270,6 +26409,26 @@ static void k1_rtl8852bs_runtime_resident_observe(
                   if (count->dhcp_offer == 0)
                     {
                       count->dhcp_offer = offered;
+                      count->dhcp_offer_attempt = 1u;
+                    }
+                }
+              else if (count->data_tx_xid_alt != 0 &&
+                       k1_rtl8852bs_runtime_dhcp_reply_match(
+                         payload, payload_length,
+                         k1_rtl8852bs_runtime_resident_header_length(
+                           mgmt.frame_control),
+                         self_mac, count->data_tx_xid_alt, &offered))
+                {
+                  /* The same answer, to the attempt that carried mainline's
+                   * header-with-LLC length instead of the vendor's.  Which of
+                   * the two was answered is this increment's whole reading.
+                   */
+
+                  count->dhcp_replies++;
+                  if (count->dhcp_offer == 0)
+                    {
+                      count->dhcp_offer = offered;
+                      count->dhcp_offer_attempt = 2u;
                     }
                 }
             }
@@ -26565,12 +26724,14 @@ static void k1_rtl8852bs_runtime_resident_observe_c2h(
 
   tag = (word[0] >> K1_RTL8852BS_TXRPT_SW_DEFINE_SHIFT) &
         K1_RTL8852BS_TXRPT_SW_DEFINE_MASK;
-  if (tag != K1_RTL8852BS_TXRPT_TAG_DATA)
+  if (tag != K1_RTL8852BS_TXRPT_TAG_DATA &&
+      tag != K1_RTL8852BS_TXRPT_TAG_DATA_MAINLINE)
     {
       return;
     }
 
   count->ccxrpt_tagged++;
+  count->ccxrpt_tag_seen |= 1u << tag;
 
   state = (word[0] >> K1_RTL8852BS_TXRPT_TX_STATE_SHIFT) &
           K1_RTL8852BS_TXRPT_TX_STATE_MASK;
@@ -26619,9 +26780,20 @@ static void k1_rtl8852bs_runtime_resident_observe_c2h(
  *   frame that was never radiated, so this is never transmitted on a run whose
  *   handshake did not complete.
  *
+ *   The window's two attempts are not one frame retransmitted.  They differ in
+ *   the one descriptor field whose correct value this port cannot derive from
+ *   the vendor tree alone -- the header-with-LLC length, the vendor's sum over
+ *   the MAC, LLC/SNAP and cipher headers against mainline's MAC header
+ *   alone -- and in nothing else but the identifier that tells them apart.
+ *   Both are transmitted, both ask for a transmit report under a tag of their
+ *   own, and the access point decides.
+ *
  * Input Parameters:
  *   self_mac - the eFuse self MAC, which is address 2 and the client address
  *   bssid    - the access point, which is address 1
+ *   attempt  - which of the window's attempts this is.  Even attempts carry
+ *              the vendor's twenty half-bytes under report tag one, odd ones
+ *              mainline's twelve under report tag two
  *   count    - the window's counters, which record what was transmitted
  *
  * Returned Value:
@@ -26630,7 +26802,7 @@ static void k1_rtl8852bs_runtime_resident_observe_c2h(
  ****************************************************************************/
 
 static int k1_rtl8852bs_runtime_resident_data_tx(
-  FAR const uint8_t *self_mac, FAR const uint8_t *bssid,
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid, unsigned int attempt,
   FAR struct k1_rtl8852bs_resident_count_s *count)
 {
   struct k1_rtl8852bs_tx_security_s security =
@@ -26645,11 +26817,13 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
   struct k1_rtl8852bs_tx_state_s tx_before;
   struct k1_rtl8852bs_tx_state_s tx_after;
   bool tx_before_valid;
+  bool mainline_form;
   FAR uint8_t *packet;
   size_t frame_length = 0;
   unsigned int drained;
   uint16_t sequence;
   uint8_t header_length = 0;
+  uint8_t report_tag;
   uint64_t packet_number;
   uint32_t transaction_id;
   int ret;
@@ -26667,28 +26841,39 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
   sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
   packet_number = k1_rtl8852bs_runtime_tx_packet_number_next();
 
+  mainline_form = (attempt & 1u) != 0;
+  report_tag = mainline_form ? K1_RTL8852BS_TXRPT_TAG_DATA_MAINLINE :
+                               K1_RTL8852BS_TXRPT_TAG_DATA;
+
   /* The transaction identifier only has to be one no other exchange on this
    * network is using and one this run can recognise again.  The tick count
    * makes it differ between runs, the sequence number between frames of a run,
    * and the low half of the hardware address between stations; the high bit is
    * forced so it can never come out zero, which is the value that means no
    * Discover was transmitted.
+   *
+   * Bit zero carries the form instead, so the two attempts can never collide
+   * on one identifier and an answer names the descriptor it accepted rather
+   * than only the exchange.
    */
 
-  if (count->data_tx_xid != 0)
+  if (mainline_form ? count->data_tx_xid_alt != 0 : count->data_tx_xid != 0)
     {
-      /* A retransmission of a Discover that was not answered keeps the first
-       * one's identifier, the way a DHCP client's does, so an answer to either
-       * attempt is recognised.
+      /* A retransmission of an attempt that was not answered keeps that
+       * attempt's identifier, the way a DHCP client's does, so a late answer
+       * is still recognised and still attributed to the right form.
        */
 
-      transaction_id = count->data_tx_xid;
+      transaction_id = mainline_form ? count->data_tx_xid_alt :
+                                       count->data_tx_xid;
     }
   else
     {
       transaction_id = 0x80000000u |
                        (((uint32_t)clock_systime_ticks() & 0xffffu) << 12) |
-                       (((uint32_t)self_mac[5] ^ (uint32_t)sequence) & 0xfffu);
+                       (((uint32_t)self_mac[5] ^ (uint32_t)sequence) &
+                        0xffeu) |
+                       (mainline_form ? 1u : 0u);
     }
 
   ret = k1_rtl8852bs_runtime_dhcp_discover_build(
@@ -26701,11 +26886,27 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
     }
 
   ret = k1_rtl8852bs_runtime_data_secure_tx_build(
-    frame_length, sequence, header_length, K1_RTL8852BS_TXRPT_TAG_DATA,
+    frame_length, sequence, header_length, report_tag,
     &security, packet, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
   if (ret < 0)
     {
       goto done;
+    }
+
+  /* The one field under test, rewritten after the build so the two attempts
+   * share every other byte of both descriptors by construction rather than by
+   * inspection.  The builder wrote the vendor's sum; this puts mainline's MAC
+   * header length in its place on the odd attempt.
+   */
+
+  if (mainline_form)
+    {
+      ret = k1_rtl8852bs_runtime_data_tx_hdr_llc_mainline(
+        packet, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, header_length);
+      if (ret < 0)
+        {
+          goto done;
+        }
     }
 
   /* Best effort, as in the management submitter: the helper only ORs one bit
@@ -26770,7 +26971,24 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
   count->data_tx_sent++;
   count->data_tx_bytes = (uint32_t)frame_length;
   count->data_tx_sequence = sequence;
-  count->data_tx_xid = transaction_id;
+
+  /* Read back out of the descriptor that was just written rather than
+   * recomputed, so the log line reports the value the hardware was handed and
+   * so it also checks the rewrite above did what it says.
+   */
+
+  count->data_tx_hdr_llc =
+    (k1_rtl8852bs_read_le32(packet) >>
+     K1_RTL8852BS_DATA_TXD_HDR_LLC_SHIFT) &
+    K1_RTL8852BS_DATA_TXD_HDR_LLC_MASK;
+  if (mainline_form)
+    {
+      count->data_tx_xid_alt = transaction_id;
+    }
+  else
+    {
+      count->data_tx_xid = transaction_id;
+    }
 
   for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
     {
@@ -27020,8 +27238,8 @@ static int k1_rtl8852bs_runtime_resident_window(
           data_attempts < K1_RTL8852BS_RESIDENT_DATA_ATTEMPTS &&
           (sclock_t)(clock_systime_ticks() - data_deadline) >= 0)
         {
-          ret = k1_rtl8852bs_runtime_resident_data_tx(self_mac, bssid, &count);
-          data_attempts++;
+          ret = k1_rtl8852bs_runtime_resident_data_tx(self_mac, bssid,
+                                                     data_attempts, &count);
           count.data_tx_status = ret;
           data_deadline = clock_systime_ticks() +
                           MSEC2TICK(K1_RTL8852BS_RESIDENT_DATA_GAP_MSEC);
@@ -27030,8 +27248,15 @@ static int k1_rtl8852bs_runtime_resident_window(
           k1_early_puthex(count.data_tx_sequence);
           k1_early_puts(" bytes=");
           k1_early_puthex(count.data_tx_bytes);
+          k1_early_puts(" hdr-llc=");
+          k1_early_puthex(count.data_tx_hdr_llc);
+          k1_early_puts(" tag=");
+          k1_early_puthex((data_attempts & 1u) != 0 ?
+                          K1_RTL8852BS_TXRPT_TAG_DATA_MAINLINE :
+                          K1_RTL8852BS_TXRPT_TAG_DATA);
           k1_early_puts(" xid=");
-          k1_early_puthex(count.data_tx_xid);
+          k1_early_puthex((data_attempts & 1u) != 0 ? count.data_tx_xid_alt :
+                                                      count.data_tx_xid);
           k1_early_puts(" pn=");
           k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
           k1_early_puts(" status=");
@@ -27041,6 +27266,7 @@ static int k1_rtl8852bs_runtime_resident_window(
           k1_early_puts(" cck=");
           k1_early_puthex(count.data_tx_cck);
           k1_early_puts("\r\n");
+          data_attempts++;
         }
 
       ret = k1_rtl8852bs_runtime_rx_read(
@@ -27369,6 +27595,15 @@ static int k1_rtl8852bs_runtime_resident_window(
    * txrpt-dat-fail says the retries ran out with no acknowledgement, which
    * points instead at rate, power or addressing.  txrpt-short counts packets
    * of the report type that were too small to decode, and it should be zero.
+   *
+   * The last three read the A/B out.  xid is the identifier of the attempt
+   * that carried the vendor's header-with-LLC length and xid2 the one that
+   * carried mainline's, so the pair says both forms were transmitted;
+   * offer-attempt is one if the answer came back to the vendor's form, two if
+   * it came back to mainline's and zero if neither was answered.
+   * ccxrpt-tag-seen is a bit per report tag observed, so bit one and bit two
+   * both set means the hardware reported on both attempts and a single bit
+   * says only one of the two ever reached the air.
    */
 
   k1_early_puts("K1 Wi-Fi GPL: resident window data tx sent=");
@@ -27377,6 +27612,8 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.data_tx_bytes);
   k1_early_puts(" sn=");
   k1_early_puthex(count.data_tx_sequence);
+  k1_early_puts(" hdr-llc=");
+  k1_early_puthex(count.data_tx_hdr_llc);
   k1_early_puts(" xid=");
   k1_early_puthex(count.data_tx_xid);
   k1_early_puts(" status=");
@@ -27422,6 +27659,12 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.ccxrpt_tag_ok);
   k1_early_puts(" ccxrpt-tag-fail=");
   k1_early_puthex(count.ccxrpt_tag_fail);
+  k1_early_puts(" xid2=");
+  k1_early_puthex(count.data_tx_xid_alt);
+  k1_early_puts(" offer-attempt=");
+  k1_early_puthex(count.dhcp_offer_attempt);
+  k1_early_puts(" ccxrpt-tag-seen=");
+  k1_early_puthex(count.ccxrpt_tag_seen);
   k1_early_puts("\r\n");
 
   /* The reports themselves, once the window is closed.  The first one is the
