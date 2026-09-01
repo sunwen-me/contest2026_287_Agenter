@@ -2271,6 +2271,112 @@ def main() -> int:
                         "about the round trip",
                         file=sys.stderr)
 
+            # The DHCP exchange as the server answered it.  The offer line
+            # is the reservation, and it is existence-only because a run in
+            # which no server answers is a reading about the network rather
+            # than about this port.
+            resident_offer_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window dhcp offer ip=(?:0x)?"
+                rb"([0-9a-fA-F]+) server-id=(?:0x)?([0-9a-fA-F]+)"
+                rb" src=(?:0x)?([0-9a-fA-F]+)"
+                rb" mask=(?:0x)?([0-9a-fA-F]+)"
+                rb" router=(?:0x)?([0-9a-fA-F]+)"
+                rb" lease=(?:0x)?([0-9a-fA-F]+)"
+                rb" offers=(?:0x)?([0-9a-fA-F]+)"
+                rb" attempt=(?:0x)?([0-9a-fA-F]+)"
+                rb" xid=(?:0x)?([0-9a-fA-F]+)"
+                rb" mac=([0-9a-fA-F]*)",
+                resident,
+            )
+            if resident_offer_result is None:
+                missing.append(
+                    "RTL8852BS2 DHCP offer parsed out of a protected reply")
+            else:
+                offer_mac = resident_offer_result.group(10).decode()
+                (offer_ip, offer_server, offer_src, offer_mask, offer_router,
+                 offer_lease, offer_count, offer_attempt,
+                 offer_xid) = (int(group, 16) for group
+                               in resident_offer_result.groups()[:9])
+
+                def quad(value):
+                    return "{0}.{1}.{2}.{3}".format(
+                        (value >> 24) & 0xff, (value >> 16) & 0xff,
+                        (value >> 8) & 0xff, value & 0xff)
+
+                if offer_ip:
+                    print(
+                        "[serial] DHCP offer: {0} for this station, from "
+                        "server {1} (datagram source {2}), mask {3}, router "
+                        "{4}, lease 0x{5:x}s, {6} offer(s), Discover attempt "
+                        "{7} (xid 0x{8:08x}), relayed by {9}"
+                        .format(quad(offer_ip), quad(offer_server),
+                                quad(offer_src), quad(offer_mask),
+                                quad(offer_router), offer_lease, offer_count,
+                                offer_attempt, offer_xid,
+                                offer_mac or "(unknown)"),
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no DHCP offer arrived in this window, so "
+                        "the acceptance below had nothing to accept",
+                        file=sys.stderr)
+
+            # And the acceptance.  sent says whether the window asked, ack
+            # and nak how the server closed the exchange.
+            resident_request_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window dhcp request sent=(?:0x)?"
+                rb"([0-9a-fA-F]+) status=(?:0x)?([0-9a-fA-F]+)"
+                rb" sn=(?:0x)?([0-9a-fA-F]+)"
+                rb" bytes=(?:0x)?([0-9a-fA-F]+)"
+                rb" reply=(?:0x)?([0-9a-fA-F]+)"
+                rb" ack=(?:0x)?([0-9a-fA-F]+)"
+                rb" ack-ip=(?:0x)?([0-9a-fA-F]+)"
+                rb" nak=(?:0x)?([0-9a-fA-F]+)",
+                resident,
+            )
+            if resident_request_result is None:
+                missing.append(
+                    "RTL8852BS2 protected DHCP Request accepting the offer")
+            else:
+                (request_sent, request_status, request_sn, request_bytes,
+                 dhcp_replies, dhcp_acks, dhcp_ack_ip,
+                 dhcp_naks) = (int(group, 16) for group
+                               in resident_request_result.groups())
+                print(
+                    "[serial] DHCP Request: {0} sent (sn 0x{1:x}, {2} bytes, "
+                    "status {3}), {4} replies seen, {5} ack, {6} nak"
+                    .format(request_sent, request_sn, request_bytes,
+                            request_status or "ok", dhcp_replies, dhcp_acks,
+                            dhcp_naks),
+                    file=sys.stderr)
+                if dhcp_acks:
+                    print(
+                        "[serial] the server acknowledged the Request, so "
+                        "0x{0:08x} is this station's address to use: the DHCP "
+                        "handshake completed over the protected link and a "
+                        "non-zero sender address is now available for ARP and "
+                        "ICMP".format(dhcp_ack_ip),
+                        file=sys.stderr)
+                elif dhcp_naks:
+                    print(
+                        "[serial] the server refused the Request, so the "
+                        "offered address was no longer free by the time it "
+                        "was accepted; the exchange has to restart from a "
+                        "Discover rather than be retried",
+                        file=sys.stderr)
+                elif request_sent:
+                    print(
+                        "[serial] the Request was queued but nothing came "
+                        "back inside the window, so either the answer landed "
+                        "after the window closed or the Request did not reach "
+                        "the server -- the transmit report says which",
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no Request was transmitted, so this line "
+                        "says nothing about the acceptance",
+                        file=sys.stderr)
+
             # Whether the receive filter was widened for the length of the
             # window, so a frame whose payload the security engine could not
             # verify is handed up instead of being dropped inside the receive

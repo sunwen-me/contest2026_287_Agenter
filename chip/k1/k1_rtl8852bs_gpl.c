@@ -582,6 +582,27 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_DHCP_OPTIONS_SIZE       22u
 #define K1_RTL8852BS_DHCP_DISCOVER_SIZE      326u
 
+/* The DHCP message types this port sends and recognises, the option numbers it
+ * writes or reads, and how much longer a Request's option block is than a
+ * Discover's: option 50 with the address being accepted and option 54 with the
+ * identifier of the server that offered it, six bytes each, both of which RFC
+ * 2131 4.3.2 requires of a client answering an offer.
+ */
+
+#define K1_RTL8852BS_DHCP_MSG_DISCOVER       1u
+#define K1_RTL8852BS_DHCP_MSG_OFFER          2u
+#define K1_RTL8852BS_DHCP_MSG_REQUEST        3u
+#define K1_RTL8852BS_DHCP_MSG_ACK            5u
+#define K1_RTL8852BS_DHCP_MSG_NAK            6u
+#define K1_RTL8852BS_DHCP_OPT_MASK           1u
+#define K1_RTL8852BS_DHCP_OPT_ROUTER         3u
+#define K1_RTL8852BS_DHCP_OPT_REQUESTED_IP   50u
+#define K1_RTL8852BS_DHCP_OPT_LEASE          51u
+#define K1_RTL8852BS_DHCP_OPT_MSG_TYPE       53u
+#define K1_RTL8852BS_DHCP_OPT_SERVER_ID      54u
+#define K1_RTL8852BS_DHCP_OPT_END            0xffu
+#define K1_RTL8852BS_DHCP_REQUEST_EXTRA_SIZE 12u
+
 /* R_AX_SS_CTRL and the four steps sta_sch_init() performs on it.  The station
  * scheduler is the DMAC block that walks the WDE queues and tells a CMAC
  * scheduler which of them hold a frame; nothing in this port has ever written
@@ -1613,6 +1634,7 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_TXRPT_TAG_ARP              0x3u
 #define K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST    0x4u
 #define K1_RTL8852BS_TXRPT_TAG_LOOPBACK         0x5u
+#define K1_RTL8852BS_TXRPT_TAG_DHCP_REQUEST     0x6u
 #define K1_RTL8852BS_RXDESC_PACKET_TYPE_C2H     10u
 #define K1_RTL8852BS_CCXRPT_C2H_CATEGORY        1u
 #define K1_RTL8852BS_CCXRPT_C2H_CLASS           0x9u
@@ -21595,7 +21617,7 @@ static uint16_t k1_rtl8852bs_runtime_inet_fold(uint32_t sum)
 }
 
 /****************************************************************************
- * Name: k1_rtl8852bs_runtime_dhcp_discover_build
+ * Name: k1_rtl8852bs_runtime_dhcp_client_build
  *
  * Description:
  *   Build the complete protected data frame this port transmits: an 802.11
@@ -21633,10 +21655,11 @@ static uint16_t k1_rtl8852bs_runtime_inet_fold(uint32_t sum)
  *
  ****************************************************************************/
 
-static int k1_rtl8852bs_runtime_dhcp_discover_build(
+static int k1_rtl8852bs_runtime_dhcp_client_build(
   FAR uint8_t *frame, size_t frame_size, FAR const uint8_t *self_mac,
   FAR const uint8_t *bssid, uint16_t sequence, uint64_t packet_number,
-  uint32_t transaction_id, FAR size_t *frame_length,
+  uint32_t transaction_id, uint32_t requested_address,
+  uint32_t server_identifier, FAR size_t *frame_length,
   FAR uint8_t *header_length)
 {
   static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
@@ -21645,6 +21668,7 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
     };
 
   size_t required;
+  size_t options;
   size_t offset;
   size_t ip_offset;
   size_t udp_offset;
@@ -21652,15 +21676,24 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
   uint16_t udp_length;
   uint16_t checksum;
   uint32_t sum;
+  bool request_form;
   int ret;
 
+  /* Which message this is, decided by the caller having an address to accept
+   * rather than by a flag of its own: a client that names an address in option
+   * 50 is answering an offer, and one that has none is asking for any.
+   */
+
+  request_form = requested_address != 0;
+  options = K1_RTL8852BS_DHCP_OPTIONS_SIZE +
+            (request_form ? K1_RTL8852BS_DHCP_REQUEST_EXTRA_SIZE : 0u);
   required = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
              K1_RTL8852BS_CCMP_HEADER_SIZE +
              K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
              K1_RTL8852BS_IPV4_HEADER_SIZE +
              K1_RTL8852BS_UDP_HEADER_SIZE +
              K1_RTL8852BS_BOOTP_FIXED_SIZE +
-             K1_RTL8852BS_DHCP_OPTIONS_SIZE;
+             options;
 
   if (frame == NULL || frame_length == NULL || header_length == NULL ||
       self_mac == NULL || bssid == NULL ||
@@ -21710,8 +21743,7 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
 
   ip_offset = offset;
   udp_length = (uint16_t)(K1_RTL8852BS_UDP_HEADER_SIZE +
-                          K1_RTL8852BS_BOOTP_FIXED_SIZE +
-                          K1_RTL8852BS_DHCP_OPTIONS_SIZE);
+                          K1_RTL8852BS_BOOTP_FIXED_SIZE + options);
   frame[ip_offset] = K1_RTL8852BS_IPV4_VERSION_IHL;
   k1_rtl8852bs_write_be16(frame + ip_offset + 2,
                           (uint16_t)(K1_RTL8852BS_IPV4_HEADER_SIZE +
@@ -21765,9 +21797,10 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
   frame[offset++] = 0x82u;
   frame[offset++] = 0x53u;
   frame[offset++] = 0x63u;
-  frame[offset++] = 53u;
+  frame[offset++] = K1_RTL8852BS_DHCP_OPT_MSG_TYPE;
   frame[offset++] = 1u;
-  frame[offset++] = 1u;
+  frame[offset++] = request_form ? K1_RTL8852BS_DHCP_MSG_REQUEST :
+                                   K1_RTL8852BS_DHCP_MSG_DISCOVER;
   frame[offset++] = 61u;
   frame[offset++] = 7u;
   frame[offset++] = 1u;
@@ -21778,7 +21811,28 @@ static int k1_rtl8852bs_runtime_dhcp_discover_build(
   frame[offset++] = 1u;
   frame[offset++] = 3u;
   frame[offset++] = 6u;
-  frame[offset++] = 0xffu;
+
+  /* And, on a Request, the two options RFC 2131 4.3.2 requires of a client
+   * answering an offer: the address being accepted, and the identifier of the
+   * server that offered it, so a second server's offer is declined by the same
+   * message that accepts this one.  ciaddr stays zero and the destination
+   * stays the broadcast address, which is what a client still without an
+   * address must send even when it knows which server it is answering.
+   */
+
+  if (request_form)
+    {
+      frame[offset++] = K1_RTL8852BS_DHCP_OPT_REQUESTED_IP;
+      frame[offset++] = 4u;
+      k1_rtl8852bs_write_be32(frame + offset, requested_address);
+      offset += 4;
+      frame[offset++] = K1_RTL8852BS_DHCP_OPT_SERVER_ID;
+      frame[offset++] = 4u;
+      k1_rtl8852bs_write_be32(frame + offset, server_identifier);
+      offset += 4;
+    }
+
+  frame[offset++] = K1_RTL8852BS_DHCP_OPT_END;
 
   if (offset != required)
     {
@@ -21967,13 +22021,35 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
   return OK;
 }
 
+/* Everything one BOOTP reply says that this port acts on.  message_type is
+ * option 53, and it is the field that separates an offer from the
+ * acknowledgement of a request and from a refusal of one -- a distinction the
+ * earlier readings did not need, because no reply had ever come back.  offered
+ * is yiaddr, server_id option 54 and source the datagram's own source address,
+ * which is the server to answer when option 54 is absent.  mask, router and
+ * lease are options 1, 3 and 51: not needed to answer, kept because an
+ * assignment that arrives without them is an assignment this port cannot use.
+ * None of these is a credential and all of them are printed.
+ */
+
+struct k1_rtl8852bs_dhcp_reply_s
+{
+  uint32_t offered;
+  uint32_t server_id;
+  uint32_t source;
+  uint32_t mask;
+  uint32_t router;
+  uint32_t lease;
+  uint8_t message_type;
+};
+
 /****************************************************************************
  * Name: k1_rtl8852bs_runtime_dhcp_reply_match
  *
  * Description:
- *   Decide whether one received 802.11 data frame is the answer to the DHCP
- *   Discover this port transmitted, and if it is, report the address it
- *   offers.
+ *   Decide whether one received 802.11 data frame is an answer to the DHCP
+ *   exchange this port started, and if it is, report what it says: which kind
+ *   of answer it is, the address it names, and the server behind it.
  *
  *   Three fields have to agree, and together they are what makes the answer
  *   evidence rather than traffic.  The datagram has to come from the DHCP
@@ -21996,7 +22072,7 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
  *   header_length   - its 802.11 header's length, as its frame control says
  *   self_mac        - the eFuse self MAC the reply has to carry back
  *   transaction_id  - the identifier the Discover was sent with
- *   offered_address - the offered address on a match, host byte order
+ *   reply           - what the reply says on a match, host byte order
  *
  * Returned Value:
  *   true when the frame is this host's own DHCP answer.
@@ -22006,7 +22082,7 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
 static bool k1_rtl8852bs_runtime_dhcp_reply_match(
   FAR const uint8_t *payload, size_t payload_length, size_t header_length,
   FAR const uint8_t *self_mac, uint32_t transaction_id,
-  FAR uint32_t *offered_address)
+  FAR struct k1_rtl8852bs_dhcp_reply_s *reply)
 {
   static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
     {
@@ -22014,12 +22090,16 @@ static bool k1_rtl8852bs_runtime_dhcp_reply_match(
     };
 
   size_t offset;
+  size_t ip_offset;
   size_t ip_length;
+  size_t option;
 
-  if (payload == NULL || self_mac == NULL || offered_address == NULL)
+  if (payload == NULL || self_mac == NULL || reply == NULL)
     {
       return false;
     }
+
+  memset(reply, 0, sizeof(*reply));
 
   offset = header_length + K1_RTL8852BS_CCMP_HEADER_SIZE;
   if (payload_length < offset + sizeof(llc_snap) ||
@@ -22039,6 +22119,8 @@ static bool k1_rtl8852bs_runtime_dhcp_reply_match(
     {
       return false;
     }
+
+  ip_offset = offset;
 
   ip_length = (size_t)(payload[offset] & 0x0fu) * 4u;
   if (ip_length < K1_RTL8852BS_IPV4_HEADER_SIZE ||
@@ -22091,11 +22173,79 @@ static bool k1_rtl8852bs_runtime_dhcp_reply_match(
       return false;
     }
 
-  *offered_address =
-    ((uint32_t)payload[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET] << 24) |
-    ((uint32_t)payload[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 1] << 16) |
-    ((uint32_t)payload[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 2] << 8) |
-    (uint32_t)payload[offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET + 3];
+  reply->offered = k1_rtl8852bs_read_be32(
+    payload + offset + K1_RTL8852BS_BOOTP_YIADDR_OFFSET);
+  reply->source = k1_rtl8852bs_read_be32(payload + ip_offset + 12);
+
+  /* The options, which begin behind the fixed part with the four cookie bytes
+   * RFC 2132 3 defines.  A reply whose cookie is absent or truncated is still
+   * this host's reply -- the three fields above already said so -- so the walk
+   * simply stops and leaves message_type zero, which the caller reads as an
+   * answer whose kind is unknown rather than as no answer.
+   *
+   * The walk is bounded twice over: by the frame length at every step, and by
+   * each option's own length, so a length byte that runs past the end ends it
+   * instead of reading past the buffer.  Options 0 and 255 carry no length
+   * byte, which is why they are handled before the length is read.
+   */
+
+  offset += K1_RTL8852BS_BOOTP_FIXED_SIZE;
+  if (payload_length < offset + 4 ||
+      payload[offset] != 0x63u || payload[offset + 1] != 0x82u ||
+      payload[offset + 2] != 0x53u || payload[offset + 3] != 0x63u)
+    {
+      return true;
+    }
+
+  offset += 4;
+  while (offset < payload_length)
+    {
+      option = payload[offset];
+      if (option == K1_RTL8852BS_DHCP_OPT_END)
+        {
+          break;
+        }
+
+      if (option == 0)
+        {
+          offset++;
+          continue;
+        }
+
+      if (payload_length < offset + 2 ||
+          payload_length < offset + 2 + (size_t)payload[offset + 1])
+        {
+          break;
+        }
+
+      if (option == K1_RTL8852BS_DHCP_OPT_MSG_TYPE &&
+          payload[offset + 1] == 1u)
+        {
+          reply->message_type = payload[offset + 2];
+        }
+      else if (payload[offset + 1] == 4u)
+        {
+          if (option == K1_RTL8852BS_DHCP_OPT_SERVER_ID)
+            {
+              reply->server_id = k1_rtl8852bs_read_be32(payload + offset + 2);
+            }
+          else if (option == K1_RTL8852BS_DHCP_OPT_MASK)
+            {
+              reply->mask = k1_rtl8852bs_read_be32(payload + offset + 2);
+            }
+          else if (option == K1_RTL8852BS_DHCP_OPT_LEASE)
+            {
+              reply->lease = k1_rtl8852bs_read_be32(payload + offset + 2);
+            }
+          else if (option == K1_RTL8852BS_DHCP_OPT_ROUTER)
+            {
+              reply->router = k1_rtl8852bs_read_be32(payload + offset + 2);
+            }
+        }
+
+      offset += 2 + (size_t)payload[offset + 1];
+    }
+
   return true;
 }
 
@@ -22552,7 +22702,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   uint32_t info2;
   uint32_t info3;
   uint32_t info4;
-  uint32_t offered = 0;
+  struct k1_rtl8852bs_dhcp_reply_s dhcp;
   uint64_t first_pn;
   uint64_t second_pn;
   size_t arp_length = 0;
@@ -22583,9 +22733,9 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   reply = buffer + K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX;
   descriptor = buffer + 2u * K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX;
 
-  ret = k1_rtl8852bs_runtime_dhcp_discover_build(
+  ret = k1_rtl8852bs_runtime_dhcp_client_build(
     frame, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, 0x123u, 1ull,
-    0x0a0b0c0du, &frame_length, &header_length);
+    0x0a0b0c0du, 0u, 0u, &frame_length, &header_length);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -22635,6 +22785,60 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
           frame + offset, frame_length - offset)) != 0)
     {
       ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* The same builder asked for a Request instead.  Twelve bytes longer, the
+   * message type changed from one to three, and the two options that carry the
+   * accepted address and the server that offered it written where the end
+   * marker used to be -- and the datagram's own length field must have moved
+   * with them, which is what re-summing the UDP checksum here proves.
+   */
+
+  if (k1_rtl8852bs_runtime_dhcp_client_build(
+        frame, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, 0x124u,
+        2ull, 0x0a0b0c0du, 0xc0a8017bu, 0xc0a80101u, &offset,
+        &header_length) != OK ||
+      offset != K1_RTL8852BS_DHCP_DISCOVER_SIZE +
+                K1_RTL8852BS_DHCP_REQUEST_EXTRA_SIZE ||
+      frame[offset - 13] != K1_RTL8852BS_DHCP_OPT_REQUESTED_IP ||
+      k1_rtl8852bs_read_be32(frame + offset - 11) != 0xc0a8017bu ||
+      frame[offset - 7] != K1_RTL8852BS_DHCP_OPT_SERVER_ID ||
+      k1_rtl8852bs_read_be32(frame + offset - 5) != 0xc0a80101u ||
+      frame[offset - 1] != K1_RTL8852BS_DHCP_OPT_END ||
+      frame[ip_offset + K1_RTL8852BS_IPV4_HEADER_SIZE +
+            K1_RTL8852BS_UDP_HEADER_SIZE + 242] !=
+      K1_RTL8852BS_DHCP_MSG_REQUEST)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  if (k1_rtl8852bs_runtime_inet_fold(
+        k1_rtl8852bs_runtime_inet_sum(
+          k1_rtl8852bs_runtime_inet_sum(
+            (uint32_t)K1_RTL8852BS_IPV4_PROTO_UDP +
+            (uint32_t)(offset - ip_offset - K1_RTL8852BS_IPV4_HEADER_SIZE),
+            frame + ip_offset + 12, 8u),
+          frame + ip_offset + K1_RTL8852BS_IPV4_HEADER_SIZE,
+          offset - ip_offset - K1_RTL8852BS_IPV4_HEADER_SIZE)) != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto error;
+    }
+
+  /* Rebuilt as the Discover again, because everything below reads the frame
+   * this test started from.
+   */
+
+  ret = k1_rtl8852bs_runtime_dhcp_client_build(
+    frame, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, 0x123u, 1ull,
+    0x0a0b0c0du, 0u, 0u, &frame_length, &header_length);
+  if (ret < 0)
+    {
       stage = __LINE__;
       goto error;
     }
@@ -22861,9 +23065,10 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
    * than write past the end of it.
    */
 
-  if (k1_rtl8852bs_runtime_dhcp_discover_build(
+  if (k1_rtl8852bs_runtime_dhcp_client_build(
         frame, K1_RTL8852BS_DHCP_DISCOVER_SIZE - 1u, self, bssid, 0x123u,
-        1ull, 0x0a0b0c0du, &frame_length, &header_length) != -EINVAL)
+        1ull, 0x0a0b0c0du, 0u, 0u, &frame_length,
+        &header_length) != -EINVAL)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -22958,7 +23163,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (!k1_rtl8852bs_runtime_dhcp_reply_match(
         reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
-        0x0a0b0c0du, &offered) || offered != 0xc0a8017bu)
+        0x0a0b0c0du, &dhcp) || dhcp.offered != 0xc0a8017bu)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -22974,12 +23179,11 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
    * is what this check asked for before and why it failed on the board.
    */
 
-  offered = 0;
   if (!k1_rtl8852bs_runtime_dhcp_reply_match(
         reply, reply_length,
         ip_offset - K1_RTL8852BS_LLC_SNAP_HEADER_SIZE, self, 0x0a0b0c0du,
-        &offered) ||
-      offered != 0xc0a8017bu)
+        &dhcp) ||
+      dhcp.offered != 0xc0a8017bu)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -22995,16 +23199,16 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (k1_rtl8852bs_runtime_dhcp_reply_match(
         reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
-        0x0a0b0c0eu, &offered) ||
+        0x0a0b0c0eu, &dhcp) ||
       k1_rtl8852bs_runtime_dhcp_reply_match(
         reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, bssid,
-        0x0a0b0c0du, &offered) ||
+        0x0a0b0c0du, &dhcp) ||
       k1_rtl8852bs_runtime_dhcp_reply_match(
         reply, reply_length - 1u, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
-        0x0a0b0c0du, &offered) ||
+        0x0a0b0c0du, &dhcp) ||
       k1_rtl8852bs_runtime_dhcp_reply_match(
         frame, K1_RTL8852BS_DHCP_DISCOVER_SIZE,
-        K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, 0x0a0b0c0du, &offered))
+        K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, 0x0a0b0c0du, &dhcp))
     {
       ret = -EIO;
       stage = __LINE__;
@@ -23014,7 +23218,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   reply[offset] = K1_RTL8852BS_BOOTP_REQUEST;
   if (k1_rtl8852bs_runtime_dhcp_reply_match(
         reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
-        0x0a0b0c0du, &offered))
+        0x0a0b0c0du, &dhcp))
     {
       ret = -EIO;
       stage = __LINE__;
@@ -23026,7 +23230,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
                           K1_RTL8852BS_DHCP_CLIENT_PORT);
   if (k1_rtl8852bs_runtime_dhcp_reply_match(
         reply, reply_length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self,
-        0x0a0b0c0du, &offered))
+        0x0a0b0c0du, &dhcp))
     {
       ret = -EIO;
       stage = __LINE__;
@@ -23198,7 +23402,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
   k1_early_puts(" pn=");
   k1_early_puthex((uintreg_t)second_pn);
   k1_early_puts(" offer=");
-  k1_early_puthex(offered);
+  k1_early_puthex(dhcp.offered);
   k1_early_puts("\r\n");
   k1_early_puts("K1 Wi-Fi GPL: runtime protected data TX head=");
   k1_rtl8852bs_scanofld_log_bytes(frame, sizeof(expect_head));
@@ -26384,7 +26588,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
  * as an access point that said nothing.
  ****************************************************************************/
 
-#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       5000u
+#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       7000u
 #define K1_RTL8852BS_RESIDENT_PROBE_DELAY_MSEC  300u
 #define K1_RTL8852BS_RESIDENT_PROBE_GAP_MSEC    500u
 #define K1_RTL8852BS_RESIDENT_PROBE_ATTEMPTS    4u
@@ -26451,6 +26655,18 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_RESIDENT_ARP_DELAY_MSEC    1100u
 #define K1_RTL8852BS_RESIDENT_ARP_GAP_MSEC      650u
 #define K1_RTL8852BS_RESIDENT_ARP_ATTEMPTS      6u
+
+/* The Request that accepts an offer, and its retransmission.  Neither has a
+ * delay of its own: the first goes out in the poll that observed the offer,
+ * because a server holds a reserved address only for as long as it chooses to
+ * and the standard's own client answers immediately.  The gap is the wait
+ * before deciding the acknowledgement is not coming, and two attempts inside a
+ * seven-second window leave the second one's answer more than three seconds to
+ * arrive.
+ */
+
+#define K1_RTL8852BS_RESIDENT_REQUEST_GAP_MSEC  900u
+#define K1_RTL8852BS_RESIDENT_REQUEST_ATTEMPTS  2u
 
 /* How much of the first protected data frame is kept.  Thirty-two bytes reach
  * past the longest header a QoS data frame from an access point can have and
@@ -26673,6 +26889,43 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t dhcp_replies;
   uint32_t dhcp_offer;
   uint32_t dhcp_offer_attempt;
+
+  /* What the answer said, and what this port sent back.  An offer is not an
+   * assignment: RFC 2131 4.3.1 has the server reserve the address and 4.3.2
+   * has the client accept it by name, so until a Request has been answered
+   * the address in dhcp_offer belongs to nobody and must not go on the air
+   * as a sender address.  dhcp_offers, dhcp_acks and dhcp_naks split
+   * dhcp_replies by option 53, the field that says which of the three came.
+   *
+   * dhcp_server_id is option 54 and dhcp_server_source the datagram's own
+   * source address, kept apart because a Request has to name the first and a
+   * server that omits it can still be answered through the second.
+   * dhcp_server_mac is the station behind them inside the distribution
+   * system: address 3 of the frame the answer arrived in, not the access
+   * point, whose address is address 2.  dhcp_mask, dhcp_router and
+   * dhcp_lease are options 1, 3 and 51 -- an assignment without them cannot
+   * be used, so their absence is a reading rather than an omission.
+   * dhcp_offer_xid is the identifier the answered Discover carried, and the
+   * Request reuses it because to the server both are one transaction.  None
+   * of these is a credential.
+   */
+
+  uint32_t dhcp_offer_xid;
+  uint32_t dhcp_offers;
+  uint32_t dhcp_acks;
+  uint32_t dhcp_naks;
+  uint32_t dhcp_ack_ip;
+  uint32_t dhcp_server_id;
+  uint32_t dhcp_server_source;
+  uint32_t dhcp_mask;
+  uint32_t dhcp_router;
+  uint32_t dhcp_lease;
+  uint32_t dhcp_request_sent;
+  uint32_t dhcp_request_bytes;
+  uint32_t dhcp_request_sequence;
+  int dhcp_request_status;
+  uint8_t dhcp_server_mac[6];
+  bool dhcp_server_mac_valid;
 
   /* What the transmit-side counters did across the writes.  data_tx_mpdu is
    * the summed increment of the MAC's transmitted-MPDU counter, data_tx_cck
@@ -27405,6 +27658,114 @@ static size_t k1_rtl8852bs_runtime_resident_header_length(
     }
 
   return length;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_observe_dhcp
+ *
+ * Description:
+ *   Record one BOOTP reply that the matcher has already established belongs to
+ *   this host's own exchange, and split it by what option 53 says it is.
+ *
+ *   The split is the point.  Every reply this port had ever received before
+ *   this increment was an offer, and an offer is a reservation the client
+ *   has yet to accept, so counting offers and acknowledgements together
+ *   would let a reserved address read as an assigned one.  A refusal is
+ *   counted and nothing is taken from it: a NAK names no address and
+ *   carries no parameters.
+ *
+ *   Each field is latched once, by the first reply that carried it, so a
+ *   second server answering the same Discover cannot overwrite the offer
+ *   this port is about to accept -- which is also why the Request has to
+ *   name the server it is answering.
+ *
+ * Input Parameters:
+ *   count          - the window's counters
+ *   reply          - what the matcher read out of the frame
+ *   source_mac     - address 3 of the frame, the station the reply came from
+ *                    inside the distribution system, or NULL when the frame
+ *                    did not carry one
+ *   transaction_id - the identifier this reply came back with
+ *   attempt        - which Discover was answered, one or two
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_resident_observe_dhcp(
+  FAR struct k1_rtl8852bs_resident_count_s *count,
+  FAR const struct k1_rtl8852bs_dhcp_reply_s *reply,
+  FAR const uint8_t *source_mac, uint32_t transaction_id,
+  unsigned int attempt)
+{
+  if (count == NULL || reply == NULL)
+    {
+      return;
+    }
+
+  count->dhcp_replies++;
+
+  if (reply->message_type == K1_RTL8852BS_DHCP_MSG_NAK)
+    {
+      count->dhcp_naks++;
+      return;
+    }
+
+  if (reply->message_type == K1_RTL8852BS_DHCP_MSG_ACK)
+    {
+      count->dhcp_acks++;
+      if (count->dhcp_ack_ip == 0)
+        {
+          count->dhcp_ack_ip = reply->offered;
+        }
+    }
+  else
+    {
+      /* An offer, or a reply whose options were absent or truncated: the
+       * three fields the matcher agreed on already say it answers this host,
+       * so it is treated as the offer it almost certainly is rather than
+       * discarded.
+       */
+
+      count->dhcp_offers++;
+    }
+
+  if (count->dhcp_offer == 0)
+    {
+      count->dhcp_offer = reply->offered;
+      count->dhcp_offer_attempt = attempt;
+      count->dhcp_offer_xid = transaction_id;
+    }
+
+  if (count->dhcp_server_id == 0)
+    {
+      count->dhcp_server_id = reply->server_id;
+    }
+
+  if (count->dhcp_server_source == 0)
+    {
+      count->dhcp_server_source = reply->source;
+    }
+
+  if (count->dhcp_mask == 0)
+    {
+      count->dhcp_mask = reply->mask;
+    }
+
+  if (count->dhcp_router == 0)
+    {
+      count->dhcp_router = reply->router;
+    }
+
+  if (count->dhcp_lease == 0)
+    {
+      count->dhcp_lease = reply->lease;
+    }
+
+  if (!count->dhcp_server_mac_valid && source_mac != NULL &&
+      k1_rtl8852bs_addr_cam_mac_valid(source_mac))
+    {
+      memcpy(count->dhcp_server_mac, source_mac, 6);
+      count->dhcp_server_mac_valid = true;
+    }
 }
 
 /****************************************************************************
@@ -28643,7 +29004,7 @@ static void k1_rtl8852bs_runtime_resident_observe(
   FAR struct k1_rtl8852bs_resident_count_s *count)
 {
   struct k1_rtl8852bs_mgmt_frame_s mgmt;
-  uint32_t offered = 0;
+  struct k1_rtl8852bs_dhcp_reply_s dhcp;
   uint8_t subtype;
   uint8_t type;
   bool from_target;
@@ -28772,33 +29133,29 @@ static void k1_rtl8852bs_runtime_resident_observe(
                     payload, payload_length,
                     k1_rtl8852bs_runtime_resident_header_length(
                       mgmt.frame_control),
-                    self_mac, count->data_tx_xid, &offered))
+                    self_mac, count->data_tx_xid, &dhcp))
                 {
-                  count->dhcp_replies++;
-                  if (count->dhcp_offer == 0)
-                    {
-                      count->dhcp_offer = offered;
-                      count->dhcp_offer_attempt = 1u;
-                    }
+                  k1_rtl8852bs_runtime_resident_observe_dhcp(
+                    count, &dhcp,
+                    mgmt.addr3_valid ? mgmt.addr3 : NULL,
+                    count->data_tx_xid, 1u);
                 }
               else if (count->data_tx_xid_alt != 0 &&
                        k1_rtl8852bs_runtime_dhcp_reply_match(
                          payload, payload_length,
                          k1_rtl8852bs_runtime_resident_header_length(
                            mgmt.frame_control),
-                         self_mac, count->data_tx_xid_alt, &offered))
+                         self_mac, count->data_tx_xid_alt, &dhcp))
                 {
                   /* The same answer, to the attempt that carried mainline's
                    * header-with-LLC length instead of the vendor's.  Which of
                    * the two was answered is this increment's whole reading.
                    */
 
-                  count->dhcp_replies++;
-                  if (count->dhcp_offer == 0)
-                    {
-                      count->dhcp_offer = offered;
-                      count->dhcp_offer_attempt = 2u;
-                    }
+                  k1_rtl8852bs_runtime_resident_observe_dhcp(
+                    count, &dhcp,
+                    mgmt.addr3_valid ? mgmt.addr3 : NULL,
+                    count->data_tx_xid_alt, 2u);
                 }
             }
 
@@ -29255,10 +29612,10 @@ static int k1_rtl8852bs_runtime_resident_data_tx(
                        (mainline_form ? 1u : 0u);
     }
 
-  ret = k1_rtl8852bs_runtime_dhcp_discover_build(
+  ret = k1_rtl8852bs_runtime_dhcp_client_build(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, sequence,
-    packet_number, transaction_id, &frame_length, &header_length);
+    packet_number, transaction_id, 0u, 0u, &frame_length, &header_length);
   if (ret < 0)
     {
       goto done;
@@ -29595,6 +29952,170 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
    * every line printed inside the window is time the receive FIFO is not being
    * drained in, which for a frame whose answer arrives in milliseconds matters
    * more here than there.
+   */
+
+  for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
+    {
+      if (k1_rtl8852bs_data_tx_resources_read(
+            K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &after_res) != OK ||
+          after_res.channel_used_pages == before_res.channel_used_pages)
+        {
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  ret = OK;
+
+done:
+  kmm_free(packet);
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_dhcp_request_tx
+ *
+ * Description:
+ *   Accept the address the server offered, by transmitting a protected DHCP
+ *   Request that names it and names the server that offered it.
+ *
+ *   This is the first frame this port sends whose content is decided by
+ *   something that came back off the air.  Everything before it -- the
+ *   Discover, the ARP probes -- was built out of what this station already
+ *   knew, so a run that transmitted them proved only that transmission works.
+ *   A Request carries an address a server chose and a transaction identifier
+ *   the server assigned to the exchange, so an answer to it is an answer that
+ *   could not have been produced without the whole path having worked in both
+ *   directions.
+ *
+ *   The identifier is reused rather than generated.  RFC 2131 4.4.1 has the
+ *   client keep one transaction identifier across Discover, Offer, Request and
+ *   Acknowledgement, and a server that receives a Request under an identifier
+ *   it never offered against will drop it or refuse it.
+ *
+ *   The frame goes to the broadcast address inside the distribution system and
+ *   ciaddr stays zero, because the address in option 50 is still the server's
+ *   until the acknowledgement arrives: a client that used it as a sender
+ *   address before then would be claiming an address that is not yet its own.
+ *   Address 1 is the access point, so the frame is still protected with the
+ *   pairwise key like every other frame this window sends.
+ *
+ * Input Parameters:
+ *   self_mac - the eFuse self MAC, address 2 and the client identifier
+ *   bssid    - the access point, address 1
+ *   count    - the window's counters, which hold the offer being accepted and
+ *              record what was transmitted
+ *
+ * Returned Value:
+ *   OK when the frame was written into the queue, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_dhcp_request_tx(
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  struct k1_rtl8852bs_tx_security_s security =
+    {
+      .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+      .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE
+    };
+
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_resources_s before_res;
+  struct k1_rtl8852bs_data_tx_resources_s after_res;
+  FAR uint8_t *packet;
+  size_t frame_length = 0;
+  unsigned int drained;
+  uint16_t sequence;
+  uint8_t header_length = 0;
+  uint64_t packet_number;
+  uint32_t server;
+  int ret;
+
+  /* Which server to name.  Option 54 is what RFC 2131 4.3.2 asks for; the
+   * datagram's source address stands in when the offer omitted it, because a
+   * Request that names no server at all is one any server may answer and none
+   * has to.
+   */
+
+  if (count == NULL || count->dhcp_offer == 0 || count->dhcp_offer_xid == 0)
+    {
+      return -EADDRNOTAVAIL;
+    }
+
+  server = count->dhcp_server_id != 0 ? count->dhcp_server_id :
+                                        count->dhcp_server_source;
+  if (server == 0)
+    {
+      return -EADDRNOTAVAIL;
+    }
+
+  packet = kmm_malloc(K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                      K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+  if (packet == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  memset(packet, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+  packet_number = k1_rtl8852bs_runtime_tx_packet_number_next();
+
+  ret = k1_rtl8852bs_runtime_dhcp_client_build(
+    packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, sequence,
+    packet_number, count->dhcp_offer_xid, count->dhcp_offer, server,
+    &frame_length, &header_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, sequence, header_length,
+    K1_RTL8852BS_TXRPT_TAG_DHCP_REQUEST, &security, packet,
+    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  k1_rtl8852bs_runtime_sch_tx_en_data();
+
+  ret = k1_rtl8852bs_data_tx_resources_read(
+    K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &before_res);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  if (before_res.channel_used_pages +
+      layout.required_wde_pages > before_res.channel_max_pages ||
+      before_res.wp_available_pages <
+      layout.required_ple_pages + K1_RTL8852BS_DATA_TX_PLE_RESERVE)
+    {
+      ret = -ENOSPC;
+      goto done;
+    }
+
+  ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
+                           layout.transfer_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  count->dhcp_request_sent++;
+  count->dhcp_request_bytes = (uint32_t)frame_length;
+  count->dhcp_request_sequence = sequence;
+
+  /* The same drain poll the other two submitters make, and for the same
+   * reason: a queue that accepted the write and a dispatcher that took the
+   * frame out of it are two different events.
    */
 
   for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
@@ -30654,6 +31175,8 @@ static int k1_rtl8852bs_runtime_resident_window(
   clock_t arp_deadline;
   unsigned int data_attempts = 0;
   unsigned int arp_attempts = 0;
+  unsigned int request_attempts = 0;
+  clock_t request_deadline = 0;
   uint32_t arp_trip_seen = 0;
   int arp_trip_last = -1;
   size_t probe_length;
@@ -31011,6 +31534,47 @@ static int k1_rtl8852bs_runtime_resident_window(
             }
 
           arp_attempts++;
+        }
+
+      /* And the Request, which is gated on the offer rather than on a clock.
+       * It goes out in the poll that observed the offer, stops as soon as an
+       * acknowledgement or a refusal arrives, and is sent at most twice: a
+       * client that keeps asking after a NAK is asking for an address the
+       * server has already said belongs to someone else.
+       */
+
+      if (g_k1_rtl8852bs_key_install.tk_installed &&
+          count.dhcp_offer != 0 && count.dhcp_acks == 0 &&
+          count.dhcp_naks == 0 &&
+          request_attempts < K1_RTL8852BS_RESIDENT_REQUEST_ATTEMPTS &&
+          (request_attempts == 0 ||
+           (sclock_t)(clock_systime_ticks() - request_deadline) >= 0))
+        {
+          ret = k1_rtl8852bs_runtime_resident_dhcp_request_tx(self_mac, bssid,
+                                                             &count);
+          count.dhcp_request_status = ret;
+          request_deadline = clock_systime_ticks() +
+                             MSEC2TICK(K1_RTL8852BS_RESIDENT_REQUEST_GAP_MSEC);
+          request_attempts++;
+
+          k1_early_puts("K1 Wi-Fi GPL: resident dhcp request tx sn=");
+          k1_early_puthex(count.dhcp_request_sequence);
+          k1_early_puts(" bytes=");
+          k1_early_puthex(count.dhcp_request_bytes);
+          k1_early_puts(" xid=");
+          k1_early_puthex(count.dhcp_offer_xid);
+          k1_early_puts(" ip=");
+          k1_early_puthex(count.dhcp_offer);
+          k1_early_puts(" server=");
+          k1_early_puthex(count.dhcp_server_id != 0 ?
+                          count.dhcp_server_id : count.dhcp_server_source);
+          k1_early_puts(" pn=");
+          k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
+          k1_early_puts(" attempt=");
+          k1_early_puthex(request_attempts);
+          k1_early_puts(" status=");
+          k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts("\r\n");
         }
 
       ret = k1_rtl8852bs_runtime_rx_read(
@@ -31689,6 +32253,68 @@ static int k1_rtl8852bs_runtime_resident_window(
       k1_early_puthex(count.arp_reply_ip);
       k1_early_puts("\r\n");
     }
+
+  /* What the server said.  The offer line is the reservation as it arrived:
+   * the address it holds out, the identity of the server that holds it, the
+   * address the datagram was sent from, and the parameters that come with the
+   * lease.  type names the message so a reply that is not an offer cannot be
+   * read as one, and mac is the station the frame arrived from, which is the
+   * access point rather than the server itself.  An offered address is not a
+   * credential.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window dhcp offer ip=");
+  k1_early_puthex(count.dhcp_offer);
+  k1_early_puts(" server-id=");
+  k1_early_puthex(count.dhcp_server_id);
+  k1_early_puts(" src=");
+  k1_early_puthex(count.dhcp_server_source);
+  k1_early_puts(" mask=");
+  k1_early_puthex(count.dhcp_mask);
+  k1_early_puts(" router=");
+  k1_early_puthex(count.dhcp_router);
+  k1_early_puts(" lease=");
+  k1_early_puthex(count.dhcp_lease);
+  k1_early_puts(" offers=");
+  k1_early_puthex(count.dhcp_offers);
+  k1_early_puts(" attempt=");
+  k1_early_puthex(count.dhcp_offer_attempt);
+  k1_early_puts(" xid=");
+  k1_early_puthex(count.dhcp_offer_xid);
+  k1_early_puts(" mac=");
+  if (count.dhcp_server_mac_valid)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.dhcp_server_mac, 6);
+    }
+
+  k1_early_puts("\r\n");
+
+  /* And the acceptance.  sent is how many Requests the queue took and status
+   * the error of the last one, so a line with sent=0 says the window never
+   * asked rather than that the server never answered.  ack and nak are the two
+   * ways the server can close the exchange: an acknowledgement carries the
+   * address that is now this station's to use, a refusal says the offer is
+   * gone.  Only ack-ip may go on the air as a sender address.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window dhcp request sent=");
+  k1_early_puthex(count.dhcp_request_sent);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(count.dhcp_request_status < 0 ?
+                              -count.dhcp_request_status : 0));
+  k1_early_puts(" sn=");
+  k1_early_puthex(count.dhcp_request_sequence);
+  k1_early_puts(" bytes=");
+  k1_early_puthex(count.dhcp_request_bytes);
+  k1_early_puts(" reply=");
+  k1_early_puthex(count.dhcp_replies);
+  k1_early_puts(" ack=");
+  k1_early_puthex(count.dhcp_acks);
+  k1_early_puts(" ack-ip=");
+  k1_early_puthex(count.dhcp_ack_ip);
+  k1_early_puts(" nak=");
+  k1_early_puthex(count.dhcp_naks);
+  k1_early_puts("\r\n");
 
   /* The reports themselves, once the window is closed.  The first one is the
    * calibration: it belongs to a management frame the access point answered
