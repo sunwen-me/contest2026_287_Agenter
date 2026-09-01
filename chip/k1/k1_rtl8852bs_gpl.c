@@ -27458,6 +27458,16 @@ struct k1_rtl8852bs_resident_count_s
    * icmp_echo_reply_src is where an answer actually came from -- which differs
    * from both if something answers on another host's behalf.
    *
+   * All three follow the latest attempt rather than the first one.  Recording
+   * them once, with the first attempt, misreports the window whenever a
+   * candidate is learned after that attempt: run 68 sent its first echo before
+   * the ARP round had an answer, so the odd attempts' address was still folded
+   * onto the even one when the pair was latched, and the report named one host
+   * twice while the frames after it went to two.  icmp_echo_last_ip is the
+   * address the attempt just made actually used, which is what the per-attempt
+   * line has to print -- deriving that line from the pair reproduces the same
+   * mistake one level down.
+   *
    * icmp_echo_reply_bad counts replies that carried this port's identifier but
    * failed their own checksum or a sequence number never sent.  A wrong answer
    * is a different finding from no answer, and folding the two together would
@@ -27469,6 +27479,7 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t icmp_echo_sequence;
   uint32_t icmp_echo_target;
   uint32_t icmp_echo_alt;
+  uint32_t icmp_echo_last_ip;
   uint32_t icmp_echo_mask;
   uint32_t icmp_echo_replies;
   uint32_t icmp_echo_reply_bad;
@@ -31341,6 +31352,13 @@ static int k1_rtl8852bs_runtime_resident_icmp_tx(
       target_mac = primary_mac;
     }
 
+  /* What this attempt is about to use, recorded before anything can fail, so
+   * the per-attempt line names the address that was chosen even when the frame
+   * never went out.
+   */
+
+  count->icmp_echo_last_ip = target_ip;
+
   if (target_ip == count->dhcp_ack_ip)
     {
       return -EADDRNOTAVAIL;
@@ -31404,16 +31422,18 @@ static int k1_rtl8852bs_runtime_resident_icmp_tx(
       goto done;
     }
 
-  /* Both candidates are recorded once, with the first attempt, so the report
-   * names the pair that was asked even after later attempts have gone out.
+  /* Both candidates are recorded again with every attempt that goes out, so
+   * the report names the pair as it stood for the last frame rather than the
+   * pair the first frame happened to see.  A candidate learned later -- the
+   * host that answers the claimed ARP round is learned inside this same window
+   * -- would otherwise be missing from a report of frames that were addressed
+   * to it.  The MAC follows the same rule and is this attempt's destination,
+   * which is the one the per-attempt line above it names.
    */
 
-  if (count->icmp_echo_attempts == 0)
-    {
-      count->icmp_echo_target = primary_ip;
-      count->icmp_echo_alt = alt_ip;
-      memcpy(count->icmp_echo_mac, primary_mac, 6);
-    }
+  count->icmp_echo_target = primary_ip;
+  count->icmp_echo_alt = alt_ip;
+  memcpy(count->icmp_echo_mac, target_mac, 6);
 
   count->icmp_echo_attempts++;
   count->icmp_echo_bytes = (uint32_t)frame_length;
@@ -33397,8 +33417,7 @@ static int k1_rtl8852bs_runtime_resident_window(
           k1_early_puts(" src=");
           k1_early_puthex(count.dhcp_ack_ip);
           k1_early_puts(" dst=");
-          k1_early_puthex((ping_attempts & 1u) != 0 ?
-                          count.icmp_echo_alt : count.icmp_echo_target);
+          k1_early_puthex(count.icmp_echo_last_ip);
           k1_early_puts(" seq=");
           k1_early_puthex(ping_attempts);
           k1_early_puts(" pn=");
@@ -34122,6 +34141,12 @@ static int k1_rtl8852bs_runtime_resident_window(
    * its own and not the same as silence.  src is where an answer came from,
    * and it differing from both targets would mean something answered on
    * another host's behalf.
+   *
+   * target, alt and a3 are the pair as the last attempt saw it, not the first:
+   * the odd attempts' host is learned inside this same window, so a pair
+   * latched with the first attempt can name one host twice while the frames
+   * that followed went to two.  When the two are equal the parity of mask
+   * still separates the attempts but no longer separates the hosts.
    */
 
   k1_early_puts("K1 Wi-Fi GPL: resident window icmp echo attempts=");

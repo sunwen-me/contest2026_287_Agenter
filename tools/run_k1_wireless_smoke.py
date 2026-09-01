@@ -2586,9 +2586,15 @@ def main() -> int:
 
                 echo_even = echo_mask & 0x55555555
                 echo_odd = echo_mask & 0xaaaaaaaa
+
+                # The two candidates are the pair the last attempt used, and
+                # they are equal whenever only one host was ever known.  The
+                # parity of the mask separates the attempts either way, but it
+                # separates the hosts only when the pair is really two.
+                echo_two_hosts = echo_target != echo_alt
                 print(
                     "[serial] ICMP echo round: {0}/{1} answered "
-                    "(mask=0x{2:02x}, {3} damaged), {4} and {5} asked, first "
+                    "(mask=0x{2:02x}, {3} damaged), {4} and {5} asked, last "
                     "attempt addressed to {6}, {7} bytes, sn=0x{8:x}, "
                     "status {9}"
                     .format(echo_replies, echo_attempts, echo_mask, echo_bad,
@@ -2605,7 +2611,17 @@ def main() -> int:
                         "acknowledged and routed one back to it"
                         .format(echo_quad(echo_src), echo_id, echo_seq),
                         file=sys.stderr)
-                    if echo_even and echo_odd:
+                    if not echo_two_hosts:
+                        print(
+                            "[serial] both candidates are the same host "
+                            "({0}), so the parity of the mask says how many "
+                            "attempts were answered and nothing about which "
+                            "host: the one outcome two targets exist to "
+                            "separate -- a peer that drops echoes -- is "
+                            "untested in this window"
+                            .format(echo_quad(echo_target)),
+                            file=sys.stderr)
+                    elif echo_even and echo_odd:
                         print(
                             "[serial] both hosts answered, so the round trip "
                             "is not a property of one peer",
