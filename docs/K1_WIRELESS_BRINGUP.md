@@ -7816,6 +7816,53 @@ ATIM(9)、Disassociation(10)、Authentication(11)、Deauthentication(12)、Actio
 TIM 这一处拿它读过管理帧的帧体，其余调用点都在数据帧上（`observe_network`、DHCP 应答匹配、回
 环回读），所以没有别处受影响；但以后要读认证帧或去关联帧的帧体时必须记住这一点。
 
+#### run 61 的读数：37 张 TIM 全部读到，本站的位一次都没被置起
+
+`--nsh-reboot` 从活着的 `nsh>` 直接走完两段恢复，这一次不用按 RST。40 条判据全过、没有 `FAIL`，
+`out/k1-serial/k1-wpa-20260901T050954Z.log`：
+
+```
+resident window tim aid=0x1 seen=0x25 aid-set=0x0 bcast-set=0x0 absent=0x0
+short=0x0 out-of-range=0x0 dtim-count=0x0 dtim-period=0x1 ctl=0x0 bmap-len=0x1
+len=0x196 head=00010000
+```
+
+先看修的那件事成不成：`seen=0x25` 是 37 张 TIM，`absent=0x0`、`short=0x0`——目标的每一帧
+Beacon 都读到了一张能走完的 TIM；`len=0x196` 是 406 字节，接收路径交付的是整帧而不是只有帧
+头。run 59 的 `seen=0x0 absent=0x26` 确实是自己读错了位置，加 `len=` 想排的第二种可能也一并
+排掉了。
+
+再看读到了什么。`dtim-period=0x1`、`dtim-count=0x0`：这个 AP 每一帧 Beacon 都是 DTIM，缓存的
+组播帧在每一帧 Beacon 之后就会发出，不存在"要等下一个 DTIM"的窗口。`bmap-len=0x1`、`ctl=0x0`：
+位图只有一个字节、偏移为 0，是这个元素的最小合法形式；`head=00010000` 把三个固定字节和那一个
+位图字节都摊开了——`00 01 00 00`，位图字节本身是 0。`bcast-set=0x0` 是同一件事的另一面：连组播
+缓存位都没有置起。`aid-set=0x0` 且 `out-of-range=0x0`：AID 1 的位就落在读到的那个字节里，读出
+来是 0，37 次都是 0，不是"没读到"。
+
+**这条读数排除掉的是一条支路，不是整个问题。** AP 手里没有为本站留着的帧，所以"答案早就产生
+了、压在 AP 的队列里、因为 AP 认为本站在睡眠所以不发、而本站又从来不去取"这一种解释可以划
+掉——省电、PS-Poll、TIM 轮询这一整套都不必做。但反过来不成立：如果 AP 认为本站醒着（本站发出
+的帧从来没置过 PM 位，AP 本来就该这么认为），产生的答案会立刻发出去，根本不会在 TIM 里出现，
+位同样是 0。所以 `aid-set=0x0` 单独不能证明"AP 根本没产生答案"。harness 里原来那句 "the reply
+was never produced" 说过头了，已经改成 "an answer that was never produced and one sent straight
+out and not received are still to be told apart"。
+
+同一个窗口里另外两条事实把剩下的两种可能框得更紧：
+
+- `data sec total=0xd target=0xb prot=0xd group=0xd a1-match=0x0 hw-dec=0xb`：窗口里 13 个数据
+  帧全是组播/广播，**没有一个的 A1 是本站**。整个驻留窗口内 AP 没有向本站单播过任何数据帧，或
+  者硬件把它滤掉了。
+- `arp sent=0x2 status=0x0 replies=0x0`、`arp-req=0x5`、`arp peer mac=ccb5d154ccc8
+  ip=0xc0a80198`、`arp ip-peer mac=60beb40996b8 ip=0xc0a80102`：两个 ARP 探询都发出去了、TX
+  成功，off-air 收到了 5 个别人的 ARP 请求（其中一个是 cc:b5:d1:54:cc:c8 在广播宣告自己的
+  192.168.1.152，探询的目标地址就是从它学来的）。有线段是活的、GTK 解密是通的、别人的广播都收
+  得到，只是没有人回本站。
+
+于是"从来没有观察到过一次"的那一种组合仍然是唯一的空白：**off-air 收到 AP 发给本站的、用成对
+密钥加密的单播数据帧。** 要把"上行根本没被 AP 转发"和"AP 回了但下行单播没收到"分开，只有两条
+路：在 AP 的有线段抓一次包（要主机权限，见 (B1)），或者在板上做一个**答案必须是组播**的探测
+——答案会走已经证明可用的广播/GTK 路径，不依赖那条空白路径，也不需要 AP 配合。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

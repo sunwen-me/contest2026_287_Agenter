@@ -2058,7 +2058,10 @@ def main() -> int:
             # both readings are conclusions.  A set AID bit means the answer to
             # this window's probes exists and was never collected, which is the
             # one explanation a silent window cannot otherwise be told apart
-            # from an access point that produced no answer at all.
+            # from an access point that produced no answer at all.  A clear bit
+            # is the negative of that one explanation and nothing more: an
+            # answer for a station the access point believes awake goes out
+            # immediately and never appears in a map.
             resident_tim_result = re.search(
                 rb"K1 Wi-Fi GPL: resident window tim aid=(?:0x)?"
                 rb"([0-9a-fA-F]+) seen=(?:0x)?([0-9a-fA-F]+)"
@@ -2125,9 +2128,11 @@ def main() -> int:
                         "[serial] no map in {0} Beacons had this station's "
                         "bit set -- {1} of them left out the octet it lives "
                         "in, which clause 9.4.2.6 defines as a clear bit -- "
-                        "so the access point had nothing buffered for it: "
-                        "the reply was never produced, which is the access "
-                        "point's own forwarding to answer for"
+                        "so the access point is holding nothing for it: an "
+                        "answer waiting in its buffer for a station it thinks "
+                        "is asleep is ruled out, and an answer that was never "
+                        "produced and one sent straight out and not received "
+                        "are still to be told apart"
                         .format(tim_seen, tim_range),
                         file=sys.stderr)
 
