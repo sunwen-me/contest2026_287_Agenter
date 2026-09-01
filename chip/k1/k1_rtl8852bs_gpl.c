@@ -1635,6 +1635,7 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST    0x4u
 #define K1_RTL8852BS_TXRPT_TAG_LOOPBACK         0x5u
 #define K1_RTL8852BS_TXRPT_TAG_DHCP_REQUEST     0x6u
+#define K1_RTL8852BS_TXRPT_TAG_ARP_CLAIM        0x7u
 #define K1_RTL8852BS_RXDESC_PACKET_TYPE_C2H     10u
 #define K1_RTL8852BS_CCXRPT_C2H_CATEGORY        1u
 #define K1_RTL8852BS_CCXRPT_C2H_CLASS           0x9u
@@ -21921,6 +21922,10 @@ static int k1_rtl8852bs_runtime_dhcp_client_build(
  *   target_mac    - address 3, the destination inside the distribution system
  *   downlink      - build the from-DS form, address 1 this host, instead
  *   target_ip     - the address being asked about, host byte order
+ *   sender_ip     - the sender protocol address, host byte order.  Zero is
+ *                   the probe form RFC 5227 asks of a host that has no
+ *                   address yet; only an address a server has acknowledged
+ *                   may be put here, because the field is a claim
  *   sequence      - the twelve-bit sequence number
  *   packet_number - the CCMP packet number
  *   frame_length  - the frame's length on success
@@ -21934,8 +21939,9 @@ static int k1_rtl8852bs_runtime_dhcp_client_build(
 static int k1_rtl8852bs_runtime_arp_probe_build(
   FAR uint8_t *frame, size_t frame_size, FAR const uint8_t *self_mac,
   FAR const uint8_t *bssid, FAR const uint8_t *target_mac, bool downlink,
-  uint32_t target_ip, uint16_t sequence, uint64_t packet_number,
-  FAR size_t *frame_length, FAR uint8_t *header_length)
+  uint32_t target_ip, uint32_t sender_ip, uint16_t sequence,
+  uint64_t packet_number, FAR size_t *frame_length,
+  FAR uint8_t *header_length)
 {
   static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
     {
@@ -21996,8 +22002,9 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
 
   /* Ethernet hardware, IPv4 protocol, six and four byte addresses, a request.
    * The sender hardware address is this host's, the sender protocol address
-   * stays zero, the target hardware address stays zero because that is what is
-   * being asked for, and the target protocol address is the question.
+   * is the caller's claim and stays zero when there is none, the target
+   * hardware address stays zero because that is what is being asked for, and
+   * the target protocol address is the question.
    */
 
   arp_offset = offset;
@@ -22007,6 +22014,12 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
   frame[offset + 5] = 4u;
   k1_rtl8852bs_write_be16(frame + offset + 6, K1_RTL8852BS_ARP_OP_REQUEST);
   memcpy(frame + offset + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, self_mac, 6);
+  if (sender_ip != 0)
+    {
+      k1_rtl8852bs_write_be32(
+        frame + offset + K1_RTL8852BS_ARP_SENDER_IP_OFFSET, sender_ip);
+    }
+
   k1_rtl8852bs_write_be32(frame + offset + K1_RTL8852BS_ARP_TARGET_IP_OFFSET,
                           target_ip);
   offset = arp_offset + K1_RTL8852BS_ARP_PAYLOAD_SIZE;
@@ -23250,7 +23263,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, false,
-    0xc0a80101u, 0x321u, 3ull, &arp_length, &arp_header);
+    0xc0a80101u, 0u, 0x321u, 3ull, &arp_length, &arp_header);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -23296,17 +23309,19 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
-        false, 0u, 0x321u, 3ull, &arp_length, &arp_header) != -EINVAL ||
+        false, 0u, 0u, 0x321u, 3ull, &arp_length,
+        &arp_header) != -EINVAL ||
       k1_rtl8852bs_runtime_arp_probe_build(
         reply, arp_length - 1u, self, bssid, peer, false, 0xc0a80101u,
-        0x321u, 3ull, &arp_length, &arp_header) != -EINVAL ||
+        0u, 0x321u, 3ull, &arp_length, &arp_header) != -EINVAL ||
       k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
-        false, 0xc0a80101u, K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK + 1u, 3ull,
+        false, 0xc0a80101u, 0u,
+        K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK + 1u, 3ull,
         &arp_length, &arp_header) != -EINVAL ||
       k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, NULL,
-        false, 0xc0a80101u, 0x321u, 3ull, &arp_length,
+        false, 0xc0a80101u, 0u, 0x321u, 3ull, &arp_length,
         &arp_header) != -EINVAL)
     {
       ret = -EIO;
@@ -23323,7 +23338,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, true,
-        0xc0a80101u, 0x321u, 3ull, &dl_length, &arp_header) < 0)
+        0xc0a80101u, 0u, 0x321u, 3ull, &dl_length, &arp_header) < 0)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -23348,7 +23363,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, false,
-        0xc0a80101u, 0x321u, 3ull, &arp_length, &arp_header) < 0)
+        0xc0a80101u, 0u, 0x321u, 3ull, &arp_length, &arp_header) < 0)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -26588,7 +26603,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
  * as an access point that said nothing.
  ****************************************************************************/
 
-#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       7000u
+#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       9000u
 #define K1_RTL8852BS_RESIDENT_PROBE_DELAY_MSEC  300u
 #define K1_RTL8852BS_RESIDENT_PROBE_GAP_MSEC    500u
 #define K1_RTL8852BS_RESIDENT_PROBE_ATTEMPTS    4u
@@ -26661,12 +26676,26 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
  * because a server holds a reserved address only for as long as it chooses to
  * and the standard's own client answers immediately.  The gap is the wait
  * before deciding the acknowledgement is not coming, and two attempts inside a
- * seven-second window leave the second one's answer more than three seconds to
+ * nine-second window leave the second one's answer more than three seconds to
  * arrive.
  */
 
 #define K1_RTL8852BS_RESIDENT_REQUEST_GAP_MSEC  900u
 #define K1_RTL8852BS_RESIDENT_REQUEST_ATTEMPTS  2u
+
+/* And the round that asks the same host again once an address has been
+ * acknowledged, this time with that address as the sender protocol address.
+ * It cannot start before the acknowledgement arrives, which in the runs so far
+ * lands around five seconds into the window, so the window is nine seconds
+ * long and three attempts seven tenths of a second apart all fit inside it
+ * with the last one's answer still having time to come back.  The gap is
+ * shorter than the probe round's because there is no ambiguity left about
+ * whether the queue takes the frame -- what is being measured is only whether
+ * the host answers.
+ */
+
+#define K1_RTL8852BS_RESIDENT_CLAIM_GAP_MSEC    700u
+#define K1_RTL8852BS_RESIDENT_CLAIM_ATTEMPTS    3u
 
 /* How much of the first protected data frame is kept.  Thirty-two bytes reach
  * past the longest header a QoS data frame from an access point can have and
@@ -27072,6 +27101,22 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t arp_trip_broadcast;
   uint32_t arp_trip_broadcast_ack;
   bool arp_trip_valid;
+
+  /* And the same rate asked again once an address has been acknowledged, with
+   * that address in the sender protocol field instead of the zero a host
+   * without one has to send.  It is a second round rather than a change to the
+   * first because the two forms answer different questions: the probe form
+   * says whether the host answers a request from nobody, and this one whether
+   * it answers a request from a station on its own subnet.  arp_claim_spa is
+   * the address that was claimed, which only a server's acknowledgement can
+   * put there.
+   */
+
+  uint32_t arp_claim_attempts;
+  uint32_t arp_claim_mask;
+  uint32_t arp_claim_acks;
+  uint32_t arp_claim_spa;
+  int arp_claim_status;
 
   /* What the access point's own Beacons say is waiting for this station.
    * This reading costs no transmitted frame: the window already receives the
@@ -28689,7 +28734,7 @@ static int k1_rtl8852bs_runtime_loopback_selftest(void)
 
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     plain, K1_RTL8852BS_RESIDENT_FRAME_MAX, self, bssid, peer, false,
-    0xc0a80101u, 0x222u, 5ull, &plain_length, &header_length);
+    0xc0a80101u, 0u, 0x222u, 5ull, &plain_length, &header_length);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -29803,6 +29848,11 @@ done:
  *   attempt  - which of the window's attempts this is.  Even attempts address
  *              the learned station under report tag three, odd ones the
  *              broadcast address under report tag four
+ *   claimed  - send the claimed form: the acknowledged address goes in the
+ *              sender protocol field, the frame always addresses the learned
+ *              station rather than alternating, and the report tag is seven.
+ *              Without an acknowledged address the caller is refused rather
+ *              than an address being claimed that no server has given out
  *   count    - the window's counters, which hold the learned address and
  *              record what was transmitted
  *
@@ -29815,7 +29865,7 @@ done:
 
 static int k1_rtl8852bs_runtime_resident_arp_tx(
   FAR const uint8_t *self_mac, FAR const uint8_t *bssid, unsigned int attempt,
-  FAR struct k1_rtl8852bs_resident_count_s *count)
+  bool claimed, FAR struct k1_rtl8852bs_resident_count_s *count)
 {
   static const uint8_t broadcast[6] =
   {
@@ -29840,6 +29890,7 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
   uint8_t report_tag;
   uint64_t packet_number;
   uint32_t target_ip;
+  uint32_t sender_ip;
   bool broadcast_form;
   int ret;
 
@@ -29880,9 +29931,34 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
       return -EADDRNOTAVAIL;
     }
 
-  broadcast_form = (attempt & 1u) != 0;
-  report_tag = broadcast_form ? K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST :
-                                K1_RTL8852BS_TXRPT_TAG_ARP;
+  /* And the address to ask from.  Only an address a server has acknowledged
+   * may go in the sender protocol address, because that field is a claim on
+   * it; with no acknowledgement the request goes out in the probe form, whose
+   * sender protocol address is zero.
+   */
+
+  sender_ip = claimed ? count->dhcp_ack_ip : 0u;
+  if (claimed && sender_ip == 0)
+    {
+      return -EADDRNOTAVAIL;
+    }
+
+  /* The claimed round does not alternate.  The question it asks is whether the
+   * host answers a request that comes from an address on its own subnet, and
+   * the answer to that has to come back addressed to this station, so asking
+   * it through the broadcast form as well would only halve the samples.
+   */
+
+  broadcast_form = !claimed && (attempt & 1u) != 0;
+  if (claimed)
+    {
+      report_tag = K1_RTL8852BS_TXRPT_TAG_ARP_CLAIM;
+    }
+  else
+    {
+      report_tag = broadcast_form ? K1_RTL8852BS_TXRPT_TAG_ARP_BROADCAST :
+                                    K1_RTL8852BS_TXRPT_TAG_ARP;
+    }
 
   packet = kmm_malloc(K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
                       K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
@@ -29900,8 +29976,8 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid,
-    broadcast_form ? broadcast : target_mac, false, target_ip, sequence,
-    packet_number, &frame_length, &header_length);
+    broadcast_form ? broadcast : target_mac, false, target_ip, sender_ip,
+    sequence, packet_number, &frame_length, &header_length);
   if (ret < 0)
     {
       goto done;
@@ -29944,6 +30020,10 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
   count->arp_tx_bytes = (uint32_t)frame_length;
   count->arp_tx_sequence = sequence;
   count->arp_tx_target_ip = target_ip;
+  if (claimed)
+    {
+      count->arp_claim_spa = sender_ip;
+    }
 
   /* The same drain poll the Discover's submitter makes, for the same reason:
    * it is what says the dispatcher took the frame out of the queue rather than
@@ -30508,8 +30588,8 @@ static int k1_rtl8852bs_runtime_loopback_downlink_probe(
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, bssid, true,
-    K1_RTL8852BS_LOOPBACK_TARGET_IP, sequence, packet_number, &frame_length,
-    &header_length);
+    K1_RTL8852BS_LOOPBACK_TARGET_IP, 0u, sequence, packet_number,
+    &frame_length, &header_length);
   if (ret < 0)
     {
       out->probe_stage = __LINE__;
@@ -30841,7 +30921,7 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, broadcast,
-    false, K1_RTL8852BS_LOOPBACK_TARGET_IP, sequence, packet_number,
+    false, K1_RTL8852BS_LOOPBACK_TARGET_IP, 0u, sequence, packet_number,
     &frame_length, &header_length);
   if (ret < 0)
     {
@@ -31090,12 +31170,17 @@ errout:
  *   count   - the window's counters, whose arp_replies is the running total
  *   attempt - index of the last attempt transmitted, or a negative value when
  *             none has gone out yet
+ *   claimed - whether that attempt belonged to the claimed round, whose
+ *             answers are counted apart from the probe round's.  One watcher
+ *             serves both rounds so that a single reply cannot be credited
+ *             twice, which is why the caller says which round it is in rather
+ *             than there being one watcher each
  *   seen    - the reply total at the previous credit, updated in place
  *
  ****************************************************************************/
 
 static void k1_rtl8852bs_runtime_resident_arp_trip_credit(
-  FAR struct k1_rtl8852bs_resident_count_s *count, int attempt,
+  FAR struct k1_rtl8852bs_resident_count_s *count, int attempt, bool claimed,
   FAR uint32_t *seen)
 {
   if (attempt < 0 || attempt >= (int)(sizeof(count->arp_trip_mask) * 8) ||
@@ -31104,7 +31189,15 @@ static void k1_rtl8852bs_runtime_resident_arp_trip_credit(
       return;
     }
 
-  if ((count->arp_trip_mask & (1u << (unsigned int)attempt)) == 0)
+  if (claimed)
+    {
+      if ((count->arp_claim_mask & (1u << (unsigned int)attempt)) == 0)
+        {
+          count->arp_claim_mask |= 1u << (unsigned int)attempt;
+          count->arp_claim_acks++;
+        }
+    }
+  else if ((count->arp_trip_mask & (1u << (unsigned int)attempt)) == 0)
     {
       count->arp_trip_mask |= 1u << (unsigned int)attempt;
       if (((unsigned int)attempt & 1u) != 0)
@@ -31177,8 +31270,11 @@ static int k1_rtl8852bs_runtime_resident_window(
   unsigned int arp_attempts = 0;
   unsigned int request_attempts = 0;
   clock_t request_deadline = 0;
+  unsigned int claim_attempts = 0;
+  clock_t claim_deadline = 0;
   uint32_t arp_trip_seen = 0;
   int arp_trip_last = -1;
+  bool arp_trip_last_claimed = false;
   size_t probe_length;
   size_t length;
   size_t offset;
@@ -31380,6 +31476,7 @@ static int k1_rtl8852bs_runtime_resident_window(
        */
 
       k1_rtl8852bs_runtime_resident_arp_trip_credit(&count, arp_trip_last,
+                                                    arp_trip_last_claimed,
                                                     &arp_trip_seen);
 
       /* The first Probe Request goes out a fraction of a second into the
@@ -31483,7 +31580,8 @@ static int k1_rtl8852bs_runtime_resident_window(
           (sclock_t)(clock_systime_ticks() - arp_deadline) >= 0)
         {
           ret = k1_rtl8852bs_runtime_resident_arp_tx(self_mac, bssid,
-                                                    arp_attempts, &count);
+                                                    arp_attempts, false,
+                                                    &count);
           count.arp_tx_status = ret;
           arp_deadline = clock_systime_ticks() +
                          MSEC2TICK(K1_RTL8852BS_RESIDENT_ARP_GAP_MSEC);
@@ -31575,6 +31673,66 @@ static int k1_rtl8852bs_runtime_resident_window(
           k1_early_puts(" status=");
           k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
           k1_early_puts("\r\n");
+        }
+
+      /* And the same host asked again, now that an address has been
+       * acknowledged and may legally go in the sender protocol field.  This is
+       * the one variable the probe round could not change: the six requests it
+       * sent came from nobody, which is the only form a station without an
+       * address is allowed to send and the form a host is least likely to
+       * answer.  Nothing else moves -- same peer, same pairwise key, same
+       * distribution system, same window.
+       */
+
+      if (g_k1_rtl8852bs_key_install.tk_installed &&
+          count.dhcp_ack_ip != 0 && count.arp_trip_valid &&
+          claim_attempts < K1_RTL8852BS_RESIDENT_CLAIM_ATTEMPTS &&
+          (claim_attempts == 0 ||
+           (sclock_t)(clock_systime_ticks() - claim_deadline) >= 0))
+        {
+          ret = k1_rtl8852bs_runtime_resident_arp_tx(self_mac, bssid,
+                                                    claim_attempts, true,
+                                                    &count);
+          count.arp_claim_status = ret;
+          claim_deadline = clock_systime_ticks() +
+                           MSEC2TICK(K1_RTL8852BS_RESIDENT_CLAIM_GAP_MSEC);
+
+          k1_early_puts("K1 Wi-Fi GPL: resident arp claim tx sn=");
+          k1_early_puthex(count.arp_tx_sequence);
+          k1_early_puts(" bytes=");
+          k1_early_puthex(count.arp_tx_bytes);
+          k1_early_puts(" tag=");
+          k1_early_puthex(K1_RTL8852BS_TXRPT_TAG_ARP_CLAIM);
+          k1_early_puts(" spa=");
+          k1_early_puthex(count.arp_claim_spa);
+          k1_early_puts(" tpa=");
+          k1_early_puthex(count.arp_tx_target_ip);
+          k1_early_puts(" a3=");
+          k1_early_puthex(k1_rtl8852bs_read_be32(count.arp_trip_mac + 2));
+          k1_early_puts(" pn=");
+          k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
+          k1_early_puts(" attempt=");
+          k1_early_puthex(claim_attempts + 1u);
+          k1_early_puts(" status=");
+          k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts(" replies=");
+          k1_early_puthex(count.arp_replies);
+          k1_early_puts("\r\n");
+
+          /* The same rule as the probe round: only a frame the queue took can
+           * be answered, and the attribution moves to this round so that a
+           * reply arriving now is not credited to the probe that preceded it.
+           */
+
+          if (ret >= 0)
+            {
+              count.arp_claim_attempts++;
+              arp_trip_last = (int)claim_attempts;
+              arp_trip_last_claimed = true;
+              arp_trip_seen = count.arp_replies;
+            }
+
+          claim_attempts++;
         }
 
       ret = k1_rtl8852bs_runtime_rx_read(
@@ -31675,6 +31833,7 @@ static int k1_rtl8852bs_runtime_resident_window(
    */
 
   k1_rtl8852bs_runtime_resident_arp_trip_credit(&count, arp_trip_last,
+                                                arp_trip_last_claimed,
                                                 &arp_trip_seen);
 
   /* The exit sample is taken before the filter goes back, so it describes the
@@ -32221,6 +32380,34 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.arp_trip_ip);
   k1_early_puts("\r\n");
 
+  /* And the same rate for the claimed round.  spa is the address that went in
+   * the sender protocol field, which is an address a server acknowledged and
+   * therefore this station's to claim; attempts and acks are the rate, mask
+   * one bit per attempt.  A line with attempts zero says no address was
+   * acknowledged inside the window, not that the host stayed silent.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window arp claim attempts=");
+  k1_early_puthex(count.arp_claim_attempts);
+  k1_early_puts(" acks=");
+  k1_early_puthex(count.arp_claim_acks);
+  k1_early_puts(" mask=");
+  k1_early_puthex(count.arp_claim_mask);
+  k1_early_puts(" spa=");
+  k1_early_puthex(count.arp_claim_spa);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(count.arp_claim_status < 0 ?
+                              -count.arp_claim_status : 0));
+  k1_early_puts(" peer=");
+  if (count.arp_trip_valid)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.arp_trip_mac, 6);
+    }
+
+  k1_early_puts(" ip=");
+  k1_early_puthex(count.arp_trip_ip);
+  k1_early_puts("\r\n");
+
   /* And the hardware addresses behind those three, each on its own line and
    * only when one was learned, so a line that is printed always carries six
    * bytes rather than six zeroes.  A station's hardware address is not a
@@ -32257,10 +32444,10 @@ static int k1_rtl8852bs_runtime_resident_window(
   /* What the server said.  The offer line is the reservation as it arrived:
    * the address it holds out, the identity of the server that holds it, the
    * address the datagram was sent from, and the parameters that come with the
-   * lease.  type names the message so a reply that is not an offer cannot be
-   * read as one, and mac is the station the frame arrived from, which is the
-   * access point rather than the server itself.  An offered address is not a
-   * credential.
+   * lease.  mac is address 3 of the frame the answer arrived in, which is the
+   * station that sent it inside the distribution system -- the server itself
+   * when the server is on the wire behind the access point.  An offered
+   * address is not a credential.
    */
 
   k1_early_puts("K1 Wi-Fi GPL: resident window dhcp offer ip=");

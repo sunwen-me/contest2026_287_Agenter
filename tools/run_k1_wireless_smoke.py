@@ -2308,7 +2308,7 @@ def main() -> int:
                         "[serial] DHCP offer: {0} for this station, from "
                         "server {1} (datagram source {2}), mask {3}, router "
                         "{4}, lease 0x{5:x}s, {6} offer(s), Discover attempt "
-                        "{7} (xid 0x{8:08x}), relayed by {9}"
+                        "{7} (xid 0x{8:08x}), sent inside the BSS by {9}"
                         .format(quad(offer_ip), quad(offer_server),
                                 quad(offer_src), quad(offer_mask),
                                 quad(offer_router), offer_lease, offer_count,
@@ -2375,6 +2375,65 @@ def main() -> int:
                     print(
                         "[serial] no Request was transmitted, so this line "
                         "says nothing about the acceptance",
+                        file=sys.stderr)
+
+            # The same host asked again with the acknowledged address in
+            # the sender protocol field.  Existence-only: a window that
+            # never got an address has nothing to claim with.
+            resident_claim_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window arp claim attempts=(?:0x)?"
+                rb"([0-9a-fA-F]+) acks=(?:0x)?([0-9a-fA-F]+)"
+                rb" mask=(?:0x)?([0-9a-fA-F]+)"
+                rb" spa=(?:0x)?([0-9a-fA-F]+)"
+                rb" status=(?:0x)?([0-9a-fA-F]+)"
+                rb" peer=([0-9a-fA-F]*) ip=(?:0x)?([0-9a-fA-F]+)",
+                resident,
+            )
+            if resident_claim_result is None:
+                missing.append(
+                    "RTL8852BS2 ARP round from an acknowledged address")
+            else:
+                claim_peer = resident_claim_result.group(6).decode()
+                (claim_attempts, claim_acks, claim_mask, claim_spa,
+                 claim_status, claim_ip) = (
+                     int(group, 16) for group in
+                     resident_claim_result.groups()[:5]
+                     + resident_claim_result.groups()[6:])
+
+                def spa_quad(value):
+                    return "{0}.{1}.{2}.{3}".format(
+                        (value >> 24) & 0xff, (value >> 16) & 0xff,
+                        (value >> 8) & 0xff, value & 0xff)
+
+                print(
+                    "[serial] claimed ARP round: {0}/{1} answered "
+                    "(mask=0x{2:02x}), from {3} to {4} at {5}, status {6}"
+                    .format(claim_acks, claim_attempts, claim_mask,
+                            spa_quad(claim_spa), claim_peer or "(none)",
+                            spa_quad(claim_ip), claim_status or "ok"),
+                    file=sys.stderr)
+                if claim_acks:
+                    print(
+                        "[serial] the host answered a request that came from "
+                        "this station's own address after ignoring six that "
+                        "came from nobody, so the zero sender protocol "
+                        "address was the reason the probe round was silent "
+                        "and the reply came back over the unicast downlink",
+                        file=sys.stderr)
+                elif claim_attempts:
+                    print(
+                        "[serial] the acknowledged sender address changed "
+                        "nothing: the same host, key, window and peer went "
+                        "unanswered in both forms, so what is left is the "
+                        "direction the answer has to take -- a frame "
+                        "addressed to this station, which this window only "
+                        "ever received as broadcast",
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no claimed request was transmitted, so no "
+                        "address was acknowledged inside the window and this "
+                        "line says nothing about the round trip",
                         file=sys.stderr)
 
             # Whether the receive filter was widened for the length of the
@@ -2911,8 +2970,8 @@ def main() -> int:
                 verdict = (
                     f"{replies} answered, from {dotted(reply_ip)}"
                     if replies else
-                    "no answer, so the encryption itself is the next place "
-                    "to look")
+                    "no answer; the encryption and the transmit path are "
+                    "both excluded, so read the claim round below")
                 print(
                     "[serial] protected ARP request: sent={0} bytes={1} "
                     "target={2} status={3}: {4}".format(
