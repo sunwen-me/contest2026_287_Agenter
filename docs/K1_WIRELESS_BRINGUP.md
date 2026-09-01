@@ -8626,6 +8626,118 @@ model`（十一段的自检行匹配不上十五段的期望值）；其余全�
 没有别的过期期望值。再拿 4a 之前的日志（`…T111205Z.log`）验，差四项——多出 4a 的两行，
 说明 replay 确实在判别而不是一律放行。
 
+### 运行 68：主机 ping 通了这块板——应答顶在上限 8 上，而交替目标第一次真的换了人
+
+run 68 日志 `out/k1-serial/k1-wpa-20260901T135550Z.log`，窗口 12000 ms。这一次的外部
+检查不需要用户做任何事：这台开发主机本身就在 AP 的子网上（`enp6s0 192.168.1.153/24`，
+默认网关 192.168.1.2），所以在主机上跑 `ping -D -i 1 -W 1 192.168.1.206` 就把 4a→4b 整条
+链路走完了——主机内核先 ARP「谁是 192.168.1.206」，板子答（4a）；主机再发单播 echo 请求，
+板子答（4b）。`--nsh-reboot` 也因此不需要有人按 RST。
+
+**先看不用读串口日志的那一半。** 主机侧 `ping` 的输出：
+
+```
+[1788271072.573756] 64 bytes from 192.168.1.206: icmp_seq=101 ttl=64 time=1097 ms
+[1788271072.612685] 64 bytes from 192.168.1.206: icmp_seq=101 ttl=64 time=1136 ms (DUP!)
+[1788271072.652566] 64 bytes from 192.168.1.206: icmp_seq=102 ttl=64 time=151 ms
+[1788271073.529049] 64 bytes from 192.168.1.206: icmp_seq=103 ttl=64 time=26.7 ms
+[1788271074.517011] 64 bytes from 192.168.1.206: icmp_seq=104 ttl=64 time=12.9 ms
+[1788271075.520912] 64 bytes from 192.168.1.206: icmp_seq=105 ttl=64 time=14.8 ms
+[1788271076.519987] 64 bytes from 192.168.1.206: icmp_seq=106 ttl=64 time=12.6 ms
+[1788271077.523235] 64 bytes from 192.168.1.206: icmp_seq=107 ttl=64 time=14.9 ms
+```
+
+同时 `ip neigh` 解出了板子自己的 MAC：`192.168.1.206 dev enp6s0 lladdr 84:fc:14:06:79:7b`。
+第一个应答 1097 ms（要等 ARP 解析、AP 缓冲和第一次下行落地），此后稳定在 12～15 ms。
+**这是本移植第一个不读日志就能验的读数**：一台真实的 Linux 主机 ping 一块只跑 RAM 镜像的
+板子，通了。
+
+板上的记账逐条对得上：
+
+```
+resident window icmp serve requests=0xd sent=0x8 bad=0x0 long=0x0 bytes=0x7c peer-ip=0xc0a80199 id=0x3bf7 seq=0x70 data=0x38 status=0x0 mac=00e2697b46e8
+resident window arp serve requests=0x2 sent=0x2 bytes=0x44 peer-ip=0xc0a80102 status=0x0 mac=60beb40996b8
+```
+
+13 个请求进来、8 个被回答，**这个差值正是上限生效的证据**：`ECHO_SERVE_MAX` 是 8，而窗口
+12 秒、`ping` 一秒一个，所以窗内必然有请求落在上限之外——`requests=0xd sent=0x8` 说明门是
+「够用且有边界」，不是「根本没触发」。`data=0x38` 是 56 字节，Linux `ping` 的默认载荷，也
+正是当初没有把 64 字节上限往下压的原因。提问者 `00e2697b46e8` / 192.168.1.153 就是这台主机
+的 `enp6s0`，`id=0x3bf7` 是那个 `ping` 进程的标识，`seq=0x70`（112）是窗尾最后一个请求的
+序号。`bad=0x0 long=0x0`：窗内没有一帧需要拒答。
+
+逐次八行把「答了谁、答的是什么」全写出来了（前导零已省，重复字段略）：
+
+```
+resident icmp serve tx bytes=0x7c tag=0xa src=0xc0a801ce dst=0xc0a80199 a3=0x697b46e8 id=0x3bf7 seq=0x65 data=0x38 pn=0x7 requests=0x1 sent=0x1 status=0x0
+... seq=0x65 pn=0x8  requests=0x2 sent=0x2
+... seq=0x66 pn=0x9  requests=0x3 sent=0x3
+... seq=0x67 pn=0xc  requests=0x4 sent=0x4
+... seq=0x68 pn=0x10 requests=0x5 sent=0x5
+... seq=0x69 pn=0x14 requests=0x6 sent=0x6
+... seq=0x6a pn=0x17 requests=0x7 sent=0x7
+... seq=0x6b pn=0x18 requests=0x8 sent=0x8
+```
+
+`src=0xc0a801ce` 是服务器承认给本站的地址，`dst`／`a3` 是提问的那台主机——回复走的是请求
+已经证明过的那条路，因为两个方向共用同一个构造函数。
+
+**ARP 应答这一窗第一次服务了两台不同的主机。** `requests=0x2 sent=0x2`，而逐次两行的
+`tpa` 不一样：`tpa=0xc0a80199 a3=0x697b46e8`（这台主机，在它第一次 ping 之前问的）与
+`tpa=0xc0a80102 a3=0xb40996b8`（网关）。窗尾那行只留最后一个提问者，所以「是两台」这件事
+只能从逐次行读出来。
+
+**要更正 run 67 留下的第一条保留意见：交替目标这一次真的换了人，错的是窗尾那行报表。**
+窗尾仍然印着 `target=0xc0a80102 alt=0xc0a80102`，逐次的 `dst=` 也全是 `0xc0a80102`，看上去
+两个候选又折成了一台。实际不是。`..._resident_icmp_tx()` 里 primary 取 DHCP 服务器那一对、
+alt 取 `arp_reply_ip`／`arp_reply_mac` 那一对，奇数次尝试用 alt；而这一窗的 ARP 回复来自
+**这台主机**：`resident window arp reply mac=00e2697b46e8 ip=0xc0a80199`。两个字段都印成
+网关，是因为它们只在第一次尝试时锁存一次（源码里 `if (count->icmp_echo_attempts == 0)`），
+而第一次 echo 在 `pn=0x3` 就发出去了，比 ARP 轮的第一帧（`pn=0x4`／`0x5`）还早——那时
+`arp_reply_valid` 还是假，`alt` 被折到 primary 上锁了下来。逐次那行的 `dst=` 又是**从锁存值
+算的**，不是从当次真正用的地址算的，所以两处一起错。
+
+真正用了哪台，有三个读数一起指向这台主机：`arp reply ip=0xc0a80199`（alt 那一对从此有效）、
+窗尾 `src=0xc0a80199` 配 `seq=0x3`（最后被认下的回复来自 192.168.1.153，而 seq 3 是奇数次、
+走 alt）、以及 `bad=0x0`（四帧回复的 ICMP 校验和全部折成 0，不是错读出来的）。所以
+`mask=0xf` 这一次的含义是**偶数位由网关答、奇数位由这台主机答**：「奇偶位分别是谁答的」这个
+判别第一次被检验了，而且两台都答了。**坏的是报表，不是那条交替。** 要修的是：窗尾的
+`target=`／`alt=` 应当每次尝试都更新（或者在两个候选第一次不相等时重新锁存），逐次的 `dst=`
+应当印当次实际用的地址。判据脚本那句「192.168.1.2 and 192.168.1.2 asked」也是从这两个字段
+读出来的，一起会错。
+
+**一条新的保留意见：本端没有做 802.11 重复帧过滤。** 主机侧 `icmp_seq=101` 收到两个应答，
+第二个被 `ping` 标成 `(DUP!)`；板上逐次行里 `seq=0x65` 也确实答了两次——`requests=0x1` 与
+`requests=0x2` 是两帧不同的请求进来，`pn=0x7`／`0x8` 是两帧不同的回复出去。主机只发了一次，
+所以是同一个请求被送上来了两遍：空口重传（本站的 ACK 丢了，AP 重发，Retry 位置 1）或者 AP
+把它交付了两遍。标准要求接收侧按 (地址, TID) 缓存上一帧的 Sequence Control、丢掉带 Retry 位
+的重复帧，本移植还没有这个缓存，所以第二份被当成新请求又答了一次——13 个请求里有一个是这么
+来的（12 个 ping ＋ 1 份重复），8 个应答里有一个花在了已经答过的请求上。claim 轮
+`attempts=0x3 acks=0x6` 的整数倍关系大概是同一个原因（也可能是网关开了 proxy ARP 一并答，
+这一窗分不开）。
+
+下行这一侧又被推上一个量级：
+
+```
+resident window data a1 self=0x1b bssid=0x0 other=0x1 self-prot=0x1b self-dec=0x1b hw-a1=0x1b
+resident window data sec total=0x34 target=0x31 prot=0x33 group=0x18 a1-match=0x1b hw-dec=0x31 sw-dec=0x2 icv=0x0 crc=0x0 dec=0x31
+```
+
+27 帧 A1 等于本站的受保护单播下行帧、27 帧全部解密成功（run 67 是 8 帧），52 帧受保护帧里
+49 帧解密成功，ICV 与 CRC 错误仍然是零。这不是新写了什么，是主机侧那十几个 ping 把下行喂到
+了这个量级。
+
+板上自检十五段全过：
+
+```
+resident network selftest net=0xc arp=0x4 ipv4=0x7 other=0x1 other-type=0x86dd arp-req=0x2 replies=0x1 reply-ip=0xc0a80109 peer-ip=0xc0a80101 peer-tpa=0xc0a8017b ip-peer-ip=0xc0a80105 serve=0x1 serve-ip=0xc0a8010a echo=0x1 echo-bad=0x1 echo-mask=0x4 echo-seq=0x2 echo-serve=0x1 echo-serve-id=0x1234 echo-serve-seq=0x7 echo-serve-data=0x28 echo-serve-bad=0x1 echo-serve-long=0x1 stage=0x0 status=0x0
+```
+
+窗内 `bad=0x0 long=0x0` 的另一面是：两条拒答支路这一次没有在空口上发生过，它们仍然只被自检
+的第十三、十四段证过。整体判据是 `PASS: K1 wireless RAM image reached NSH`，含新加的
+`resident window icmp serve` 一块与换成十五段的 `arp_model_result`——run 67 那次 FAIL 到此
+闭环，而且这次是同一个提交里代码与判据一起改的。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来
