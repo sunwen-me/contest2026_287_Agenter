@@ -1400,6 +1400,33 @@ ACK 的那台服务器，它愿意回答本站，只是不回答 SPA＝0 的请�
 192.168.1.2 发 ICMP echo，并且开始回答对本站地址的 ARP 请求——run 66 的
 `arp-req=0x20 peer-tpa=0xc0a801ce` 说明本子网上已经有人在问「谁是 192.168.1.206」，而不回答
 的直接后果是对端给本站发单播 IP 报文时会先卡在 ARP 上。
+**增量 4a 已经写完并构建通过（`text=826392 data=9768 bss=25296`，SHA256
+`21ca32cc374f88caebd9669a08611952b2f589664844ba59b0687bb65bdce0b8`），等待 run 67 上板。**
+它在同一个驻留窗里做两件事、分开记账：(1) 观察器认出目标协议地址等于 `dhcp_ack_ip` 的受保护
+ARP 请求，**提问者的硬件地址从载荷里的发送方硬件地址取而不是从帧的 A3 取**（经 AP 转发时 A3 是
+原发的无线站，提问者在有线一侧时只有载荷里的地址是对的），然后用 `arp_probe_build(reply=true,
+downlink=false)` 回一帧，不带定时器、听见就答、上限 4 次；(2) 发受保护 to-DS 的 ICMP echo
+请求（100 字节明文＋硬件 MIC，标识 `0x8852`，序号＝尝试序数，校验和覆盖 ICMP 头＋载荷），
+四次、间隔 700 ms、放在 claim 轮之后，**窗口因此从 9000 ms 加到 12000 ms**（时间表其余不变，
+run 66 的读数仍可比；harness `--boot-timeout` 默认 120 s，多 3 s 安全）。
+**echo 的目标在两台主机之间交替，这是与 3x/3y/3z 相反的做法且是有意的**：序号原样回在回复里，
+归属精确，所以偶数次发 DHCP 服务器那一对（`dhcp_server_source` ＋ `dhcp_server_mac`，路由器一定
+实现 echo），奇数次发回答过 claim 轮的那台（`arp_reply_ip` / `arp_reply_mac`），只有一个候选时两
+种奇偶都用它——单一目标分不开「本端 IP 层不通」和「那台按策略丢 echo」，交替能分开。回复的判定
+读出 IHL 而不假定 20、要求目的地址等于 `dhcp_ack_ip`／协议 1／类型 0／标识 `0x8852`，校验和用
+`inet_fold(inet_sum(...)) == 0` 验，不过的单独计入 `icmp_echo_reply_bad`（坏回复与沉默是两种不同
+的发现），过的置 `icmp_echo_mask |= 1u << (seq & 0x1f)`，掩码偶／奇位就说明是哪台答的。
+新增打印：窗内每次发送一行 `resident arp serve tx …` / `resident icmp echo tx … dst= seq= replies=`，
+窗尾两行 `resident window arp serve requests= sent= bytes= peer-ip= status= mac=` 与
+`resident window icmp echo attempts= mask= replies= bad= target= alt= src= id= seq= sn= bytes=
+status= a3=`；判据脚本对应新增 `resident_serve_result` / `resident_echo_result` 两块与两条
+`missing` 项。内存自检 `..._resident_network_selftest()` 从六段扩到十一段：第七段钉住「提问者从
+载荷取」（载荷里的发送方故意与 A3 不一致），第八／九／十段分别是正确回复、别的主机的标识（必须
+直接忽略）、标识对而校验和坏（必须只进 `reply_bad`），**第十一段反向检查本端构出的 echo 请求**
+（帧控制、三个地址、ethertype、IPv4 总长／TTL／协议、两个校验和逐项对）——出站路上没有任何环节
+校验这两个校验和，算错了对端只会静静丢掉，从本端看与「这台不答 echo」一模一样。
+run 67 的读法：`arp serve requests=` 非零否（有没有人问）→ `sent=`／`status=`（答没答出去）→
+`icmp echo attempts=` 与每行 `dst=`（发给了谁）→ `replies=`／`bad=`／`mask=`（谁答了、对不对）。
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们

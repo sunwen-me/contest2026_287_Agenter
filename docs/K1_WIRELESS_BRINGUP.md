@@ -8354,6 +8354,81 @@ resident window arp sent=0x9 ... arp-req=0x20 peer-ip=0xc0a801a6 peer-tpa=0xc0a8
 在问「谁是 192.168.1.206」，而本站一个字也不回。按 RFC 826，持有某地址的主机必须回答对
 该地址的请求；不回答的直接后果是：任何想给本站发单播 IP 报文的对端都会先卡在 ARP 上。
 
+### 增量 4a：第一次 IP 层往返——回答对本站地址的 ARP，同时向两台主机发 ICMP echo
+
+run 66 收尾的那个读数（`arp-req=0x20 peer-tpa=0xc0a801ce`）把下一步框死了：子网上已经有人
+在问「谁是 192.168.1.206」，而本站一个字也不回。这一增量把两件事一起做进同一个驻留窗，
+并且分开记账。
+
+**为什么是一起做而不是分两步。** 期待的 echo 回复是一个单播 IPv4 报文，对端 IP 栈要发出
+它，先得知道 192.168.1.206 的 MAC；按 RFC 826，那就是先发一个 ARP 请求，然后等本站回答。
+所以「回答对本站地址的 ARP」不是与 echo 并列的另一件事，而是 echo 能不能收到回复的前置
+条件。分两步做的结果只会是：先做 echo，一片安静，然后无法判断安静来自本端的 IP 层还是
+来自没人能解析本站的 MAC。两件事各有自己的计数器，所以合在一个窗里也不会混。
+
+**ARP 应答这一半。** 观察器在受保护的 ARP 请求里多读一个字段：目标协议地址。它等于
+DHCP 已确认的 `dhcp_ack_ip` 时，`arp_serve_requests++`，并且——这一点是刻意的——把提问者
+的硬件地址从**载荷里的发送方硬件地址**取，而不是从帧的第三地址取。经 AP 转发过来的请求，
+A3 是原发的那台无线站；如果提问者在有线一侧，A3 会是网桥这一侧的地址，只有载荷里的
+发送方硬件地址才是要回给的那台。发送用的是 3z 已经在用的 `arp_probe_build()`，只是把
+`reply` 置真、`downlink` 置假、发送协议地址填本站的 192.168.1.206、目标填提问者。
+这一支**不带定时器**：听见就答，最多 4 次（`K1_RTL8852BS_RESIDENT_SERVE_MAX`）。
+`arp_serve_pending` 只在 `k1_sdio_wifi_write()` 成功之后才清，构帧或资源不足时下一圈重试。
+
+**echo 这一半。** 一帧受保护的 to-DS 数据帧，24（802.11 头）＋8（CCMP 头）＋8（LLC/SNAP）
+＋20（IPv4）＋8（ICMP 头）＋32（载荷）＝100 字节明文，MIC 由硬件追加。IPv4 是 `0x45`、
+总长 60、TTL 64、协议 1，首部校验和本端算；ICMP 是 type 8 / code 0、标识
+`0x8852`（`K1_RTL8852BS_ICMP_ECHO_IDENTIFIER`）、序号取本次尝试的序数、校验和覆盖
+「ICMP 头＋载荷」——ICMP 没有伪首部，这一点与 UDP 不同。载荷是 `0x10 + i` 的递增 32 字节。
+
+**目标在两台主机之间交替，这是与前几轮相反的做法，而且是有意的。** 3x/3y/3z 每一轮都把
+目标钉死在一台上，因为那几轮的归属判断全靠时间先后，多一个目标就多一份含糊。echo 不是：
+序号原样回在回复里，归属是精确的。于是偶数次尝试发给 DHCP 服务器那一对
+（`dhcp_server_source` ＋ `dhcp_server_mac`，两者出自同一帧，而且一台路由器一定实现 echo），
+奇数次发给回答过 3z claim 轮的那台（`arp_reply_ip` / `arp_reply_mac`）；只有一个候选时两种
+奇偶都用它。这样做正是为了消掉单一目标消不掉的那个含糊：**一台按策略丢弃 echo 的主机，在
+只有一个目标时读起来与「本端 IP 层不通」完全一样。**
+
+**窗口从 9000 ms 加到 12000 ms。** claim 轮之后要放四次 echo，间隔 700 ms
+（`K1_RTL8852BS_RESIDENT_PING_GAP_MSEC` / `..._PING_ATTEMPTS`）。除此之外整个时间表没有
+任何改动，所以 run 66 的其它读数仍然可比。harness 的 `--boot-timeout` 默认 120 s，多 3 s 是
+安全的。
+
+**回复怎么认。** IPv4 首部长度是**读出来的**（`payload[offset] & 0x0f` 乘 4），不是假定 20；
+目的地址必须等于 `dhcp_ack_ip`、协议必须是 1；ICMP 类型必须是 0（echo reply）、标识必须是
+`0x8852`——否则直接不看，别的主机之间的 echo 流量不能算成本站的往返。声明长度按实到长度
+截断；校验和用 `inet_fold(inet_sum(0, msg, len)) == 0` 验，**不过**的计入
+`icmp_echo_reply_bad` 并返回。过了的记 `icmp_echo_replies++`，并且
+`icmp_echo_mask |= 1u << (seq & 0x1f)`——掩码的偶数位与奇数位分别对应上面两台主机，所以窗尾
+一眼能看出是谁答的。
+
+窗内每一次发送各打一行，窗尾多两行：
+
+```
+K1 Wi-Fi GPL: resident arp serve tx bytes= tag= spa= tpa= a3= pn= requests= sent= status=
+K1 Wi-Fi GPL: resident icmp echo tx sn= bytes= tag= src= dst= seq= pn= attempt= status= replies=
+K1 Wi-Fi GPL: resident window arp serve requests= sent= bytes= peer-ip= status= mac=
+K1 Wi-Fi GPL: resident window icmp echo attempts= mask= replies= bad= target= alt= src= id= seq= sn= bytes= status= a3=
+```
+
+判据脚本新增 `resident_serve_result` 与 `resident_echo_result` 两块，各自往 `missing` 里放一
+条（「RTL8852BS2 ARP answers for this station's own address」／「... ICMP echo round from the
+acknowledged address」），并按「答了／被问过但没答／根本没人问」和「有回复（再分两台都答
+／只有服务器／只有那台 peer）／只有坏回复／发了但全静／一次没发」分支给结论。
+
+**在内存里先验，这次连发送方向一起验。** `k1_rtl8852bs_runtime_resident_network_selftest()`
+从六段载荷扩到十段再加一段：第七段是一个目标协议地址等于本站地址的请求，而且载荷里的
+发送方**故意**与帧的 A3 不一致，用来钉住「提问者要从载荷里取」；第八段是一段正确的 echo
+回复；第九段把标识换成 `0x1234` 并重算校验和，必须被直接忽略；第十段把标识改回
+`0x8852` 而把第九段的校验和留在原处，必须只进 `icmp_echo_reply_bad`。第十一段反过来，检查
+**本端构出的 echo 请求**：帧控制、三个地址、ethertype、IPv4 总长／TTL／协议、两个校验和逐项
+对。理由与上面那条「含糊」是同一条——出站路上没有任何环节校验这两个校验和，算错了对端只
+会静静丢掉，从本端看与「这台不答 echo」一模一样。
+
+跑 run 67 时按这个顺序读：`arp serve requests=` 是否非零（有没有人问）→ `sent=` 与
+`status=`（答没答出去）→ `icmp echo attempts=` 与每行的 `dst=`（发给了谁）→ `replies=` /
+`bad=` / `mask=`（谁答了、答得对不对）。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来
