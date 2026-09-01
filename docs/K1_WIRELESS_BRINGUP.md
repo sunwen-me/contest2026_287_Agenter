@@ -8124,6 +8124,99 @@ K1 Wi-Fi GPL: resident window arp trip attempts= replies= mask= uni= uni-ack= bc
 个请求本身促成的）」「一次都没发出去（窗里没学到可问的主机，这一行什么也不说
 明）」四种解读。
 
+### 运行 64 的两个读数：ARP 速率是 0/6，而 DHCP 第一次收到了 OFFER
+
+增量 3x 上板（`out/k1-serial/k1-wpa-20260901T100715Z.log`，0 FAIL，40/40）给出两件事，
+一件是否证，一件比原计划大得多。
+
+**否证：`resident window arp trip attempts=0x6 replies=0x0 mask=0x0 uni=0x3 uni-ack=0x0
+bcast=0x3 bcast-ack=0x0 peer=60beb40996b8 ip=0xc0a80102`。** 六次全部进了队列
+（`status=0x0`，sn 0xb/0xc/0xe/0xf/0x10/0x11，PN 2..8，tag 交替 3/4，a3 交替
+`b40996b8`/`ffffffff`），一次都没有被回答。这一次窗内先学到的是网关 **192.168.1.2**
+（`60:be:b4:09:96:b8`），也就是此前四次沉默运行问的同一台主机，而不是运行 63 那台
+192.168.1.144。
+
+而「重传运气」这个解释在同一条日志里被杀死了：`ccxrpt-tag=0x1f ok=0x8 fail=0x17`——
+8 次 OK 正好等于本窗发出的 8 帧（2 个 Discover ＋ 6 个 ARP），也就是**每一帧最终都被
+确认了**，23 次 fail 是它们各自更早的重传尝试。同时 `echo frames=0x5 group=0x5
+data=0x5`：2 个 DHCP ＋ 3 个广播 ARP 被泛洪回来，而 3 个单播 DA 的 ARP **没有**被回
+显——AP 把它们桥到有线段上去了。所以帧发出去了、被确认了、被分发系统正确投递了，仍
+然没有回答。剩下的解释是被问的那台主机的性质：本端探测发送的 SPA 是 0（RFC 5227 的
+探测形态），很多路由器不回答这种请求。
+
+**比计划大的那件：`dhcp-reply=0x2 offer-ip=0xc0a801ce offer-attempt=0x1`。** 这是本移植
+史上第一个 DHCP OFFER，提供 **192.168.1.206**，在本站自己生成的 xid `0x8db7f070`
+*和* 本站自己的 chaddr 双重匹配下认出，并由 `peer-tpa=0xc0a801ce`（网关正在 ARP 探
+测这个被提供的地址）从另一侧印证。两个 OFFER 帧都是组地址的（`data a1 self=0x0 ...
+other=0x1 hw-a1=0x0`，`total=0x15 group=0x14`），也就是走已经验证过的 GTK 广播路径回
+来的。
+
+这两条合起来的含义是明确的：本端的 UDP 数据报到达了一台 DHCP 服务器，服务器生成的、
+指名本站的回答回来了——这已经是一次 IP 层往返。而它同时也是拿到一个**非零发送地址**
+的正途，于是下一步不是继续猜 ARP，而是把这次握手做完。
+
+### 增量 3y：OFFER 不是分配——用受保护的 DHCP Request 把它收下
+
+RFC 2131 4.3.1/4.3.2/4.4.1 把这件事说得很干净：OFFER 是一个**保留**，不是分配；在
+Request 被回答之前，那个地址不属于任何人，因此**不能**作为发送地址上到空口。客户端接
+受的方式是发一个 DHCPREQUEST，用选项 50 指名要的地址、选项 54 指名给它的服务器，复用
+Discover 那个事务标识，`ciaddr` 仍为 0，帧仍然广播——因为地址还不是自己的。A1 依旧是
+AP，所以这个 Request 和窗内其它所有帧一样是成对密钥保护的。
+
+驱动侧的改动分四块。
+
+**一，把 OFFER 读全。** `k1_rtl8852bs_runtime_dhcp_reply_match()` 原来只回 `yiaddr`，
+现在回一个 `struct k1_rtl8852bs_dhcp_reply_s`：`offered`、`server_id`（选项 54）、
+`source`（数据报自己的源 IP，作为选项 54 缺失时的退路）、`mask`（选项 1）、`router`
+（选项 3）、`lease`（选项 51）、`message_type`（选项 53）。选项遍历是有界的：先验
+magic cookie `63 82 53 63`（缺失就当作 `message_type = 0` 直接返回真），`0xff` 断出，
+`0` 在读长度之前就跳过，其余按 tag/len 走且每次都检查剩余长度。匹配条件一个都没有放
+松——LLC/SNAP、IPv4、UDP 67→68、BOOTREPLY、xid 精确等于本站生成的那个、chaddr 等于本
+站 MAC，全部满足才算。
+
+**二，同一个构造器造两种帧。** `k1_rtl8852bs_runtime_dhcp_discover_build()` 改名为
+`..._dhcp_client_build()`，多两个参数 `requested_address` / `server_identifier`；两者非
+零即为 Request 形态：选项 53 的值从 1 变 3，尾部追加 `50 04 <ip>` 与 `54 04 <server>`
+共 12 字节，`required` 与 UDP 长度、UDP 校验和都按加长后的长度重算。三个 Discover 调用
+点传 `0u, 0u`，形态不变。自检里加了一条 Request 形态的构造断言：长度等于
+`DISCOVER_SIZE + REQUEST_EXTRA_SIZE`，`offset-13` 是选项 50、`offset-11` 是请求的地
+址、`offset-7` 是选项 54、`offset-5` 是服务器、`offset-1` 是 `0xff`，选项 53 的值等于
+3，并把 UDP 校验和按伪首部重新求和验证，最后再把 Discover 重建回去，后面的检查不受影
+响。
+
+**三，观察者与计数。** 新的 `k1_rtl8852bs_runtime_resident_observe_dhcp()` 把每个匹配
+到的回复按选项 53 分流：NAK 只计 `dhcp_naks`；ACK 计 `dhcp_acks` 并锁存 `dhcp_ack_ip`；
+其余计 `dhcp_offers`，并在第一次锁存 `dhcp_offer` / `dhcp_offer_attempt` /
+`dhcp_offer_xid` / `dhcp_server_id` / `dhcp_server_source` / `dhcp_mask` /
+`dhcp_router` / `dhcp_lease`，以及帧的 A2（即 AP，不是服务器本身）作为
+`dhcp_server_mac`。
+
+**四，窗内的发送门。** 常驻窗从 5000 ms 放到 **7000 ms**，ARP 门之后加 Request 门：
+条件是 TK 已装、`dhcp_offer != 0`、`dhcp_acks == 0`、`dhcp_naks == 0`、次数
+`< K1_RTL8852BS_RESIDENT_REQUEST_ATTEMPTS`（2）且距上次至少
+`K1_RTL8852BS_RESIDENT_REQUEST_GAP_MSEC`（900 ms）。第一次不设延时——它就在观察到
+OFFER 的那一轮轮询里发出去。收到 ACK 或 NAK 立刻停：NAK 之后还继续问，是在要一个服务
+器已经说了属于别人的地址。`k1_rtl8852bs_runtime_resident_dhcp_request_tx()` 完全照
+`arp_tx` 的形状写：`server = dhcp_server_id ?: dhcp_server_source`（两者皆零则拒绝
+发），序号与 PN 从同一对分配器取，`data_secure_tx_build()` 带
+`K1_RTL8852BS_TXRPT_TAG_DHCP_REQUEST`（0x6）以便在 TX 报告里认出这一帧，然后是资源读、
+WDE/PLE 余量检查、`k1_sdio_wifi_write()` 与标准的排空轮询。
+
+报告是两行，都是「存在即通过」，不对数值设门槛：
+
+```
+K1 Wi-Fi GPL: resident window dhcp offer ip= server-id= src= mask= router= lease= offers= attempt= xid= mac=<6 字节>
+K1 Wi-Fi GPL: resident window dhcp request sent= status= sn= bytes= reply= ack= ack-ip= nak=
+```
+
+验收数仍是 **40**（两条检查都在既有的 `--require-runtime-resident` 里面）。四种解读分
+别打印：ACK（握手完成，`ack-ip` 是本站可用的地址，ARP/ICMP 从此有了非零发送地址）、
+NAK（地址在被接受之前已经不空闲，必须从 Discover 重来而不是重试）、发了但窗内无回答
+（回答落在窗关闭之后，或 Request 没到服务器——看 TX 报告）、没发（本行不说明任何事
+情）。
+
+被提供的地址、掩码、网关、租期、事务标识、AP 的 MAC 都不是凭据，可以打印。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来
