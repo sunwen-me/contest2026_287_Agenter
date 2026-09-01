@@ -1543,6 +1543,31 @@ ping 的重传。** 顺带修掉主机侧 ping 活不过三秒的问题：不是
 `icmp serve` 仍是 0，4b 的服务侧这一窗没被外部流量检验过（run 68 检验过），下一次上板要
 带上这个脚本。**
 
+**已完成（2026-09-02，运行 71／72）：4b 的回显应答支路第一次在空口上被外部流量检验，4c
+的两半都拿到了它们要的那一窗；同时发现一个 ARP claim 记账缺陷，见下条。** run 71 死在写
+死的 `--boot-timeout 300`（`--manual-reset` 下这 300 秒是人走到板子跟前的时间），
+`b70e194` 改成 `K1_BOOT_TIMEOUT`，run 72 用 1800 秒重开，镜像和 run 70 逐字节相同。run
+72 日志 `out/k1-serial/k1-wpa-20260901T170943Z.log`，0 条 FAIL。带上
+`tools/k1_host_ping.sh` 之后窗内 `icmp serve requests=0x2a sent=0x8`：42 个请求进来、8
+个被答、`sent` 停在 `ECHO_SERVE_MAX` 的上界，`data=0x38` 是 iputils 默认的 56 字节载荷，
+`bad=0x0 long=0x0` 两条拒答支路仍然只有自检证过。主机侧 8 条应答 RTT 从 2404 毫秒降到
+15.2 毫秒，**0 条 `(DUP!)`——run 68 的重复应答没有再出现**。回显轮次这次
+`target=0xc0a80102 alt=0xc0a80199 src=0xc0a80199`，`mask=0xf replies=0x4`，harness 印的
+是 192.168.1.2 and 192.168.1.153 asked——**run 67 起挂着的第一条保留意见结了：奇偶交替确
+实各打了一台**。过滤器 `checked=0x59 retries=0x3 dropped=0x3`，
+`streams=0x1 evictions=0x0 last-seq=0x360`，89 个键帧里 3 个重传全丢，`evictions=0` 让它
+是精确总数，最后丢的序号 54、非 QoS。ping 脚本在窗口之前重启了 207 次，每次约 2.8 秒被
+EHOSTUNREACH 顶出去，板子起来之后那一个 invocation 自己活满。
+
+**待修（记账，下一个增量）：`arp_trip_last_claimed` 是个永不复位的闩锁。** run 72 印出
+`arp claim attempts=0x3 acks=0x6 mask=0x3f`——确认数比尝试数多，而窗内只有三条 claim 发送
+且 status 全 0，掩码最多只能亮 bit 0..2。claim 发送处把 `arp_trip_last_claimed` 置 true
+之后没有任何地方置回 false，probe 发送处只更新 `arp_trip_last`；于是第一条 claim 之后到
+达的每个 ARP 应答都记到 claim 轮次，probe 下标一过 2 就点亮不存在的 claim 位。这同时解释
+了两跑里都有的 `arp trip mask=0x0 uni-ack=0x0 bcast-ack=0x0`，也推翻了 run 68 条目里「大
+概是重复帧或网关 proxy ARP」的猜测。和增量 4c 第一部分同类：一个活得比它所描述的事情更久
+的闩锁。
+
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们
@@ -1757,7 +1782,7 @@ C2H result 等待机制，但使用原厂定义的 `source=RF`、RF path A/B、m
 - 实板长记录：`docs/K1_WIRELESS_BRINGUP.md`
 - 来源/许可：`docs/K1_SOURCE_AND_LICENSES.md`
 - RAM 加载工具：`tools/run_k1_wireless_smoke.py`
-- 窗内主机侧 ping：`tools/k1_host_ping.sh`（到点之前循环重启 `ping`，因为目标还没进 
+- 窗内主机侧 ping：`tools/k1_host_ping.sh`（到点之前循环重启 `ping`，因为目标还没进
   neigh 表时 iputils 会自己退出）
 
 ## 工作区注意事项

@@ -8874,3 +8874,55 @@ EHOSTUNREACH，iputils 的 `ping` 攒够几个本地错误就自己印统计块�
 启 `ping`；板子一起来，当前那个 invocation 就自己活下去，不会再重启。14 秒的冒烟跑重启了
 4 次、把整段覆盖满。
 
+### 运行 71／72：主机 ping 脚本让回显应答支路第一次在空口上跑起来
+
+run 71 没上到板：runner 里 `--boot-timeout 300` 是写死的，而 `--manual-reset` 下这 300
+秒是一个人走到板子跟前的时间。监听器连发 29 条 "still waiting for a physical RST" 之后自
+己判了 `FAIL: did not acquire U-Boot prompt`，此时监听端其实是唯一准备好的一侧。
+`b70e194` 把它变成 `K1_BOOT_TIMEOUT`，run 72 用 1800 秒重开。
+
+run 72 的镜像和 run 70 完全一样，845352 字节、两次控制台都是
+`[host] gzip 845352 -> 417424 bytes`，所以这一跑读到的差别全部来自空口一侧，不是二进制变
+了。结果 0 条 `^FAIL:`，`PASS: K1 wireless RAM image reached NSH`，串口日志
+`out/k1-serial/k1-wpa-20260901T170943Z.log`。
+
+**回显应答支路第一次在空口上跑起来。** `tools/k1_host_ping.sh` 在窗口之前就起来了，整段
+窗口里它重启了 207 次 `ping`，每次约 2.8 秒就被 EHOSTUNREACH 顶出去；等板子拿到租约、能
+回 ARP 之后，当时那个 invocation 自己活下来，收满 8 条应答。板上读数是
+`icmp serve requests=0x2a sent=0x8`，另外
+`bad=0x0 long=0x0 data=0x38 id=0xea6d seq=0x2a`：42 个请求进来、8 个被答，`sent` 停在
+`K1_RTL8852BS_RESIDENT_ECHO_SERVE_MAX` 的上界，`data=0x38` 是 56 字节、正好是 iputils 的
+默认载荷，所以这些请求确实是主机 `ping` 打进来的、不是别的什么东西。主机侧 8 条应答的
+RTT 从 2404 毫秒一路降到 15.2 毫秒——应答是一串发出去的、按到达顺序先答旧的——而最后一条
+15.2 毫秒是真实的空口往返。**整个主机日志 0 条 `(DUP!)`**：run 68 那条重复应答没有再出
+现。
+
+**回显轮次这次真的问了两台不同的主机。**
+`target=0xc0a80102 alt=0xc0a80199 src=0xc0a80199`，
+`attempts=0x4 mask=0xf replies=0x4 bad=0x0`。harness 现在印的是 "192.168.1.2 and
+192.168.1.153 asked, last attempt addressed to 00e2697b46e8"，不再是 run 70 的 "both
+candidates are the same host"。这条把 run 67 起就一直挂着的保留意见结了：奇偶交替确实各
+打了一台，mask 的奇偶位现在可以读成"哪台答了"，而不只是"答了几次"。
+
+**重复帧过滤器第二次在板上丢帧。**
+`checked=0x59 retries=0x3 dropped=0x3 streams=0x1 evictions=0x0`，加上
+`last-seq=0x360 last-tid=0x10`：89 个帧被按（发送方地址，TID）建键，3 个带 Retry 位、3
+个都被丢在动作之前，仍然只有 1 条流、0 次淘汰——所以 `dropped` 是精确总数而不是下界。最后
+丢的那帧序号 0x360>>4 = 54，`last-tid=0x10` 说明是非 QoS Data。对比 run 70 的 31／1／1：
+进来的回显请求从 0 涨到 42 之后重传数跟着涨，而丢弃与重传之比一直是 1，没有出现"看见重传
+却没丢"的缝。
+
+**这一跑的计数器同时暴露了一个记账缺陷，下一步就修它。**
+`arp claim attempts=0x3 acks=0x6 mask=0x3f`——确认数比尝试数还多。窗口里只有三条 claim 发
+送，`attempt=0x1`／`0x2`／`0x3` 且 status 全 0，掩码最多只能亮 bit 0..2。原因在
+`arp_trip_last_claimed`：它在 claim 发送处被置 true，之后再没有任何地方把它置回 false，
+而 probe 发送处只更新 `arp_trip_last`。于是第一条 claim 发出去之后到达的每一个 ARP 应答
+都被记到 claim 轮次上，probe 的下标一过 2 就去点亮根本不存在的 claim 尝试位。run 70 之所
+以看不出来，是它那 3 条应答刚好都落在 claim 轮次自己的区间里；run 72 的 9 条应答落不进
+去。这和增量 4c 第一部分修掉的是同一类毛病：一个活得比它所描述的事情更久的闩锁。顺带也解
+释了两跑里都有的 `arp trip mask=0x0 uni-ack=0x0 bcast-ack=0x0`——probe 轮次的确认位在第一
+条 claim 之后就再也拿不到归属了。
+
+run 68 那一窗也是 `attempts=0x3 acks=0x6`，当时把这个整数倍关系归给了重复帧或者网关的
+proxy ARP、说分不开；现在它有确定答案了，跟重复帧和 proxy ARP 都没关系。
+
