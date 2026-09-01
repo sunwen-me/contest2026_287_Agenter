@@ -2754,6 +2754,83 @@ def main() -> int:
                         "acknowledged address from a host on the same subnet",
                         file=sys.stderr)
 
+            # Duplicate detection, clause 10.3.2.14, which run 68 proved
+            # this port needed: the host logged one (DUP!) and the port
+            # answered one request twice out of two received copies, spending
+            # one of the eight answers the window allows on a frame it had
+            # already answered.  checked is what the filter was asked about,
+            # retries how many of those carried the Retry bit, and dropped how
+            # many were also already in the cache -- that last number is
+            # protocol actions not taken twice, and every one of them is a
+            # frame still counted as received and decrypted, because the
+            # filter suppresses the action and never the accounting.
+            resident_dup_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window dup checked=(?:0x)?"
+                rb"([0-9a-fA-F]+) retries=(?:0x)?([0-9a-fA-F]+)"
+                rb" dropped=(?:0x)?([0-9a-fA-F]+)"
+                rb" streams=(?:0x)?([0-9a-fA-F]+)"
+                rb" evictions=(?:0x)?([0-9a-fA-F]+)"
+                rb" last-seq=(?:0x)?([0-9a-fA-F]+)"
+                rb" last-tid=(?:0x)?([0-9a-fA-F]+)",
+                resident,
+            )
+            if resident_dup_result is None:
+                missing.append(
+                    "RTL8852BS2 802.11 duplicate-frame filter")
+            else:
+                (dup_checked, dup_retries, dup_dropped, dup_streams,
+                 dup_evictions, dup_last_seq, dup_last_tid) = (
+                     int(group, 16) for group in
+                     resident_dup_result.groups())
+
+                print(
+                    "[serial] duplicate filter: {0} frames checked, {1} "
+                    "retried, {2} dropped as already acted on, {3} streams "
+                    "cached, {4} evicted, last drop seq={5} tid={6}"
+                    .format(dup_checked, dup_retries, dup_dropped,
+                            dup_streams, dup_evictions,
+                            dup_last_seq >> 4, dup_last_tid),
+                    file=sys.stderr)
+                if dup_dropped:
+                    print(
+                        "[serial] the access point sent {0} frame(s) this "
+                        "port had already acted on and they were dropped "
+                        "before the action, so the answers, the addresses "
+                        "learned and the lease taken in this window each "
+                        "happened once -- run 68's doubled echo reply cannot "
+                        "recur"
+                        .format(dup_dropped),
+                        file=sys.stderr)
+                elif dup_retries:
+                    print(
+                        "[serial] retransmissions arrived but none repeated a "
+                        "Sequence Control the cache held, so they were first "
+                        "copies of frames whose acknowledgement was lost, not "
+                        "frames this port had already seen",
+                        file=sys.stderr)
+                elif dup_checked:
+                    print(
+                        "[serial] no frame from the access point carried the "
+                        "Retry bit, so this window had no duplicate to drop "
+                        "and the filter is untested by it -- the selftest "
+                        "stages are what say the cache works",
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no data frame from the associated access "
+                        "point reached the filter, so this line says nothing "
+                        "about duplicates",
+                        file=sys.stderr)
+
+                if dup_evictions:
+                    print(
+                        "[serial] the cache evicted {0} stream(s), so it is "
+                        "smaller than this network needs and a duplicate may "
+                        "have got through unfiltered -- the dropped count "
+                        "above is a floor, not a total"
+                        .format(dup_evictions),
+                        file=sys.stderr)
+
             # Whether the receive filter was widened for the length of the
             # window, so a frame whose payload the security engine could not
             # verify is handed up instead of being dropped inside the receive
@@ -3212,6 +3289,18 @@ def main() -> int:
             # either refusal.  stage=0 status=0 is the fifteenth stage's
             # verdict as well: it asserts internally and a mismatch there
             # lands here as a nonzero status.
+            #
+            # 4c adds five stages for duplicate detection, which sits in the
+            # caller rather than the observer, so its five stages feed headers
+            # to the filter directly and the payload totals above do not move.
+            # The dup fields are their arithmetic: six frames offered, five of
+            # them carrying the Retry bit, two dropped as frames already acted
+            # on, three streams learned -- one per transmitter-and-identifier
+            # pair the stages use -- and no eviction, which is what says the
+            # cache was keyed on the standard's pair and not on less.  The two
+            # that were dropped are the two that must be; the three retried
+            # frames that were not are a different identifier, a different
+            # transmitter and a sequence never seen.
             arp_model_result = re.search(
                 rb"K1 Wi-Fi GPL: resident network selftest net=(?:0x)?0*c"
                 rb" arp=(?:0x)?0*4 ipv4=(?:0x)?0*7 other=(?:0x)?0*1"
@@ -3226,7 +3315,10 @@ def main() -> int:
                 rb" echo-serve-seq=(?:0x)?0*7"
                 rb" echo-serve-data=(?:0x)?0*28"
                 rb" echo-serve-bad=(?:0x)?0*1"
-                rb" echo-serve-long=(?:0x)?0*1 stage=0x0*"
+                rb" echo-serve-long=(?:0x)?0*1"
+                rb" dup=(?:0x)?0*6 dup-retries=(?:0x)?0*5"
+                rb" dup-dropped=(?:0x)?0*2 dup-streams=(?:0x)?0*3"
+                rb" dup-evictions=0x0*(?![0-9a-fA-F]) stage=0x0*"
                 rb"(?![0-9a-fA-F]) status=0x0+(?![0-9a-fA-F])",
                 started,
             )

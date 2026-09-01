@@ -27008,6 +27008,32 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_RESIDENT_ECHO_HEAD         8u
 #define K1_RTL8852BS_RESIDENT_SEC_A1_HEAD       8u
 
+/* Duplicate detection, clause 10.3.2.14.  A receiver keeps, for every
+ * transmitter address and traffic identifier it hears, the Sequence Control
+ * field of the last frame it accepted, and discards a frame whose Retry bit is
+ * set when that field matches: the transmitter did not hear the
+ * acknowledgement and sent the same frame again, and acting on it twice is a
+ * protocol error, not a second event.  Run 68 has the proof this port needs
+ * the cache -- the host logged one (DUP!) for icmp_seq=101 and the port
+ * answered sequence 0x65 twice, out of two received copies, spending one of
+ * the eight answers the window allows on a frame it had already answered.
+ *
+ * Eight slots, because the cache is keyed by address as well as identifier and
+ * the standard's key is the pair; one associated access point using four
+ * traffic identifiers fits with room left, and the round-robin replacement
+ * that follows costs a missed duplicate rather than a wrong drop.  Seventeen
+ * identifiers exist as far as this cache is concerned: the sixteen a QoS
+ * Control field can name, and one more for a frame that has no QoS Control at
+ * all, which the standard treats as its own stream.
+ */
+
+#define K1_RTL8852BS_RESIDENT_DUP_SLOTS         8u
+#define K1_RTL8852BS_RESIDENT_DUP_TID_NONE      16u
+#define K1_RTL8852BS_IEEE80211_FC_RETRY         0x0800u
+#define K1_RTL8852BS_IEEE80211_SEQCTL_OFFSET    22u
+#define K1_RTL8852BS_IEEE80211_QOS_OFFSET       24u
+#define K1_RTL8852BS_IEEE80211_QOS_OFFSET_FOUR  30u
+
 /* The channel-defining registers of the three layers, as the vendor names
  * them.  cfg_mac_bw() owns the first two, halbb_ctrl_bw_ch_8852b() the
  * baseband set, and halrf_ctrl_ch_8852b() the radio's 0x18.
@@ -27529,6 +27555,33 @@ struct k1_rtl8852bs_resident_count_s
   uint8_t icmp_serve_data_length;
   bool icmp_serve_pending;
   int icmp_serve_status;
+
+  /* Duplicate detection, one cache line per transmitter address and traffic
+   * identifier.  dup_checked counts the frames the filter was asked about, so
+   * a zero there separates "no duplicates arrived" from "the filter never
+   * ran"; dup_retries counts the ones that carried the Retry bit, which is how
+   * often the access point had to send a frame again for any reason;
+   * dup_dropped counts the ones that were also already in the cache, which is
+   * the number of protocol actions this port used to take twice.  dup_new is
+   * the count of streams the cache learned and dup_evictions the times
+   * round-robin replacement threw one away, because a cache that is thrashing
+   * would let duplicates through and the window has to say so rather than
+   * quietly miss them.  dup_last_seqctl and dup_last_tid name the last frame
+   * dropped, so a single line can be checked against the peer's own log.
+   */
+
+  uint8_t dup_addr[K1_RTL8852BS_RESIDENT_DUP_SLOTS][6];
+  uint16_t dup_seqctl[K1_RTL8852BS_RESIDENT_DUP_SLOTS];
+  uint8_t dup_tid[K1_RTL8852BS_RESIDENT_DUP_SLOTS];
+  bool dup_valid[K1_RTL8852BS_RESIDENT_DUP_SLOTS];
+  uint32_t dup_checked;
+  uint32_t dup_retries;
+  uint32_t dup_dropped;
+  uint32_t dup_new;
+  uint32_t dup_evictions;
+  uint16_t dup_last_seqctl;
+  uint8_t dup_last_tid;
+  uint8_t dup_next_slot;
 
   /* What the access point's own Beacons say is waiting for this station.
    * This reading costs no transmitted frame: the window already receives the
@@ -28115,6 +28168,148 @@ static size_t k1_rtl8852bs_runtime_resident_header_length(
     }
 
   return length;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_frame_tid
+ *
+ * Description:
+ *   Which traffic identifier one received frame belongs to, for the purpose of
+ *   duplicate detection.  A QoS data frame carries it in the low four bits of
+ *   the QoS Control field, which sits behind the addresses: at offset
+ *   twenty-four in the three-address form and thirty in the four-address one.
+ *   Anything else -- a non-QoS data frame, a management frame -- has no such
+ *   field, and clause 10.3.2.14 gives that traffic its own cache entry rather
+ *   than folding it onto identifier zero, so it gets an identifier of its own
+ *   here too.  A frame too short to hold the field it claims is treated the
+ *   same way: the alternative is reading past the end of it.
+ *
+ ****************************************************************************/
+
+static unsigned int k1_rtl8852bs_runtime_resident_frame_tid(
+  FAR const uint8_t *payload, size_t payload_length, uint16_t frame_control)
+{
+  uint8_t subtype = (uint8_t)((frame_control >>
+                              K1_RTL8852BS_IEEE80211_SUBTYPE_SHIFT) &
+                              K1_RTL8852BS_IEEE80211_SUBTYPE_MASK);
+  size_t offset = K1_RTL8852BS_IEEE80211_QOS_OFFSET;
+
+  if (((frame_control >> 2) & K1_RTL8852BS_IEEE80211_TYPE_MASK) !=
+      K1_RTL8852BS_IEEE80211_TYPE_DATA ||
+      (subtype & 0x8u) == 0)
+    {
+      return K1_RTL8852BS_RESIDENT_DUP_TID_NONE;
+    }
+
+  if ((frame_control & 0x0300u) == 0x0300u)
+    {
+      offset = K1_RTL8852BS_IEEE80211_QOS_OFFSET_FOUR;
+    }
+
+  if (payload_length < offset + 2)
+    {
+      return K1_RTL8852BS_RESIDENT_DUP_TID_NONE;
+    }
+
+  return payload[offset] & 0x0fu;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_duplicate
+ *
+ * Description:
+ *   Whether this frame is one this port has already acted on.  Clause
+ *   10.3.2.14: a receiver keeps the Sequence Control field of the last frame
+ *   it accepted from each transmitter address and traffic identifier, and a
+ *   frame arriving with the Retry bit set and a matching Sequence Control is a
+ *   retransmission of it -- the transmitter did not hear the acknowledgement,
+ *   not a second event.  The cache is updated by every frame that is not
+ *   dropped, retried or not, because the next retransmission is a
+ *   retransmission of whatever arrived last.
+ *
+ *   Only the protocol action is suppressed, never the accounting: the caller
+ *   has already counted the frame, its decryption and its bytes by the time
+ *   this is asked, so the raw counters keep describing what the radio received
+ *   and only the answer, the address learned, the lease taken is withheld.
+ *   A frame with no address to key on, or one too short to hold a Sequence
+ *   Control field, is not filtered at all -- guessing which stream it belongs
+ *   to could drop a frame that was never a duplicate, and a missed duplicate
+ *   is the cheaper mistake.
+ *
+ * Returned Value:
+ *   1 when the caller must not act on this frame again, 0 otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_duplicate(
+  FAR struct k1_rtl8852bs_resident_count_s *count,
+  FAR const uint8_t *addr, FAR const uint8_t *payload,
+  size_t payload_length, uint16_t frame_control)
+{
+  unsigned int tid;
+  uint16_t seqctl;
+  unsigned int i;
+  unsigned int slot;
+  bool retry;
+
+  if (count == NULL || addr == NULL || payload == NULL ||
+      payload_length < K1_RTL8852BS_IEEE80211_HEADER_SIZE)
+    {
+      return 0;
+    }
+
+  tid = k1_rtl8852bs_runtime_resident_frame_tid(payload, payload_length,
+                                                frame_control);
+  seqctl = k1_rtl8852bs_read_le16(payload +
+                                  K1_RTL8852BS_IEEE80211_SEQCTL_OFFSET);
+  retry = (frame_control & K1_RTL8852BS_IEEE80211_FC_RETRY) != 0;
+
+  count->dup_checked++;
+  if (retry)
+    {
+      count->dup_retries++;
+    }
+
+  for (i = 0; i < K1_RTL8852BS_RESIDENT_DUP_SLOTS; i++)
+    {
+      if (!count->dup_valid[i] || count->dup_tid[i] != (uint8_t)tid ||
+          memcmp(count->dup_addr[i], addr, 6) != 0)
+        {
+          continue;
+        }
+
+      if (retry && count->dup_seqctl[i] == seqctl)
+        {
+          count->dup_dropped++;
+          count->dup_last_seqctl = seqctl;
+          count->dup_last_tid = (uint8_t)tid;
+          return 1;
+        }
+
+      count->dup_seqctl[i] = seqctl;
+      return 0;
+    }
+
+  /* A stream not in the cache.  Round-robin replacement: the eight slots are
+   * more than one access point needs, and an eviction is recorded so a window
+   * that outgrew the cache says so instead of silently letting duplicates
+   * through.
+   */
+
+  slot = count->dup_next_slot % K1_RTL8852BS_RESIDENT_DUP_SLOTS;
+  if (count->dup_valid[slot])
+    {
+      count->dup_evictions++;
+    }
+
+  memcpy(count->dup_addr[slot], addr, 6);
+  count->dup_seqctl[slot] = seqctl;
+  count->dup_tid[slot] = (uint8_t)tid;
+  count->dup_valid[slot] = true;
+  count->dup_next_slot = (uint8_t)((slot + 1) %
+                                   K1_RTL8852BS_RESIDENT_DUP_SLOTS);
+  count->dup_new++;
+  return 0;
 }
 
 /****************************************************************************
@@ -28889,6 +29084,14 @@ static void k1_rtl8852bs_runtime_resident_observe_network(
  *   returned byte for byte, the addresses the other way round, and both
  *   checksums.
  *
+ *   Five more cover the duplicate filter, which is not the observer's but its
+ *   caller's: sixteen a first copy, which passes and is remembered; seventeen
+ *   that copy again with the Retry bit set, which is dropped; eighteen and
+ *   nineteen the same frame under another traffic identifier and from another
+ *   transmitter, both of which pass because the cache is keyed on the pair;
+ *   and twenty a retry of a sequence never seen, which passes and then
+ *   becomes the remembered one, so the copy behind it is dropped.
+ *
  * Returned Value:
  *   OK when every counter matched, a negated errno otherwise.
  *
@@ -29482,6 +29685,98 @@ static int k1_rtl8852bs_runtime_resident_network_selftest(void)
       goto errout;
     }
 
+  /* Five more for duplicate detection, which belongs not to the observer but
+   * to the caller that feeds it: the receive path has to ask whether a frame
+   * is one it already acted on before it acts.  The filter reads a header and
+   * nothing else, so these stages build headers and nothing else.
+   *
+   * Sixteen is a first copy, Retry clear, which must pass and must be
+   * remembered.  Seventeen is that same frame with Retry set, which must be
+   * dropped -- the one case the cache exists for.  Eighteen repeats it under a
+   * different traffic identifier and nineteen from a different transmitter,
+   * both of which must pass: a cache keyed on less than the standard's pair
+   * would drop a frame that was never a duplicate, and a dropped frame is
+   * gone.  Twenty retries a sequence the cache has not seen, which must pass
+   * and must then become the remembered one, because the next retransmission
+   * is a retransmission of whatever arrived last -- a cache that kept only the
+   * first frame of a stream would pass both copies.
+   */
+
+  memset(payload, 0, K1_RTL8852BS_RESIDENT_FRAME_MAX);
+  k1_rtl8852bs_write_le16(payload, 0x4288u);
+  memcpy(payload + 4, self, 6);
+  memcpy(payload + 10, bssid, 6);
+  memcpy(payload + 16, peer, 6);
+  k1_rtl8852bs_write_le16(payload + 22, (uint16_t)(0x65u << 4));
+  payload[K1_RTL8852BS_IEEE80211_QOS_OFFSET] = 0u;
+  length = K1_RTL8852BS_IEEE80211_QOS_OFFSET + 2u +
+           K1_RTL8852BS_CCMP_HEADER_SIZE;
+
+  if (k1_rtl8852bs_runtime_resident_duplicate(count, bssid, payload, length,
+                                              0x4288u) != 0 ||
+      count->dup_checked != 1 || count->dup_new != 1 ||
+      count->dup_retries != 0 || count->dup_dropped != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Seventeen. */
+
+  k1_rtl8852bs_write_le16(payload, 0x4a88u);
+  if (k1_rtl8852bs_runtime_resident_duplicate(count, bssid, payload, length,
+                                              0x4a88u) != 1 ||
+      count->dup_dropped != 1 || count->dup_retries != 1 ||
+      count->dup_last_seqctl != (uint16_t)(0x65u << 4) ||
+      count->dup_last_tid != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Eighteen. */
+
+  payload[K1_RTL8852BS_IEEE80211_QOS_OFFSET] = 6u;
+  if (k1_rtl8852bs_runtime_resident_duplicate(count, bssid, payload, length,
+                                              0x4a88u) != 0 ||
+      count->dup_dropped != 1 || count->dup_new != 2)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Nineteen. */
+
+  payload[K1_RTL8852BS_IEEE80211_QOS_OFFSET] = 0u;
+  if (k1_rtl8852bs_runtime_resident_duplicate(count, other, payload, length,
+                                              0x4a88u) != 0 ||
+      count->dup_dropped != 1 || count->dup_new != 3)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Twenty. */
+
+  k1_rtl8852bs_write_le16(payload + 22, (uint16_t)(0x66u << 4));
+  if (k1_rtl8852bs_runtime_resident_duplicate(count, bssid, payload, length,
+                                              0x4a88u) != 0 ||
+      count->dup_dropped != 1 ||
+      k1_rtl8852bs_runtime_resident_duplicate(count, bssid, payload, length,
+                                              0x4a88u) != 1 ||
+      count->dup_dropped != 2 ||
+      count->dup_last_seqctl != (uint16_t)(0x66u << 4) ||
+      count->dup_evictions != 0 || count->dup_checked != 6)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
   ret = OK;
 
 errout:
@@ -29531,6 +29826,16 @@ errout:
   k1_early_puthex(count->icmp_serve_bad);
   k1_early_puts(" echo-serve-long=");
   k1_early_puthex(count->icmp_serve_long);
+  k1_early_puts(" dup=");
+  k1_early_puthex(count->dup_checked);
+  k1_early_puts(" dup-retries=");
+  k1_early_puthex(count->dup_retries);
+  k1_early_puts(" dup-dropped=");
+  k1_early_puthex(count->dup_dropped);
+  k1_early_puts(" dup-streams=");
+  k1_early_puthex(count->dup_new);
+  k1_early_puts(" dup-evictions=");
+  k1_early_puthex(count->dup_evictions);
   k1_early_puts(" stage=");
   k1_early_puthex((uintreg_t)stage);
   k1_early_puts(" status=");
@@ -30172,6 +30477,24 @@ static void k1_rtl8852bs_runtime_resident_observe(
           if (from_target)
             {
               count->data_frames_target++;
+
+              /* Whether the access point has sent this frame before.  The
+               * check goes here, behind every counter that describes what the
+               * radio received and in front of everything that acts on what
+               * the frame says, so a retransmission still counts as a frame
+               * received and decrypted -- it was -- while the answer it would
+               * have drawn, the address it would have taught and the lease it
+               * would have taken happen once.  Run 68 spent one of its eight
+               * allowed echo replies answering the same request twice for want
+               * of this.
+               */
+
+              if (k1_rtl8852bs_runtime_resident_duplicate(
+                    count, mgmt.addr2_valid ? mgmt.addr2 : NULL,
+                    payload, payload_length, mgmt.frame_control))
+                {
+                  return;
+                }
 
               /* What was inside it.  This runs before the DHCP question
                * because it is the more general one: it classifies every
@@ -34219,6 +34542,35 @@ static int k1_rtl8852bs_runtime_resident_window(
       k1_rtl8852bs_scanofld_log_bytes(count.icmp_serve_mac, 6);
     }
 
+  k1_early_puts("\r\n");
+
+  /* Duplicate detection.  checked is the frames from the associated access
+   * point the filter was asked about, retries how many of them carried the
+   * Retry bit, and dropped how many of those were also already in the cache --
+   * that last one is the number of times this window would otherwise have
+   * acted twice on one frame, which run 68 did once.  streams is how many
+   * transmitter-and-identifier pairs the cache learned and evictions how often
+   * round-robin replacement threw one away; a non-zero evictions count means
+   * the cache is too small for this network and duplicates may have got
+   * through, so it has to be visible rather than inferred.  last-seq is the
+   * Sequence Control of the last frame dropped, high twelve bits the sequence
+   * number, so it can be lined up against the peer's own log.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window dup checked=");
+  k1_early_puthex(count.dup_checked);
+  k1_early_puts(" retries=");
+  k1_early_puthex(count.dup_retries);
+  k1_early_puts(" dropped=");
+  k1_early_puthex(count.dup_dropped);
+  k1_early_puts(" streams=");
+  k1_early_puthex(count.dup_new);
+  k1_early_puts(" evictions=");
+  k1_early_puthex(count.dup_evictions);
+  k1_early_puts(" last-seq=");
+  k1_early_puthex(count.dup_last_seqctl);
+  k1_early_puts(" last-tid=");
+  k1_early_puthex(count.dup_last_tid);
   k1_early_puts("\r\n");
 
   /* And the hardware addresses behind those three, each on its own line and
