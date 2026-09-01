@@ -8293,6 +8293,67 @@ K1 Wi-Fi GPL: resident window arp claim attempts= acks= mask= spa= status= peer=
 `role_cam` 未使用告警外无新增），风格基线不变（驱动超 79 列 50 行、判据脚本 55 行，零
 tab、零行尾空白，`ast.parse` 通过）。
 
+### 运行 66：SPA＝0 就是原因——3/3 被回答，而单播下行本来就是通的
+
+run 66 是 3z 的对照实验，日志 `out/k1-serial/k1-wpa-20260901T111205Z.log`，两个 PASS
+marker 都在，零 FAIL，判据脚本没有列出任何缺失项。窗尾两行并排读就是结论：
+
+```
+resident window arp trip  attempts=0x6 replies=0x3 mask=0x0 uni=0x3 uni-ack=0x0 bcast=0x3 bcast-ack=0x0 peer=24a3f050081f ip=0xc0a801a6
+resident window arp claim attempts=0x3 acks=0x3 mask=0x7 spa=0xc0a801ce status=0x0 peer=24a3f050081f ip=0xc0a801a6
+```
+
+同一个窗、同一台主机 `24:a3:f0:50:08:1f`（192.168.1.166）、同一把成对密钥、同一条分发
+路径：发送协议地址为 0 的六次请求一次没被回答（`uni-ack=0` ＋ `bcast-ack=0`），把发送
+协议地址换成服务器确认过的 192.168.1.206 之后**三次全被回答**（`mask=0x7`，三次各自配上
+了一个回复）。三行 tx 里的 `replies=` 依次是 0、1、2，说明每一次都在 700 ms 的间隔内被
+答复，不是最后一起回来的。
+
+所以 3z 的两个候选里第一个成立：**这台主机不回答发送协议地址为 0 的请求**。RFC 5227 的
+探测形态在协议上是合法的，但对端愿不愿意答复它是实现自由；这台不答。
+
+第二个候选同时被证伪，而且证据比「有回复」更直接：
+
+```
+resident window data a1 self=0x3 bssid=0x0 other=0x2 self-prot=0x3 self-dec=0x3 hw-a1=0x3
+resident window data a1 first fc=0x4208 len=0x62 flags=0x31 sec=0x6 a2=504f3be2e6d2 a3=24a3f050081f head=0300002000000000
+```
+
+三帧数据帧的 A1 就是本站，三帧都是受保护的，三帧都解密成功，而且描述符里的 `A1_MATCH`
+位与软件自己比出来的数完全一致（`hw-a1=0x3` 对 `self=0x3`）。run 65 里这一整块是全零，
+现在知道那不是过滤器把单播扣下了——那一窗确实没有一帧单播要给本站。第一帧的 a2 是 AP
+`50:4f:3b:e2:e6:d2`、a3 是回答的那台站，末八字节 `0300002000000000` 是 CCMP 头（ExtIV
+置位、key id 0、PN＝3）。
+
+**接收过滤器这一支就此关闭**：`SNIFFER_MODE` 不用清，`A_UC_CAM_MATCH` /
+`A_BC_CAM_MATCH` 不用置，原厂 `rx_fltr_init()` 的这一部分不必再复刻——寻址到本站的受保护
+单播下行帧本来就收得进来、解得开，描述符的匹配位也是对的。3w 那一节留下的问号（sniffer
+模式下 `A1_MATCH` 按什么规则置位）到这里有了经验答案：至少在成对密钥装好、A1 等于本站
+MAC 的受保护数据帧上，它与软件比较的结果一致。
+
+DHCP 这一轮完整复现，而且地址是同一个：
+
+```
+resident window dhcp offer   ip=0xc0a801ce server-id=0xc0a80102 src=0xc0a80102 mask=0xffffff00 router=0xc0a80102 lease=0xa8c0 offers=0x1 attempt=0x1 xid=0x8cfe8076 mac=60beb40996b8
+resident window dhcp request sent=0x1 status=0x0 sn=0xd bytes=0x152 reply=0x2 ack=0x1 ack-ip=0xc0a801ce nak=0x0
+```
+
+新的 xid（`0x8cfe8076`）、一次 Discover、一个 OFFER、一次 Request、一个 ACK，地址仍是
+192.168.1.206——服务器把它留给了本站的 MAC，两次运行拿到同一个。`ccxrpt-tag=0x7
+ccxrpt-tag-ok=0x7 ccxrpt-tag-fail=0x0`：七个带标签的帧全部第一次就被 ACK，仍然没有重传。
+`data sec total=0x44 target=0x3b prot=0x44 group=0x3f hw-dec=0x3b sw-dec=0x9 icv=0x0
+crc=0x0`——68 帧全部受保护，59 帧解密成功，ICV 与 CRC 错误都是零。
+
+还有一个读数是下一步的前提：
+
+```
+resident window arp sent=0x9 ... arp-req=0x20 peer-ip=0xc0a801a6 peer-tpa=0xc0a801ce
+```
+
+窗内听到 32 个 ARP 请求，其中有请求的**目标协议地址就是 0xc0a801ce**——本子网上已经有人
+在问「谁是 192.168.1.206」，而本站一个字也不回。按 RFC 826，持有某地址的主机必须回答对
+该地址的请求；不回答的直接后果是：任何想给本站发单播 IP 报文的对端都会先卡在 ARP 上。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

@@ -1234,7 +1234,7 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   `data a1 self=0x0`，三帧 DHCP 回复全是组地址、走 GTK 广播路径）。两者只差一个变量，而 ACK
   刚好把那个变量合法地给了出来。
 
-- **已编译待上板（增量 3z）：把同一台主机再问一遍，这次带上自己的地址。** 除了发送协议地址
+- **已上板并出结论（增量 3z，run 66）：把同一台主机再问一遍，这次带上自己的地址。** 除了发送协议地址
   什么都不动：`runtime_arp_probe_build()` 多 `sender_ip`（0 即 RFC 5227 探测形态，行为与今天
   逐字节一致；非零才写 `SENDER_IP_OFFSET`），十一个调用点里十个传 `0u`；
   `runtime_resident_arp_tx()` 多 `claimed`——`sender_ip = claimed ? dhcp_ack_ip : 0`，没有被
@@ -1252,6 +1252,22 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   步看加密本身」，加密在 3s/3t 已排除、DHCP 现已往返，改为「加密与发送路径都已排除，看
   claim 轮」）和一处措辞错误（`mac=` 是 address 3 ＝ 服务器自己，不是 AP）。已编译通过
   （`text=820248 data=9768 bss=25296`，SHA256 `0d089615…`），风格基线不变。
+- **run 66 的读数（一次对照实验，两个候选一次定案）：** `arp trip attempts=0x6 replies=0x3
+  mask=0x0 uni-ack=0x0 bcast-ack=0x0` 对 `arp claim attempts=0x3 acks=0x3 mask=0x7
+  spa=0xc0a801ce`，同一个窗、同一台主机 `24:a3:f0:50:08:1f`（192.168.1.166）、同一把密钥、
+  同一条分发路径——**SPA＝0 是沉默的原因**，三行 claim tx 的 `replies=` 依次 0/1/2 说明每次
+  都在 700 ms 内被答复。同窗 `data a1 self=0x3 bssid=0x0 other=0x2 self-prot=0x3
+  self-dec=0x3 hw-a1=0x3` ＋ `first fc=0x4208 len=0x62 sec=0x6 a2=504f3be2e6d2
+  a3=24a3f050081f head=0300002000000000`（CCMP 头，ExtIV、key id 0、PN＝3）：**寻址到本站的
+  受保护单播下行帧收得进来、解得开、描述符 `A1_MATCH` 与软件比较结果一致**，run 65 那一块
+  全零只是因为那一窗没有单播要给本站。**结论：接收过滤器这一支关闭**（不用清
+  `SNIFFER_MODE`、不用置 `A_UC_CAM_MATCH`/`A_BC_CAM_MATCH`），3w 留下的「sniffer 模式下
+  `A1_MATCH` 怎么置位」有了经验答案。DHCP 完整复现且地址相同（新 xid `0x8cfe8076`、1 个
+  OFFER、1 个 ACK、`ack-ip=0xc0a801ce`、lease `0xa8c0`），`ccxrpt-tag=0x7 ok=0x7 fail=0x0`
+  七帧全部一次 ACK，`data sec total=0x44 prot=0x44 hw-dec=0x3b sw-dec=0x9 icv=0x0 crc=0x0`。
+  另一个读数是下一步的前提：`arp-req=0x20 peer-tpa=0xc0a801ce`——本子网上已经有人在问「谁是
+  192.168.1.206」，本站不答，对端就会在给本站发单播 IP 报文前卡在 ARP 上。日志
+  `out/k1-serial/k1-wpa-20260901T111205Z.log`，两个 PASS marker，零 FAIL。
 
 
 
@@ -1374,10 +1390,16 @@ DHCP OFFER（192.168.1.206，本站 xid ＋ 本站 chaddr 双重匹配，走 GTK
 ack-ip=0xc0a801ce`，本站在受保护链路上走完了完整的 DHCP 四步，拿到 192.168.1.206。** 于是现
 在有了合法的非零发送地址，而 run 65 同时把问题收得极窄：被 ARP 问的那台主机就是回了 OFFER 和
 ACK 的那台服务器，它愿意回答本站，只是不回答 SPA＝0 的请求——或者回答了而单播下行丢了。
-**增量 3z 就是这一个变量的对照实验：同一台 peer、同一把密钥、同一个窗，只把 SPA 从 0 换成
-192.168.1.206，三次，单播形态，独立记账（已编译待上板）。** 命中就说明 SPA＝0 是原因且单播下
-行通了，下一步直接对网关做 ICMP echo；全不中就说明剩下的只有「寻址到本站的下行帧」这一支，那
-就回到接收过滤器（原厂 `rx_fltr_init()`：清 SNIFFER_MODE、置 CAM-match 位）。
+**增量 3z 就是这一个变量的对照实验，run 66 给了确定的答案：同一个窗、同一台主机
+`24:a3:f0:50:08:1f`（192.168.1.166）、同一把密钥、同一条分发路径，SPA＝0 的六次请求
+`uni-ack=0 bcast-ack=0`，换成 192.168.1.206 之后 `attempts=0x3 acks=0x3 mask=0x7`——三次
+全被回答，每次都在 700 ms 内。** 所以沉默的原因就是发送协议地址为 0；同一窗里
+`data a1 self=0x3 self-prot=0x3 self-dec=0x3 hw-a1=0x3` 又把另一支一起证伪：寻址到本站的
+受保护单播下行帧收得进来、解得开、描述符匹配位也对，**接收过滤器这一支（`rx_fltr_init()`
+清 SNIFFER_MODE、置 CAM-match 位）不必再做**。下一步是第一次 IP 层往返：对 DHCP 给出的网关
+192.168.1.2 发 ICMP echo，并且开始回答对本站地址的 ARP 请求——run 66 的
+`arp-req=0x20 peer-tpa=0xc0a801ce` 说明本子网上已经有人在问「谁是 192.168.1.206」，而不回答
+的直接后果是对端给本站发单播 IP 报文时会先卡在 ARP 上。
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们
