@@ -7782,6 +7782,40 @@ K1 Wi-Fi GPL: resident window tim aid= seen= aid-set= bcast-set= absent=
 
 也就是说，无论落到哪一种，这一行都把 (B1) 从「不知道」变成一个可以往下走的方向。
 
+#### run 59 的读数：38 帧 Beacon 一个 TIM 都没读到——错在读的位置
+
+run 59（`k1-wpa-20260901T044828Z.log`，40/40，`RUN_EXIT=0`；关联与四次握手照旧全过：
+`aid=0x1 msg1..msg4=0x1 mic=0x1`，BSSID `504f3be2e6d2`）打出的是：
+
+```
+resident window tim aid=0x1 seen=0x0 aid-set=0x0 bcast-set=0x0 absent=0x26
+short=0x0 out-of-range=0x0 dtim-count=0x0 dtim-period=0x0 ctl=0x0 bmap-len=0x0 head=
+```
+
+`absent=0x26` ＝38 帧目标 Beacon，`seen=0x0` ＝一帧都没读出 TIM。**这个读数不可能是 AP 的说
+法**：TIM 在 Beacon 里是必备元素，真实 AP 每一帧都带。所以错在本移植这一侧，查出来是一处两字
+节的偏移错误。
+
+元素列表的起点当时用了 `k1_rtl8852bs_runtime_resident_header_length()`。那个函数是给**数据
+帧**写的：它按「子类型第 3 位 ＝ QoS 数据」加两字节 QoS 控制字段——而 **Beacon 的子类型正好
+是 8**（`0b1000`），于是它给管理帧也加了两字节，元素表起点从 36 变成 38，正好落进 SSID 元素里
+面（`00 02 'S' 'B'` 的第三个字节），后面整条链全歪，最后越界退出、记一次 `absent`。
+
+修正是不再用那个 helper：管理帧没有 QoS 控制字段、也没有第四个地址，头就是平的 24 字节，所以
+起点直接写 `K1_RTL8852BS_IEEE80211_HEADER_SIZE ＋
+K1_RTL8852BS_IEEE80211_BEACON_FIXED_SIZE`——和管理帧解析器自己找 SSID 用的是同一个式子（那一
+处一直是对的，所以扫描能读出 SSID）。函数签名去掉 `header_length` 参数，免得下一个调用点再
+踩。
+
+顺手加了一个字段 `len=`：第一帧目标 Beacon 的实际长度，在走元素表之前就记下。这样下一次读数
+能同时排掉第二种可能——如果 `len=` 只有几十字节，那就是接收路径只交付了帧头、元素表根本没
+到，跟偏移无关。这一行的字段从 12 个变成 13 个，判据仍然是 40。
+
+顺带记下一条一般性的坑：这个 helper 对**所有子类型 ≥ 8 的管理帧**都会多加两字节——Beacon(8)、
+ATIM(9)、Disassociation(10)、Authentication(11)、Deauthentication(12)、Action(13)。目前只有
+TIM 这一处拿它读过管理帧的帧体，其余调用点都在数据帧上（`observe_network`、DHCP 应答匹配、回
+环回读），所以没有别处受影响；但以后要读认证帧或去关联帧的帧体时必须记住这一点。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

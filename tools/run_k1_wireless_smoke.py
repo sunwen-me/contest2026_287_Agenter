@@ -2071,6 +2071,7 @@ def main() -> int:
                 rb" dtim-period=(?:0x)?([0-9a-fA-F]+)"
                 rb" ctl=(?:0x)?([0-9a-fA-F]+)"
                 rb" bmap-len=(?:0x)?([0-9a-fA-F]+)"
+                rb" len=(?:0x)?([0-9a-fA-F]+)"
                 rb" head=([0-9a-fA-F]*)",
                 resident,
             )
@@ -2081,20 +2082,20 @@ def main() -> int:
             else:
                 (tim_aid, tim_seen, tim_aid_set, tim_bcast_set, tim_absent,
                  tim_short, tim_range, tim_dtim_count, tim_dtim_period,
-                 tim_control, tim_bitmap) = (
+                 tim_control, tim_bitmap, tim_frame) = (
                      int(group, 16)
-                     for group in resident_tim_result.groups()[:11])
-                tim_head = resident_tim_result.group(12).decode("ascii")
+                     for group in resident_tim_result.groups()[:12])
+                tim_head = resident_tim_result.group(13).decode("ascii")
 
                 print(
                     "[serial] traffic indication map: aid={0} seen={1} "
                     "aid-set={2} bcast-set={3} absent={4} short={5} "
                     "out-of-range={6} dtim={7}/{8} ctl={9:#04x} "
-                    "bitmap={10} head={11}"
+                    "bitmap={10} frame={11} head={12}"
                     .format(tim_aid, tim_seen, tim_aid_set, tim_bcast_set,
                             tim_absent, tim_short, tim_range, tim_dtim_count,
                             tim_dtim_period, tim_control, tim_bitmap,
-                            tim_head or "none"),
+                            tim_frame, tim_head or "none"),
                     file=sys.stderr)
                 if tim_aid == 0:
                     print(
@@ -2105,8 +2106,10 @@ def main() -> int:
                 elif tim_seen == 0:
                     print(
                         "[serial] no Beacon from the access point carried a "
-                        "map, so this window says nothing about buffered "
-                        "traffic",
+                        "map ({0} of them had no element list this reader "
+                        "could walk, first was {1} bytes), so this window "
+                        "says nothing about buffered traffic"
+                        .format(tim_absent, tim_frame),
                         file=sys.stderr)
                 elif tim_aid_set:
                     print(

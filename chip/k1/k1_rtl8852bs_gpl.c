@@ -26707,6 +26707,7 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t tim_out_of_range;
   uint32_t tim_absent;
   uint16_t tim_aid;
+  uint16_t tim_frame_length;
   uint8_t tim_dtim_count;
   uint8_t tim_dtim_period;
   uint8_t tim_bitmap_control;
@@ -28292,28 +28293,40 @@ static void k1_rtl8852bs_runtime_resident_keep_other(
  *   truncated element's length byte says nothing about how many bytes are
  *   really there.
  *
+ *   The header in front of those fixed fields is the flat twenty-four byte
+ *   one, which is why this does not call the receive path's header length
+ *   helper: that helper reads bit 3 of the subtype as the QoS control field a
+ *   data frame carries, and a Beacon is subtype 8, so it would put the
+ *   element list two bytes further on than it is.  A management frame has no
+ *   QoS control field and no fourth address; the element walk here matches
+ *   the one the management parser already does for the SSID.
+ *
  *   Nothing here is transmitted and nothing is written to the hardware.
  *
  * Input Parameters:
  *   payload        - the received frame, from its frame control onwards
  *   payload_length - how many bytes of it were received
- *   header_length  - the length of its 802.11 header
  *   aid            - the association identifier to look for
  *   count          - where the reading is recorded
  *
  ****************************************************************************/
 
 static void k1_rtl8852bs_runtime_resident_tim_read(
-  FAR const uint8_t *payload, size_t payload_length, size_t header_length,
+  FAR const uint8_t *payload, size_t payload_length,
   uint16_t aid, FAR struct k1_rtl8852bs_resident_count_s *count)
 {
-  size_t offset = header_length + 12u;
+  size_t offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+                  K1_RTL8852BS_IEEE80211_BEACON_FIXED_SIZE;
   size_t offset_bytes;
   size_t byte_index;
   size_t length;
   size_t take;
 
   count->tim_aid = aid;
+  if (count->tim_frame_length == 0 && payload_length <= 0xffffu)
+    {
+      count->tim_frame_length = (uint16_t)payload_length;
+    }
 
   while (offset + 2u <= payload_length)
     {
@@ -28538,7 +28551,6 @@ static void k1_rtl8852bs_runtime_resident_observe(
 
           k1_rtl8852bs_runtime_resident_tim_read(
             payload, payload_length,
-            k1_rtl8852bs_runtime_resident_header_length(mgmt.frame_control),
             g_k1_rtl8852bs_assoc_action.response_aid, count);
         }
 
@@ -30791,6 +30803,8 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.tim_bitmap_control);
   k1_early_puts(" bmap-len=");
   k1_early_puthex(count.tim_bitmap_length);
+  k1_early_puts(" len=");
+  k1_early_puthex(count.tim_frame_length);
   k1_early_puts(" head=");
   if (count.tim_first_length != 0)
     {
