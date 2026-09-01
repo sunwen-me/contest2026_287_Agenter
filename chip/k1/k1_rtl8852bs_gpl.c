@@ -1460,6 +1460,29 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RF_PA_BIAS_TRIM_2G_MASK 0x0000f000u
 #define K1_RTL8852BS_RF_PA_BIAS_TRIM_5G_MASK 0x000f0000u
 
+/* halrf_set_dpd_backoff_8852b() of halrf_8852b.c:801.  0x44a0 carries the
+ * baseband transmit scaling, its frequency division multiplexing backoff in
+ * bits 16 to 12 and the scale itself in bits 6 to 0; 0x81bc carries the
+ * three per path predistortion gain scalers, one byte each, and 0x100
+ * separates the two paths.  Forty four is the vendor threshold, and the
+ * two gain settings are the values the predistortion reads later.
+ */
+
+#define K1_RTL8852BS_BB_REG_TX_SCALE         0x44a0u
+#define K1_RTL8852BS_BB_TX_SCALE_OFDM_MASK   0x0001f000u
+#define K1_RTL8852BS_BB_TX_SCALE_OFDM_SHIFT  12u
+#define K1_RTL8852BS_BB_TX_SCALE_MASK        0x0000007fu
+#define K1_RTL8852BS_BB_DPD_BACKOFF_LIMIT    44u
+#define K1_RTL8852BS_BB_REG_DPD_BACKOFF      0x81bcu
+#define K1_RTL8852BS_BB_DPD_BACKOFF_STRIDE   0x0100u
+#define K1_RTL8852BS_BB_DPD_BACKOFF_MASK     0x007fffffu
+#define K1_RTL8852BS_BB_DPD_BACKOFF_ZERO     0x007f7f7fu
+#define K1_RTL8852BS_RF_DPK_GS_BASEBAND      0x7fu
+#define K1_RTL8852BS_RF_DPK_GS_DEFAULT       0x5bu
+#define K1_RTL8852BS_RF_DPK_TXAGC_MAX        0x3fu
+#define K1_RTL8852BS_RF_RXBB_BW_INVALID      0xffu
+#define K1_RTL8852BS_RF_CHLK_MAP_ALL         0xffffffffu
+
 /* The per path control, result and offset words, then the four the two
  * paths share: the converter clock of each path, the receive FIFO and the
  * converter reset field.  That field holds while the path is rearranged,
@@ -17311,6 +17334,236 @@ static void k1_rtl8852bs_rf_efuse_trim_trigger(void)
     }
 }
 
+/****************************************************************************
+ * Name: k1_rtl8852bs_rf_self_init_trigger
+ *
+ * Description:
+ *   halrf_rfk_self_init() of halrf_init.c:275, the step the vendor runs
+ *   between the noise control image and the serial interface reset.  Nearly
+ *   all of it is software.  It clears the per channel calibration map so
+ *   the first channel that asks for a calibration gets one, marks the
+ *   transmit gain compensation and the transmit receive imbalance
+ *   calibration as never having run, turns the receive direct current
+ *   tracker on, drops every path out of transmit power tracking mode,
+ *   enables the predistortion and its tracker while forbidding it to
+ *   reload a saved result, and parks the receive baseband bandwidth of both
+ *   paths at a value no real bandwidth can equal so that the first real
+ *   bandwidth is always applied.
+ *
+ *   This port carries that state because the per channel calibrations that
+ *   read it are the increments that come next.  It does not carry the per
+ *   channel predistortion backup table the vendor zeroes here: the stage
+ *   that fills that table is not ported, and a table nothing reads would be
+ *   dead weight rather than a port.
+ *
+ *   The one part that touches the chip is halrf_dpk_init_8852b(), which is
+ *   halrf_set_dpd_backoff_8852b().  It reads the baseband transmit scaling
+ *   register, adds the frequency division multiplexing backoff to the
+ *   scale, and if the two together already back the transmit path off by 44
+ *   steps or more it moves the predistortion backoff into the baseband,
+ *   writing the three per path gain scalers of 0x81bc to their maximum and
+ *   recording a predistortion gain setting of 0x7f.  Otherwise it leaves
+ *   the backoff to the predistortion itself with a gain setting of 0x5b.
+ *   Both branches are sampled and logged here; only the first writes.
+ *
+ *   halrf_rx_dck_init() and halrf_tssi_init() have no 8852B hardware half
+ *   at all.  The register read in the first belongs to the 8852C, D and BP
+ *   cases of its switch and this chip falls through to the default.
+ *
+ ****************************************************************************/
+
+struct k1_rtl8852bs_rfk_self_s
+{
+  uint32_t chlk_map;
+  uint8_t  gapk_init;
+  uint8_t  iqk_init;
+  uint8_t  rxdck_track;
+  uint8_t  tssi_mode[K1_RTL8852BS_RF_PATHS];
+  uint8_t  dpk_enable;
+  uint8_t  dpk_track;
+  uint8_t  dpk_reload;
+  uint8_t  dpk_index[K1_RTL8852BS_RF_PATHS];
+  uint8_t  dpk_txagc_max[K1_RTL8852BS_RF_PATHS];
+  uint8_t  dpk_gs;
+  uint8_t  rxbb_bw[K1_RTL8852BS_RF_PATHS];
+  uint8_t  valid;
+};
+
+struct k1_rtl8852bs_rf_dpd_backoff_trace_s
+{
+  uint32_t scale;
+  uint32_t before[K1_RTL8852BS_RF_PATHS];
+  uint32_t after[K1_RTL8852BS_RF_PATHS];
+  uint8_t  ofdm_backoff;
+  uint8_t  tx_scale;
+  uint8_t  moved;
+};
+
+static struct k1_rtl8852bs_rfk_self_s g_k1_rtl8852bs_rfk_self;
+
+static int k1_rtl8852bs_rf_dpd_backoff(
+  FAR struct k1_rtl8852bs_rf_dpd_backoff_trace_s *trace)
+{
+  unsigned int path;
+  unsigned int sum;
+  uint32_t address;
+  int ret;
+
+  ret = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_REG_TX_SCALE,
+                               &trace->scale);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  trace->ofdm_backoff = (uint8_t)
+    ((trace->scale & K1_RTL8852BS_BB_TX_SCALE_OFDM_MASK) >>
+     K1_RTL8852BS_BB_TX_SCALE_OFDM_SHIFT);
+  trace->tx_scale = (uint8_t)(trace->scale &
+                              K1_RTL8852BS_BB_TX_SCALE_MASK);
+
+  sum = (unsigned int)trace->ofdm_backoff +
+        (unsigned int)trace->tx_scale;
+  trace->moved = sum >= K1_RTL8852BS_BB_DPD_BACKOFF_LIMIT ? 1u : 0u;
+
+  /* The gain setting the predistortion will use once it is ported.  The
+   * vendor decides it here as well, by this same comparison, before any
+   * calibration has run.
+   */
+
+  g_k1_rtl8852bs_rfk_self.dpk_gs = trace->moved ?
+    K1_RTL8852BS_RF_DPK_GS_BASEBAND : K1_RTL8852BS_RF_DPK_GS_DEFAULT;
+
+  /* Both paths are sampled either way, so a log that wrote nothing still
+   * carries the proof that it wrote nothing.  halrf_kpath_8852b() returns
+   * both paths whenever the dual band concurrent split is off, and this
+   * port never turns it on.
+   */
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      address = K1_RTL8852BS_BB_REG_DPD_BACKOFF +
+                ((uint32_t)path * K1_RTL8852BS_BB_DPD_BACKOFF_STRIDE);
+
+      ret = k1_rtl8852bs_bb_read32(address, &trace->before[path]);
+      if (ret < 0)
+        {
+          return ret;
+        }
+
+      if (trace->moved)
+        {
+          ret = k1_rtl8852bs_bb_update_field(
+            address, K1_RTL8852BS_BB_DPD_BACKOFF_MASK,
+            K1_RTL8852BS_BB_DPD_BACKOFF_ZERO);
+          if (ret < 0)
+            {
+              return ret;
+            }
+        }
+
+      ret = k1_rtl8852bs_bb_read32(address, &trace->after[path]);
+      if (ret < 0)
+        {
+          return ret;
+        }
+    }
+
+  return OK;
+}
+
+static void k1_rtl8852bs_rf_self_init_trigger(void)
+{
+  struct k1_rtl8852bs_rf_dpd_backoff_trace_s trace;
+  FAR struct k1_rtl8852bs_rfk_self_s *self;
+  unsigned int path;
+  int ret;
+
+  memset(&trace, 0, sizeof(trace));
+
+  self = &g_k1_rtl8852bs_rfk_self;
+  memset(self, 0, sizeof(*self));
+
+  self->chlk_map    = K1_RTL8852BS_RF_CHLK_MAP_ALL;
+  self->gapk_init   = 0;
+  self->iqk_init    = 0;
+  self->rxdck_track = 1;
+  self->dpk_enable  = 1;
+  self->dpk_track   = 1;
+  self->dpk_reload  = 0;
+  self->dpk_gs      = K1_RTL8852BS_RF_DPK_GS_DEFAULT;
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      self->tssi_mode[path]     = 0;
+      self->dpk_index[path]     = 0;
+      self->dpk_txagc_max[path] = K1_RTL8852BS_RF_DPK_TXAGC_MAX;
+      self->rxbb_bw[path]       = K1_RTL8852BS_RF_RXBB_BW_INVALID;
+    }
+
+  self->valid = 1;
+
+  ret = k1_rtl8852bs_rf_dpd_backoff(&trace);
+
+  k1_early_puts("K1 Wi-Fi GPL: RF SELF-INIT chlk-map=");
+  k1_early_puthex(self->chlk_map);
+  k1_early_puts(" gapk/iqk=");
+  k1_early_puthex(self->gapk_init);
+  k1_early_puts("/");
+  k1_early_puthex(self->iqk_init);
+  k1_early_puts(" rxdck-track=");
+  k1_early_puthex(self->rxdck_track);
+  k1_early_puts(" tssi-mode=");
+  k1_early_puthex(self->tssi_mode[0]);
+  k1_early_puts("/");
+  k1_early_puthex(self->tssi_mode[1]);
+  k1_early_puts(" rxbb-bw=");
+  k1_early_puthex(self->rxbb_bw[0]);
+  k1_early_puts("/");
+  k1_early_puthex(self->rxbb_bw[1]);
+  k1_early_puts("\r\n");
+
+  k1_early_puts("K1 Wi-Fi GPL: RF SELF-INIT dpk en/trk/rld=");
+  k1_early_puthex(self->dpk_enable);
+  k1_early_puts("/");
+  k1_early_puthex(self->dpk_track);
+  k1_early_puts("/");
+  k1_early_puthex(self->dpk_reload);
+  k1_early_puts(" txagc-max=");
+  k1_early_puthex(self->dpk_txagc_max[0]);
+  k1_early_puts("/");
+  k1_early_puthex(self->dpk_txagc_max[1]);
+  k1_early_puts(" gs=");
+  k1_early_puthex(self->dpk_gs);
+  k1_early_puts("\r\n");
+
+  k1_early_puts("K1 Wi-Fi GPL: RF SELF-INIT dpd scale=");
+  k1_early_puthex(trace.scale);
+  k1_early_puts(" ofdm-bkof=");
+  k1_early_puthex(trace.ofdm_backoff);
+  k1_early_puts(" tx-scale=");
+  k1_early_puthex(trace.tx_scale);
+  k1_early_puts(" limit=");
+  k1_early_puthex(K1_RTL8852BS_BB_DPD_BACKOFF_LIMIT);
+  k1_early_puts(" moved=");
+  k1_early_puthex(trace.moved);
+  k1_early_puts(" backoff=");
+  k1_early_puthex(trace.before[0]);
+  k1_early_puts("->");
+  k1_early_puthex(trace.after[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.before[1]);
+  k1_early_puts("->");
+  k1_early_puthex(trace.after[1]);
+  if (ret < 0)
+    {
+      k1_early_puts(" error=");
+      k1_early_puthex((uintreg_t)-ret);
+    }
+
+  k1_early_puts("\r\n");
+}
+
 struct k1_rtl8852bs_scan_rf_readback_s
 {
   uint32_t mode[K1_RTL8852BS_RF_PATHS];
@@ -21953,12 +22206,18 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
       k1_rtl8852bs_scan_rf_readback_log("pre-si-reset", &rf_readback);
     }
 
-  /* Run the serial interface reset of halrf_dm_init() between the two
-   * samples.  It is the vendor workaround for a radio that reads back as
-   * zero, so the pair of samples measures it directly.  A failure is
-   * reported and then ignored, like the samples themselves: it must not
-   * change the result of the scan.
+  /* Run the two steps halrf_dm_init() has here between the two samples.
+   * The first is the calibration self init, the software state every later
+   * calibration reads plus the one baseband decision it makes; the vendor
+   * runs it immediately before the reset, and it writes no radio register,
+   * so the sample just taken still measures what it measured before.  The
+   * second is the serial interface reset itself, the vendor workaround for
+   * a radio that reads back as zero, which is why the pair of samples
+   * brackets it.  A failure of either is reported and then ignored, like
+   * the samples themselves: it must not change the result of the scan.
    */
+
+  k1_rtl8852bs_rf_self_init_trigger();
 
   rf_readback_ret = k1_rtl8852bs_rf_si_reset();
   if (rf_readback_ret < 0)
