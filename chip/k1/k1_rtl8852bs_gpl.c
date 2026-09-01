@@ -33056,6 +33056,13 @@ errout:
  *   At most one reply is credited per attempt, so the mask answers "was this
  *   attempt answered" and cannot be inflated by a host that replies twice.
  *
+ *   The index is also checked against the round's own attempt count, so a
+ *   mask bit can only ever stand for an attempt that was transmitted.  Run 72
+ *   printed acks=0x6 against attempts=0x3 because the caller's "which round"
+ *   flag had latched true and probe indices were lighting claim bits; that
+ *   flag is written by both transmit sites now, and this check makes
+ *   acks <= attempts hold whatever a caller says.
+ *
  * Input Parameters:
  *   count   - the window's counters, whose arp_replies is the running total
  *   attempt - index of the last attempt transmitted, or a negative value when
@@ -33073,8 +33080,11 @@ static void k1_rtl8852bs_runtime_resident_arp_trip_credit(
   FAR struct k1_rtl8852bs_resident_count_s *count, int attempt, bool claimed,
   FAR uint32_t *seen)
 {
+  uint32_t round_attempts = claimed ? count->arp_claim_attempts :
+                                      count->arp_trip_attempts;
+
   if (attempt < 0 || attempt >= (int)(sizeof(count->arp_trip_mask) * 8) ||
-      count->arp_replies <= *seen)
+      (uint32_t)attempt >= round_attempts || count->arp_replies <= *seen)
     {
       return;
     }
@@ -33505,6 +33515,10 @@ static int k1_rtl8852bs_runtime_resident_window(
 
           /* Only a frame the queue took can be answered, so a refused one
            * spends its attempt without joining the rate the mask reports.
+           * The attribution moves back to this round as well: the flag says
+           * which round transmitted last, so both sites have to write it or
+           * it latches on the first claim and every reply after that is
+           * credited to a round that has stopped transmitting.
            */
 
           if (ret >= 0)
@@ -33520,6 +33534,7 @@ static int k1_rtl8852bs_runtime_resident_window(
                 }
 
               arp_trip_last = (int)arp_attempts;
+              arp_trip_last_claimed = false;
               arp_trip_seen = count.arp_replies;
             }
 
