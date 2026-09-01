@@ -1069,8 +1069,8 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   harness 里那句 "the reply was never produced" 因此改成了 "an answer that was never produced
   and one sent straight out and not received are still to be told apart"。**
 
-- **已实现、等上板（增量 3v，判据仍为 40）：看 AP 有没有把本站发上去的广播帧又播回空口——这一
-  侧唯一能自证「上行通了」的读数。** 3u 划掉省电那条支路之后，剩下的两种可能是「上行根本没被
+- **已上板并出结论（增量 3v，run 62，40/40）：AP 把本站发上去的三个广播帧一个不落地又播回了
+  BSS——上行整条链闭合了。** 3u 划掉省电那条支路之后，剩下的两种可能是「上行根本没被
   AP 转发」和「AP 回了但本端没收下」。分开它们看似只能在 AP 的有线段抓包，但桥转发的定义给了
   第三条路：网桥把组播帧泛洪到除入端口以外的所有端口，而同一个 BSS 里还挂着别的 STA，所以 AP
   必须把某个 STA 发上来的广播帧再从空口播一遍（mac80211 的 `ieee80211_rx_h_data` 就是克隆一份
@@ -1081,11 +1081,25 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   0，所以 0 只是「这一行什么也没说」。实现是在常驻窗口 `self_frames`（A2 ＝ 本站）那一段后面加
   一个判断，**零新发送、零新 H2C、零寄存器写入**；窗口本来就会发一帧广播 ARP Request
   （`attempt & 1`）和一帧广播 DHCP Discover，所以有东西可播。新增一行
-  `resident window echo frames= group= data= fc= len= head=`，`head=` 是帧头结尾的 8 字节（解开
-  了就是 LLC/SNAP：`aaaa030000000806` ＝ ARP、`...0800` ＝ IPv4；没解开就是 CCMP 的包号头，两
-  种都不是密文），挂在既有的 `--require-runtime-resident` 上、只要求存在，判据仍是 40。已编译
+  `resident window echo frames= group= data= fc= len= head=`，`head=` 是帧头结尾的 8 字节（这颗硬件是原地
+  解密、CCMP 头留在原处，所以受保护帧这 8 字节恒为 CCMP 包号头，解没解开都一样、也都不是密
+  文；解密成不成要看 `hw-dec`／`dec`／`icv`），挂在既有的 `--require-runtime-resident` 上、只要求存在，判据仍是 40。已编译
   通过（`text=813522 data=9768 bss=25296`，SHA256 `9a5d239c…`，无新增告警），判据正则对三条合成
   行各命中 6 组。
+  **run 62（`out/k1-serial/k1-wpa-20260901T053802Z.log`，40 条全过、0 `FAIL`）的读数是
+  `echo frames=0x3 group=0x3 data=0x3 fc=0x4208 len=0x152 head=f5c900604f000000`。**这一窗本站
+  发上去的组播帧正好三个（DHCP Discover `sn=0xc`／`sn=0xe`，广播 ARP `sn=0xf`；`sn=0xd` 那帧是
+  发给网关的单播，不该计），回声三个，一帧不差。`fc=0x4208` ＝ Data、FromDS=1／ToDS=0、
+  Protected=1；`len=0x152`＝338 字节，正好是本站 `bytes=0x146`＝326 字节那帧加上硬件补的 8 字节
+  MIC 和 4 字节 FCS；`head` 是 CCMP 头，`60` ＝ ExtIV ＋ KeyID=1（组密钥），PN=0x00004fc9f5，而
+  同窗一个真实局域网主机的组播帧 PN=0x00004fc9f2——回声就落在 AP 自己那条组密钥包号序列上、只
+  靠后三个计数，所以这是 AP 的字节。同窗 `data sec ... hw-dec=0xd icv=0x0 crc=0x0 dec=0xd`，目标
+  发来的 13 帧全部硬件解开。**由此得到三条：(1) 上行整条链闭合——AP 用成对密钥解开了本站的
+  CCMP（不解开就看不到帧内的以太网源地址、无从桥接和泛洪），再用 GTK 播回，密钥／包号／AAD／
+  nonce／四个地址全部被对端接受，这是对端行为而非自证；(2) AP 没开客户端隔离，隔离首先掐掉的
+  就是这次泛洪；(3) 仍为零的只剩 `a1-match=0x0`——整窗没有一帧 A1 是本站单播地址，而 `sn=0xd`
+  那帧单播 ARP Request 按协议必须换来一帧单播 ARP Reply。**于是问题被压到一句：发往本站单播地
+  址的帧，是 AP 根本没发，还是发了而本站在进 RX FIFO 之前就被硬件丢掉了。
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
@@ -1193,7 +1207,11 @@ Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手�
 **增量 3t 已在 run 58 上板（40/40，`RUN_EXIT=0`）：回环里那一帧 A1 ＝ 自己 MAC 的受保护数据帧
 报 `a1-match=0x1 hw-dec=0x1 icv=0x0 sec-cam=0x0 diff-bytes=0x0`——接收路径接得住发给自己的
 单播，成对密钥表项在接收方向上也命中并解对了，所以 (B2) 在 MAC/SEC 这一层排除。**
-**当前实际下一步因此不在本移植的收发引擎上，而在「AP 到底有没有把回复投递出来」：**
+**当前实际下一步（run 62 之后已经改写）：上行不再是问题，问题只剩「发往本站单播地址的下行帧
+是没发出来，还是发出来了而被本端硬件在进 RX FIFO 之前丢掉」。**增量 3v 把上行那一半彻底关
+掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
+下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们
+记录了各条支路是怎么一条条被排掉的：
 (B1) 要主机权限，在 AP 的有线段用 `tcpdump` 确认；**不需要 AP 配合、连一个字节都不用再发的那
 一半已经做完（增量 3u，run 61，40/40）：目标 Beacon 的 TIM 读到 37 张，本站 AID 那一位 37 次全
 为 0（`aid-set=0x0 out-of-range=0x0 absent=0x0`），所以「回复产生过、压在 AP 队列里、AP 以为本

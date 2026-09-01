@@ -7893,14 +7893,65 @@ resident window echo frames= group= data= fc= len= head=
 ```
 
 `frames` 是所有「AP 发的、A3 ＝ 本站」的帧，`group` 是其中 A1 为组播地址的，`data` 是其中数据帧
-的；`fc`／`len` 是第一帧的 frame control 和长度，`head=` 是它帧头结尾处的 8 字节——硬件解开了就
-是 LLC/SNAP（`aaaa030000000806` ＝ ARP、`aaaa030000000800` ＝ IPv4），没解开就是 CCMP 的 8 字节
-包号头，两种都不是密文。判据仍然是 40：这一行挂在既有的 `--require-runtime-resident` 里，只要
+的；`fc`／`len` 是第一帧的 frame control 和长度，`head=` 是它帧头结尾处的 8 字节——受保护帧在这
+颗硬件上是原地解密、CCMP 头留在原处的（同一行的 `llc-iv`／`llc-plain` 就是这么数出来的），所以
+这 8 字节是 CCMP 的包号头，解开没解开都一样，不是密文，也不用来判断解密成不成（那要看
+`hw-dec`／`dec`／`icv`）。判据仍然是 40：这一行挂在既有的 `--require-runtime-resident` 里，只要
 求它存在、不要求其中任何一个值。
 
 编译通过：`text=813522 data=9768 bss=25296`，SHA256 `9a5d239c…`，除两个既有的 `role_cam` 未使用
 告警外无新增告警；判据正则对三条合成行（全零、两帧带 ARP 的 LLC、一帧带 IPv4 的 LLC）都命中 6
 组。
+
+#### run 62 的读数：本站发上去的三个组播帧，AP 一个不落地又播回了 BSS
+
+`out/k1-serial/k1-wpa-20260901T053802Z.log`，40 条判据全过、0 条 `FAIL`，最后一行
+`PASS: K1 wireless RAM image reached NSH`。关联和四次握手照旧走完
+（`aid=0x1 auth-rsp=0x1 msg1=0x1 msg2=0x1 msg3=0x1 mic=0x1 msg4=0x1 bssid=504f3be2e6d2`），
+驻留窗口 `frames=0x59 mgmt=0x44 data=0x15 bcn-target=0x1f`，TIM 一行与 run 61 逐字一致
+（`seen=0x1f aid-set=0x0 bcast-set=0x0 absent=0x0 short=0x0 out-of-range=0x0 dtim-count=0x0
+dtim-period=0x1 bmap-len=0x1 len=0x196 head=00010000`）。3v 的那一行是：
+
+```
+resident window echo frames=0x3 group=0x3 data=0x3 fc=0x4208 len=0x152
+head=f5c900604f000000
+```
+
+先数分母。这一窗本站一共发上去四帧数据：`resident data tx sn=0xc`、`sn=0xe` 是两个 DHCP
+Discover（DA 恒为广播），`resident arp tx sn=0xf tag=0x4 a3=0xffffffff` 是那个广播 ARP
+Request，`resident arp tx sn=0xd tag=0x3 a3=0xb40996b8` 是发给网关的**单播** ARP
+Request——单播帧不会被泛洪回来，本来就不该计。组播上行三帧，`echo frames=0x3`，一帧不差，
+而且 `group=0x3 data=0x3` 说明这三帧回来时仍是组播数据帧。
+
+再看它们确实是 AP 的字节。`fc=0x4208`：subtype 0 的 Data，ToDS=0／FromDS=1（AP 往 BSS 发，
+A2 就是 BSSID），Protected=1。`len=0x152` 是 338 字节，正好是本站那帧 `bytes=0x146`＝326
+字节的 DHCP Discover 加上硬件补的 8 字节 CCMP MIC 和 4 字节 FCS。`head=f5c900604f000000`
+是 CCMP 包号头而不是 LLC/SNAP：`f5`＝PN0、`c9`＝PN1、`00` 保留、`60` 是 ExtIV 置位加
+KeyID=1（组密钥）、`4f 00 00 00`＝PN2..PN5，即 PN=0x00004fc9f5。同一窗的
+`data sec first head=0842 0000 01005e7f0001 504f3be2e6d2 24a3f050081f 504c f2c900604f000000`
+是局域网上一个真实主机（24:a3:f0:50:08:1f）发的组播帧，PN=0x00004fc9f2——回声就落在 AP
+自己那条组密钥包号序列上、只比它靠后三个计数。所以这三帧是 AP 用 GTK 加密、经空口发出的，
+不是本站发送报告里的推断。解没解开要看别处：`data sec total=0x15 target=0xd prot=0x12
+group=0xf hw-dec=0xd sw-dec=0x5 icv=0x0 crc=0x0 dec=0xd`，目标发来的 13 帧全部由硬件解开、
+零 ICV 错、零 CRC 错。
+
+结论有三条，第一条是这一侧第一次拿到的正面证据：
+
+1. **上行整条链闭合了。**AP 用成对密钥把本站的 CCMP 解开了——不解开它看不到帧里那个以太网
+   源地址，也就无从把这三帧当作"本 BSS 某个站发的"去桥接和泛洪；解开之后它按正常站处理，
+   再用 GTK 加密播回 BSS。密钥、包号、AAD、nonce、四个地址字段全部被对端接受，这是对端的
+   行为，不是自证。3t 的 MAC 环回只证明本站的 CAM 能解开自己造的帧，这一条证明的是空口另
+   一头也认。
+2. **AP 没有开客户端隔离。**隔离首先掐掉的就是站到 BSS 的这次泛洪。
+3. **仍然为零的只剩一件事**：`a1-match=0x0`，整窗没有任何一帧的 A1 是本站单播地址。而这一窗
+   AP 一定有理由发单播——`arp tx sn=0xd` 是发给网关 60:be:b4:09:96:b8（192.168.1.2）的单播
+   ARP Request，按协议它的回答就是一帧单播 ARP Reply，而 AP 既然桥接了本站的广播帧，也一定
+   桥接了这一帧。
+
+于是问题被压到一句话：**发往本站单播地址的帧，是 AP 根本没发，还是发了而本站在进 RX FIFO
+之前就被硬件丢掉了。**3v 的零分支那条警告（不泛洪回本 BSS 的 AP 也读零）这一次用不上了，但
+留在代码和判据里。
+
 
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
