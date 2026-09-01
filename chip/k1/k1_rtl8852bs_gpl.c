@@ -1502,6 +1502,97 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_BB_ADDC_WRAP            0x00001000u
 #define K1_RTL8852BS_BB_ADDC_AVERAGE         32
 
+/* The transmit half of the converter calibration: halrf_dack_8852b(), which
+ * is halrf_dack_8852b_s0() then _s1(), and the backup each of them ends
+ * with.  Every path runs seventeen numbered steps over two identical sides,
+ * the transmit converter's I and Q.  The sides differ only in their
+ * addresses, and not by one stride: the control words sit 0x20 apart while
+ * the report words sit 0x24 apart, which is why the table below carries both
+ * columns rather than deriving the second from the first.  Path one is the
+ * same again with 0x100 added to every converter word and 0x2000 to the two
+ * front end words.
+ *
+ * Two waits inside the sequence are the calibration itself.  The first is the
+ * successive approximation over the sixteen most significant bit weights of
+ * each side, and the second is the converter's own direct current
+ * calibration.  Neither is fatal when it does not finish: the vendor records
+ * the timeout and carries on, and so does this, with the poll count in the
+ * log line.
+ *
+ * Three notes on the vendor source.  Its s1 waits for the two done bits with
+ * && where its s0 waits with ||, so s1 leaves the wait as soon as either side
+ * reports done; its own firmware offload branch waits for both, so this waits
+ * for both on both paths.  Its steps six and seven write only the I side, the
+ * Q twins being commented out, and that asymmetry is deliberate enough to be
+ * kept.  And its reload, which would write the results back into the working
+ * registers, is commented out on both paths: the calibration applies its own
+ * answers and the reload exists for restoring them after a power state
+ * change, so there is nothing here for it to do.
+ */
+
+#define K1_RTL8852BS_BB_DACK_GATE_S0         0x12a0u
+#define K1_RTL8852BS_BB_DACK_GATE_S1         0x32a0u
+#define K1_RTL8852BS_BB_DACK_GATE_BIT        0x00008000u
+#define K1_RTL8852BS_BB_DACK_GATE_MASK       0x00007000u
+#define K1_RTL8852BS_BB_DACK_GATE_CAL        0x00003000u
+#define K1_RTL8852BS_BB_DACK_GATE_IDLE       0x00007000u
+#define K1_RTL8852BS_BB_DACK_RESET_CLOCK     0x10000000u
+#define K1_RTL8852BS_BB_DACK_FIFO_BIT        0x80000000u
+#define K1_RTL8852BS_BB_DACK_HOLD_S0         0xc0d8u
+#define K1_RTL8852BS_BB_DACK_HOLD_S1         0xc1d8u
+#define K1_RTL8852BS_BB_DACK_HOLD_BIT        0x00010000u
+#define K1_RTL8852BS_BB_DACK_SOURCE_S0       0xc0dcu
+#define K1_RTL8852BS_BB_DACK_SOURCE_S1       0xc1dcu
+#define K1_RTL8852BS_BB_DACK_SOURCE_MASK     0x0c000000u
+#define K1_RTL8852BS_BB_DACK_SOURCE_CAL      0x0c000000u
+#define K1_RTL8852BS_BB_DACK_SOURCE_IDLE     0x00000000u
+#define K1_RTL8852BS_BB_DACK_CTRL_S0_I       0xc004u
+#define K1_RTL8852BS_BB_DACK_CTRL_S0_Q       0xc024u
+#define K1_RTL8852BS_BB_DACK_CTRL_S1_I       0xc104u
+#define K1_RTL8852BS_BB_DACK_CTRL_S1_Q       0xc124u
+#define K1_RTL8852BS_BB_DACK_CTRL_MANUAL     0x40000000u
+#define K1_RTL8852BS_BB_DACK_CTRL_TRIM_MASK  0x3ff00000u
+#define K1_RTL8852BS_BB_DACK_CTRL_TRIM_VALUE 0x03000000u
+#define K1_RTL8852BS_BB_DACK_CTRL_TOP_MASK   0xc0000000u
+#define K1_RTL8852BS_BB_DACK_CTRL_ENABLE     0x00020000u
+#define K1_RTL8852BS_BB_DACK_CTRL_AUTO       0x00000001u
+#define K1_RTL8852BS_BB_DACK_SW_S0_I         0xc00cu
+#define K1_RTL8852BS_BB_DACK_SW_S0_Q         0xc02cu
+#define K1_RTL8852BS_BB_DACK_SW_S1_I         0xc10cu
+#define K1_RTL8852BS_BB_DACK_SW_S1_Q         0xc12cu
+#define K1_RTL8852BS_BB_DACK_SW_BIT          0x00000004u
+#define K1_RTL8852BS_BB_DACK_DONE_S0_I       0xc040u
+#define K1_RTL8852BS_BB_DACK_DONE_S0_Q       0xc064u
+#define K1_RTL8852BS_BB_DACK_DONE_S1_I       0xc140u
+#define K1_RTL8852BS_BB_DACK_DONE_S1_Q       0xc164u
+#define K1_RTL8852BS_BB_DACK_MSBK_DONE       0x80000000u
+#define K1_RTL8852BS_BB_DACK_REPORT_S0_I     0xc05cu
+#define K1_RTL8852BS_BB_DACK_REPORT_S0_Q     0xc080u
+#define K1_RTL8852BS_BB_DACK_REPORT_S1_I     0xc15cu
+#define K1_RTL8852BS_BB_DACK_REPORT_S1_Q     0xc180u
+#define K1_RTL8852BS_BB_DACK_DADCK_DONE      0x00000004u
+#define K1_RTL8852BS_BB_DACK_BIAS_S0_I       0xc048u
+#define K1_RTL8852BS_BB_DACK_BIAS_S0_Q       0xc06cu
+#define K1_RTL8852BS_BB_DACK_BIAS_S1_I       0xc148u
+#define K1_RTL8852BS_BB_DACK_BIAS_S1_Q       0xc16cu
+#define K1_RTL8852BS_BB_DACK_BIAS_MASK       0x00000ffcu
+#define K1_RTL8852BS_BB_DACK_BIAS_SHIFT      2u
+#define K1_RTL8852BS_BB_DACK_OFFSET_S0_I     0xc060u
+#define K1_RTL8852BS_BB_DACK_OFFSET_S0_Q     0xc084u
+#define K1_RTL8852BS_BB_DACK_OFFSET_S1_I     0xc160u
+#define K1_RTL8852BS_BB_DACK_OFFSET_S1_Q     0xc184u
+#define K1_RTL8852BS_BB_DACK_VALUE_MASK      0xff000000u
+#define K1_RTL8852BS_BB_DACK_VALUE_SHIFT     24u
+#define K1_RTL8852BS_BB_DACK_INDEX_MASK      0x0000001eu
+#define K1_RTL8852BS_BB_DACK_INDEX_SHIFT     1u
+#define K1_RTL8852BS_BB_DACK_SIDES           2
+#define K1_RTL8852BS_BB_DACK_ENTRIES         16
+#define K1_RTL8852BS_BB_DACK_PER_WORD        4
+#define K1_RTL8852BS_BB_DACK_SETTLE_USEC     100
+#define K1_RTL8852BS_BB_DACK_ARM_USEC        1
+#define K1_RTL8852BS_BB_DACK_POLL_COUNT      400
+#define K1_RTL8852BS_BB_DACK_POLL_USEC       1
+
 /* The radio register the read back diagnostic probes with a known value.  The
  * radio image of each path writes RF 0x5a exactly once and nothing else in
  * this component touches it, and the value differs per path, so a firmware
@@ -16089,6 +16180,745 @@ static void k1_rtl8852bs_rf_addck_trigger(void)
   k1_early_puts("\r\n");
 }
 
+
+/* The eleven words that differ between the two paths, and within a path the
+ * two columns that differ between the converter's two sides.  The first two
+ * are the front end gate and the converter clock of the path; the rest are
+ * per side: the index the backup steps through the bit weights with, the
+ * control word, the switch that hands the side over to the calibration, the
+ * done bit of the successive approximation, the report the bit weights and
+ * the direct current done bit are read from, the bias code and the direct
+ * current code.  The index word is the same word the converter reset above
+ * pulses, so it is named there rather than again here.
+ */
+
+struct k1_rtl8852bs_bb_dack_regs_s
+{
+  uint32_t gate;
+  uint32_t clock;
+  uint32_t hold;
+  uint32_t source;
+  uint32_t index[K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t ctrl[K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t sw[K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t done[K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t report[K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t bias[K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t offset[K1_RTL8852BS_BB_DACK_SIDES];
+};
+
+static const struct k1_rtl8852bs_bb_dack_regs_s
+  g_k1_rtl8852bs_bb_dack_regs[K1_RTL8852BS_RF_PATHS] =
+{
+  {
+    K1_RTL8852BS_BB_DACK_GATE_S0, K1_RTL8852BS_BB_ADDCK_CLOCK_S0,
+    K1_RTL8852BS_BB_DACK_HOLD_S0, K1_RTL8852BS_BB_DACK_SOURCE_S0,
+    {K1_RTL8852BS_BB_DACK_RESET_S0_0, K1_RTL8852BS_BB_DACK_RESET_S0_1},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_I, K1_RTL8852BS_BB_DACK_CTRL_S0_Q},
+    {K1_RTL8852BS_BB_DACK_SW_S0_I, K1_RTL8852BS_BB_DACK_SW_S0_Q},
+    {K1_RTL8852BS_BB_DACK_DONE_S0_I, K1_RTL8852BS_BB_DACK_DONE_S0_Q},
+    {K1_RTL8852BS_BB_DACK_REPORT_S0_I, K1_RTL8852BS_BB_DACK_REPORT_S0_Q},
+    {K1_RTL8852BS_BB_DACK_BIAS_S0_I, K1_RTL8852BS_BB_DACK_BIAS_S0_Q},
+    {K1_RTL8852BS_BB_DACK_OFFSET_S0_I, K1_RTL8852BS_BB_DACK_OFFSET_S0_Q}
+  },
+  {
+    K1_RTL8852BS_BB_DACK_GATE_S1, K1_RTL8852BS_BB_ADDCK_CLOCK_S1,
+    K1_RTL8852BS_BB_DACK_HOLD_S1, K1_RTL8852BS_BB_DACK_SOURCE_S1,
+    {K1_RTL8852BS_BB_DACK_RESET_S1_0, K1_RTL8852BS_BB_DACK_RESET_S1_1},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_I, K1_RTL8852BS_BB_DACK_CTRL_S1_Q},
+    {K1_RTL8852BS_BB_DACK_SW_S1_I, K1_RTL8852BS_BB_DACK_SW_S1_Q},
+    {K1_RTL8852BS_BB_DACK_DONE_S1_I, K1_RTL8852BS_BB_DACK_DONE_S1_Q},
+    {K1_RTL8852BS_BB_DACK_REPORT_S1_I, K1_RTL8852BS_BB_DACK_REPORT_S1_Q},
+    {K1_RTL8852BS_BB_DACK_BIAS_S1_I, K1_RTL8852BS_BB_DACK_BIAS_S1_Q},
+    {K1_RTL8852BS_BB_DACK_OFFSET_S1_I, K1_RTL8852BS_BB_DACK_OFFSET_S1_Q}
+  },
+};
+
+struct k1_rtl8852bs_bb_dack_trace_s
+{
+  uint32_t save[K1_RTL8852BS_RF_PATHS];
+  uint32_t mode[K1_RTL8852BS_RF_PATHS];
+  uint32_t opt[K1_RTL8852BS_RF_PATHS];
+  uint32_t gate[K1_RTL8852BS_RF_PATHS];
+  uint32_t gate_after[K1_RTL8852BS_RF_PATHS];
+  uint32_t fifo;
+  uint32_t reset;
+  uint32_t msbk_polls[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t dadck_polls[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t bias[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_DACK_SIDES];
+  uint32_t offset[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_DACK_SIDES];
+  uint8_t msbk[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_DACK_SIDES]
+              [K1_RTL8852BS_BB_DACK_ENTRIES];
+  bool msbk_done[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_DACK_SIDES];
+  bool dadck_done[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_DACK_SIDES];
+};
+
+/* The four groups of writes the seventeen steps fall into once the waits are
+ * taken out of them.  The first holds the path still: the front end gate goes
+ * to its calibration value, the converter clock runs, the converter reset is
+ * held and the receive FIFO clock stops.  The second arms both sides: the
+ * report is held, the calibration is made the source, the manual override and
+ * the top of the control word are cleared, the trim the vendor calibrates
+ * around is written, both sides are enabled and handed over, and both are put
+ * into automatic mode.  The third takes the source back and returns both
+ * switches once the bit weights are in.  The fourth leaves automatic mode and
+ * puts the gate back where it was found.
+ */
+
+static const struct k1_rtl8852bs_register_field_s
+  g_k1_rtl8852bs_bb_dack_open[K1_RTL8852BS_RF_PATHS][5] =
+{
+  {
+    {K1_RTL8852BS_BB_DACK_GATE_S0, K1_RTL8852BS_BB_DACK_GATE_BIT,
+      K1_RTL8852BS_BB_DACK_GATE_BIT},
+    {K1_RTL8852BS_BB_DACK_GATE_S0, K1_RTL8852BS_BB_DACK_GATE_MASK,
+      K1_RTL8852BS_BB_DACK_GATE_CAL},
+    {K1_RTL8852BS_BB_ADDCK_CLOCK_S0, K1_RTL8852BS_BB_ADDCK_CLOCK_BIT,
+      K1_RTL8852BS_BB_ADDCK_CLOCK_BIT},
+    {K1_RTL8852BS_BB_ADDCK_RESET, K1_RTL8852BS_BB_DACK_RESET_CLOCK,
+      K1_RTL8852BS_BB_DACK_RESET_CLOCK},
+    {K1_RTL8852BS_BB_ADDCK_FIFO, K1_RTL8852BS_BB_DACK_FIFO_BIT, 0u}
+  },
+  {
+    {K1_RTL8852BS_BB_DACK_GATE_S1, K1_RTL8852BS_BB_DACK_GATE_BIT,
+      K1_RTL8852BS_BB_DACK_GATE_BIT},
+    {K1_RTL8852BS_BB_DACK_GATE_S1, K1_RTL8852BS_BB_DACK_GATE_MASK,
+      K1_RTL8852BS_BB_DACK_GATE_CAL},
+    {K1_RTL8852BS_BB_ADDCK_CLOCK_S1, K1_RTL8852BS_BB_ADDCK_CLOCK_BIT,
+      K1_RTL8852BS_BB_ADDCK_CLOCK_BIT},
+    {K1_RTL8852BS_BB_ADDCK_RESET, K1_RTL8852BS_BB_DACK_RESET_CLOCK,
+      K1_RTL8852BS_BB_DACK_RESET_CLOCK},
+    {K1_RTL8852BS_BB_ADDCK_FIFO, K1_RTL8852BS_BB_DACK_FIFO_BIT, 0u}
+  },
+};
+
+static const struct k1_rtl8852bs_register_field_s
+  g_k1_rtl8852bs_bb_dack_arm[K1_RTL8852BS_RF_PATHS][12] =
+{
+  {
+    {K1_RTL8852BS_BB_DACK_HOLD_S0, K1_RTL8852BS_BB_DACK_HOLD_BIT,
+      K1_RTL8852BS_BB_DACK_HOLD_BIT},
+    {K1_RTL8852BS_BB_DACK_SOURCE_S0, K1_RTL8852BS_BB_DACK_SOURCE_MASK,
+      K1_RTL8852BS_BB_DACK_SOURCE_CAL},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_I, K1_RTL8852BS_BB_DACK_CTRL_MANUAL, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_Q, K1_RTL8852BS_BB_DACK_CTRL_MANUAL, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_I, K1_RTL8852BS_BB_DACK_CTRL_TRIM_MASK,
+      K1_RTL8852BS_BB_DACK_CTRL_TRIM_VALUE},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_I, K1_RTL8852BS_BB_DACK_CTRL_TOP_MASK, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_I, K1_RTL8852BS_BB_DACK_CTRL_ENABLE,
+      K1_RTL8852BS_BB_DACK_CTRL_ENABLE},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_Q, K1_RTL8852BS_BB_DACK_CTRL_ENABLE,
+      K1_RTL8852BS_BB_DACK_CTRL_ENABLE},
+    {K1_RTL8852BS_BB_DACK_SW_S0_I, K1_RTL8852BS_BB_DACK_SW_BIT, 0u},
+    {K1_RTL8852BS_BB_DACK_SW_S0_Q, K1_RTL8852BS_BB_DACK_SW_BIT, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_I, K1_RTL8852BS_BB_DACK_CTRL_AUTO,
+      K1_RTL8852BS_BB_DACK_CTRL_AUTO},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_Q, K1_RTL8852BS_BB_DACK_CTRL_AUTO,
+      K1_RTL8852BS_BB_DACK_CTRL_AUTO}
+  },
+  {
+    {K1_RTL8852BS_BB_DACK_HOLD_S1, K1_RTL8852BS_BB_DACK_HOLD_BIT,
+      K1_RTL8852BS_BB_DACK_HOLD_BIT},
+    {K1_RTL8852BS_BB_DACK_SOURCE_S1, K1_RTL8852BS_BB_DACK_SOURCE_MASK,
+      K1_RTL8852BS_BB_DACK_SOURCE_CAL},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_I, K1_RTL8852BS_BB_DACK_CTRL_MANUAL, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_Q, K1_RTL8852BS_BB_DACK_CTRL_MANUAL, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_I, K1_RTL8852BS_BB_DACK_CTRL_TRIM_MASK,
+      K1_RTL8852BS_BB_DACK_CTRL_TRIM_VALUE},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_I, K1_RTL8852BS_BB_DACK_CTRL_TOP_MASK, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_I, K1_RTL8852BS_BB_DACK_CTRL_ENABLE,
+      K1_RTL8852BS_BB_DACK_CTRL_ENABLE},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_Q, K1_RTL8852BS_BB_DACK_CTRL_ENABLE,
+      K1_RTL8852BS_BB_DACK_CTRL_ENABLE},
+    {K1_RTL8852BS_BB_DACK_SW_S1_I, K1_RTL8852BS_BB_DACK_SW_BIT, 0u},
+    {K1_RTL8852BS_BB_DACK_SW_S1_Q, K1_RTL8852BS_BB_DACK_SW_BIT, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_I, K1_RTL8852BS_BB_DACK_CTRL_AUTO,
+      K1_RTL8852BS_BB_DACK_CTRL_AUTO},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_Q, K1_RTL8852BS_BB_DACK_CTRL_AUTO,
+      K1_RTL8852BS_BB_DACK_CTRL_AUTO}
+  },
+};
+
+static const struct k1_rtl8852bs_register_field_s
+  g_k1_rtl8852bs_bb_dack_mid[K1_RTL8852BS_RF_PATHS][3] =
+{
+  {
+    {K1_RTL8852BS_BB_DACK_SOURCE_S0, K1_RTL8852BS_BB_DACK_SOURCE_MASK,
+      K1_RTL8852BS_BB_DACK_SOURCE_IDLE},
+    {K1_RTL8852BS_BB_DACK_SW_S0_I, K1_RTL8852BS_BB_DACK_SW_BIT,
+      K1_RTL8852BS_BB_DACK_SW_BIT},
+    {K1_RTL8852BS_BB_DACK_SW_S0_Q, K1_RTL8852BS_BB_DACK_SW_BIT,
+      K1_RTL8852BS_BB_DACK_SW_BIT}
+  },
+  {
+    {K1_RTL8852BS_BB_DACK_SOURCE_S1, K1_RTL8852BS_BB_DACK_SOURCE_MASK,
+      K1_RTL8852BS_BB_DACK_SOURCE_IDLE},
+    {K1_RTL8852BS_BB_DACK_SW_S1_I, K1_RTL8852BS_BB_DACK_SW_BIT,
+      K1_RTL8852BS_BB_DACK_SW_BIT},
+    {K1_RTL8852BS_BB_DACK_SW_S1_Q, K1_RTL8852BS_BB_DACK_SW_BIT,
+      K1_RTL8852BS_BB_DACK_SW_BIT}
+  },
+};
+
+static const struct k1_rtl8852bs_register_field_s
+  g_k1_rtl8852bs_bb_dack_close[K1_RTL8852BS_RF_PATHS][5] =
+{
+  {
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_I, K1_RTL8852BS_BB_DACK_CTRL_AUTO, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S0_Q, K1_RTL8852BS_BB_DACK_CTRL_AUTO, 0u},
+    {K1_RTL8852BS_BB_DACK_HOLD_S0, K1_RTL8852BS_BB_DACK_HOLD_BIT, 0u},
+    {K1_RTL8852BS_BB_DACK_GATE_S0, K1_RTL8852BS_BB_DACK_GATE_BIT, 0u},
+    {K1_RTL8852BS_BB_DACK_GATE_S0, K1_RTL8852BS_BB_DACK_GATE_MASK,
+      K1_RTL8852BS_BB_DACK_GATE_IDLE}
+  },
+  {
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_I, K1_RTL8852BS_BB_DACK_CTRL_AUTO, 0u},
+    {K1_RTL8852BS_BB_DACK_CTRL_S1_Q, K1_RTL8852BS_BB_DACK_CTRL_AUTO, 0u},
+    {K1_RTL8852BS_BB_DACK_HOLD_S1, K1_RTL8852BS_BB_DACK_HOLD_BIT, 0u},
+    {K1_RTL8852BS_BB_DACK_GATE_S1, K1_RTL8852BS_BB_DACK_GATE_BIT, 0u},
+    {K1_RTL8852BS_BB_DACK_GATE_S1, K1_RTL8852BS_BB_DACK_GATE_MASK,
+      K1_RTL8852BS_BB_DACK_GATE_IDLE}
+  },
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_bb_dack_stage
+ *
+ * Description:
+ *   Write one group of the sequence above.  The groups are the parts of the
+ *   vendor's seventeen steps that are nothing but read modify writes, so a
+ *   loop over a table says as much as the steps do and says it in the order
+ *   the vendor writes them.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_bb_dack_stage(FAR const struct
+                                      k1_rtl8852bs_register_field_s *fields,
+                                      unsigned int count)
+{
+  unsigned int index;
+  int ret = OK;
+
+  for (index = 0; index < count && ret >= 0; index++)
+    {
+      ret = k1_rtl8852bs_bb_update_field(fields[index].address,
+                                         fields[index].mask,
+                                         fields[index].value);
+    }
+
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_bb_dack_wait
+ *
+ * Description:
+ *   Wait for one done bit of one side.  A bit that never arrives is not an
+ *   error: the vendor records the timeout and finishes the sequence anyway,
+ *   because the steps after the wait put the path back the way they found it
+ *   and skipping them would leave it held.  The poll count goes to the caller
+ *   either way, so the log says which of the two happened.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_bb_dack_wait(uint32_t address, uint32_t bit,
+                                     FAR uint32_t *polls, FAR bool *done)
+{
+  uint32_t value = 0;
+  uint32_t count;
+  int ret = OK;
+
+  for (count = 0; count < K1_RTL8852BS_BB_DACK_POLL_COUNT; count++)
+    {
+      ret = k1_rtl8852bs_bb_read32(address, &value);
+      if (ret < 0)
+        {
+          break;
+        }
+
+      if ((value & bit) != 0)
+        {
+          *done = true;
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_BB_DACK_POLL_USEC);
+    }
+
+  *polls = count;
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_bb_dack_backup
+ *
+ * Description:
+ *   halrf_dack_backup_s0_8852b() and its s1 twin: the sixteen bit weights of
+ *   each side, read one at a time by pointing the index at them, then the
+ *   bias code and the direct current code of each side.  Nothing consumes
+ *   these; they are the answer the calibration arrived at, and the only way
+ *   to see whether it arrived at one.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_bb_dack_backup(unsigned int path,
+                                       FAR struct
+                                       k1_rtl8852bs_bb_dack_trace_s *trace)
+{
+  FAR const struct k1_rtl8852bs_bb_dack_regs_s *regs;
+  uint32_t value = 0;
+  unsigned int entry;
+  unsigned int side;
+  int ret;
+
+  regs = &g_k1_rtl8852bs_bb_dack_regs[path];
+
+  ret = k1_rtl8852bs_bb_update_field(regs->clock,
+                                     K1_RTL8852BS_BB_ADDCK_CLOCK_BIT,
+                                     K1_RTL8852BS_BB_ADDCK_CLOCK_BIT);
+
+  for (entry = 0; entry < K1_RTL8852BS_BB_DACK_ENTRIES && ret >= 0; entry++)
+    {
+      for (side = 0; side < K1_RTL8852BS_BB_DACK_SIDES && ret >= 0; side++)
+        {
+          ret = k1_rtl8852bs_bb_update_field(
+            regs->index[side], K1_RTL8852BS_BB_DACK_INDEX_MASK,
+            (uint32_t)entry << K1_RTL8852BS_BB_DACK_INDEX_SHIFT);
+          if (ret >= 0)
+            {
+              ret = k1_rtl8852bs_bb_read32(regs->report[side], &value);
+            }
+
+          if (ret >= 0)
+            {
+              trace->msbk[path][side][entry] = (uint8_t)
+                ((value & K1_RTL8852BS_BB_DACK_VALUE_MASK) >>
+                 K1_RTL8852BS_BB_DACK_VALUE_SHIFT);
+            }
+        }
+    }
+
+  for (side = 0; side < K1_RTL8852BS_BB_DACK_SIDES && ret >= 0; side++)
+    {
+      ret = k1_rtl8852bs_bb_read32(regs->bias[side], &value);
+      if (ret >= 0)
+        {
+          trace->bias[path][side] =
+            (value & K1_RTL8852BS_BB_DACK_BIAS_MASK) >>
+            K1_RTL8852BS_BB_DACK_BIAS_SHIFT;
+          ret = k1_rtl8852bs_bb_read32(regs->offset[side], &value);
+        }
+
+      if (ret >= 0)
+        {
+          trace->offset[path][side] =
+            (value & K1_RTL8852BS_BB_DACK_VALUE_MASK) >>
+            K1_RTL8852BS_BB_DACK_VALUE_SHIFT;
+        }
+    }
+
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_bb_dack_path
+ *
+ * Description:
+ *   One path's seventeen steps: hold the path, arm both sides, wait for the
+ *   successive approximation, hand the switches back, wait for the direct
+ *   current calibration, put the gate back and read the answers out.  The
+ *   front end gate is sampled on either side of the sequence for the same
+ *   reason the front end words of the opening increment are: the vendor's
+ *   last step writes a fixed value into it rather than the one it found, and
+ *   the only way to know whether that is a restore or a change is to read it
+ *   both times.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_bb_dack_path(unsigned int path,
+                                     FAR struct
+                                     k1_rtl8852bs_bb_dack_trace_s *trace)
+{
+  FAR const struct k1_rtl8852bs_bb_dack_regs_s *regs;
+  unsigned int side;
+  int release;
+  int ret;
+
+  if (path >= K1_RTL8852BS_RF_PATHS)
+    {
+      return -EINVAL;
+    }
+
+  regs = &g_k1_rtl8852bs_bb_dack_regs[path];
+
+  ret = k1_rtl8852bs_bb_read32(regs->gate, &trace->gate[path]);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_bb_dack_stage(
+        g_k1_rtl8852bs_bb_dack_open[path],
+        sizeof(g_k1_rtl8852bs_bb_dack_open[path]) /
+        sizeof(g_k1_rtl8852bs_bb_dack_open[path][0]));
+    }
+
+  if (ret >= 0)
+    {
+      up_udelay(K1_RTL8852BS_BB_DACK_SETTLE_USEC);
+      ret = k1_rtl8852bs_bb_dack_stage(
+        g_k1_rtl8852bs_bb_dack_arm[path],
+        sizeof(g_k1_rtl8852bs_bb_dack_arm[path]) /
+        sizeof(g_k1_rtl8852bs_bb_dack_arm[path][0]));
+    }
+
+  if (ret >= 0)
+    {
+      up_udelay(K1_RTL8852BS_BB_DACK_ARM_USEC);
+    }
+
+  for (side = 0; side < K1_RTL8852BS_BB_DACK_SIDES && ret >= 0; side++)
+    {
+      ret = k1_rtl8852bs_bb_dack_wait(regs->done[side],
+                                      K1_RTL8852BS_BB_DACK_MSBK_DONE,
+                                      &trace->msbk_polls[path][side],
+                                      &trace->msbk_done[path][side]);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_bb_dack_stage(
+        g_k1_rtl8852bs_bb_dack_mid[path],
+        sizeof(g_k1_rtl8852bs_bb_dack_mid[path]) /
+        sizeof(g_k1_rtl8852bs_bb_dack_mid[path][0]));
+    }
+
+  if (ret >= 0)
+    {
+      up_udelay(K1_RTL8852BS_BB_DACK_ARM_USEC);
+    }
+
+  for (side = 0; side < K1_RTL8852BS_BB_DACK_SIDES && ret >= 0; side++)
+    {
+      ret = k1_rtl8852bs_bb_dack_wait(regs->report[side],
+                                      K1_RTL8852BS_BB_DACK_DADCK_DONE,
+                                      &trace->dadck_polls[path][side],
+                                      &trace->dadck_done[path][side]);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_bb_dack_stage(
+        g_k1_rtl8852bs_bb_dack_close[path],
+        sizeof(g_k1_rtl8852bs_bb_dack_close[path]) /
+        sizeof(g_k1_rtl8852bs_bb_dack_close[path][0]));
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_bb_read32(regs->gate, &trace->gate_after[path]);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_bb_dack_backup(path, trace);
+    }
+
+  /* Step seventeen stops the converter clock again whatever happened above,
+   * for the same reason the receive half releases the radios whatever
+   * happened: a path left with a calibration clock running is a path the scan
+   * cannot use.
+   */
+
+  release = k1_rtl8852bs_bb_update_field(regs->clock,
+                                         K1_RTL8852BS_BB_ADDCK_CLOCK_BIT, 0u);
+  return ret >= 0 ? release : ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_rf_dack_trigger
+ *
+ * Description:
+ *   The end of halrf_dac_cal_8852b(): the transmit converters of both paths
+ *   are calibrated with the radios parked, the sixteen bit weights and the
+ *   two direct current answers of each side are read back, and the radios are
+ *   released.  The vendor runs this with the park the receive half left
+ *   behind; this one parks again, because the receive half here puts the
+ *   radios back so the scan can keep receiving between the two.
+ *
+ *   Three radio words are parked, in the order the vendor writes them: the
+ *   save word stops, the mode word takes the calibration value, and the
+ *   option word clears.  They are put back in the opposite order, and only
+ *   when the sample says they were read, because a zero written back from a
+ *   word that was never read would be the park rather than the release.
+ *
+ *   Two front end bits are put back as well, which the vendor never does.
+ *   Its second step starts the converter clock in one and stops the receive
+ *   FIFO clock in the other, and nothing in the vendor tree restores either;
+ *   it can afford that at power on, where nothing is receiving yet.  Here the
+ *   scan is live and the port transmits as soon as this returns, so both are
+ *   sampled first and written back at the end.
+ *
+ *   A failure is reported and does not stop the caller, and the release is
+ *   attempted whatever the calibration did.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_rf_dack_trigger(void)
+{
+  struct k1_rtl8852bs_bb_dack_trace_s trace;
+  int cal[K1_RTL8852BS_RF_PATHS];
+  unsigned int path;
+  unsigned int side;
+  unsigned int entry;
+  uint32_t word;
+  int park;
+  int step;
+  int back;
+
+  memset(&trace, 0, sizeof(trace));
+
+  park = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_ADDCK_FIFO, &trace.fifo);
+  if (park >= 0)
+    {
+      park = k1_rtl8852bs_bb_read32(K1_RTL8852BS_BB_ADDCK_RESET,
+                                    &trace.reset);
+    }
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS && park >= 0; path++)
+    {
+      park = k1_rtl8852bs_rf_read((uint8_t)path,
+                                  K1_RTL8852BS_RF_REG_MODE_SAVE,
+                                  &trace.save[path], NULL);
+      if (park >= 0)
+        {
+          park = k1_rtl8852bs_rf_read((uint8_t)path,
+                                      K1_RTL8852BS_RF_REG_MODE,
+                                      &trace.mode[path], NULL);
+        }
+
+      if (park >= 0)
+        {
+          park = k1_rtl8852bs_rf_read((uint8_t)path,
+                                      K1_RTL8852BS_RF_REG_MODE_OPT,
+                                      &trace.opt[path], NULL);
+        }
+
+      if (park >= 0)
+        {
+          park = k1_rtl8852bs_rf_write((uint8_t)path,
+                                       K1_RTL8852BS_RF_REG_MODE_SAVE,
+                                       K1_RTL8852BS_RF_MASK,
+                                       K1_RTL8852BS_RF_MODE_SAVE_STOP,
+                                       NULL);
+        }
+
+      if (park >= 0)
+        {
+          park = k1_rtl8852bs_rf_write((uint8_t)path,
+                                       K1_RTL8852BS_RF_REG_MODE,
+                                       K1_RTL8852BS_RF_MASK,
+                                       K1_RTL8852BS_RF_MODE_DACK, NULL);
+        }
+
+      if (park >= 0)
+        {
+          park = k1_rtl8852bs_rf_write((uint8_t)path,
+                                       K1_RTL8852BS_RF_REG_MODE_OPT,
+                                       K1_RTL8852BS_RF_MASK,
+                                       K1_RTL8852BS_RF_MODE_OPT_DACK, NULL);
+        }
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RF DACK park fifo=");
+  k1_early_puthex(trace.fifo);
+  k1_early_puts(" rst=");
+  k1_early_puthex(trace.reset);
+  k1_early_puts(" save=");
+  k1_early_puthex(trace.save[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.save[1]);
+  k1_early_puts(" mode=");
+  k1_early_puthex(trace.mode[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.mode[1]);
+  k1_early_puts(" opt=");
+  k1_early_puthex(trace.opt[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.opt[1]);
+  if (park < 0)
+    {
+      k1_early_puts(" error=");
+      k1_early_puthex((uintreg_t)-park);
+    }
+
+  k1_early_puts("\r\n");
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      cal[path] = park >= 0 ? k1_rtl8852bs_bb_dack_path(path, &trace) : park;
+
+      k1_early_puts("K1 Wi-Fi GPL: RF DACK path=");
+      k1_early_puthex(path);
+      k1_early_puts(" mpolls=");
+      k1_early_puthex(trace.msbk_polls[path][0]);
+      k1_early_puts("/");
+      k1_early_puthex(trace.msbk_polls[path][1]);
+      k1_early_puts(" mdone=");
+      k1_early_puthex(trace.msbk_done[path][0] ? 1 : 0);
+      k1_early_puts("/");
+      k1_early_puthex(trace.msbk_done[path][1] ? 1 : 0);
+      k1_early_puts(" dpolls=");
+      k1_early_puthex(trace.dadck_polls[path][0]);
+      k1_early_puts("/");
+      k1_early_puthex(trace.dadck_polls[path][1]);
+      k1_early_puts(" ddone=");
+      k1_early_puthex(trace.dadck_done[path][0] ? 1 : 0);
+      k1_early_puts("/");
+      k1_early_puthex(trace.dadck_done[path][1] ? 1 : 0);
+      if (cal[path] < 0)
+        {
+          k1_early_puts(" error=");
+          k1_early_puthex((uintreg_t)-cal[path]);
+        }
+
+      k1_early_puts("\r\n");
+
+      k1_early_puts("K1 Wi-Fi GPL: RF DACK code path=");
+      k1_early_puthex(path);
+      k1_early_puts(" bias=");
+      k1_early_puthex(trace.bias[path][0]);
+      k1_early_puts("/");
+      k1_early_puthex(trace.bias[path][1]);
+      k1_early_puts(" dadck=");
+      k1_early_puthex(trace.offset[path][0]);
+      k1_early_puts("/");
+      k1_early_puthex(trace.offset[path][1]);
+      k1_early_puts(" gate=");
+      k1_early_puthex(trace.gate[path]);
+      k1_early_puts("->");
+      k1_early_puthex(trace.gate_after[path]);
+      k1_early_puts("\r\n");
+
+      /* The sixteen bit weights of each side, packed four to a word so the
+       * line stays a line: the printer spells every value out to the full
+       * width of a register, and sixteen of those on their own would not.
+       */
+
+      for (side = 0; side < K1_RTL8852BS_BB_DACK_SIDES; side++)
+        {
+          k1_early_puts("K1 Wi-Fi GPL: RF DACK msbk path=");
+          k1_early_puthex(path);
+          k1_early_puts(" side=");
+          k1_early_puthex(side);
+          k1_early_puts(" w=");
+
+          word = 0;
+          for (entry = 0; entry < K1_RTL8852BS_BB_DACK_ENTRIES; entry++)
+            {
+              word = (word << 8) | trace.msbk[path][side][entry];
+              if ((entry % K1_RTL8852BS_BB_DACK_PER_WORD) ==
+                  K1_RTL8852BS_BB_DACK_PER_WORD - 1)
+                {
+                  k1_early_puthex(word);
+                  k1_early_puts(entry + 1 < K1_RTL8852BS_BB_DACK_ENTRIES ?
+                                "/" : "");
+                  word = 0;
+                }
+            }
+
+          k1_early_puts("\r\n");
+        }
+    }
+
+  /* The release, in the opposite order to the park, skipping any word whose
+   * sample is zero for the reason the receive half skips them.  For the
+   * option word that rule costs nothing either way: its park value is zero,
+   * so a skipped restore and a performed one leave the same value behind.
+   */
+
+  back = OK;
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      if (trace.opt[path] != 0)
+        {
+          step = k1_rtl8852bs_rf_write((uint8_t)path,
+                                       K1_RTL8852BS_RF_REG_MODE_OPT,
+                                       K1_RTL8852BS_RF_MASK,
+                                       trace.opt[path], NULL);
+          if (back >= 0)
+            {
+              back = step;
+            }
+        }
+
+      if (trace.mode[path] != 0)
+        {
+          step = k1_rtl8852bs_rf_write((uint8_t)path,
+                                       K1_RTL8852BS_RF_REG_MODE,
+                                       K1_RTL8852BS_RF_MASK,
+                                       trace.mode[path], NULL);
+          if (back >= 0)
+            {
+              back = step;
+            }
+        }
+
+      if (trace.save[path] != 0)
+        {
+          step = k1_rtl8852bs_rf_write((uint8_t)path,
+                                       K1_RTL8852BS_RF_REG_MODE_SAVE,
+                                       K1_RTL8852BS_RF_MASK,
+                                       trace.save[path], NULL);
+          if (back >= 0)
+            {
+              back = step;
+            }
+        }
+    }
+
+  if (trace.fifo != 0)
+    {
+      step = k1_rtl8852bs_bb_update_field(K1_RTL8852BS_BB_ADDCK_FIFO,
+                                          K1_RTL8852BS_BB_DACK_FIFO_BIT,
+                                          trace.fifo &
+                                          K1_RTL8852BS_BB_DACK_FIFO_BIT);
+      if (back >= 0)
+        {
+          back = step;
+        }
+    }
+
+  if (trace.reset != 0)
+    {
+      step = k1_rtl8852bs_bb_update_field(K1_RTL8852BS_BB_ADDCK_RESET,
+                                          K1_RTL8852BS_BB_DACK_RESET_CLOCK,
+                                          trace.reset &
+                                          K1_RTL8852BS_BB_DACK_RESET_CLOCK);
+      if (back >= 0)
+        {
+          back = step;
+        }
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RF DACK unpark save=");
+  k1_early_puthex(trace.save[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.save[1]);
+  k1_early_puts(" mode=");
+  k1_early_puthex(trace.mode[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.mode[1]);
+  k1_early_puts(" opt=");
+  k1_early_puthex(trace.opt[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.opt[1]);
+  if (back < 0)
+    {
+      k1_early_puts(" error=");
+      k1_early_puthex((uintreg_t)-back);
+    }
+
+  k1_early_puts("\r\n");
+}
+
 struct k1_rtl8852bs_scan_rf_readback_s
 {
   uint32_t mode[K1_RTL8852BS_RF_PATHS];
@@ -20756,14 +21586,18 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
    * next: its front end words, its converter resets and the D die RC
    * calibration.  The third is the receive half of that calibration, which
    * parks both radios, measures the direct current of both converters,
-   * calibrates them and releases the radios again; the transmit half needs
-   * the radios parked across it and is not here yet.  The samples on either
-   * side then measure all three the same way they measure the reset.
+   * calibrates them and releases the radios again.  The fourth is the
+   * transmit half, which parks the radios a second time because the third
+   * put them back: the vendor keeps one park across both halves, but nothing
+   * receives during the vendor's, and the scan here has to keep receiving
+   * between the two.  The samples on either side then measure all four the
+   * same way they measure the reset.
    */
 
   k1_rtl8852bs_rf_rck_trigger();
   k1_rtl8852bs_rf_drck_trigger();
   k1_rtl8852bs_rf_addck_trigger();
+  k1_rtl8852bs_rf_dack_trigger();
 
   rf_readback_ret = k1_rtl8852bs_scan_rf_readback_read(&rf_readback);
   if (rf_readback_ret < 0)
