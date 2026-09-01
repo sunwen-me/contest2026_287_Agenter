@@ -1427,6 +1427,22 @@ status= a3=`；判据脚本对应新增 `resident_serve_result` / `resident_echo
 校验这两个校验和，算错了对端只会静静丢掉，从本端看与「这台不答 echo」一模一样。
 run 67 的读法：`arp serve requests=` 非零否（有没有人问）→ `sent=`／`status=`（答没答出去）→
 `icmp echo attempts=` 与每行 `dst=`（发给了谁）→ `replies=`／`bad=`／`mask=`（谁答了、对不对）。
+
+**run 67 的结果：增量 4a 在实体板上成立，第一次 IP 层往返完成。**
+日志 `out/k1-serial/k1-wpa-20260901T124002Z.log`。窗尾：
+`icmp echo attempts=0x4 mask=0xf replies=0x5 bad=0x0 target=0xc0a80102 alt=0xc0a80102
+src=0xc0a80102 id=0x8852` 与 `arp serve requests=0x1 sent=0x1 peer-ip=0xc0a80102
+mac=60beb40996b8`——四发、四个序号全回、零帧损坏、标识是本端的。窗内顺序自己说明了因果：
+第一次 echo 发出去之后网关才来问「谁是 192.168.1.206」，本站答了，回复才来（run 66 听到 32 个
+这样的请求、一个也没答）。下行同时从三帧涨到八帧：`data a1 self=0x8 self-prot=0x8 self-dec=0x8
+hw-a1=0x8`。`arp trip mask=0x0` 与 `arp claim mask=0x7`、DHCP 第三次给同一地址，都复现 run 66。
+**两条保留意见**：`target == alt == 0xc0a80102`——这一窗回答 claim 轮的就是 DHCP 服务器自己，
+两个候选折成一台，所以「奇偶位分别是谁答的」这个判别没被检验；`replies=0x5` 对四个序号是
+seq 0 被回了两次（空口重传导致响应者回两份，或同一帧上来两次，这一窗分不开，观察器不按序号去重）。
+**整体判据当次是 FAIL，原因全在主机侧**：`arp_model_result` 正则还写着六段自检的期望值，而板上
+自检返回 `stage=0x0 status=0x0`（十一段全过）；已在 `df4c080` 换成十一段的值并用捕获日志离线验过
+（匹配 run 67、不匹配 run 66），同一提交改掉两处过期措辞（「缺的是下行」已被 run 67 反驳、
+echo 汇总行的 MAC 是第一次尝试的目的地址而不是提问者）。同一镜像重跑即应得到全项 PASS。
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们

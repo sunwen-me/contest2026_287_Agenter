@@ -8429,6 +8429,83 @@ acknowledged address」），并按「答了／被问过但没答／根本没人
 `status=`（答没答出去）→ `icmp echo attempts=` 与每行的 `dst=`（发给了谁）→ `replies=` /
 `bad=` / `mask=`（谁答了、答得对不对）。
 
+### 运行 67：第一次 IP 层往返成立——四发五回、零损坏，而 ARP 应答就是它的前置条件
+
+run 67 日志 `out/k1-serial/k1-wpa-20260901T124002Z.log`，窗口 12000 ms
+（`window-ms=0x2ee0`）。窗尾两行是结论：
+
+```
+resident window arp serve requests=0x1 sent=0x1 bytes=0x44 peer-ip=0xc0a80102 status=0x0 mac=60beb40996b8
+resident window icmp echo attempts=0x4 mask=0xf replies=0x5 bad=0x0 target=0xc0a80102 alt=0xc0a80102 src=0xc0a80102 id=0x8852 seq=0x3 sn=0x1a bytes=0x64 status=0x0 a3=60beb40996b8
+```
+
+四次 echo 请求，四个序号**全部**被回答（`mask=0xf`），共收到 5 帧回复，**零帧损坏**
+（`bad=0x0`，每一帧的 ICMP 校验和都折成 0），标识全是本端的 `0x8852`，源地址 192.168.1.2。
+这是本移植第一次让对端的 IP 栈为本站产生一个报文：ARP 的回答由内核 ARP 模块或 AP 就能给出，
+而 echo 回复必须有人接收一个寻址到本站地址的数据报、再往回路由一个。
+
+**窗内的先后顺序本身就是 4a 把两半放在一个增量里的理由：**
+
+```
+resident icmp echo tx ... dst=0xc0a80102 seq=0x0 pn=0x3  attempt=0x1 status=0x0 replies=0x0
+resident arp serve tx  ... spa=0xc0a801ce tpa=0xc0a80102 a3=0xb40996b8 pn=0x4 requests=0x1 sent=0x1 status=0x0
+resident icmp echo tx ... dst=0xc0a80102 seq=0x1 pn=0xc  attempt=0x2 status=0x0 replies=0x2
+resident icmp echo tx ... dst=0xc0a80102 seq=0x2 pn=0xe  attempt=0x3 status=0x0 replies=0x3
+resident icmp echo tx ... dst=0xc0a80102 seq=0x3 pn=0x10 attempt=0x4 status=0x0 replies=0x4
+```
+
+第一次 echo 发出去之后，网关**立刻来问「谁是 192.168.1.206」**——`tpa=0xc0a80102` 就是
+它自己的地址、`mac=60beb40996b8` 就是回 OFFER/ACK 的那台——本站答了（`sent=0x1`），然后
+回复才来。run 66 在同一子网上听到 32 个 ARP 请求、一个也没答，这一窗只听到 4 个，其中一个
+是问本站的，答了，往返立刻成立。**这就是 RFC 826 的前置条件在一个窗里现场发生**：不回答
+ARP，对端的 echo 回复连第一跳都发不出去。
+
+`replies=0x5` 比 `attempts=0x4` 多一帧，而 `mask=0xf` 只有四位——多出来的一帧是 **seq 0 被
+回答了两次**（attempt 2 打印时 `replies=0x2`，此后每次只加一）。两种解释都成立而这一窗分不
+开：空口重传把同一个请求送到了网关两次（echo 响应者对每一份收到的拷贝都回一份），或者同一
+帧回复被送上来两次。观察器按帧计数、不按序号去重，所以两者都会读成 5。
+
+下行这一侧同时被推到新的量级：
+
+```
+resident window data a1 self=0x8 bssid=0x0 other=0x1 self-prot=0x8 self-dec=0x8 hw-a1=0x8
+resident window data sec total=0x2b target=0x22 prot=0x2b group=0x22 a1-match=0x8 hw-dec=0x22 sw-dec=0x9 icv=0x0 crc=0x0 dec=0x22
+```
+
+八帧 A1 等于本站的受保护单播下行帧，八帧全部解密成功，描述符匹配位与软件比较完全一致
+（run 66 是三帧）。ICV 与 CRC 错误仍然是零。窗内 34 段解密载荷里 19 段是 IPv4、7 段是 ARP。
+
+其余读数复现 run 66，没有一个反过来：
+
+```
+resident window arp trip  attempts=0x6 replies=0x3 mask=0x0 uni-ack=0x0 bcast-ack=0x0 peer=60beb40996b8 ip=0xc0a80102
+resident window arp claim attempts=0x3 acks=0x3 mask=0x7 spa=0xc0a801ce status=0x0
+resident window dhcp offer   ip=0xc0a801ce server-id=0xc0a80102 ... xid=0x8cc90070
+resident window dhcp request sent=0x1 status=0x0 ack=0x1 ack-ip=0xc0a801ce nak=0x0
+```
+
+发送协议地址为 0 的六次探测又一次一个回答都没有（`mask=0x0`），换成 192.168.1.206 的三次
+又一次全被回答（`mask=0x7`）——3z 的结论在另一台主机上重复了一遍。DHCP 第三次给出同一个
+地址 192.168.1.206。
+
+**两条必须写下来的保留意见。**
+
+第一，**交替目标这一次没有真正交替**：`target=0xc0a80102 alt=0xc0a80102`。这一窗回答 claim
+轮的那台就是 DHCP 服务器自己（`arp reply mac=60beb40996b8 ip=0xc0a80102`，run 66 那台是
+192.168.1.166 的 `24:a3:f0:50:08:1f`），两个候选折成同一台，所以「奇偶位分别是谁答的」这个
+判别没有被检验过。四个序号全回、零损坏本身已经把「本端 IP 层不通」排除干净，但「某台主机
+按策略丢 echo」这一支仍然只是没有出现，不是被证伪。
+
+第二，**这一次运行的整体判据是 FAIL，原因全在主机侧**：唯一缺失项是
+`RTL8852BS2 decrypted-payload observer model`。板上自检返回 `stage=0x0 status=0x0`——十一段
+全过，包括新加的第十一段（检查本端构出的 echo 请求）。是判据脚本里那条离线模型的正则还写
+着六段时代的期望值（`net=5 arp=3 ipv4=1 ...`），4a 把自检扩到十段＋一段却没有同步改它。
+已在提交 `df4c080` 里改成十段的总数加 4a 新增的六个字段，并且用捕获到的日志离线验过：
+新正则匹配 run 67 的那一行、不匹配 run 66 的那一行，所以是换了期望值而不是放宽了它。
+同一提交还改掉两处过期措辞：上行 echo 那行原来断言「缺的是下行」，run 67 直接反驳了它
+（一个窗八帧受保护单播下行 ＋ 四个 echo 回复）；echo 汇总行把记下的 MAC 说成「问的那台」，
+其实是第一次尝试的目的地址。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来
