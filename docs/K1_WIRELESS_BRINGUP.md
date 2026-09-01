@@ -8020,6 +8020,60 @@ mainline 从不置 `SNIFFER_MODE`（只在 WoW 里清它），而本端跑在 sn
 槛——它们是判断依据，不是通过条件。判据总数仍然是 **40**。
 
 
+#### run 63 的读数：AP 用本站的成对密钥把一帧 ARP Reply 单播回来了——下行也通了
+
+`out/k1-serial/k1-wpa-20260901T090930Z.log`，40 条判据全过、0 `FAIL`。三件仪器一次全出结果，
+而且出的是这一侧一直缺的那一个：
+
+```
+resident arp tx sn=0xb tag=0x3 a3=0x88c7683b tpa=0xc0a80190 pn=0x2 status=0x0
+resident window data a1 self=0x1 bssid=0x0 other=0x0 self-prot=0x1 self-dec=0x1 hw-a1=0x1
+resident window data a1 first fc=0x4208 len=0x50 flags=0x31 sec=0x6
+                           a2=504f3be2e6d2 a3=aace88c7683b head=0300002000000000
+resident window arp sent=0x1 ... replies=0x1 reply-ip=0xc0a80190 arp-req=0x1e
+resident window arp reply mac=aace88c7683b ip=0xc0a80190
+```
+
+**一次完整的受保护单播往返。**本站发了一帧受保护单播 ARP Request 给 aa:ce:88:c7:68:3b、问
+192.168.1.144（`tag=0x3`，本端成对密钥 PN=2）；AP 解开它、桥到有线段；那台主机回了；AP 用
+**本站的成对密钥**重新加密成单播发回来——`head=0300002000000000` 里 `0x20` ＝ ExtIV ＋
+**KeyID=0（成对密钥，不是 GTK）**，PN=0x000000000003；本端硬件解开了它，`flags=0x31` ＝
+bit 0 硬件解密 ＋ bit 4 描述符 A1_MATCH ＋ bit 5 长描述符，`icv`／`crc` 两位都是 0；驱动把它
+认成了正是本站要问的那个 IP 的 ARP Reply。长度也对得上：`len=0x50`＝80 ＝ 24 帧头 ＋ 8 CCMP
+＋ 8 LLC/SNAP ＋ 28 ARP ＋ 8 MIC ＋ 4 FCS。
+
+到此为止，空口两个方向的受保护单播都有了对端参与的证据：上行由 3v 的回声证明（AP 解开并转
+发），下行由这一帧证明（AP 用成对密钥加密、本端解开、载荷解析正确）。**接收方向上的地址匹
+配、ADDR_CAM／SEC CAM 的成对密钥查表、CCMP 解密、到主机的投递，整条路是通的。**
+
+三件仪器各自的读数：
+
+1. **软件比 A1 和描述符位这一次一致。**`self=1 hw-a1=1`；同窗 `data sec total=0x26 group=0x25`
+   ——38 帧数据、37 帧组播，恰好 1 帧单播，就是它。所以那个硬件位在 sniffer 模式下是可信的，
+   3q 到 3v 的那些 `a1-match=0x0` 是字面意思：那些窗里确实没有任何一帧发给本站。这条仪器的价
+   值不在于推翻了旧读数，而在于旧读数从此不再是孤证。
+2. **过滤器丢掉的是 FCS 错帧，不是发给本站的帧。**`delta-pktfltr-drp=0x132`（306）对上同一对
+   采样之间的 `delta-fail=0x14c`（332 次 CRC 失败），`invd`／`fulldrp`／`fulldrp-pkt` 全零。
+   也就是说这一级的拒收几乎全部是 FCS 坏帧——正是本增量故意没有放行的那一类（bit 11 未
+   置）。「本端过滤器把答案丢了」这条支路排除。
+3. **错误放行位确实置上了，但这一帧不是靠它进来的。**`rx-err-filter
+   before=0xf017000f after=0xf017200f status=0x0`，bit 13 写进去也读回来了；可这一帧
+   `icv=0 crc=0`，RMAC 本来就不把它当错误帧。
+
+**于是「为什么这一次成了」仍然没有定论，这一点必须写清楚。**`replies=0x1` 是这个移植史上第一
+次：053802Z（run 62）、044828Z、194727Z 问的是网关 192.168.1.2，`replies` 全为 0；050954Z 问
+的是一台普通主机 192.168.1.152，同样是 0。三个候选原因一次运行分不开——(a) 错误放行位，证据
+弱，见上；(b) 问的是哪台主机，证据也弱，`.152` 那次同样不是网关；(c) 重传运气，本次
+`ccxrpt-tag=0x4 ccxrpt-tag-ok=0x3 ccxrpt-tag-fail=0x1`，四次带标签的发送里确实有一次没被
+ACK。所以下一个增量先把这次往返做成**可重复**的：同一台 peer、窗内重发若干次、逐次记结果，
+这同时就把 (c) 那一支量出来。
+
+DHCP 仍然没有 OFFER（`data tx ... dhcp-reply=0x0 offer-ip=0x0`，两帧 Discover 都发出去了、也
+都被 AP 播回，`echo frames=0x2 group=0x2 data=0x2`，2 比 2）。既然单播下行已经证明可用，拿地
+址就不必再只押在 DHCP 上：可以按 RFC 5227 用 ARP 探测自己claim 一个 on-link 地址，然后对
+192.168.1.144 做 ICMP echo，这会是第一次真正的 IP 层往返。
+
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

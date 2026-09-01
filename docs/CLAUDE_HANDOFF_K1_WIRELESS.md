@@ -1101,8 +1101,8 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   那帧单播 ARP Request 按协议必须换来一帧单播 ARP Reply。**于是问题被压到一句：发往本站单播地
   址的帧，是 AP 根本没发，还是发了而本站在进 RX FIFO 之前就被硬件丢掉了。
 
-- **已实现待上板（增量 3w）：先别信那个「没有帧发给本站」——它是一个硬件位，而本端的接收过滤
-  器不是原厂的。** 3v 把问题压到「AP 到底发没发单播给本站」之后，先查了这个结论自己是怎么读
+- **已上板并出结论（增量 3w，run 63，40/40）：AP 用本站的成对密钥把一帧 ARP Reply 单播回来了
+  ——下行也通了。** 3v 把问题压到「AP 到底发没发单播给本站」之后，先查了这个结论自己是怎么读
   出来的，结果不太好看：常驻窗口的 `a1-match` 读的是接收描述符里的硬件位
   （`frame->a1_match = (descriptor3 & K1_RTL8852BS_RXDESC_A1_MATCH) != 0`，8073 行），而四次握
   手那边的 `data-self=0x4` 是软件比较（`k1_rtl8852bs_scanofld_is_self_mac(mgmt.addr1)`，约
@@ -1127,6 +1127,31 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   `--require-runtime-resident` 上、只要求存在、不对数值设门槛，判据仍是 **40**。已编译通过
   （`text=815126 data=9768 bss=25296`，SHA256 `2b920aa5…`，无新增告警），风格基线不变（驱动
   超 79 列 50 行、判据脚本 55 行，零 tab、零行尾空白，`ast.parse` 通过）。
+  **run 63（`out/k1-serial/k1-wpa-20260901T090930Z.log`，40 条全过、0 `FAIL`）一次把三件仪器
+  的读数都拿到了，而且拿到的是这一侧一直缺的那一个：`resident window data a1 self=0x1
+  bssid=0x0 other=0x0 self-prot=0x1 self-dec=0x1 hw-a1=0x1`，`data a1 first fc=0x4208 len=0x50
+  flags=0x31 sec=0x6 a2=504f3be2e6d2 a3=aace88c7683b head=0300002000000000`，配上
+  `resident window arp sent=0x1 ... replies=0x1 reply-ip=0xc0a80190` 和 `arp reply
+  mac=aace88c7683b ip=0xc0a80190`——一次完整的受保护单播往返：本站发受保护单播 ARP Request 给
+  aa:ce:88:c7:68:3b 问 192.168.1.144（`arp tx tag=0x3 pn=0x2`），AP 解开、桥到有线段、主机回
+  了，AP 用**本站的成对密钥**（`head` 里 `0x20` ＝ ExtIV ＋ KeyID=0，不是 GTK；PN=3）加密成单播
+  发回，本端硬件解开（`flags=0x31` ＝ hw-dec ＋ 描述符 A1_MATCH ＋ 长描述符，`icv=0 crc=0`），
+  驱动认出是所问 IP 的 ARP Reply。`len=0x50`＝80 ＝ 24 帧头 ＋ 8 CCMP ＋ 8 LLC/SNAP ＋ 28 ARP ＋
+  8 MIC ＋ 4 FCS。**至此空口两个方向的受保护单播都有对端参与的证据：上行由 3v 的回声、下行由这
+  一帧；接收方向的地址匹配、ADDR_CAM／SEC CAM 成对密钥查表、CCMP 解密、投递到主机整条路是通
+  的。** 另外两件仪器：软件比 A1 与描述符位一致（`self=1 hw-a1=1`，同窗 `total=0x26 group=0x25`
+  ⇒ 恰好 1 帧单播），所以那个硬件位在 sniffer 模式下可信、3q–3v 的零是字面意思；
+  `delta-pktfltr-drp=0x132`（306）对上 `delta-fail=0x14c`（332 次 CRC 失败）、`invd/fulldrp` 全
+  零，说明过滤器丢的是 FCS 坏帧而不是发给本站的帧，「本端过滤器把答案丢了」排除；错误放行位写
+  进去也读回来了（`0xf017000f`→`0xf017200f`），但这一帧 `icv=0 crc=0`，不是靠它进来的。
+  **「为什么这一次成了」仍无定论**：`replies=0x1` 是移植史上第一次（053802Z、044828Z、194727Z
+  问网关 192.168.1.2 全为 0，050954Z 问普通主机 192.168.1.152 也是 0），三个候选——错误放行位
+  （弱）、问的是哪台主机（也弱）、重传运气（本次 `ccxrpt-tag-ok=0x3 ccxrpt-tag-fail=0x1`）——一
+  次运行分不开。DHCP 仍无 OFFER（`dhcp-reply=0x0 offer-ip=0x0`，两帧 Discover 回声 2/2）。**下
+  一步：先把这次往返做成可重复的（同一台 peer、窗内重发若干次、逐次记结果，顺手量出重传运气那
+  一支），再按 RFC 5227 用 ARP 探测自 claim 一个 on-link 地址、对 192.168.1.144 做 ICMP echo，
+  拿第一次真正的 IP 层往返。**
+
 
 
 新增的几条硬结论（读日志/写发送路径之前先看）：
@@ -1235,10 +1260,13 @@ Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手�
 **增量 3t 已在 run 58 上板（40/40，`RUN_EXIT=0`）：回环里那一帧 A1 ＝ 自己 MAC 的受保护数据帧
 报 `a1-match=0x1 hw-dec=0x1 icv=0x0 sec-cam=0x0 diff-bytes=0x0`——接收路径接得住发给自己的
 单播，成对密钥表项在接收方向上也命中并解对了，所以 (B2) 在 MAC/SEC 这一层排除。**
-**当前实际下一步（run 62 之后已经改写）：上行不再是问题，问题只剩「发往本站单播地址的下行帧
-是没发出来，还是发出来了而被本端硬件在进 RX FIFO 之前丢掉」。**这一问已经由增量 3w 落成三件
-接收侧仪器（软件比 A1、放行解密失败帧、RMAC 阶段计数器增量，见上面那条），代码已编译通过、等
-上板。**增量 3v 把上行那一半彻底关
+**当前实际下一步（run 63 之后已经改写）：空口两个方向的受保护单播都通了，剩下的是让那次往返可
+重复、再往上垒 IP 层。**run 63 里本站的受保护单播 ARP Request 换来了一帧 AP 用本站成对密钥加密
+的 ARP Reply（`replies=0x1`，移植史上第一次），所以「发往本站单播地址的下行帧到底存不存在」这一
+问已经有了肯定答案，而「为什么之前四次都没有」还没有——错误放行位、问的是哪台主机、重传运气三
+条一次运行分不开。因此下一个增量是同一台 peer、窗内重发若干次 ARP、逐次记结果；随后按 RFC 5227
+用 ARP 探测自 claim 一个 on-link 地址、对 192.168.1.144 做 ICMP echo，拿第一次真正的 IP 层往返。
+**增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们
 记录了各条支路是怎么一条条被排掉的：
