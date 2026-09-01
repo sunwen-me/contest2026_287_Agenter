@@ -8506,6 +8506,102 @@ resident window dhcp request sent=0x1 status=0x0 ack=0x1 ack-ip=0xc0a801ce nak=0
 （一个窗八帧受保护单播下行 ＋ 四个 echo 回复）；echo 汇总行把记下的 MAC 说成「问的那台」，
 其实是第一次尝试的目的地址。
 
+### 增量 4b：回答别人发过来的 ping——第一次本端欠一个 IP 应答
+
+到 4a 为止，本端发出去的每一个 IP 数据报都是自己挑时候发的：DHCP 是本端要地址，ARP
+请求是本端要问一台主机，echo 请求是本端要试一次往返。连 3z 那个 ARP 应答也不例外——
+ARP 回答的是「谁持有这个地址」，它答的是一个关于地址的问题，不是一个发给本站的数据报。
+
+4b 是第一次反过来：一台主机自己决定往 192.168.1.206 发一个 echo 请求，本端必须把它收
+下、承认这个目的地址就是自己的、再用它的字段造一个新的数据报回去。这也是整个移植里唯
+一一处不用读日志就能验的部分——窗口开着的那 12 秒里，同一网段上任何一台机器
+`ping 192.168.1.206`，有回显就是成立。
+
+**RFC 792 决定了实现形状。** 回复必须把请求的 identifier、sequence 和 data 原样带回
+去：identifier 是问的那台主机自己选的（不是本端的 0x8852），sequence 是它用来把回复对
+上自己第几个请求的，data 则要求逐字节不变。三样里少一样，`ping` 就不认这条回复。所以
+有两种请求是明确拒答的，而不是尽力答：
+
+- 自己的 ICMP 校验和不对的（`icmp_serve_bad`）。不答。答了就等于报告「这条路通」，而
+  实际上这条路正在损坏帧。
+- data 超过 64 字节装不下的（`icmp_serve_long`）。也不答，而不是截短了答。问的那台主
+  机无论收到长的短的都算一次往返成功，所以截短不是「部分正确」，是错报。
+
+两个计数器分开，是为了让一行读数不把三件事糅在一起：`requests=` 只数「本端认下并且有
+能力回答」的请求，`sent=` 是真发出去的，`bad=`/`long=` 是两种拒答。`requests>0
+sent=0` 是「进得来、答不出去」，`requests=0` 是「窗内没人 ping」——单个计数器会把这两
+个读成同一件事。
+
+**一发一收共用一条路。** `k1_rtl8852bs_runtime_icmp_echo_build()` 现在多收三个参数
+（`icmp_type`、`echo_data`、`echo_data_length`），请求和回复由同一个函数造。这样回复走
+的是请求已经证明过的那条路，而不是第二条平行实现——两条实现会各自烂在不同的地方。
+
+**收包路径不发帧。** 观察器跑在接收路径上，那里不允许发送，所以它只把回答需要的东西
+抄下来（对端 MAC、对端 IP、identifier、sequence、data 及其长度）并置
+`icmp_serve_pending`，由窗口循环发出去。队列一格深、新的盖旧的：一个还没答出去就被下
+一个顶掉的请求已经过期了，问的那台主机早就在等下一个 sequence 号。队列只在 SDIO 写成
+功之后才清，写失败的请求还留着，下一轮再试。
+
+**门是不计时的，但有上限。** 和 ARP 应答同一条理由：对面有人在等，晚到的 echo 回复被
+任何工具都当成丢包，所以不排队等下一个时隙。上限
+`K1_RTL8852BS_RESIDENT_ECHO_SERVE_MAX = 8`，是 ARP 那个的两倍——`ping` 一秒一个请求，
+窗口 12 秒。
+
+`K1_RTL8852BS_RESIDENT_FRAME_MAX` 从 128 抬到 192，只有一个原因：第十四段自检要在内存
+里**造出**那个必须被拒答的超长请求，32+8+20+8+65 = 133 字节装不进 128。抬这个数比把
+64 字节的上限压下去安全——Linux 的 `ping` 默认就发 56 字节 data，压到 56 以下等于把最
+常见的一种 ping 变成拒答。抬之前逐处确认过：这个常量的每一处使用都是诊断/自检缓冲区
+大小，没有一处是协议常量。
+
+**自检从十一段扩到十五段。** 十二段是一个发给本站的 ping（identifier 0x1234、sequence
+7、40 字节 data），检查 `requests`/`pending`/`peer-ip`/`id`/`seq`/`data`/对端 MAC 全部
+落对；十三段把同一个请求的 ICMP 校验和翻掉一位，要求 `bad` 加一而**已排队的那个不被顶
+掉**（拒答的请求不许挤掉还欠着回复的那个）；十四段带 65 字节 data，要求 `long` 加一、
+同样不顶掉队列——这一段是手工拼的，因为本端的构造函数拒绝造这种帧，而这正是重点：请求
+来自外面，没有任何东西阻止一台主机用更大的 data 来问。十五段检查回复本身，在任何东西
+上天线之前：type 为 0、identifier 和 sequence 原样、data 逐字节相同、两个地址对调、
+IPv4 与 ICMP 两个校验和都自洽。
+
+最后一段的理由和 4a 第十一段一样，也是这整套内存自检存在的唯一理由：出站路上没有任何
+环节校验 ICMP 或 IPv4 校验和，算错了对端只会静静丢掉，从本端看与「这台主机不答」完全
+一样。
+
+**判据脚本和代码在同一个提交里改。** 这是 run 67 留下的教训：`arp_model_result` 还写着
+十一段时代的期望值，于是板上自检返回 `stage=0x0 status=0x0` 的那一次被判成 FAIL。这次
+两条新正则都先离线验过，而且验的方式是从驱动源码里把那两行**重新拼出来**（按
+`k1_early_puts` 的字面量顺序），再拿正则去匹配——这样字段顺序和拼写是从代码里来的，不
+是从记忆里来的。同时验了过期的十一段那行现在会被拒绝，以及 `echo-serve`、
+`echo-serve-bad`、`echo-serve-long`、`echo-serve-data`、`status` 每一个被改坏时都会被
+拒绝。
+
+十五段自检的期望值：
+
+```
+net=0xc arp=0x4 ipv4=0x7 other=0x1 other-type=0x86dd arp-req=0x2 replies=0x1
+reply-ip=0xc0a80109 peer-ip=0xc0a80101 peer-tpa=0xc0a8017b ip-peer-ip=0xc0a80105
+serve=0x1 serve-ip=0xc0a8010a echo=0x1 echo-bad=0x1 echo-mask=0x4 echo-seq=0x2
+echo-serve=0x1 echo-serve-id=0x1234 echo-serve-seq=0x7 echo-serve-data=0x28
+echo-serve-bad=0x1 echo-serve-long=0x1 stage=0x0 status=0x0
+```
+
+窗尾新增一行，逐次发送时另有一行 `resident icmp serve tx`：
+
+```
+K1 Wi-Fi GPL: resident window icmp serve requests= sent= bad= long= bytes= peer-ip= id= seq= data= status= mac=
+```
+
+跑 run 68 时按这个顺序读：`icmp serve requests=` 是否非零（窗内有没有人 ping 本站）→
+`sent=` 与 `status=`（答没答出去）→ `bad=`/`long=`（有没有被拒答、是哪一种）→ 主机侧
+`ping` 的输出（唯一一处不用读日志的判据）。`requests=0` 不是失败，是「没人问」——那一
+次这行对应答能力什么都没说。
+
+run 68 同时还验两件旧事：`df4c080` 那个判据修正（同一镜像重跑 4a 应当得到全项 PASS），
+以及 4a 遗留的两个诚实边界（echo 的两台主机会不会真的分成两台、seq 0 被答两次是不是重
+复投递）。
+
+镜像：`text=830344 data=9768 bss=25296`，SHA256
+`ed5b088300d170632b3768baa4184c400989e3995240991fcf5f305b50044ed3`。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来
