@@ -26396,6 +26396,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_IEEE80211_EID_TIM          5u
 #define K1_RTL8852BS_RESIDENT_TIM_FIXED         3u
 #define K1_RTL8852BS_RESIDENT_TIM_HEAD          8u
+#define K1_RTL8852BS_RESIDENT_ECHO_HEAD         8u
 
 /* The channel-defining registers of the three layers, as the vendor names
  * them.  cfg_mac_bw() owns the first two, halbb_ctrl_bw_ch_8852b() the
@@ -26714,6 +26715,27 @@ struct k1_rtl8852bs_resident_count_s
   uint8_t tim_bitmap_length;
   uint8_t tim_first[K1_RTL8852BS_RESIDENT_TIM_HEAD];
   uint8_t tim_first_length;
+
+  /* A frame the access point transmitted that carries this host's own address
+   * as the source of the payload inside it.  A bridge floods a
+   * group-addressed frame to every port except the one it arrived on, and a
+   * basic service set is one port, so an access point that floods back to the
+   * set retransmits a station's own broadcast to the whole set and the sender
+   * hears it.  That retransmission is the access point's own bytes, and it
+   * cannot exist unless the uplink frame was received, decrypted and
+   * forwarded, so echo_frames is the one statement available from this side
+   * that the uplink got through.  A zero is not the opposite statement: an
+   * access point that does not flood back to the set it received from reads
+   * zero as well.
+   */
+
+  uint32_t echo_frames;
+  uint32_t echo_group;
+  uint32_t echo_data;
+  uint16_t echo_first_frame_control;
+  uint16_t echo_first_length;
+  uint8_t echo_first[K1_RTL8852BS_RESIDENT_ECHO_HEAD];
+  uint8_t echo_first_head_length;
 
   /* And the transmit half of it.  arp_tx_target_ip is the address the probe
    * asked about, so the reply's sender address can be checked against the
@@ -28444,6 +28466,54 @@ static void k1_rtl8852bs_runtime_resident_observe(
   if (mgmt.addr2_valid && memcmp(mgmt.addr2, self_mac, 6) == 0)
     {
       count->self_frames++;
+    }
+
+  /* The access point retransmitting a frame this port sent.  From the
+   * distribution system with to-the-distribution-system clear is a frame the
+   * access point itself transmitted, and address 3 of such a frame is the
+   * source of the payload inside it, so address 3 holding this host's own
+   * address makes these this host's own bytes coming back off the air after
+   * the access point received and decrypted them.  The eight bytes kept are
+   * the ones at the end of the frame header: the protocol header of a frame
+   * the hardware decrypted, and the packet number header of one it did not.
+   */
+
+  if (((mgmt.frame_control >> 8) & 0x3u) == 0x2u &&
+      mgmt.addr3_valid && memcmp(mgmt.addr3, self_mac, 6) == 0)
+    {
+      count->echo_frames++;
+      if (mgmt.addr1_valid && (mgmt.addr1[0] & 1u) != 0)
+        {
+          count->echo_group++;
+        }
+
+      if (type == K1_RTL8852BS_IEEE80211_TYPE_DATA)
+        {
+          count->echo_data++;
+        }
+
+      if (count->echo_first_length == 0 && payload_length <= 0xffffu)
+        {
+          size_t head = k1_rtl8852bs_runtime_resident_header_length(
+                          mgmt.frame_control);
+
+          count->echo_first_length = (uint16_t)payload_length;
+          count->echo_first_frame_control = mgmt.frame_control;
+
+          if (type == K1_RTL8852BS_IEEE80211_TYPE_DATA &&
+              payload_length > head)
+            {
+              size_t take = payload_length - head;
+
+              if (take > K1_RTL8852BS_RESIDENT_ECHO_HEAD)
+                {
+                  take = K1_RTL8852BS_RESIDENT_ECHO_HEAD;
+                }
+
+              memcpy(count->echo_first, payload + head, take);
+              count->echo_first_head_length = (uint8_t)take;
+            }
+        }
     }
 
   /* Whether the frame came from the access point this run associated with.
@@ -30776,9 +30846,10 @@ static int k1_rtl8852bs_runtime_resident_window(
 
   /* And what the access point's Beacons say is waiting for this station.  A
    * set AID bit is an answer that exists and was not collected; a window of
-   * Beacons with it clear, with seen equal to the target's Beacon count, is an
-   * answer that was never produced.  head= is the element's own bytes, which
-   * is what makes the bit test checkable rather than trusted.
+   * Beacons with it clear rules that one explanation out and no more, since an
+   * answer for a station the access point believes awake goes out at once and
+   * never appears in a map.  head= is the element's own bytes, which is what
+   * makes the bit test checkable rather than trusted.
    */
 
   k1_early_puts("K1 Wi-Fi GPL: resident window tim aid=");
@@ -30810,6 +30881,35 @@ static int k1_rtl8852bs_runtime_resident_window(
     {
       k1_rtl8852bs_scanofld_log_bytes(count.tim_first,
                                       count.tim_first_length);
+    }
+
+  k1_early_puts("\r\n");
+
+  /* And whether any of this port's own uplink bytes came back off the air.  A
+   * frame the access point transmitted whose payload source is this host is
+   * the access point flooding a group-addressed frame this port sent up back
+   * out to the basic service set, and that cannot exist unless the uplink
+   * frame was received, decrypted and forwarded.  The window sends one
+   * broadcast ARP Request and one broadcast Discover, so there is something
+   * for it to flood; a zero still is not the opposite statement, because an
+   * access point that does not flood back to the set reads zero too.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window echo frames=");
+  k1_early_puthex(count.echo_frames);
+  k1_early_puts(" group=");
+  k1_early_puthex(count.echo_group);
+  k1_early_puts(" data=");
+  k1_early_puthex(count.echo_data);
+  k1_early_puts(" fc=");
+  k1_early_puthex(count.echo_first_frame_control);
+  k1_early_puts(" len=");
+  k1_early_puthex(count.echo_first_length);
+  k1_early_puts(" head=");
+  if (count.echo_first_head_length != 0)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.echo_first,
+                                      count.echo_first_head_length);
     }
 
   k1_early_puts("\r\n");

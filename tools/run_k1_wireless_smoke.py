@@ -302,7 +302,8 @@ def parse_args() -> argparse.Namespace:
               "inside one bounded receive window, every sampled channel "
               "register unchanged across it, the receive filter restored, and "
               "the target's traffic indication map read for this station's "
-              "AID"),
+              "AID, and any of this port's own uplink frames the access "
+              "point sent back out counted"),
     )
     parser.add_argument(
         "--require-runtime-data-secure-tx", action="store_true",
@@ -2134,6 +2135,63 @@ def main() -> int:
                         "produced and one sent straight out and not received "
                         "are still to be told apart"
                         .format(tim_seen, tim_range),
+                        file=sys.stderr)
+
+            # And whether any of this port's own uplink bytes came back off
+            # the air.  A frame the access point transmitted whose payload
+            # source is this host is the access point flooding a
+            # group-addressed frame this port sent up back out to the basic
+            # service set, which cannot happen unless the uplink frame was
+            # received, decrypted and forwarded.  The line is required to
+            # exist and no value in it is required: a nonzero count is a
+            # statement about the uplink, and a zero is not its opposite,
+            # because an access point that does not flood back to the set it
+            # received from reads zero as well.
+            resident_echo_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window echo frames=(?:0x)?"
+                rb"([0-9a-fA-F]+) group=(?:0x)?([0-9a-fA-F]+)"
+                rb" data=(?:0x)?([0-9a-fA-F]+)"
+                rb" fc=(?:0x)?([0-9a-fA-F]+)"
+                rb" len=(?:0x)?([0-9a-fA-F]+)"
+                rb" head=([0-9a-fA-F]*)",
+                resident,
+            )
+            if resident_echo_result is None:
+                missing.append(
+                    "RTL8852BS2 count of this port's own uplink frames the "
+                    "access point sent back out")
+            else:
+                echo_frames = int(resident_echo_result.group(1), 16)
+                echo_group = int(resident_echo_result.group(2), 16)
+                echo_data = int(resident_echo_result.group(3), 16)
+                echo_fc = int(resident_echo_result.group(4), 16)
+                echo_len = int(resident_echo_result.group(5), 16)
+                echo_head = resident_echo_result.group(6).decode()
+                print(
+                    "[serial] uplink echo: frames={0} group={1} data={2} "
+                    "fc=0x{3:04x} len={4} head={5}"
+                    .format(echo_frames, echo_group, echo_data, echo_fc,
+                            echo_len, echo_head or "(none)"),
+                    file=sys.stderr)
+                if echo_frames:
+                    print(
+                        "[serial] the access point transmitted {0} frame(s) "
+                        "carrying this station's own address as the source of "
+                        "the payload inside them: the uplink was received, "
+                        "decrypted and forwarded, so what is missing is on "
+                        "the downlink -- an answer the access point produced "
+                        "and this station did not take in"
+                        .format(echo_frames),
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no frame the access point transmitted "
+                        "carried this station's own address as the source of "
+                        "the payload, so nothing here says the uplink got "
+                        "through; an access point that does not flood a "
+                        "group-addressed frame back to the set it came from "
+                        "reads the same, so this is not the opposite "
+                        "statement",
                         file=sys.stderr)
 
             # The transmit half.  The status of the Probe Request separates a

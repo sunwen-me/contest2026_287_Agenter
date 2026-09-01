@@ -1069,6 +1069,24 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   harness 里那句 "the reply was never produced" 因此改成了 "an answer that was never produced
   and one sent straight out and not received are still to be told apart"。**
 
+- **已实现、等上板（增量 3v，判据仍为 40）：看 AP 有没有把本站发上去的广播帧又播回空口——这一
+  侧唯一能自证「上行通了」的读数。** 3u 划掉省电那条支路之后，剩下的两种可能是「上行根本没被
+  AP 转发」和「AP 回了但本端没收下」。分开它们看似只能在 AP 的有线段抓包，但桥转发的定义给了
+  第三条路：网桥把组播帧泛洪到除入端口以外的所有端口，而同一个 BSS 里还挂着别的 STA，所以 AP
+  必须把某个 STA 发上来的广播帧再从空口播一遍（mac80211 的 `ieee80211_rx_h_data` 就是克隆一份
+  `xmit_skb` 再从无线口发出去），**原发送者自己也收得到**。于是空口上只要出现一帧「FromDS=1、
+  ToDS=0、A3 ＝ 本站 MAC」的帧，它就只能是 AP 把本站刚发上去的广播帧收下、解密、又播了出来——
+  这是 AP 自己的字节，不是从 TX report 推断的，一次性证明上行被收到、被成对密钥解开、并且被转
+  发；到那一步缺的东西就一定在下行。**反过来不成立**：不把组播帧播回原 BSS 的 AP 读数同样是
+  0，所以 0 只是「这一行什么也没说」。实现是在常驻窗口 `self_frames`（A2 ＝ 本站）那一段后面加
+  一个判断，**零新发送、零新 H2C、零寄存器写入**；窗口本来就会发一帧广播 ARP Request
+  （`attempt & 1`）和一帧广播 DHCP Discover，所以有东西可播。新增一行
+  `resident window echo frames= group= data= fc= len= head=`，`head=` 是帧头结尾的 8 字节（解开
+  了就是 LLC/SNAP：`aaaa030000000806` ＝ ARP、`...0800` ＝ IPv4；没解开就是 CCMP 的包号头，两
+  种都不是密文），挂在既有的 `--require-runtime-resident` 上、只要求存在，判据仍是 40。已编译
+  通过（`text=813522 data=9768 bss=25296`，SHA256 `9a5d239c…`，无新增告警），判据正则对三条合成
+  行各命中 6 组。
+
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
 - **Association Request 沉默的原因几乎总在请求内容里，不在发送路径里。** run 30 发了 6 次
