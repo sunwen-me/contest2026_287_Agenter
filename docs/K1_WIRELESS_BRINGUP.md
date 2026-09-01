@@ -8602,6 +8602,30 @@ run 68 同时还验两件旧事：`df4c080` 那个判据修正（同一镜像重
 镜像：`text=830344 data=9768 bss=25296`，SHA256
 `ed5b088300d170632b3768baa4184c400989e3995240991fcf5f305b50044ed3`。
 
+### 工具：`--replay LOG`——先拿旧日志验判据，别用板子的一次复位去验正则
+
+run 67 是这么坏的：板上自检返回 `stage=0x0 status=0x0`，判据脚本里那条离线模型的正则还写着
+上一代的期望值，于是一次成立的运行被判成 FAIL。改正则花了几分钟，发现它花掉了一次上板。
+
+`run_k1_wireless_smoke.py --replay LOG` 把捕获的串口日志当成唯一输入，一个字节都不发、
+一个设备都不开，然后把全部判据照原样跑一遍。实现上是把开机那一半（停 U-Boot、loadx、go）
+抽成 `boot_from_board()`，判据那一段一行没动——这是有意的：如果判据代码在两种模式下不是
+同一份，那 replay 就证明不了任何东西。三条要向板子提问才能得到答案的判据
+（`/dev/ttyHCI0` 打开、Bluetooth host scan、`wlan0` scan）在 replay 里跑不了，所以它们被
+**明确报成 skipped**——没跑过的判据不许读成过了的判据。
+
+用法与效果（`tools/run_k1_wpa.sh` 的旗标集原样透传）：
+
+```
+tools/run_k1_wpa.sh --replay out/k1-serial/k1-wpa-20260901T124002Z.log
+```
+
+拿它验这次 4b 的改动：run 67 的日志（4a 镜像）只差两项——`RTL8852BS2 ICMP echo answers for
+this station's own address`（那一行是 4b 才有的）与 `RTL8852BS2 decrypted-payload observer
+model`（十一段的自检行匹配不上十五段的期望值）；其余全部通过，所以这次除了新加的两条之外
+没有别的过期期望值。再拿 4a 之前的日志（`…T111205Z.log`）验，差四项——多出 4a 的两行，
+说明 replay 确实在判别而不是一律放行。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

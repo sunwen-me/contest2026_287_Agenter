@@ -58,6 +58,15 @@ def parse_args() -> argparse.Namespace:
         "--boot-timeout", type=float, default=120,
         help="seconds to wait for U-Boot and NSH (default: 120)",
     )
+    parser.add_argument(
+        "--replay", type=pathlib.Path, default=None,
+        help=("read a captured serial log instead of booting a board, and "
+              "apply every verdict below to it -- no device is opened and "
+              "nothing is transmitted.  This exists because run 67 was "
+              "reported FAIL by a stale expectation in this script while the "
+              "board's own selftest passed: a verdict change can now be "
+              "checked against captured logs before it costs a board cycle"),
+    )
     reset_mode = parser.add_mutually_exclusive_group()
     reset_mode.add_argument(
         "--manual-reset",
@@ -1079,54 +1088,91 @@ def verify_wlan0_scan(serial: K1Xmodem, ifname: str, timeout: float) -> None:
           f"dropped={sweep.group(3).decode('ascii')}): {detail}", file=sys.stderr)
 
 
+def boot_from_board(args: argparse.Namespace, serial: K1Xmodem,
+                    wrapper: pathlib.Path,
+                    payload: pathlib.Path) -> tuple:
+    """Stop U-Boot, load the RAM image and return everything NuttX printed.
+
+    Split out of main() so the verdicts below can also be applied to a
+    captured log with --replay.  Nothing here is reachable in replay mode:
+    no device is opened, no reset is requested and no byte is transmitted.
+    """
+
+    compressed_payload = None
+    if args.gzip_payload:
+        compressed_payload = make_gzip_payload(payload, args.log_dir)
+    if args.manual_reset:
+        # A USB-TTL adapter can retain the final U-Boot/Linux bytes from
+        # a previous session.  Discard them before prompting so only the
+        # next physical reset is eligible for the U-Boot stop window.
+        discard_stale_serial(serial)
+        print("[serial] press RST; waiting for and stopping U-Boot autoboot",
+              file=sys.stderr)
+        # The serial listener is already open above.  Speak before each
+        # operator action so a physical reset is never requested silently.
+        if args.voice_prompt:
+            announce_reset()
+        halt_at_uboot_from_serial(serial, args.boot_timeout,
+                                  allow_running_os=True)
+    elif args.nsh_reboot:
+        halt_at_uboot_from_nsh(serial, args.boot_timeout)
+    elif args.uboot_ready:
+        # Repeated CAN also leaves a stale U-Boot loadx session without
+        # touching storage; at an ordinary prompt it is harmless input.
+        serial.write(b"\x18" * 8 + b"\r")
+        serial.wait_for_text(b"=>", 5.0)
+    else:
+        halt_at_uboot(serial, args.adb, args.boot_timeout)
+    started = boot_wireless(serial, wrapper, payload, compressed_payload,
+                            args.boot_timeout)
+    return started, compressed_payload
+
+
 def main() -> int:
     args = parse_args()
     if args.bt_scan_seconds <= 0:
         raise XmodemError("--bt-scan-seconds must be positive")
     if args.wlan0_scan_timeout <= 0:
         raise XmodemError("--wlan0-scan-timeout must be positive")
-    wrapper = require_file(args.wrapper, "wrapper")
-    payload = require_file(args.payload, "payload")
-    args.log_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = args.log_dir / f"{payload.parent.name}-{timestamp}.log"
+    replay = None
+    if args.replay is not None:
+        replay = require_file(args.replay, "replay log")
+    wrapper = None if replay is not None else require_file(
+        args.wrapper, "wrapper")
+    payload = None if replay is not None else require_file(
+        args.payload, "payload")
     compressed_payload = None
-    device = resolve_serial_device(args.device)
-    print(f"[serial] using {device}", file=sys.stderr)
-    serial = K1Xmodem(
-        device,
-        args.baud,
-        log_path,
-        reconnect_on_reenumeration=True,
-    )
+    if replay is not None:
+        # No device, no reset, no transmission: the log is the whole input.
+        # Every verdict below reads the captured bytes, so the ones that
+        # depend on asking the board a question at the end are skipped and
+        # said to be skipped rather than silently counted as passing.
+        log_path = replay
+        serial = None
+        print(f"[replay] applying verdicts to {replay} without a board",
+              file=sys.stderr)
+    else:
+        args.log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now(
+            dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        log_path = args.log_dir / f"{payload.parent.name}-{timestamp}.log"
+        device = resolve_serial_device(args.device)
+        print(f"[serial] using {device}", file=sys.stderr)
+        serial = K1Xmodem(
+            device,
+            args.baud,
+            log_path,
+            reconnect_on_reenumeration=True,
+        )
 
     try:
-        if args.gzip_payload:
-            compressed_payload = make_gzip_payload(payload, args.log_dir)
-        if args.manual_reset:
-            # A USB-TTL adapter can retain the final U-Boot/Linux bytes from
-            # a previous session.  Discard them before prompting so only the
-            # next physical reset is eligible for the U-Boot stop window.
-            discard_stale_serial(serial)
-            print("[serial] press RST; waiting for and stopping U-Boot autoboot",
+        if replay is not None:
+            started = replay.read_bytes()
+            print(f"[replay] {len(started)} bytes captured",
                   file=sys.stderr)
-            # The serial listener is already open above.  Speak before each
-            # operator action so a physical reset is never requested silently.
-            if args.voice_prompt:
-                announce_reset()
-            halt_at_uboot_from_serial(serial, args.boot_timeout,
-                                      allow_running_os=True)
-        elif args.nsh_reboot:
-            halt_at_uboot_from_nsh(serial, args.boot_timeout)
-        elif args.uboot_ready:
-            # Repeated CAN also leaves a stale U-Boot loadx session without
-            # touching storage; at an ordinary prompt it is harmless input.
-            serial.write(b"\x18" * 8 + b"\r")
-            serial.wait_for_text(b"=>", 5.0)
         else:
-            halt_at_uboot(serial, args.adb, args.boot_timeout)
-        started = boot_wireless(serial, wrapper, payload, compressed_payload,
-                                args.boot_timeout)
+            started, compressed_payload = boot_from_board(
+                args, serial, wrapper, payload)
         required = [b"K1: entry", b"K1 Wi-Fi:"]
         bt_hci_device_markers = (
             b"K1 Bluetooth: H5 stack registered /dev/ttyHCI0",
@@ -1139,11 +1185,13 @@ def main() -> int:
         if args.require_wlan0_scan:
             required.append(b"K1 Wi-Fi: wlan0 scan device registered")
         if args.require_bt_host_scan:
-            started += wait_for_bt_host_registration(serial)
+            if serial is not None:
+                started += wait_for_bt_host_registration(serial)
             required.append(b"K1 Bluetooth: H5 host stack registered")
         elif (args.require_h5 or args.require_bt_hci_device) and \
                 b"K1 Bluetooth: H5 raw HCI registered /dev/ttyHCI0" not in started:
-            started += wait_for_bt_raw_registration(serial)
+            if serial is not None:
+                started += wait_for_bt_raw_registration(serial)
         missing = [marker.decode("ascii") for marker in required if marker not in started]
         if args.require_bt_hci_device and \
                 not any(marker in started for marker in bt_hci_device_markers):
@@ -3603,10 +3651,32 @@ def main() -> int:
                 rb"dispatched=(?:0x)?0*1"
             )
             if runtime_rx_complete.search(started) is None:
+                if serial is None:
+                    raise XmodemError(
+                        "captured log has no runtime RX worker dispatch and "
+                        "a replay cannot ask the board for one")
+
                 wait_for_runtime_rx_worker(serial)
             else:
                 print("PASS: K1 runtime RX worker dispatched C2H loopback",
                       file=sys.stderr)
+        if serial is None:
+            # These three ask the board a question rather than read the log,
+            # so a replay cannot run them.  Say which ones were skipped: a
+            # verdict that was never applied must not read as one that passed.
+            skipped = [name for flag, name in (
+                (args.verify_bt_hci_open, "/dev/ttyHCI0 open"),
+                (args.require_bt_host_scan, "Bluetooth host scan"),
+                (args.require_wlan0_scan, "wlan0 scan"))
+                if flag]
+            if skipped:
+                print("[replay] not applied (needs a board): "
+                      + ", ".join(skipped), file=sys.stderr)
+
+            print("PASS: every log-only verdict holds for this capture",
+                  file=sys.stderr)
+            return 0
+
         if args.verify_bt_hci_open:
             verify_bt_hci_open(serial)
         if args.require_bt_host_scan:
@@ -3617,10 +3687,13 @@ def main() -> int:
         print("PASS: K1 wireless RAM image reached NSH", file=sys.stderr)
         return 0
     finally:
-        serial.close()
+        if serial is not None:
+            serial.close()
         if compressed_payload is not None:
             compressed_payload.unlink(missing_ok=True)
-        print(f"Serial log: {log_path}", file=sys.stderr)
+        print("{0}: {1}".format(
+            "Replayed log" if replay is not None else "Serial log", log_path),
+            file=sys.stderr)
 
 
 if __name__ == "__main__":
