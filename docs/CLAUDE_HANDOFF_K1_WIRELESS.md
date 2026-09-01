@@ -754,7 +754,8 @@ bssid=50:4f:3b:e2:e6:d2`，13 个 dwell 全部有帧，`crc-err=0 icv-err=0`，
   「以后要切信道时才需要」，不再是数据面的前提。3b/3c/3d 欠的 `JOININFO` 顺序已在 3g
   还清（认证前 `disconn=0x1`、关联时 `disconn=0x0`）。增量 3h 自己（不跑扫描的驻留收发
   窗口）已上板跑过 run 36／run 37／run 38，前两轮的失败都已定位修完，**run 38 一次跑通**。
-  (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/RCK/IQK/DPK/TSSI），
+  (2) `rtw_hal_bb_dm_init` / `rtw_hal_rf_dm_init`（DACK/IQK/DPK/TSSI；RCK 已在增量 5a
+  移植，AACK 与 LCK 对这颗芯片是空操作，见下），
   发送正确性与 RSSI 精度要靠它；同一批还有 `set_enable_bb_rf(hal, 0)` 的 disable 半边、
   `halbb_dm_init()`/`halrf_dm_init()` 正文、五张 `init_rf_reg` store 表、halbb `phy_reg_gain`。
   (3) 真正的 STA 链路最终还是要把 `rtw8852b_set_channel_{mac,bb,rf}` 移植进来，
@@ -1588,6 +1589,23 @@ proxy ARP"的猜测。修法是两个发送处都写这个标志，再让辅助�
 次第二个请求来自网关；`dup checked=0x62 retries=0xc dropped=0xc` 加 `evictions=0x0`；主
 机侧 8 个应答、RTT 2194 ms 收到 13.3 ms、`(DUP!)` 零条。日志压缩生效，三地址改成每字节两
 位十六进制。RCK 读数仍是 `rck=0x3a00 rck-sts=0x73800`，`BIT(3)` 清，下一步从这里进。
+
+**已做（2026-09-02，增量 5a）：原厂的 RC 校准移植进来了，提交 `cd5dc74`；AACK 与 LCK 从
+待办里划掉。** 依据是每份日志都读到 `rck=0x3a00 rck-sts=0x73800`，`BIT(3)` 是 done 位且
+一直是清的，射频滤波器一直跑在镜像的默认值上。`halrf_rck_8852b()`（`halrf_8852b.c:711`）
+九步全是普通 RF 寄存器访问，用已有的 `k1_rtl8852bs_rf_read`／`k1_rtl8852bs_rf_write` 一
+比一抄下来：存 RF 0x5、清它 bit0、模式字压成 RF_RX、往 RF 0x1b 写 `0x00240`、轮询 RF
+0x1c 的 BIT(3) 十次每次 2 µs、从 RF 0x1b[14:10] 读出校准码、把码当普通值写回 RF 0x1b、还
+原 RF 0x5；两条路径都跑，不看 ability 位，与 `halrf_rck_trigger()` 对 RF_RTL8852B 的做法
+一致。`MASKRFMODE` 本地没有定义，靠 `enum halrf_rf_mode` 的 `RF_RX = 0x3` 与板子读回的
+`0x337e1`／`0x3b7e1` 夹出字段在 [19:16]。落点在串行接口复位之后、`before` 采样之前。**
+AACK 空操作**：`halrf_aack_trigger()` 只有 `RF_RTL8851B` 分支。**LCK 也不跑**：
+`halrf_lck_trigger()` 开头就 `if (!(rf->support_ability & HAL_RF_LCK)) return;`，而
+`halrf_rfability_init()` 的 `RF_RTL8852B` 分支里 `HAL_RF_LCK` 是注释掉的。于是 (2) 那批
+剩下 DACK、`halrf_get_efuse_trim`、`halrf_rfk_self_init`（纯软件）和逐信道的 RX DCK／IQK
+／DPK／TXGAPK；DACK 的函数体不在本地参考子集里（走 `halrf_ops_dack()`，ops 表所在文件没
+缓存），要港得再抓一个原厂文件。下一次上板看三样：两行 `RF RCK` 的 `done=1`、`code=` 非
+零且 `rck=` 等于它、以及 `before`／`after` 采样里 `rck-sts` 的 BIT(3) 置起。
 
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；

@@ -9007,3 +9007,48 @@ ARP 请求来自网关而不是主机，服务支路对两种来源都答了。
 
 RCK 的读数没有变化：两条路径都是 `rck=0x3a00 rck-sts=0x73800`，`0x73800 & BIT(3) == 0`，
 RC 校准的 done 位仍是清的。这条读数是下一步的入口。
+
+### 增量 5a：把原厂的 RC 校准搬过来，同时划掉 AACK 与 LCK
+
+这个移植从运行 44 起就在每份日志里采样 RF 0x1b 和 RF 0x1c，两条路径读到的一直是
+`rck=0x3a00 rck-sts=0x73800`。`0x73800 & BIT(3) == 0`，而 BIT(3) 是 RC 校准的 done 位，
+所以结论只有一个：这颗射频的滤波器一直跑在射频镜像留下的默认值上，校准从来没被触发过。
+
+原厂的实现是 `halrf_rck_8852b()`，在 `halrf_8852b.c:711`，短到可以逐条抄：存下 RF 0x5，
+清掉它的 bit0（`halrf_8852b.c` 里每个校准跑之前都清这一位，跑完整寄存器还原），把模式字
+压成 RF_RX，往 RF 0x1b 写 `0x00240` 触发，轮询 RF 0x1c 的 BIT(3) 十次、每次间隔 2 µs，从
+RF 0x1b 的 [14:10] 读出校准码，再把这个码当普通值写回 RF 0x1b，最后还原 RF 0x5。派发器
+`halrf_rck_trigger()` 对 RF_RTL8852B 是两条路径都跑、不看 ability 位，移植照此。
+
+`MASKRFMODE` 是个原厂用了但本地参考子集里没有定义的名字，值靠两头夹出来：
+`enum halrf_rf_mode` 给出 `RF_RX = 0x3`，而板子在接收支路已经跑起来的状态下把模式字读回
+`0x337e1` 与 `0x3b7e1`，两条路径的 [19:16] 都是 0x3，字段位置就此确定。
+
+移植用的是本来就有的 `k1_rtl8852bs_rf_read` 与 `k1_rtl8852bs_rf_write`，没有新增底层原
+语。轮询超时按原厂的做法只记录不致命——原厂打一行 timeout 然后照样去读码，因为 done 位和
+码都在报表里，报表自己会说校准有没有出结果。RF 0x5 在所有出口都还原，包括出错的那几条：
+调用者的下一步就是采样射频，一个被按住的保存寄存器会被读成射频自己的状态。落点是串行接口
+复位之后、`before` 采样之前，和 `halrf_dm_init` 的顺序一致；AACK、LCK、DACK 落地时进同一
+处。
+
+有一个声明顺序的坑值得记下来：`k1_rtl8852bs_rf_write` 定义在这个校准函数之后，而在原型的
+参数表里第一次出现的结构体 tag 会另起一个类型，于是写操作的 trace 结构体上移到读操作那个
+旁边，两个 trace 就此并排。编译 exit 0，text 832302 → 833194，多出 892 字节，警告仍只有
+两条已知的 `role_cam` 未使用函数；`out/k1-wpa/contest-nuttx-flat.bin` 的 SHA-256 是
+`16d2e9a73114a77e404b32fa5d43cb2e5079a028d6ee20f98cd7bb3687ddda75`。
+
+**顺手划掉了两项。** `halrf_aack_trigger()` 在 `halrf.c:6720`，switch 里只有
+`RF_RTL8851B` 一个分支，`default` 什么都不做——AACK 对这颗芯片是空操作。
+`halrf_lck_trigger()` 在 `halrf.c:845`，函数第一件事是
+`if (!(rf->support_ability & HAL_RF_LCK)) return;`，而 `halrf_rfability_init()` 的
+`RF_RTL8852B` 分支里 `HAL_RF_LCK` 那一行是注释掉的，所以原厂在这颗芯片上压根不跑 LCK。这
+两项从待办里去掉，不是"没做"而是"原厂也不做"。
+
+于是 Priority 2 剩下的是：DACK、`halrf_get_efuse_trim`（热敏／PA bias／TSSI trim）、
+`halrf_rfk_self_init`（纯软件状态，不写寄存器）以及逐信道那批 RX DCK／IQK／DPK／TXGAPK。
+DACK 的函数体不在本地这份 4.2 MB 参考子集里：`halrf_dack_trigger()` 对本芯片走
+`halrf_ops_dack()`，ops 表所在的文件没缓存，要港得再抓一个原厂文件下来。
+
+下一次上板要看三样：`RF RCK path=0` 与 `path=1` 两行里 `done=1`，`code=` 是个五位以内的
+小数而不是 0，`rck=` 等于那个 code；以及 `before` 与 `after` 两次采样里 `rck-sts` 的 BIT
+(3) 置起、`rck` 不再是 `0x3a00`。
