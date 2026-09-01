@@ -8217,6 +8217,82 @@ NAK（地址在被接受之前已经不空闲，必须从 Discover 重来而不�
 
 被提供的地址、掩码、网关、租期、事务标识、AP 的 MAC 都不是凭据，可以打印。
 
+### 运行 65：DHCP 握手做完了——ACK 拿到 192.168.1.206
+
+增量 3y 上板（`out/k1-serial/k1-wpa-20260901T104437Z.log`，0 FAIL，40/40）：
+
+```
+resident dhcp request tx sn=0x16 bytes=0x152 xid=0x8c79b074 ip=0xc0a801ce server=0xc0a80102 pn=0x9 attempt=0x1 status=0x0
+resident window dhcp offer ip=0xc0a801ce server-id=0xc0a80102 src=0xc0a80102 mask=0xffffff00 router=0xc0a80102 lease=0xa8c0 offers=0x2 attempt=0x1 xid=0x8c79b074 mac=60beb40996b8
+resident window dhcp request sent=0x1 status=0x0 sn=0x16 bytes=0x152 reply=0x3 ack=0x1 ack-ip=0xc0a801ce nak=0x0
+```
+
+**`ack=0x1 ack-ip=0xc0a801ce nak=0x0`：服务器确认了这次接受。** 本站在受保护链路上完成了
+完整的 DHCP 四步——Discover、Offer、Request、Ack——拿到 **192.168.1.206**，掩码
+255.255.255.0，网关 192.168.1.2，租期 43200 秒。`reply=0x3` 是三帧通过全部匹配条件的
+BOOTREPLY（两个 OFFER ＋ 一个 ACK），`bytes=0x152`＝338＝326＋12，正是加了选项 50/54 之
+后的长度，`ccxrpt-tag=0x8 ccxrpt-tag-ok=0x8 ccxrpt-tag-fail=0x0`——这一轮九帧里被报告的八
+帧全部一次成功，连重传都没有。
+
+有一处措辞要更正：`mac=60beb40996b8` 是回复帧的 address 3，即在分发系统内部把这一帧发出
+来的那台站，也就是**服务器自己**（它就是网关 192.168.1.2）；不是 AP（AP 是 address 2）。
+驱动里字段注释本来是对的，窗尾那段注释和判据脚本的措辞写错了，已改。
+
+同一个窗里另一半仍是 0/6：`resident window arp trip attempts=0x6 replies=0x0 ...
+peer=60beb40996b8 ip=0xc0a80102`。这才是这条日志最有价值的地方——**被 ARP 问的那台主机，
+和刚刚回了本站两次 OFFER、一次 ACK 的那台服务器，是同一台**（`60:be:b4:09:96:b8` ＝
+192.168.1.2），在同一个窗、同一把密钥、同一条分发路径上。所以它显然愿意回答本站；它只是
+没有回答那六个请求。
+
+剩下的两个候选因此收窄成：
+
+1. 它不回答 SPA＝0 的请求（本站没有地址时唯一合法的探测形态）；
+2. 它回答了，但回复是**单播到本站 MAC** 的帧，而本移植的接收路径对单播下行只成功过一次
+   （run 63）——本窗 `data a1 self=0x0`，三帧 DHCP 回复全部是组地址的，走 GTK 广播路径。
+
+这两个候选只差一个变量：发送协议地址。而 ACK 刚好把那个变量合法地给了出来。
+
+### 增量 3z：把同一台主机再问一遍，这次带上自己的地址
+
+3z 不改任何别的东西——同一台 peer、同一把成对密钥、同一个窗、同一条分发路径——只把 ARP
+请求里的发送协议地址从 0 换成服务器确认过的 192.168.1.206，然后数回答。
+
+- `runtime_arp_probe_build()` 多一个 `sender_ip` 参数（0 即 RFC 5227 的探测形态，行为与
+  今天完全一致；非零才写 `SENDER_IP_OFFSET`）。十一个调用点里十个传 `0u`，只有常驻窗那
+  个例外。
+- `runtime_resident_arp_tx()` 多一个 `claimed`：`sender_ip = claimed ? dhcp_ack_ip : 0`，
+  没有被确认的地址就返回 `-EADDRNOTAVAIL` 而不是凭空claim一个地址；claimed 形态**不交替
+  广播**（要问的问题是「来自本子网一台站的请求会不会被回答」，答案必须单播回本站，用广
+  播形态只会把样本数砍半），报告标签是新的 `TAG_ARP_CLAIM`＝0x7。
+- 计数分开：`arp_claim_attempts` / `arp_claim_acks` / `arp_claim_mask` / `arp_claim_spa` /
+  `arp_claim_status`。记账仍然只有**一个** watcher：credit helper 多一个 `claimed` 参数，
+  窗里用 `arp_trip_last` ＋ `arp_trip_last_claimed` 记住最后一次发送属于哪一轮，共享同一
+  个 `arp_trip_seen`——两个 watcher 各自 seen 会把同一个回复记两次。
+- 时序：窗 7000 → **9000 ms**；claim 门在 Request 门之后，条件是 `dhcp_ack_ip != 0 &&
+  arp_trip_valid`，`K1_RTL8852BS_RESIDENT_CLAIM_ATTEMPTS` ＝ **3**、
+  `K1_RTL8852BS_RESIDENT_CLAIM_GAP_MSEC` ＝ **700 ms**。ACK 在 run 65 里大约落在窗内五秒
+  处，所以三次都装得下，最后一次的回答也还有时间回来。
+
+窗尾多一行：
+
+```
+K1 Wi-Fi GPL: resident window arp claim attempts= acks= mask= spa= status= peer= ip=
+```
+
+判据脚本里这一行同样**只要求存在**，验收数仍是 **40**，三种解读：命中（那台主机在忽略
+六个来自「无名氏」的请求之后回答了来自本站自己地址的请求，所以 SPA＝0 就是探测轮沉默的
+原因，而且回复走通了单播下行）／全不中（发送地址不是原因；同一台主机、同一把密钥、同一
+个窗、同一台 peer 两种形态都不答，剩下的就只有回答必须走的方向——一帧寻址到本站的下行
+帧，而本窗只成功收到过广播）／没发出去（窗内没有拿到被确认的地址，本行不说明任何事情）。
+
+顺手改掉一处过时的解读：ARP 无回答时判据脚本原来打印「下一步该看加密本身」，而加密早在
+3s/3t 就被排除、DHCP 现在也往返成功了，改成「加密与发送路径都已排除，看下面的 claim
+轮」。
+
+镜像已编译通过（`text=820248 data=9768 bss=25296`，SHA256 `0d089615…`，除既有两条
+`role_cam` 未使用告警外无新增），风格基线不变（驱动超 79 列 50 行、判据脚本 55 行，零
+tab、零行尾空白，`ast.parse` 通过）。
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

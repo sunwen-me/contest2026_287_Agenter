@@ -1191,7 +1191,7 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   广播路径。**含义：本端的 UDP 数据报到达了一台 DHCP 服务器，服务器生成并指名本站的回答回来
   了——这已经是一次 IP 层往返，而它同时是拿到非零发送地址的正途。**
 
-- **已编译待上板（增量 3y）：OFFER 不是分配——用受保护的 DHCP Request 把它收下。** RFC 2131
+- **已上板（增量 3y，run 65）：OFFER 不是分配——用受保护的 DHCP Request 把它收下。** RFC 2131
   4.3.1/4.3.2/4.4.1：OFFER 是保留不是分配，在 Request 被回答之前那个地址不属于任何人，因此**不
   能**作为发送地址上空口；接受的方式是发 DHCPREQUEST，选项 50 指名地址、选项 54 指名服务器、复
   用 Discover 的事务标识、`ciaddr` 为 0、帧仍广播，A1 仍是 AP 所以照样成对密钥保护。四块改动：
@@ -1206,8 +1206,9 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   `offset-7`=54、`offset-5`=服务器、`offset-1`=`0xff`、选项 53 值 3，并按伪首部重算校验和），
   最后把 Discover 重建回去。③新 `runtime_resident_observe_dhcp()` 按选项 53 分流：NAK 计
   `dhcp_naks`，ACK 计 `dhcp_acks` 并锁 `dhcp_ack_ip`，其余计 `dhcp_offers` 并首次锁存
-  `dhcp_offer`/`_attempt`/`_xid`/`server_id`/`server_source`/`mask`/`router`/`lease` 与帧 A2
-  （AP，不是服务器本身）作 `dhcp_server_mac`。④窗长 5000 → **7000 ms**，ARP 门后加 Request
+  `dhcp_offer`/`_attempt`/`_xid`/`server_id`/`server_source`/`mask`/`router`/`lease` 与帧的
+  address 3（在分发系统内部发出这一帧的那台站，也就是服务器自己；AP 是 address 2）作
+  `dhcp_server_mac`。④窗长 5000 → **7000 ms**，ARP 门后加 Request
   门：TK 已装且 `dhcp_offer != 0 && dhcp_acks == 0 && dhcp_naks == 0`，次数上限 **2**、间隔
   **900 ms**，第一次不设延时（就在观察到 OFFER 的那一轮发出），收到 ACK 或 NAK 立即停；
   `runtime_resident_dhcp_request_tx()` 照 `arp_tx` 的形状写，`server = dhcp_server_id ?:
@@ -1218,6 +1219,39 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   是本站可用地址，ARP/ICMP 从此有非零发送地址）／NAK（地址在被接受前已不空闲，必须从 Discover
   重来）／发了但窗内无回答／没发。已编译通过，风格基线不变（驱动超 79 列 50 行、判据脚本 55
   行，零 tab、零行尾空白，`ast.parse` 通过）。
+
+- **run 65（`out/k1-serial/k1-wpa-20260901T104437Z.log`，0 FAIL，40/40）：DHCP 握手做完了。**
+  `resident window dhcp request sent=0x1 status=0x0 sn=0x16 bytes=0x152 reply=0x3 ack=0x1
+  ack-ip=0xc0a801ce nak=0x0`——本站在受保护链路上走完 Discover→Offer→Request→Ack，拿到
+  **192.168.1.206**，掩码 255.255.255.0、网关 192.168.1.2、租期 43200 秒（`offer` 行：
+  `server-id=0xc0a80102 src=0xc0a80102 mask=0xffffff00 router=0xc0a80102 lease=0xa8c0
+  offers=0x2 xid=0x8c79b074 mac=60beb40996b8`）。`bytes=0x152`＝338＝326＋12 正是加了选项
+  50/54 的长度；`ccxrpt-tag=0x8 ccxrpt-tag-ok=0x8 ccxrpt-tag-fail=0x0`，这一轮连重传都没有。
+  **同一个窗里 ARP 仍是 0/6，而被问的那台主机 `60:be:b4:09:96:b8` ＝ 192.168.1.2 正是刚回了
+  本站两次 OFFER 一次 ACK 的那台服务器**——同一台主机、同一把密钥、同一个窗、同一条分发路
+  径，它显然愿意回答本站，只是没回答那六个请求。于是只剩两个候选：它不回答 SPA＝0 的请求；
+  或者它回答了而回复是**单播到本站**的帧，而单播下行在本移植只成功过一次（run 63；本窗
+  `data a1 self=0x0`，三帧 DHCP 回复全是组地址、走 GTK 广播路径）。两者只差一个变量，而 ACK
+  刚好把那个变量合法地给了出来。
+
+- **已编译待上板（增量 3z）：把同一台主机再问一遍，这次带上自己的地址。** 除了发送协议地址
+  什么都不动：`runtime_arp_probe_build()` 多 `sender_ip`（0 即 RFC 5227 探测形态，行为与今天
+  逐字节一致；非零才写 `SENDER_IP_OFFSET`），十一个调用点里十个传 `0u`；
+  `runtime_resident_arp_tx()` 多 `claimed`——`sender_ip = claimed ? dhcp_ack_ip : 0`，没有被
+  确认的地址就返回 `-EADDRNOTAVAIL`，claimed 形态**不交替广播**（答案必须单播回本站，用广播
+  形态只会把样本砍半），报告标签新增 `TAG_ARP_CLAIM`＝0x7；计数分开
+  （`arp_claim_attempts`/`_acks`/`_mask`/`_spa`/`_status`），但**记账仍只有一个 watcher**
+  （credit helper 多 `claimed` 参数，窗里用 `arp_trip_last` ＋ `arp_trip_last_claimed` 记住最
+  后一次发送属于哪一轮，共享同一个 `arp_trip_seen`——两个 watcher 各自 seen 会把同一个回复记
+  两次）；窗 7000 → **9000 ms**，claim 门在 Request 门之后、条件 `dhcp_ack_ip != 0 &&
+  arp_trip_valid`，**3** 次、间隔 **700 ms**（ACK 在 run 65 落在窗内约五秒处，三次都装得
+  下）。窗尾一行 `resident window arp claim attempts= acks= mask= spa= status= peer= ip=`，
+  harness 只要求存在，验收数仍是 **40**，三种解读：命中（SPA＝0 就是探测轮沉默的原因，且回
+  复走通了单播下行）／全不中（发送地址不是原因，剩下的只有回答必须走的方向——寻址到本站的
+  下行帧）／没发（窗内没拿到被确认的地址）。顺手改掉一处过时解读（ARP 无回答时原来说「下一
+  步看加密本身」，加密在 3s/3t 已排除、DHCP 现已往返，改为「加密与发送路径都已排除，看
+  claim 轮」）和一处措辞错误（`mac=` 是 address 3 ＝ 服务器自己，不是 AP）。已编译通过
+  （`text=820248 data=9768 bss=25296`，SHA256 `0d089615…`），风格基线不变。
 
 
 
@@ -1336,10 +1370,14 @@ Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手�
 窗内六次 ARP、逐次记账，结果是 **0/6**，而 `ccxrpt-tag ok=0x8`（八帧全部被确认）把「重传运气」
 这一支排除掉了，剩下的解释是被问的那台网关不回答 SPA＝0 的探测。同一次运行还给了移植史上第一个
 DHCP OFFER（192.168.1.206，本站 xid ＋ 本站 chaddr 双重匹配，走 GTK 广播路径回来），所以下一步
-不是继续猜 ARP，而是把这次握手做完：**增量 3y 用受保护的 DHCP Request 收下这个 OFFER（选项
-50/54、复用 xid、ciaddr 为 0、仍广播；已编译待上板）**；拿到 ACK 之后就有了合法的非零发送地址，
-再用它对同一台 peer 发一次真 SPA 的 ARP（这正好检验 SPA＝0 那个假说，也是 RFC 正确的形态），
-然后对 192.168.1.144 做 ICMP echo，拿第一次完整的 IP 层往返。
+不是继续猜 ARP，而是把这次握手做完——**增量 3y 已在 run 65 上板并成功：`ack=0x1
+ack-ip=0xc0a801ce`，本站在受保护链路上走完了完整的 DHCP 四步，拿到 192.168.1.206。** 于是现
+在有了合法的非零发送地址，而 run 65 同时把问题收得极窄：被 ARP 问的那台主机就是回了 OFFER 和
+ACK 的那台服务器，它愿意回答本站，只是不回答 SPA＝0 的请求——或者回答了而单播下行丢了。
+**增量 3z 就是这一个变量的对照实验：同一台 peer、同一把密钥、同一个窗，只把 SPA 从 0 换成
+192.168.1.206，三次，单播形态，独立记账（已编译待上板）。** 命中就说明 SPA＝0 是原因且单播下
+行通了，下一步直接对网关做 ICMP echo；全不中就说明剩下的只有「寻址到本站的下行帧」这一支，那
+就回到接收过滤器（原厂 `rx_fltr_init()`：清 SNIFFER_MODE、置 CAM-match 位）。
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们
