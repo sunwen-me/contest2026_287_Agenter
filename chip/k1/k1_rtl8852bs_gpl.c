@@ -1342,6 +1342,33 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RF_REG_RCK_TRIGGER      0x1bu
 #define K1_RTL8852BS_RF_REG_RCK_STATUS       0x1cu
 #define K1_RTL8852BS_RF_CHANNEL_MASK         0x000000ffu
+
+/* halrf_rck_8852b()'s own constants.  The vendor sources spell the mode
+ * word's field MASKRFMODE without defining it anywhere in the reference
+ * subset, but enum halrf_rf_mode gives RF_RX = 0x3 and this radio reads its
+ * mode word back as 0x337e1 and 0x3b7e1 while its receive path is running, so
+ * the field is bits [19:16].  Bit 0 of the save register is the bit every
+ * calibration in halrf_8852b.c clears while it runs, before restoring the
+ * whole register at the end.
+ */
+
+#define K1_RTL8852BS_RF_MODE_MASK            0x000f0000u
+#define K1_RTL8852BS_RF_MODE_RX              0x00000003u
+#define K1_RTL8852BS_RF_MODE_SAVE_RUN        0x00000001u
+
+/* The RC calibration proper: the word that starts it, the done bit of the
+ * status register, and the field of the trigger register the radio reports
+ * the calibration code in.  The code is stored back into the same register as
+ * a plain value, which is why a path that has never run this reads the
+ * default 0x3a00 there instead of a five bit number.
+ */
+
+#define K1_RTL8852BS_RF_RCK_TRIGGER_VALUE    0x00000240u
+#define K1_RTL8852BS_RF_RCK_DONE             0x00000008u
+#define K1_RTL8852BS_RF_RCK_CODE_MASK        0x00007c00u
+#define K1_RTL8852BS_RF_RCK_CODE_SHIFT       10u
+#define K1_RTL8852BS_RF_RCK_POLL_COUNT       10
+#define K1_RTL8852BS_RF_RCK_POLL_USEC        2
 #define K1_RTL8852BS_RF_PATHS                2
 
 /* The radio register the read back diagnostic probes with a known value.  The
@@ -14310,8 +14337,9 @@ static void k1_rtl8852bs_scan_phy_counters_log(
  *   halbb_read_rf_reg_8852b_a() does: wait for the RF serial interface to be
  *   idle in both directions, write the path and offset into the read select
  *   register and confirm it latched, wait for the done bit, and take the 20
- *   bit result out of the status word.  This is a read-only path; every RF
- *   write in this component stays with the firmware through CMD_OFLD.
+ *   bit result out of the status word.  The radio images are still offloaded
+ *   to the firmware through CMD_OFLD; the host side writes below are the
+ *   calibrations, which have to read a result back before they can finish.
  *
  ****************************************************************************/
 
@@ -14322,6 +14350,19 @@ struct k1_rtl8852bs_rf_read_trace_s
   uint32_t status;
   uint16_t select_polls;
   uint16_t done_polls;
+};
+
+/* The write's trace sits with the read's rather than with the write itself,
+ * because the RC calibration below is declared before that function and a
+ * struct tag first seen in a prototype's parameter list is a tag of its own.
+ */
+
+struct k1_rtl8852bs_rf_write_trace_s
+{
+  uint32_t pre_status;
+  uint32_t command;
+  uint32_t command_readback;
+  uint16_t polls;
 };
 
 static int k1_rtl8852bs_rf_read(uint8_t path, uint8_t address,
@@ -14716,6 +14757,210 @@ static int k1_rtl8852bs_rf_si_reset(void)
   return OK;
 }
 
+/* Defined below, next to the read: the RC calibration is the first thing in
+ * this component that writes a radio register outside the image loader.
+ */
+
+static int k1_rtl8852bs_rf_write(uint8_t path, uint8_t address,
+                                 uint32_t mask, uint32_t value,
+                                 FAR struct k1_rtl8852bs_rf_write_trace_s
+                                 *trace);
+
+struct k1_rtl8852bs_rf_rck_trace_s
+{
+  uint32_t save;         /* RF 0x5 as the calibration found it */
+  uint32_t mode;         /* RF 0x0 once the mode word was forced to RX */
+  uint32_t status;       /* RF 0x1c, the register carrying the done bit */
+  uint32_t trigger;      /* RF 0x1b as the radio left it after the trigger */
+  uint32_t code;         /* RF 0x1b[14:10], the calibration code itself */
+  uint32_t readback;     /* RF 0x1b once the code was stored back into it */
+  uint16_t polls;
+  bool done;
+};
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_rf_rck_path
+ *
+ * Description:
+ *   halrf_rck_8852b() for one radio path: the RC calibration of the radio's
+ *   filter.  Every step of the vendor sequence is a plain RF register access,
+ *   so it ports one to one -- save RF 0x5, clear the bit a running
+ *   calibration clears, force the mode word to RF_RX, write the trigger word
+ *   to RF 0x1b, poll the done bit RF 0x1c[3], read the code out of
+ *   RF 0x1b[14:10], store that code back into RF 0x1b and restore RF 0x5.
+ *
+ *   The code arrives in a field of the same register the trigger was written
+ *   to, and storing it back as a plain value is the point of the whole
+ *   sequence: the radio computes a code, reports it, and the driver has to
+ *   put it where the filter reads it from.  A path that never ran this holds
+ *   whatever the radio image left in RF 0x1b, which is what every log of
+ *   this port so far shows -- rck=0x3a00 with the done bit clear.
+ *
+ *   A poll timeout is recorded and does not stop the caller, which is what
+ *   the vendor does as well: it prints a timeout and reads the code anyway.
+ *   The trace carries both the done bit and the code, so the report says by
+ *   itself whether the calibration produced anything.  RF 0x5 is restored on
+ *   every path out, including the failing ones, because the caller's next
+ *   step samples the radio and a save register left held would be read as
+ *   the radio's own state.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_rf_rck_path(uint8_t path,
+                                    FAR struct k1_rtl8852bs_rf_rck_trace_s
+                                    *trace)
+{
+  uint32_t save = 0;
+  uint32_t status = 0;
+  uint32_t trigger = 0;
+  unsigned int polls;
+  int restore;
+  int ret;
+
+  if (trace == NULL)
+    {
+      return -EINVAL;
+    }
+
+  memset(trace, 0, sizeof(*trace));
+
+  ret = k1_rtl8852bs_rf_read(path, K1_RTL8852BS_RF_REG_MODE_SAVE, &save,
+                             NULL);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  trace->save = save;
+
+  ret = k1_rtl8852bs_rf_write(path, K1_RTL8852BS_RF_REG_MODE_SAVE,
+                              K1_RTL8852BS_RF_MODE_SAVE_RUN, 0, NULL);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write(path, K1_RTL8852BS_RF_REG_MODE,
+                                  K1_RTL8852BS_RF_MODE_MASK,
+                                  K1_RTL8852BS_RF_MODE_RX, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_read(path, K1_RTL8852BS_RF_REG_MODE,
+                                 &trace->mode, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write(path, K1_RTL8852BS_RF_REG_RCK_TRIGGER,
+                                  K1_RTL8852BS_RF_MASK,
+                                  K1_RTL8852BS_RF_RCK_TRIGGER_VALUE, NULL);
+    }
+
+  for (polls = 0; ret >= 0 && polls < K1_RTL8852BS_RF_RCK_POLL_COUNT;
+       polls++)
+    {
+      ret = k1_rtl8852bs_rf_read(path, K1_RTL8852BS_RF_REG_RCK_STATUS,
+                                 &status, NULL);
+      if (ret < 0)
+        {
+          break;
+        }
+
+      if ((status & K1_RTL8852BS_RF_RCK_DONE) != 0)
+        {
+          trace->done = true;
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_RF_RCK_POLL_USEC);
+    }
+
+  trace->status = status;
+  trace->polls = (uint16_t)polls;
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_read(path, K1_RTL8852BS_RF_REG_RCK_TRIGGER,
+                                 &trigger, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      trace->trigger = trigger;
+      trace->code = (trigger & K1_RTL8852BS_RF_RCK_CODE_MASK) >>
+                    K1_RTL8852BS_RF_RCK_CODE_SHIFT;
+      ret = k1_rtl8852bs_rf_write(path, K1_RTL8852BS_RF_REG_RCK_TRIGGER,
+                                  K1_RTL8852BS_RF_MASK, trace->code, NULL);
+    }
+
+  restore = k1_rtl8852bs_rf_write(path, K1_RTL8852BS_RF_REG_MODE_SAVE,
+                                  K1_RTL8852BS_RF_MASK, save, NULL);
+  if (ret >= 0)
+    {
+      ret = restore;
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_read(path, K1_RTL8852BS_RF_REG_RCK_TRIGGER,
+                                 &trace->readback, NULL);
+    }
+
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_rf_rck_trigger
+ *
+ * Description:
+ *   halrf_rck_trigger() for this chip: both paths, no ability gating, which
+ *   is exactly what the vendor dispatcher does for RF_RTL8852B.  A path that
+ *   fails is reported and does not stop the other one, and neither failure
+ *   stops the caller: this runs next to the radio samples of the scan path,
+ *   and a calibration that could not be written must not change what the
+ *   scan reports.
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_rf_rck_trigger(void)
+{
+  struct k1_rtl8852bs_rf_rck_trace_s trace;
+  unsigned int path;
+  int ret;
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      ret = k1_rtl8852bs_rf_rck_path((uint8_t)path, &trace);
+
+      k1_early_puts("K1 Wi-Fi GPL: RF RCK path=");
+      k1_early_puthex(path);
+      if (ret < 0)
+        {
+          k1_early_puts(" error=");
+          k1_early_puthex((uintreg_t)-ret);
+          k1_early_puts("\r\n");
+          continue;
+        }
+
+      k1_early_puts(" save=");
+      k1_early_puthex(trace.save);
+      k1_early_puts(" mode=");
+      k1_early_puthex(trace.mode);
+      k1_early_puts(" sts=");
+      k1_early_puthex(trace.status);
+      k1_early_puts(" polls=");
+      k1_early_puthex(trace.polls);
+      k1_early_puts(" done=");
+      k1_early_puthex(trace.done ? 1 : 0);
+      k1_early_puts(" trig=");
+      k1_early_puthex(trace.trigger);
+      k1_early_puts(" code=");
+      k1_early_puthex(trace.code);
+      k1_early_puts(" rck=");
+      k1_early_puthex(trace.readback);
+      k1_early_puts("\r\n");
+    }
+}
+
 struct k1_rtl8852bs_scan_rf_readback_s
 {
   uint32_t mode[K1_RTL8852BS_RF_PATHS];
@@ -14952,14 +15197,6 @@ static void k1_rtl8852bs_scan_rf_readback_log(
  *   A host write followed by a host read separates the two.
  *
  ****************************************************************************/
-
-struct k1_rtl8852bs_rf_write_trace_s
-{
-  uint32_t pre_status;
-  uint32_t command;
-  uint32_t command_readback;
-  uint16_t polls;
-};
 
 static int k1_rtl8852bs_rf_write(uint8_t path, uint8_t address,
                                  uint32_t mask, uint32_t value,
@@ -19380,6 +19617,17 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
       k1_early_puthex((uintreg_t)-rf_readback_ret);
       k1_early_puts("\r\n");
     }
+
+  /* halrf_dm_init() runs the RC calibration after this reset, and the port
+   * has never run it: the pre-si-reset sample of every log so far reads
+   * rck=0x3a00 with RF 0x1c[3] clear, so the radio's filter is still on
+   * whatever the image left behind.  This is where the RF init steps this
+   * port has ported live, so this is where the calibration goes; AACK, LCK
+   * and DACK join it here as they land.  The samples on either side then
+   * measure it the same way they measure the reset.
+   */
+
+  k1_rtl8852bs_rf_rck_trigger();
 
   rf_readback_ret = k1_rtl8852bs_scan_rf_readback_read(&rf_readback);
   if (rf_readback_ret < 0)
