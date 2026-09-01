@@ -2197,6 +2197,80 @@ def main() -> int:
                         "statement",
                         file=sys.stderr)
 
+            # The round trip taken as a rate.  run 63 received the first ARP
+            # reply this port has ever had, and one reply cannot say whether
+            # the exchange repeats: three explanations for the four silent runs
+            # before it were left standing, and one of them is transmit retry
+            # luck, which only a repeat count measures.  Six attempts against
+            # one latched host, three addressed to it and three broadcast, so
+            # a rate is read and the delivery form is compared at the same
+            # time.  The line is required to exist and no value in it is
+            # required.
+            resident_trip_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window arp trip attempts=(?:0x)?"
+                rb"([0-9a-fA-F]+) replies=(?:0x)?([0-9a-fA-F]+)"
+                rb" mask=(?:0x)?([0-9a-fA-F]+)"
+                rb" uni=(?:0x)?([0-9a-fA-F]+)"
+                rb" uni-ack=(?:0x)?([0-9a-fA-F]+)"
+                rb" bcast=(?:0x)?([0-9a-fA-F]+)"
+                rb" bcast-ack=(?:0x)?([0-9a-fA-F]+)"
+                rb" peer=([0-9a-fA-F]*) ip=(?:0x)?([0-9a-fA-F]+)",
+                resident,
+            )
+            if resident_trip_result is None:
+                missing.append(
+                    "RTL8852BS2 repeated protected ARP round trip against one "
+                    "host")
+            else:
+                trip_attempts = int(resident_trip_result.group(1), 16)
+                trip_replies = int(resident_trip_result.group(2), 16)
+                trip_mask = int(resident_trip_result.group(3), 16)
+                trip_uni = int(resident_trip_result.group(4), 16)
+                trip_uni_ack = int(resident_trip_result.group(5), 16)
+                trip_bcast = int(resident_trip_result.group(6), 16)
+                trip_bcast_ack = int(resident_trip_result.group(7), 16)
+                trip_peer = resident_trip_result.group(8).decode()
+                trip_ip = int(resident_trip_result.group(9), 16)
+                print(
+                    "[serial] protected ARP round trip: {0}/{1} answered "
+                    "(mask=0x{2:02x}), addressed {3}/{4}, broadcast {5}/{6}, "
+                    "host {7} at {8}"
+                    .format(trip_replies, trip_attempts, trip_mask,
+                            trip_uni_ack, trip_uni, trip_bcast_ack,
+                            trip_bcast, trip_peer or "(none)",
+                            ".".join(str((trip_ip >> shift) & 0xff)
+                                     for shift in (24, 16, 8, 0))),
+                    file=sys.stderr)
+                if trip_attempts and trip_replies >= trip_attempts:
+                    print(
+                        "[serial] every request the queue took was answered, "
+                        "so the protected unicast round trip is not a one-off "
+                        "and transmit retry luck does not explain the runs "
+                        "that saw none",
+                        file=sys.stderr)
+                elif trip_replies:
+                    print(
+                        "[serial] {0} of {1} requests were answered, so the "
+                        "round trip works and is lossy; a rate this far below "
+                        "one is what transmit retry luck would look like, and "
+                        "the earlier silent runs sent one or two requests"
+                        .format(trip_replies, trip_attempts),
+                        file=sys.stderr)
+                elif trip_attempts:
+                    print(
+                        "[serial] none of the {0} requests was answered, so "
+                        "whatever produced run 63's reply was not the request "
+                        "itself; the host that answered then is not "
+                        "necessarily the one asked here"
+                        .format(trip_attempts),
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no request was transmitted, so the window "
+                        "learned no host to ask and this line says nothing "
+                        "about the round trip",
+                        file=sys.stderr)
+
             # Whether the receive filter was widened for the length of the
             # window, so a frame whose payload the security engine could not
             # verify is handed up instead of being dropped inside the receive

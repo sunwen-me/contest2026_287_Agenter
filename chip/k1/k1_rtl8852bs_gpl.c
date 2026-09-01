@@ -26384,7 +26384,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
  * as an access point that said nothing.
  ****************************************************************************/
 
-#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       3000u
+#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       5000u
 #define K1_RTL8852BS_RESIDENT_PROBE_DELAY_MSEC  300u
 #define K1_RTL8852BS_RESIDENT_PROBE_GAP_MSEC    500u
 #define K1_RTL8852BS_RESIDENT_PROBE_ATTEMPTS    4u
@@ -26436,14 +26436,21 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 
 /* And when the protected ARP probe goes out.  Later than the Discover, because
  * it cannot be built until the window has learned an address to ask about, and
- * that address comes out of the access point's own group traffic; the second
- * attempt differs from the first only in whether the distribution system is
- * asked to deliver it to one station or to all of them.
+ * that address comes out of the access point's own group traffic.
+ * Even attempts ask the distribution system to deliver the frame to one
+ * station and odd ones to all of them.
+ *
+ * Six attempts, not two, because run 63 produced the first reply this port has
+ * ever received and one reply cannot say whether the round trip repeats.  Six
+ * spaced attempts give three of each delivery form, so a reply rate is read
+ * instead of a single outcome, and the transmit-retry explanation for the four
+ * silent runs before it is measured rather than argued about.  The window is
+ * five seconds so all six fit with the last one's answer still inside it.
  */
 
 #define K1_RTL8852BS_RESIDENT_ARP_DELAY_MSEC    1100u
-#define K1_RTL8852BS_RESIDENT_ARP_GAP_MSEC      800u
-#define K1_RTL8852BS_RESIDENT_ARP_ATTEMPTS      2u
+#define K1_RTL8852BS_RESIDENT_ARP_GAP_MSEC      650u
+#define K1_RTL8852BS_RESIDENT_ARP_ATTEMPTS      6u
 
 /* How much of the first protected data frame is kept.  Thirty-two bytes reach
  * past the longest header a QoS data frame from an access point can have and
@@ -26783,6 +26790,35 @@ struct k1_rtl8852bs_resident_count_s
   bool arp_peer_valid;
   bool ipv4_peer_valid;
   bool arp_reply_valid;
+
+  /* The round trip taken as a rate rather than as a single outcome.  run 63
+   * received the first ARP reply this port has ever had, and one reply cannot
+   * say whether the exchange repeats -- three explanations for the four silent
+   * runs before it were left standing, and one of them is transmit retry luck,
+   * which only a repeat count can measure.
+   *
+   * The address is latched on the first attempt into arp_trip_mac and
+   * arp_trip_ip so that every attempt in the window asks the same host: the
+   * observer keeps learning stations while the window runs, so without the
+   * latch a later attempt could ask a different one and the reply rate would
+   * be a rate over several questions rather than over one.
+   *
+   * arp_trip_mask has one bit per attempt, set when the reply count grew after
+   * that attempt and before the next.  Attribution is not proof of causation
+   * for any single bit -- an answer to attempt two can arrive after attempt
+   * three went out -- but over six attempts the count is what is being read,
+   * and the per-form counters say whether the delivery form matters.
+   */
+
+  uint8_t arp_trip_mac[6];
+  uint32_t arp_trip_ip;
+  uint32_t arp_trip_attempts;
+  uint32_t arp_trip_mask;
+  uint32_t arp_trip_unicast;
+  uint32_t arp_trip_unicast_ack;
+  uint32_t arp_trip_broadcast;
+  uint32_t arp_trip_broadcast_ack;
+  bool arp_trip_valid;
 
   /* What the access point's own Beacons say is waiting for this station.
    * This reading costs no transmitted frame: the window already receives the
@@ -29455,15 +29491,32 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
    * and the caller is told so rather than a made-up address being probed.
    */
 
-  if (count->arp_peer_valid)
+  if (count->arp_trip_valid)
     {
-      target_mac = count->arp_peer_mac;
-      target_ip = count->arp_peer_ip;
+      /* Every attempt after the first asks the host the first one asked.  The
+       * observer goes on learning stations while the window runs, so reading
+       * the learned address again here would let a later attempt ask someone
+       * else and turn the reply count into a rate over several questions.
+       */
+
+      target_mac = count->arp_trip_mac;
+      target_ip = count->arp_trip_ip;
+    }
+  else if (count->arp_peer_valid)
+    {
+      memcpy(count->arp_trip_mac, count->arp_peer_mac, 6);
+      count->arp_trip_ip = count->arp_peer_ip;
+      count->arp_trip_valid = true;
+      target_mac = count->arp_trip_mac;
+      target_ip = count->arp_trip_ip;
     }
   else if (count->ipv4_peer_valid)
     {
-      target_mac = count->ipv4_peer_mac;
-      target_ip = count->ipv4_peer_ip;
+      memcpy(count->arp_trip_mac, count->ipv4_peer_mac, 6);
+      count->arp_trip_ip = count->ipv4_peer_ip;
+      count->arp_trip_valid = true;
+      target_mac = count->arp_trip_mac;
+      target_ip = count->arp_trip_ip;
     }
   else
     {
@@ -30496,6 +30549,57 @@ errout:
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_arp_trip_credit
+ *
+ * Description:
+ *   Credit one received ARP reply to the attempt that most recently went out.
+ *
+ *   The window polls; a reply is seen some iterations after the request that
+ *   caused it, and the only thing available to attribute it to is which
+ *   attempt was the last one transmitted.  That is an attribution and not a
+ *   proof for any single bit -- the answer to attempt two can arrive after
+ *   attempt three has gone out, and it would then be credited to three -- but
+ *   what is being read here is a rate over six attempts, and the total is
+ *   exact however the individual bits fall.
+ *
+ *   At most one reply is credited per attempt, so the mask answers "was this
+ *   attempt answered" and cannot be inflated by a host that replies twice.
+ *
+ * Input Parameters:
+ *   count   - the window's counters, whose arp_replies is the running total
+ *   attempt - index of the last attempt transmitted, or a negative value when
+ *             none has gone out yet
+ *   seen    - the reply total at the previous credit, updated in place
+ *
+ ****************************************************************************/
+
+static void k1_rtl8852bs_runtime_resident_arp_trip_credit(
+  FAR struct k1_rtl8852bs_resident_count_s *count, int attempt,
+  FAR uint32_t *seen)
+{
+  if (attempt < 0 || attempt >= (int)(sizeof(count->arp_trip_mask) * 8) ||
+      count->arp_replies <= *seen)
+    {
+      return;
+    }
+
+  if ((count->arp_trip_mask & (1u << (unsigned int)attempt)) == 0)
+    {
+      count->arp_trip_mask |= 1u << (unsigned int)attempt;
+      if (((unsigned int)attempt & 1u) != 0)
+        {
+          count->arp_trip_broadcast_ack++;
+        }
+      else
+        {
+          count->arp_trip_unicast_ack++;
+        }
+    }
+
+  *seen = count->arp_replies;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_resident_window
  *
  * Description:
@@ -30550,6 +30654,8 @@ static int k1_rtl8852bs_runtime_resident_window(
   clock_t arp_deadline;
   unsigned int data_attempts = 0;
   unsigned int arp_attempts = 0;
+  uint32_t arp_trip_seen = 0;
+  int arp_trip_last = -1;
   size_t probe_length;
   size_t length;
   size_t offset;
@@ -30745,6 +30851,14 @@ static int k1_rtl8852bs_runtime_resident_window(
     {
       count.polls++;
 
+      /* A reply seen since the last pass is credited to the attempt that was
+       * last transmitted, before this pass can send another one and move the
+       * attribution on.
+       */
+
+      k1_rtl8852bs_runtime_resident_arp_trip_credit(&count, arp_trip_last,
+                                                    &arp_trip_seen);
+
       /* The first Probe Request goes out a fraction of a second into the
        * window, so the receive loop is already draining when the answer
        * arrives, and it is repeated on a gap while no answer has come: one
@@ -30839,8 +30953,9 @@ static int k1_rtl8852bs_runtime_resident_window(
        */
 
       if (g_k1_rtl8852bs_key_install.tk_installed &&
-          count.beacons_target > 0 && count.arp_replies == 0 &&
-          (count.arp_peer_valid || count.ipv4_peer_valid) &&
+          count.beacons_target > 0 &&
+          (count.arp_trip_valid || count.arp_peer_valid ||
+           count.ipv4_peer_valid) &&
           arp_attempts < K1_RTL8852BS_RESIDENT_ARP_ATTEMPTS &&
           (sclock_t)(clock_systime_ticks() - arp_deadline) >= 0)
         {
@@ -30869,7 +30984,32 @@ static int k1_rtl8852bs_runtime_resident_window(
           k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
           k1_early_puts(" status=");
           k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts(" trip=");
+          k1_early_puthex(count.arp_trip_attempts);
+          k1_early_puts(" replies=");
+          k1_early_puthex(count.arp_replies);
           k1_early_puts("\r\n");
+
+          /* Only a frame the queue took can be answered, so a refused one
+           * spends its attempt without joining the rate the mask reports.
+           */
+
+          if (ret >= 0)
+            {
+              count.arp_trip_attempts++;
+              if ((arp_attempts & 1u) != 0)
+                {
+                  count.arp_trip_broadcast++;
+                }
+              else
+                {
+                  count.arp_trip_unicast++;
+                }
+
+              arp_trip_last = (int)arp_attempts;
+              arp_trip_seen = count.arp_replies;
+            }
+
           arp_attempts++;
         }
 
@@ -30965,6 +31105,13 @@ static int k1_rtl8852bs_runtime_resident_window(
     }
 
   k1_sdio_wifi_suppress_command_trace(false);
+
+  /* A reply that arrived in the last pass has had no next pass to credit it,
+   * so the last attempt is credited here before anything is reported.
+   */
+
+  k1_rtl8852bs_runtime_resident_arp_trip_credit(&count, arp_trip_last,
+                                                &arp_trip_seen);
 
   /* The exit sample is taken before the filter goes back, so it describes the
    * hardware as the window ran it rather than as the restore leaves it.
@@ -31474,6 +31621,40 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.arp_peer_target_ip);
   k1_early_puts(" ip-peer-ip=");
   k1_early_puthex(count.ipv4_peer_ip);
+  k1_early_puts("\r\n");
+
+  /* The round trip as a rate.  attempts is how many requests the queue took,
+   * replies the answers the observer recognised, and mask one bit per attempt
+   * that was followed by one -- bit 0 the first, and even bits are the form
+   * addressed to the host itself while odd ones are the broadcast form.  The
+   * pairs beside them split the same two totals by form, which is the reading
+   * that says whether it matters how the distribution system was asked to
+   * deliver the request.  peer and ip are latched on the first attempt, so
+   * every attempt in the line asked that one host.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window arp trip attempts=");
+  k1_early_puthex(count.arp_trip_attempts);
+  k1_early_puts(" replies=");
+  k1_early_puthex(count.arp_replies);
+  k1_early_puts(" mask=");
+  k1_early_puthex(count.arp_trip_mask);
+  k1_early_puts(" uni=");
+  k1_early_puthex(count.arp_trip_unicast);
+  k1_early_puts(" uni-ack=");
+  k1_early_puthex(count.arp_trip_unicast_ack);
+  k1_early_puts(" bcast=");
+  k1_early_puthex(count.arp_trip_broadcast);
+  k1_early_puts(" bcast-ack=");
+  k1_early_puthex(count.arp_trip_broadcast_ack);
+  k1_early_puts(" peer=");
+  if (count.arp_trip_valid)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.arp_trip_mac, 6);
+    }
+
+  k1_early_puts(" ip=");
+  k1_early_puthex(count.arp_trip_ip);
   k1_early_puts("\r\n");
 
   /* And the hardware addresses behind those three, each on its own line and
