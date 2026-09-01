@@ -1574,6 +1574,21 @@ proxy ARP"的猜测。修法是两个发送处都写这个标志，再让辅助�
 `attempts`，且 `trip mask` 第一次非零——六次 probe 尝试里有五次一直是被答着的。** 和增量
 4c 第一部分同类：一个活得比它所描述的事情更久的闩锁。
 
+**已验（2026-09-02，运行 73）：板子逐字确认了 4d 的预测，提交 `c2bcded` 的镜像。** 日志
+`out/k1-serial/k1-wpa-20260901T174806Z.log`，`^FAIL:` 零条，`PASS` 到 NSH。两行读数正是
+离线重放算出来的：
+`arp trip attempts=0x6 replies=0x9 mask=0x3e uni=0x3 uni-ack=0x2 bcast=0x3 bcast-ack=0x3`，
+以及 `arp claim attempts=0x3 acks=0x3 mask=0x7`。`arp trip mask` 在这个移植的全部日志史
+里第一次非零，六次 probe 里五次被应答，空着的 bit0 是归属规则本身的结果（第一条应答到达
+时 claim 已经发过一帧）；`acks <= attempts` 结构性成立。这条读数把运行 44 以来每份日志里
+的 `arp trip mask=0x0` 定性为记账假象。同窗其余读数：
+`icmp echo attempts=0x4 mask=0xf replies=0x4` 四发四回、两台主机交替；
+`icmp serve requests=0x2a sent=0x8 data=0x38` 与运行 72 同形（`sent` 卡在
+`ECHO_SERVE_MAX`，`id` 换值说明是新一轮主机 ping）；`arp serve requests=0x2 sent=0x2` 这
+次第二个请求来自网关；`dup checked=0x62 retries=0xc dropped=0xc` 加 `evictions=0x0`；主
+机侧 8 个应答、RTT 2194 ms 收到 13.3 ms、`(DUP!)` 零条。日志压缩生效，三地址改成每字节两
+位十六进制。RCK 读数仍是 `rck=0x3a00 rck-sts=0x73800`，`BIT(3)` 清，下一步从这里进。
+
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们
