@@ -8763,3 +8763,114 @@ SPL banner 起持续写 `s`（最多 20 秒），直到读到 `=>` 为止；写�
 另外，窗口一旦错过就不再是致命错误：手动复位下看到 `Try to boot` 只意味着这一次没赶上，工具
 丢掉这次尝试、重置状态继续听，操作员**再按一次 RST** 就开出一个新窗口，不必重启工具。改完
 run 39c 第一次按就停住了。
+
+### 增量 4c：报告要说真话，同一帧不要做两遍
+
+run 68 留下两件事：一件是报表撒了谎，一件是标准要求做而本移植一直没做的过滤。4c 把两件都
+修完，`91eb838` 和 `d256230`。
+
+**第一件：`dst=` 印的不是这一发真正的目的地。** `icmp_echo_target`／`icmp_echo_alt`／
+`icmp_echo_mac` 三个字段原来只在 `if (count->icmp_echo_attempts == 0)` 时锁存一次，而逐
+次日志的 `dst=` 就是从那个锁存值印出来的。run 68 的第一发在 `pn=0x3` 出去，早于 ARP 轮的
+第一帧（`pn=0x4`／`0x5`），那一刻 `arp_reply_valid` 还是 false，交替的另一支被折到网关
+上——于是三个字段整窗都是网关，而第 2、4 次尝试其实真的发给了这台开发主机（回来的包 
+`src=0xc0a80199`，奇数 `seq=0x3`，`bad=0x0`）。**所以 run 67 的第一条保留意见（「交替目
+标塌成了一台」）在空口上不成立，塌掉的是报告。** 修法：新增 `icmp_echo_last_ip`，在奇偶
+选择之后、`dhcp_ack_ip` 那道守卫之前记下这一发真正的目的 IP；把一次性锁存换成每次尝试都
+更新（写进去的是 `target_mac`，这一发的目的 MAC）；逐次打印改用 `icmp_echo_last_ip`。判
+据脚本同步加了 `echo_two_hosts = echo_target != echo_alt`，两个候选相同时先把这件事说清
+楚，再谈奇偶位。
+
+**第二件：802.11 重复帧过滤（clause 10.3.2.14）。** 标准要求接收端按 (发送方地址, TID) 
+记住最后一帧被接受的 Sequence Control 字段；再收到一帧带 Retry 位、且该字段相同的，丢
+掉。run 68 的证据两侧同时成立：主机记了一条 `(DUP!)`（`icmp_seq=101`），板子从收到的两份
+拷贝（`pn=0x7`／`0x8`）答了两次 `seq=0x65`；13 个请求＝12 个不同的 ping ＋ 1 个重复，8 
+个允许的应答里有一个花在已经答过的请求上。
+
+**承重的设计决定：过滤只压掉协议动作，绝不动记账。** 它被问的位置是 
+`count->data_frames_target++` 之后、观察器和 DHCP 匹配之前——重复帧照旧算作「收到并解密」
+（它确实收到并解密了，把它从收包统计里抹掉就是把驱动的账做假），而应答、学到的地址、拿到
+的租约各只发生一次。没有地址可作键、或整帧短于 24 字节的，一律不过滤：漏掉一个重复比错丢
+一帧便宜。
+
+**作用域是证出来的，不是约定的。** `k1_rtl8852bs_runtime_resident_duplicate()` 只有一个
+调用者 `..._resident_observe()`，后者也只有一个调用者 `..._resident_window()`，调用点在 
+`if (!frame.crc_error && !frame.icv_error && frame.packet_type == 0)` 里面。所以这个过滤
+器碰不到扫描，也碰不到四次握手；八格缓存活在窗内那个 `count` 结构里，每开一个窗从空开
+始。TID 用 16 表示「非 QoS、没有 TID」，因为 QoS 的 TID 只到 15。
+
+自检从十五段扩到二十段：十六段第一份拷贝要过（`checked==1 new==1`）；十七段同一帧带 
+Retry 位要返回 1（`dropped==1 retries==1 last-seqctl==0x650 last-tid==0`）；十八段换 TID
+6 要过（同一发送方的另一条流），十九段换发送方要过，二十段序号 0x66 带 Retry 位先过、同
+一调用再来一次才丢，收尾 `dropped==2 evictions==0 checked==6`。窗尾新增一行：
+
+```
+resident window dup checked= retries= dropped= streams= evictions= last-seq= last-tid=
+```
+
+判据脚本新增 `resident_dup_result` 一块与一条 `missing` 项，`arp_model_result` 的自检正
+则同步换成二十段的期望值（`dup=0x6 dup-retries=0x5 dup-dropped=0x2`、
+`dup-streams=0x3 dup-evictions=0x0`）——和代码在同一个提交里改，这是 run 67 的教训。
+`evictions` 单独判一句：一旦发生过驱逐，`dropped` 就只是下界而不是总数。
+
+**离线验完才上板。** 把过滤器逐句转写成 Python 跑了一遍那五段，得到的正是正则要求的那组
+总数；又拿 run 68 的日志加上五个自检字段和一条 `resident window dup` 行做成合成 
+fixture，`--replay` 过，`last-seq` 右移四位解回 101——run 68 那个被答两次的序号。最后把未
+打补丁的 run 68 原日志重放一次，结果恰好在两条新要求上 FAIL、其余全过：新判据不是空的。
+
+
+### 运行 69／70：过滤器在板上真的丢了一帧——而这一次不是 ping 的重传
+
+run 69 没进到窗口：`passive scan RX ... beacon=0x0 probe-rsp=0x0 bss=0x0`，收上来的只有
+本站自己的 13 帧 Probe Request（`self-tx=0xd self-preq=0xd`），随后 
+`scan-offload wait error=0x3d`（ENODATA）、`bring-up failed: -61`。这是 run 44／48／52／
+54／57／60 那一族空接收窗，不是 4c 的回归——判据按设计拒绝往下走，重跑即可。
+
+run 70 日志 `out/k1-serial/k1-wpa-20260901T162422Z.log`：扫描 4 个 BSS，DHCP ACK 拿到 
+192.168.1.206，ARP claim 3/3、serve 1/1，echo 四发四回零损坏，整体 0 条 FAIL。新增的那一
+行是这样：
+
+```
+resident window dup checked=0x1f retries=0x1 dropped=0x1 streams=0x1 evictions=0x0 last-seq=0x60 last-tid=0x10
+```
+
+31 帧过了过滤器，其中 1 帧带 Retry 位，1 帧被丢在动作之前。`streams=0x1` 是只缓存过一条
+流（AP 的 addr2 加 TID 16——下行是普通 Data 而不是 QoS Data，
+`data a1 first fc=0x4208`），`evictions=0x0` 因此让 `dropped=0x1` 成为精确总数而不是下
+界。`last-tid=0x10` 就是那个表示「非 QoS」的 16，`last-seq=0x60` 右移四位是序号 6。
+
+**这一帧不是 ping 的重传。** 这一窗 `icmp serve requests=0x0 sent=0x0`——主机侧的 ping 没
+活到窗内（原因见下一节），窗内没有任何外部 echo 请求进来。被丢掉的是 AP 自己重传的一帧下
+行数据。这比只能靠 ping 复现更强：过滤器不是为一个人造场景写的，AP 的常规重传就会逼出
+它。
+
+**报表修正也第一次在板上生效。** 窗尾 
+`target=0xc0a80102 alt=0xc0a80102 src=0xc0a80102`，判据脚本据此印出「both candidates are
+the same host (192.168.1.2)」，把 `mask=0xf replies=0x4` 这个漂亮读数的适用范围一并说清
+楚：奇偶位这一窗只说明四发四回，说不了「哪台答的」。两个候选为什么又相同——这一窗的 ARP 
+只解到网关（`arp peer-ip=0xc0a80102`），开发主机 192.168.1.153 整窗没出现，奇偶两支于是
+都折到网关。这正是 4c 第一件事要的效果：读数照旧漂亮，但报告不再替它多说一句。
+
+自检二十段全过：`dup=0x6 dup-retries=0x5 dup-dropped=0x2`、
+`dup-streams=0x3 dup-evictions=0x0 stage=0x0`。
+
+### 工具：主机侧 `ping` 为什么活不到窗内——地址还没进 neigh 表，iputils 自己就退了
+
+run 69 和 70 的主机 ping 都在两三秒后就结束了，`-w 900` 完全没起作用：
+
+```
+6 packets transmitted, 0 received, +5 errors, 100% packet loss, time 2772ms
+pipe 5
+```
+
+第一反应是后台进程被工具的 wrapper shell 连坐杀掉了。这个猜想是错的，而且很容易证伪：同
+一句 `nohup ping ... &`（不加 `setsid`）打给网关，跑满 40 包 19.5 秒，一次没断。真正的原
+因用一个不存在的同网段地址就能复现：目标还没进主机的 neigh 表时，内核对每一发都回 
+EHOSTUNREACH，iputils 的 `ping` 攒够几个本地错误就自己印统计块退出——
+`+5 errors ... pipe 5`，和 run 70 的签名一字不差。run 68 之所以没遇到，是因为板子的地址
+早就被上一轮跑留在 neigh 表里了。
+
+所以修法不是 `setsid`，是退出就重开：新增 `tools/k1_host_ping.sh`，在截止时间之前循环重
+启 `ping`；板子一起来，当前那个 invocation 就自己活下去，不会再重启。14 秒的冒烟跑重启了
+4 次、把整段覆盖满。
+

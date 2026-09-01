@@ -1516,6 +1516,33 @@ ARP 应答这一窗服务了两台不同的主机（逐次行 `tpa=0xc0a80199` �
 claim 轮 `attempts=0x3 acks=0x6` 的整数倍关系大概同源（也可能是网关 proxy ARP，分不开）。
 窗内 `bad=0x0 long=0x0` 说明两条拒答支路只被自检证过、没在空口上发生过。
 
+**已完成（2026-09-02，增量 4c）：run 68 的两个问题都修完，run 70 上板成立。** 提交
+`91eb838`（报表）＋ `d256230`（过滤器），run 70 日志
+`out/k1-serial/k1-wpa-20260901T162422Z.log`，0 条 FAIL。**报表那一半**：
+`icmp_echo_target`／`alt`／`mac` 原来只在第一次尝试时锁存，逐次 `dst=` 印的就是那个锁存
+值；run 68 的第一发早于 ARP 轮，`arp_reply_valid` 还是 false，交替另一支被折到网关，于是
+整窗看着像塌成一台，而第 2、4 次尝试真的发给了开发主机（`src=0xc0a80199`、奇数
+`seq=0x3`、`bad=0x0`）——**run 67 的第一条保留意见是报表缺陷，不是空口事实**。现在新增
+`icmp_echo_last_ip`（奇偶选择之后、`dhcp_ack_ip` 守卫之前记下），三个字段每次尝试都更
+新，判据脚本加 `echo_two_hosts`，两个候选相同时先声明「奇偶位说不了哪台答的」。run 70 就
+是这种窗（ARP 只解到网关，主机整窗没出现），报表如实印了 both candidates are the same
+host。**过滤器那一半**：clause 10.3.2.14 的接收侧——按 (发送方地址, TID) 缓存上一帧
+Sequence Control，带 Retry 位且相同就丢；八格缓存活在窗内 `count` 里，TID 16 表示非
+QoS。同一条 clause 在增量 3b 咬过发送侧（本站所有请求同一个序列控制字段，被 AP 当重复丢
+掉），4c 是它的另一半。**位置是承重的**：过滤在 `count->data_frames_target++` 之后、观察
+器和 DHCP 匹配之前被问，只压协议动作不动记账；没有地址可作键或短于 24 字节的不过滤。调用
+链只有一条（`resident_window` → `resident_observe` → `resident_duplicate`，且在
+`!crc_error && !icv_error && packet_type == 0` 里面），所以碰不到扫描和四次握手。自检十
+五段扩到二十段，`arp_model_result` 同步换值。**run 70 的读数：
+`resident window dup checked=0x1f retries=0x1 dropped=0x1`、
+`streams=0x1 evictions=0x0 last-seq=0x60 last-tid=0x10`——`evictions=0` 让 `dropped=1` 是
+精确总数；而这一窗 `icmp serve requests=0x0`，被丢的那一帧是 AP 自己重传的下行数据，不是
+ping 的重传。** 顺带修掉主机侧 ping 活不过三秒的问题：不是后台进程被杀——`nohup ping` 打
+网关跑满 19.5 秒没断——而是目标还没进 neigh 表时 iputils 攒够几个 EHOSTUNREACH 就自己退出
+（`+5 errors ... pipe 5`）；新增 `tools/k1_host_ping.sh` 到点之前循环重启。**窗内
+`icmp serve` 仍是 0，4b 的服务侧这一窗没被外部流量检验过（run 68 检验过），下一次上板要
+带上这个脚本。**
+
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们
@@ -1730,6 +1757,8 @@ C2H result 等待机制，但使用原厂定义的 `source=RF`、RF path A/B、m
 - 实板长记录：`docs/K1_WIRELESS_BRINGUP.md`
 - 来源/许可：`docs/K1_SOURCE_AND_LICENSES.md`
 - RAM 加载工具：`tools/run_k1_wireless_smoke.py`
+- 窗内主机侧 ping：`tools/k1_host_ping.sh`（到点之前循环重启 `ping`，因为目标还没进 
+  neigh 表时 iputils 会自己退出）
 
 ## 工作区注意事项
 
