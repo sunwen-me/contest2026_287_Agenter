@@ -548,6 +548,7 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_IPV4_VERSION_IHL        0x45u
 #define K1_RTL8852BS_IPV4_TTL                64u
 #define K1_RTL8852BS_IPV4_PROTO_UDP          17u
+#define K1_RTL8852BS_IPV4_PROTO_ICMP         1u
 #define K1_RTL8852BS_UDP_HEADER_SIZE         8u
 #define K1_RTL8852BS_DHCP_CLIENT_PORT        68u
 #define K1_RTL8852BS_DHCP_SERVER_PORT        67u
@@ -579,6 +580,25 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_ARP_SENDER_IP_OFFSET    14u
 #define K1_RTL8852BS_ARP_TARGET_HW_OFFSET    18u
 #define K1_RTL8852BS_ARP_TARGET_IP_OFFSET    24u
+
+/* The echo request this port sends once a server has acknowledged an address,
+ * and the fields its answer has to carry itself back with.  An echo is the
+ * smallest exchange above ARP that proves an address works: the request goes
+ * out through the access point to a host on the subnet, the answer comes back
+ * from that host's own IP stack rather than from the access point's bridge,
+ * and the identifier and sequence in it are the ones written here, so a reply
+ * cannot be confused with somebody else's traffic.  The identifier is fixed
+ * because it identifies this station's echoes and nothing else; the sequence
+ * counts the attempts, which is what lets the report say which attempt was
+ * answered rather than only how many were.
+ */
+
+#define K1_RTL8852BS_ICMP_HEADER_SIZE        8u
+#define K1_RTL8852BS_ICMP_ECHO_REQUEST       8u
+#define K1_RTL8852BS_ICMP_ECHO_REPLY         0u
+#define K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE  32u
+#define K1_RTL8852BS_ICMP_ECHO_IDENTIFIER    0x8852u
+
 #define K1_RTL8852BS_DHCP_OPTIONS_SIZE       22u
 #define K1_RTL8852BS_DHCP_DISCOVER_SIZE      326u
 
@@ -1636,6 +1656,8 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_TXRPT_TAG_LOOPBACK         0x5u
 #define K1_RTL8852BS_TXRPT_TAG_DHCP_REQUEST     0x6u
 #define K1_RTL8852BS_TXRPT_TAG_ARP_CLAIM        0x7u
+#define K1_RTL8852BS_TXRPT_TAG_ARP_SERVE        0x8u
+#define K1_RTL8852BS_TXRPT_TAG_ICMP_ECHO        0x9u
 #define K1_RTL8852BS_RXDESC_PACKET_TYPE_C2H     10u
 #define K1_RTL8852BS_CCXRPT_C2H_CATEGORY        1u
 #define K1_RTL8852BS_CCXRPT_C2H_CLASS           0x9u
@@ -21913,6 +21935,16 @@ static int k1_rtl8852bs_runtime_dhcp_client_build(
  *   that inconsistency costs nothing and holding the body still is what makes
  *   the two directions comparable.
  *
+ *   With reply set the same twenty-eight bytes become an answer instead of a
+ *   question: operation two, the target hardware address filled in with the
+ *   station being answered rather than left zero, and a sender protocol
+ *   address that must not be zero, because an answer is a statement about an
+ *   address this host holds.  RFC 826 requires a host to answer requests for
+ *   an address it owns, and the consequence of not answering is not cosmetic:
+ *   a peer with no entry for this station cannot send it a unicast datagram at
+ *   all, so every exchange above ARP would stall on the peer's side while this
+ *   station's own transmits kept succeeding.
+ *
  * Input Parameters:
  *   frame         - where the frame goes
  *   frame_size    - how much room frame has
@@ -21926,6 +21958,8 @@ static int k1_rtl8852bs_runtime_dhcp_client_build(
  *                   the probe form RFC 5227 asks of a host that has no
  *                   address yet; only an address a server has acknowledged
  *                   may be put here, because the field is a claim
+ *   reply         - build the answer form: operation two, target hardware
+ *                   address target_mac, and sender_ip required
  *   sequence      - the twelve-bit sequence number
  *   packet_number - the CCMP packet number
  *   frame_length  - the frame's length on success
@@ -21939,7 +21973,7 @@ static int k1_rtl8852bs_runtime_dhcp_client_build(
 static int k1_rtl8852bs_runtime_arp_probe_build(
   FAR uint8_t *frame, size_t frame_size, FAR const uint8_t *self_mac,
   FAR const uint8_t *bssid, FAR const uint8_t *target_mac, bool downlink,
-  uint32_t target_ip, uint32_t sender_ip, uint16_t sequence,
+  uint32_t target_ip, uint32_t sender_ip, bool reply, uint16_t sequence,
   uint64_t packet_number, FAR size_t *frame_length,
   FAR uint8_t *header_length)
 {
@@ -21960,7 +21994,7 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
 
   if (frame == NULL || frame_length == NULL || header_length == NULL ||
       self_mac == NULL || bssid == NULL || target_mac == NULL ||
-      target_ip == 0 ||
+      target_ip == 0 || (reply && sender_ip == 0) ||
       !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
       !k1_rtl8852bs_addr_cam_mac_valid(bssid) ||
       sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK ||
@@ -22000,11 +22034,12 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
   memcpy(frame + offset, llc_snap, sizeof(llc_snap));
   offset += sizeof(llc_snap);
 
-  /* Ethernet hardware, IPv4 protocol, six and four byte addresses, a request.
-   * The sender hardware address is this host's, the sender protocol address
-   * is the caller's claim and stays zero when there is none, the target
-   * hardware address stays zero because that is what is being asked for, and
-   * the target protocol address is the question.
+  /* Ethernet hardware, IPv4 protocol, six and four byte addresses, a request
+   * or an answer.  The sender hardware address is this host's, the sender
+   * protocol address is the caller's claim and stays zero when there is none,
+   * the target hardware address stays zero in a request because that is what
+   * is being asked for and names the station being answered in a reply, and
+   * the target protocol address is the question or the address that asked it.
    */
 
   arp_offset = offset;
@@ -22012,12 +22047,20 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
   k1_rtl8852bs_write_be16(frame + offset + 2, K1_RTL8852BS_ETHERTYPE_IPV4);
   frame[offset + 4] = 6u;
   frame[offset + 5] = 4u;
-  k1_rtl8852bs_write_be16(frame + offset + 6, K1_RTL8852BS_ARP_OP_REQUEST);
+  k1_rtl8852bs_write_be16(frame + offset + 6,
+                          reply ? K1_RTL8852BS_ARP_OP_REPLY :
+                                  K1_RTL8852BS_ARP_OP_REQUEST);
   memcpy(frame + offset + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, self_mac, 6);
   if (sender_ip != 0)
     {
       k1_rtl8852bs_write_be32(
         frame + offset + K1_RTL8852BS_ARP_SENDER_IP_OFFSET, sender_ip);
+    }
+
+  if (reply)
+    {
+      memcpy(frame + offset + K1_RTL8852BS_ARP_TARGET_HW_OFFSET,
+             target_mac, 6);
     }
 
   k1_rtl8852bs_write_be32(frame + offset + K1_RTL8852BS_ARP_TARGET_IP_OFFSET,
@@ -22028,6 +22071,174 @@ static int k1_rtl8852bs_runtime_arp_probe_build(
     {
       return -EIO;
     }
+
+  *frame_length = required;
+  *header_length = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_icmp_echo_build
+ *
+ * Description:
+ *   Build one CCMP-protected ICMP echo request, in 802.11 form, from the
+ *   address a server acknowledged to a host on the same subnet.
+ *
+ *   This is the first frame this port sends whose answer has to come from a
+ *   peer's IP stack rather than from the access point.  An ARP reply proves
+ *   the two stations can reach each other and that the pairwise key works in
+ *   both directions; it says nothing about whether the address the server
+ *   handed out is usable, because ARP carries the address as an opaque field
+ *   and every host on the segment would answer the same request no matter who
+ *   held it.  An echo reply cannot be produced without routing: the peer has
+ *   to accept a datagram addressed to it, look up the source, and address a
+ *   new datagram back to this station.
+ *
+ *   Everything below the payload is the Discover builder's frame: a to-DS
+ *   protected data frame, address 1 the access point, address 2 this host,
+ *   address 3 the peer inside the distribution system, the caller's CCMP
+ *   header with key identifier zero, and an LLC/SNAP header with the IPv4
+ *   ethertype.  Both checksums that an echo needs are computed -- the IPv4
+ *   header's and the ICMP message's, the second over the header and payload
+ *   together, because ICMP has no pseudo header.
+ *
+ *   The payload is thirty-two bytes of a fixed ascending pattern.  An echo
+ *   reply must return the payload unchanged, so a pattern that is wrong in a
+ *   recognisable way is worth more than zeroes: a peer that truncates or pads
+ *   is visible, and so is a receive path that hands up a frame from the wrong
+ *   offset.
+ *
+ * Input Parameters:
+ *   frame          - where the frame goes
+ *   frame_size     - how much room frame has
+ *   self_mac       - the eFuse self MAC, address 2
+ *   bssid          - the access point, address 1
+ *   target_mac     - address 3, the peer inside the distribution system
+ *   source_ip      - this station's acknowledged address, host byte order
+ *   target_ip      - the peer's address, host byte order
+ *   identifier     - the echo identifier the answer has to carry back
+ *   echo_sequence  - the echo sequence number, which says which attempt this
+ *                    is and which attempt an answer belongs to
+ *   sequence       - the twelve-bit 802.11 sequence number
+ *   packet_number  - the CCMP packet number
+ *   frame_length   - the frame's length on success
+ *   header_length  - its 802.11 header length on success
+ *
+ * Returned Value:
+ *   OK on success, a negated errno otherwise.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_icmp_echo_build(
+  FAR uint8_t *frame, size_t frame_size, FAR const uint8_t *self_mac,
+  FAR const uint8_t *bssid, FAR const uint8_t *target_mac, uint32_t source_ip,
+  uint32_t target_ip, uint16_t identifier, uint16_t echo_sequence,
+  uint16_t sequence, uint64_t packet_number, FAR size_t *frame_length,
+  FAR uint8_t *header_length)
+{
+  static const uint8_t llc_snap[K1_RTL8852BS_LLC_SNAP_HEADER_SIZE] =
+    {
+      0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00, 0x08, 0x00
+    };
+
+  size_t required;
+  size_t offset;
+  size_t ip_offset;
+  size_t icmp_offset;
+  size_t index;
+  uint16_t checksum;
+  int ret;
+
+  required = K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+             K1_RTL8852BS_CCMP_HEADER_SIZE +
+             K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+             K1_RTL8852BS_IPV4_HEADER_SIZE +
+             K1_RTL8852BS_ICMP_HEADER_SIZE +
+             K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE;
+
+  if (frame == NULL || frame_length == NULL || header_length == NULL ||
+      self_mac == NULL || bssid == NULL || target_mac == NULL ||
+      source_ip == 0 || target_ip == 0 ||
+      !k1_rtl8852bs_addr_cam_mac_valid(self_mac) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(bssid) ||
+      !k1_rtl8852bs_addr_cam_mac_valid(target_mac) ||
+      sequence > K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK ||
+      frame_size < required)
+    {
+      return -EINVAL;
+    }
+
+  memset(frame, 0, required);
+
+  k1_rtl8852bs_write_le16(frame, K1_RTL8852BS_DATA_TODS_PROT_FC);
+  memcpy(frame + 4, bssid, 6);
+  memcpy(frame + 10, self_mac, 6);
+  memcpy(frame + 16, target_mac, 6);
+  k1_rtl8852bs_write_le16(frame + 22, (uint16_t)(sequence << 4));
+  offset = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
+
+  ret = k1_rtl8852bs_runtime_ccmp_header_build(
+    packet_number, 0u, frame + offset, K1_RTL8852BS_CCMP_HEADER_SIZE);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  offset += K1_RTL8852BS_CCMP_HEADER_SIZE;
+
+  memcpy(frame + offset, llc_snap, sizeof(llc_snap));
+  offset += sizeof(llc_snap);
+
+  /* The IPv4 header.  No options, so five words; identification zero and no
+   * fragment flags, which is what a datagram this small never needs; and the
+   * two addresses this exchange is about.
+   */
+
+  ip_offset = offset;
+  frame[ip_offset] = K1_RTL8852BS_IPV4_VERSION_IHL;
+  k1_rtl8852bs_write_be16(frame + ip_offset + 2,
+                          (uint16_t)(K1_RTL8852BS_IPV4_HEADER_SIZE +
+                                     K1_RTL8852BS_ICMP_HEADER_SIZE +
+                                     K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE));
+  frame[ip_offset + 8] = K1_RTL8852BS_IPV4_TTL;
+  frame[ip_offset + 9] = K1_RTL8852BS_IPV4_PROTO_ICMP;
+  k1_rtl8852bs_write_be32(frame + ip_offset + 12, source_ip);
+  k1_rtl8852bs_write_be32(frame + ip_offset + 16, target_ip);
+  offset += K1_RTL8852BS_IPV4_HEADER_SIZE;
+
+  icmp_offset = offset;
+  frame[icmp_offset] = K1_RTL8852BS_ICMP_ECHO_REQUEST;
+  k1_rtl8852bs_write_be16(frame + icmp_offset + 4, identifier);
+  k1_rtl8852bs_write_be16(frame + icmp_offset + 6, echo_sequence);
+  offset += K1_RTL8852BS_ICMP_HEADER_SIZE;
+
+  for (index = 0; index < K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE; index++)
+    {
+      frame[offset + index] = (uint8_t)(0x10u + index);
+    }
+
+  offset += K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE;
+  if (offset != required)
+    {
+      return -EIO;
+    }
+
+  k1_rtl8852bs_write_be16(
+    frame + ip_offset + 10,
+    k1_rtl8852bs_runtime_inet_fold(
+      k1_rtl8852bs_runtime_inet_sum(0u, frame + ip_offset,
+                                    K1_RTL8852BS_IPV4_HEADER_SIZE)));
+
+  /* The ICMP checksum covers the message and nothing else: no pseudo header,
+   * no addresses.  Zero is not a special value here as it is for UDP, so the
+   * fold goes in as it comes out.
+   */
+
+  checksum = k1_rtl8852bs_runtime_inet_fold(
+    k1_rtl8852bs_runtime_inet_sum(0u, frame + icmp_offset,
+                                  K1_RTL8852BS_ICMP_HEADER_SIZE +
+                                  K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE));
+  k1_rtl8852bs_write_be16(frame + icmp_offset + 2, checksum);
 
   *frame_length = required;
   *header_length = K1_RTL8852BS_IEEE80211_HEADER_SIZE;
@@ -23263,7 +23474,7 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, false,
-    0xc0a80101u, 0u, 0x321u, 3ull, &arp_length, &arp_header);
+    0xc0a80101u, 0u, false, 0x321u, 3ull, &arp_length, &arp_header);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -23309,19 +23520,19 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
-        false, 0u, 0u, 0x321u, 3ull, &arp_length,
+        false, 0u, 0u, false, 0x321u, 3ull, &arp_length,
         &arp_header) != -EINVAL ||
       k1_rtl8852bs_runtime_arp_probe_build(
         reply, arp_length - 1u, self, bssid, peer, false, 0xc0a80101u,
-        0u, 0x321u, 3ull, &arp_length, &arp_header) != -EINVAL ||
+        0u, false, 0x321u, 3ull, &arp_length, &arp_header) != -EINVAL ||
       k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer,
-        false, 0xc0a80101u, 0u,
+        false, 0xc0a80101u, 0u, false,
         K1_RTL8852BS_DATA_TXD_SEQUENCE_MASK + 1u, 3ull,
         &arp_length, &arp_header) != -EINVAL ||
       k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, NULL,
-        false, 0xc0a80101u, 0u, 0x321u, 3ull, &arp_length,
+        false, 0xc0a80101u, 0u, false, 0x321u, 3ull, &arp_length,
         &arp_header) != -EINVAL)
     {
       ret = -EIO;
@@ -23338,7 +23549,8 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, true,
-        0xc0a80101u, 0u, 0x321u, 3ull, &dl_length, &arp_header) < 0)
+        0xc0a80101u, 0u, false, 0x321u, 3ull, &dl_length,
+        &arp_header) < 0)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -23363,7 +23575,8 @@ int k1_rtl8852bs_fwdl_runtime_data_secure_tx_diagnostic(void)
 
   if (k1_rtl8852bs_runtime_arp_probe_build(
         reply, K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self, bssid, peer, false,
-        0xc0a80101u, 0u, 0x321u, 3ull, &arp_length, &arp_header) < 0)
+        0xc0a80101u, 0u, false, 0x321u, 3ull, &arp_length,
+        &arp_header) < 0)
     {
       ret = -EIO;
       stage = __LINE__;
@@ -26603,7 +26816,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
  * as an access point that said nothing.
  ****************************************************************************/
 
-#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       9000u
+#define K1_RTL8852BS_RESIDENT_WINDOW_MSEC       12000u
 #define K1_RTL8852BS_RESIDENT_PROBE_DELAY_MSEC  300u
 #define K1_RTL8852BS_RESIDENT_PROBE_GAP_MSEC    500u
 #define K1_RTL8852BS_RESIDENT_PROBE_ATTEMPTS    4u
@@ -26696,6 +26909,28 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 
 #define K1_RTL8852BS_RESIDENT_CLAIM_GAP_MSEC    700u
 #define K1_RTL8852BS_RESIDENT_CLAIM_ATTEMPTS    3u
+
+/* The first round trip above ARP, which is increment 4a, and the answering of
+ * requests it depends on.
+ *
+ * Four echo attempts seven tenths of a second apart, started once the claimed
+ * ARP round has finished so that the two rounds do not share a window's
+ * transmit queue while each is being read as a rate.  That is three seconds
+ * more than the claim round needed, which is why the window grew from nine
+ * seconds to twelve; nothing else in it changed, and every earlier round keeps
+ * the delay and gap it was measured with so that run 66's readings stay
+ * comparable.
+ *
+ * The serve limit bounds the answers, not the questions.  A window that hears
+ * thirty-two ARP requests could be asked for this station's address many
+ * times, and answering every one would spend the window transmitting instead
+ * of receiving; four is enough to show the answer goes out and is enough for
+ * any peer that needs one, because a peer whose entry is filled stops asking.
+ */
+
+#define K1_RTL8852BS_RESIDENT_PING_GAP_MSEC     700u
+#define K1_RTL8852BS_RESIDENT_PING_ATTEMPTS     4u
+#define K1_RTL8852BS_RESIDENT_SERVE_MAX         4u
 
 /* How much of the first protected data frame is kept.  Thirty-two bytes reach
  * past the longest header a QoS data frame from an access point can have and
@@ -27117,6 +27352,78 @@ struct k1_rtl8852bs_resident_count_s
   uint32_t arp_claim_acks;
   uint32_t arp_claim_spa;
   int arp_claim_status;
+
+  /* Answering, rather than asking.  run 66's window heard thirty-two ARP
+   * requests, at least one of them asking who holds 192.168.1.206 -- the very
+   * address the server had just acknowledged to this station -- and this port
+   * answered none of them.  RFC 826 makes answering a requirement and not a
+   * courtesy: a peer with no entry for this station cannot address a unicast
+   * datagram to it at all, so every exchange a peer wants to start with this
+   * station stalls before its first frame.
+   *
+   * arp_serve_requests counts only the requests for this station's own
+   * acknowledged address, which is what separates "nobody asked" from "asked
+   * and not answered".  arp_serve_pending is the one-deep queue between the
+   * observer, which sees the request while draining the receive FIFO, and the
+   * window loop, which is the only place allowed to transmit.  One deep is
+   * enough: a second asker that goes unanswered asks again, and a real queue
+   * would only delay the answer that matters.
+   */
+
+  uint32_t arp_serve_requests;
+  uint32_t arp_serve_sent;
+  uint32_t arp_serve_bytes;
+  uint32_t arp_serve_peer_ip;
+  uint8_t arp_serve_mac[6];
+  bool arp_serve_pending;
+  int arp_serve_status;
+
+  /* The first exchange whose answer has to come out of a peer's IP stack.  An
+   * ARP reply proves two stations can reach each other and that the pairwise
+   * key works in both directions, but it says nothing about the address
+   * itself: ARP carries it as an opaque field, and a host answers a request
+   * for an address whoever was told to hold it.  An echo reply cannot be
+   * produced without the peer accepting a datagram addressed to it, looking up
+   * its source and addressing a new datagram back, so it is the first evidence
+   * that the address the server acknowledged is usable.
+   *
+   * icmp_echo_mask has one bit per echo sequence number, set when a reply
+   * carrying that sequence arrives.  Attribution is exact here, unlike in the
+   * two ARP rounds: the sequence number travels in the request and has to come
+   * back unchanged, so a reply says which attempt it answers instead of the
+   * window having to guess from timing.
+   *
+   * That exactness is why the attempts alternate between two hosts rather than
+   * asking one of them four times.  Every earlier round kept its target fixed
+   * because its attribution was a guess from timing, and two targets would
+   * have made a rate meaningless; here the mask says which host answered, so
+   * asking both costs nothing and covers the one outcome a single target
+   * cannot separate -- a host that simply does not answer echoes, which is
+   * common enough to be the default on some stacks, would otherwise read as
+   * this port's own IP layer failing.  icmp_echo_target and icmp_echo_mac are
+   * the even attempts' host and icmp_echo_alt the odd attempts' address, and
+   * icmp_echo_reply_src is where an answer actually came from -- which differs
+   * from both if something answers on another host's behalf.
+   *
+   * icmp_echo_reply_bad counts replies that carried this port's identifier but
+   * failed their own checksum or a sequence number never sent.  A wrong answer
+   * is a different finding from no answer, and folding the two together would
+   * hide a receive path that hands up a damaged payload.
+   */
+
+  uint32_t icmp_echo_attempts;
+  uint32_t icmp_echo_bytes;
+  uint32_t icmp_echo_sequence;
+  uint32_t icmp_echo_target;
+  uint32_t icmp_echo_alt;
+  uint32_t icmp_echo_mask;
+  uint32_t icmp_echo_replies;
+  uint32_t icmp_echo_reply_bad;
+  uint32_t icmp_echo_reply_src;
+  uint32_t icmp_echo_reply_id;
+  uint32_t icmp_echo_reply_seq;
+  uint8_t icmp_echo_mac[6];
+  int icmp_echo_status;
 
   /* What the access point's own Beacons say is waiting for this station.
    * This reading costs no transmitted frame: the window already receives the
@@ -28122,7 +28429,11 @@ static void k1_rtl8852bs_runtime_resident_observe_network(
   };
 
   size_t offset;
+  size_t ip_header_length;
+  size_t icmp_offset;
+  size_t icmp_length;
   uint32_t sender_ip;
+  uint32_t target_ip;
   uint16_t ethertype;
   uint16_t operation;
 
@@ -28166,6 +28477,68 @@ static void k1_rtl8852bs_runtime_resident_observe_network(
           count->ipv4_peer_valid = true;
         }
 
+      /* An answer to this window's own echo request.  Three fields have to
+       * agree before a datagram counts as one: the protocol, the destination,
+       * which must be the address the server acknowledged to this station, and
+       * the identifier, which is this port's own and separates its echoes from
+       * any other host's on the same subnet.
+       *
+       * The header length is read rather than assumed.  This port sends
+       * twenty-byte headers, but the answer is written by somebody else's
+       * stack, and a header carrying options would put the ICMP message four
+       * or more bytes further along -- read at the wrong offset, a good reply
+       * would be counted as a damaged one.
+       */
+
+      ip_header_length = (size_t)(payload[offset] & 0x0fu) * 4u;
+      target_ip = k1_rtl8852bs_read_be32(payload + offset + 16);
+      if (count->dhcp_ack_ip == 0 || target_ip != count->dhcp_ack_ip ||
+          payload[offset + 9] != K1_RTL8852BS_IPV4_PROTO_ICMP ||
+          ip_header_length < K1_RTL8852BS_IPV4_HEADER_SIZE ||
+          payload_length < offset + ip_header_length +
+                           K1_RTL8852BS_ICMP_HEADER_SIZE)
+        {
+          return;
+        }
+
+      icmp_offset = offset + ip_header_length;
+      if (payload[icmp_offset] != K1_RTL8852BS_ICMP_ECHO_REPLY ||
+          k1_rtl8852bs_read_be16(payload + icmp_offset + 4) !=
+          K1_RTL8852BS_ICMP_ECHO_IDENTIFIER)
+        {
+          return;
+        }
+
+      /* The length the sender says the datagram is, clamped to what actually
+       * arrived.  An echo reply has to return the request's payload, so the
+       * checksum is over the whole message and a short frame would fold to
+       * something else -- which is a damaged answer and is counted as one.
+       */
+
+      icmp_length = (size_t)k1_rtl8852bs_read_be16(payload + offset + 2);
+      if (icmp_length <= ip_header_length ||
+          icmp_offset + (icmp_length - ip_header_length) > payload_length)
+        {
+          count->icmp_echo_reply_bad++;
+          return;
+        }
+
+      icmp_length -= ip_header_length;
+      if (k1_rtl8852bs_runtime_inet_fold(
+            k1_rtl8852bs_runtime_inet_sum(0u, payload + icmp_offset,
+                                          icmp_length)) != 0)
+        {
+          count->icmp_echo_reply_bad++;
+          return;
+        }
+
+      count->icmp_echo_replies++;
+      count->icmp_echo_reply_src = sender_ip;
+      count->icmp_echo_reply_id =
+        (uint32_t)k1_rtl8852bs_read_be16(payload + icmp_offset + 4);
+      count->icmp_echo_reply_seq =
+        (uint32_t)k1_rtl8852bs_read_be16(payload + icmp_offset + 6);
+      count->icmp_echo_mask |= 1u << (count->icmp_echo_reply_seq & 0x1fu);
       return;
     }
 
@@ -28198,6 +28571,38 @@ static void k1_rtl8852bs_runtime_resident_observe_network(
   if (operation == K1_RTL8852BS_ARP_OP_REQUEST)
     {
       count->arp_requests++;
+
+      /* A request for the address this station was given, which RFC 826 says
+       * a host holding that address has to answer.  run 66 counted thirty-two
+       * requests in one window and at least one of them was this: somebody on
+       * this subnet asking who holds 192.168.1.206 while this port stayed
+       * silent, which leaves that peer unable to address a single unicast
+       * datagram here.
+       *
+       * The asker's own address and hardware address are what the answer needs
+       * -- an ARP reply is addressed back to the sender of the request -- and
+       * they are taken from the payload rather than from the frame's third
+       * address so that a request relayed by the access point still names the
+       * station that asked.  A request whose sender protocol address is zero
+       * is a probe of the kind this port itself sent in run 66 and has no
+       * address to answer to, so it is counted and not queued.
+       */
+
+      target_ip = k1_rtl8852bs_read_be32(payload + offset +
+                                         K1_RTL8852BS_ARP_TARGET_IP_OFFSET);
+      if (count->dhcp_ack_ip != 0 && target_ip == count->dhcp_ack_ip &&
+          sender_ip != 0 &&
+          k1_rtl8852bs_addr_cam_mac_valid(payload + offset +
+                                          K1_RTL8852BS_ARP_SENDER_HW_OFFSET) &&
+          memcmp(payload + offset + K1_RTL8852BS_ARP_SENDER_HW_OFFSET,
+                 self_mac, 6) != 0)
+        {
+          count->arp_serve_requests++;
+          memcpy(count->arp_serve_mac,
+                 payload + offset + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, 6);
+          count->arp_serve_peer_ip = sender_ip;
+          count->arp_serve_pending = true;
+        }
     }
 
   /* The answer to this window's own probe.  The probe went out with a sender
@@ -28243,7 +28648,8 @@ static void k1_rtl8852bs_runtime_resident_observe_network(
  *
  * Description:
  *   Check the network observer in memory, before the window hands it a frame
- *   off the air, against six payloads built here.
+ *   off the air, against ten payloads built here, and then the echo request
+ *   this port transmits, before any of it is sent.
  *
  *   The observer is what decides which station a protected ARP request is
  *   aimed at and whether an answer came back, so a mistake in it would either
@@ -28252,13 +28658,32 @@ static void k1_rtl8852bs_runtime_resident_observe_network(
  *   settle.  Feeding it payloads whose right answers are written out here is
  *   the only way to tell those apart without an access point.
  *
- *   The six are: a request from a station, a reply addressed back to this
- *   host, an IPv4 datagram, a payload with an ethertype the observer does not
- *   claim, a payload with no LLC/SNAP header at all, and a reply addressed to
- *   somebody else.  The fifth must not be counted at all, the sixth must be
+ *   The first six are: a request from a station, a reply addressed back to
+ *   this host, an IPv4 datagram, a payload with an ethertype the observer does
+ *   not claim, a payload with no LLC/SNAP header at all, and a reply addressed
+ *   to somebody else.  The fifth must not be counted at all, the sixth must be
  *   counted as traffic but must not be counted as an answer, and the first
  *   must keep its place as the learned station even though the second and the
  *   third arrive after it.
+ *
+ *   Four more cover what increment 4a added.  A request for this station's own
+ *   address has to be recognised and the asker taken from inside the payload
+ *   rather than from the frame's third address, which the payload deliberately
+ *   disagrees with.  Then three echo replies: one correct, one carrying
+ *   another host's identifier, and one carrying this port's identifier with a
+ *   checksum that no longer holds.  The first must be counted as an answer,
+ *   the second must be ignored outright, and the third must be counted apart
+ *   as damaged -- because a damaged answer and no answer are different
+ *   findings, and another host's echo traffic must never be read as this
+ *   port's round trip completing.
+ *
+ *   The eleventh stage runs the other way and checks the request builder's own
+ *   output: the frame control and three addresses, the ethertype, the IPv4
+ *   total length, time to live and protocol, and both checksums.  Nothing on
+ *   the path out verifies those two checksums, so a wrong one is dropped in
+ *   silence by the peer -- indistinguishable, from here, from a peer that does
+ *   not answer echoes at all.  Checking them here is what leaves a silent
+ *   round with one explanation instead of two.
  *
  * Returned Value:
  *   OK when every counter matched, a negated errno otherwise.
@@ -28295,8 +28720,13 @@ static int k1_rtl8852bs_runtime_resident_network_selftest(void)
   FAR struct k1_rtl8852bs_resident_count_s *count;
   FAR uint8_t *payload;
   FAR uint8_t *arp;
+  FAR uint8_t *echo;
+  FAR uint8_t *ipv4;
   size_t body;
   size_t length;
+  size_t echo_length;
+  size_t built_length;
+  uint8_t built_header;
   int stage = 0;
   int ret;
 
@@ -28484,6 +28914,185 @@ static int k1_rtl8852bs_runtime_resident_network_selftest(void)
       goto errout;
     }
 
+  /* From here on the counters need an address this station is supposed to
+   * hold, because that is what the two new readings are about: a request for
+   * it has to be answered, and an echo reply addressed to anything else is not
+   * this port's.  Nothing before this point depended on it being zero.
+   */
+
+  count->dhcp_ack_ip = 0xc0a801ceu;
+
+  /* Seven: a request for this station's own address, which is the frame run 66
+   * heard thirty-two times and answered none of.  The frame's third address is
+   * one station and the ARP sender is another, which is the discriminating
+   * part: an answer has to go back to the station named inside the payload,
+   * and taking the address from the frame instead would answer the wrong host.
+   */
+
+  k1_rtl8852bs_write_be16(arp + 6, K1_RTL8852BS_ARP_OP_REQUEST);
+  memcpy(arp + K1_RTL8852BS_ARP_SENDER_HW_OFFSET, other, 6);
+  k1_rtl8852bs_write_be32(arp + K1_RTL8852BS_ARP_SENDER_IP_OFFSET,
+                          0xc0a8010au);
+  memset(arp + K1_RTL8852BS_ARP_TARGET_HW_OFFSET, 0, 6);
+  k1_rtl8852bs_write_be32(arp + K1_RTL8852BS_ARP_TARGET_IP_OFFSET,
+                          0xc0a801ceu);
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, count);
+
+  if (count->net_frames != 6 || count->net_arp != 4 ||
+      count->arp_requests != 2 || count->arp_serve_requests != 1 ||
+      !count->arp_serve_pending ||
+      count->arp_serve_peer_ip != 0xc0a8010au ||
+      memcmp(count->arp_serve_mac, other, 6) != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Eight: an answer to this window's own echo request, which is the frame the
+   * whole increment exists to receive.  Its checksum is computed here the same
+   * way a peer would compute it, so a mistake in the verifier shows up as this
+   * stage failing rather than as a good answer being counted as damaged.
+   */
+
+  memset(payload + body, 0, K1_RTL8852BS_RESIDENT_FRAME_MAX - body);
+  memcpy(payload + body, llc_arp, sizeof(llc_arp));
+  k1_rtl8852bs_write_be16(payload + body + 6, K1_RTL8852BS_ETHERTYPE_IPV4);
+  arp = payload + body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+  arp[0] = K1_RTL8852BS_IPV4_VERSION_IHL;
+  k1_rtl8852bs_write_be16(arp + 2,
+                          (uint16_t)(K1_RTL8852BS_IPV4_HEADER_SIZE +
+                                     K1_RTL8852BS_ICMP_HEADER_SIZE +
+                                     K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE));
+  arp[8] = K1_RTL8852BS_IPV4_TTL;
+  arp[9] = K1_RTL8852BS_IPV4_PROTO_ICMP;
+  k1_rtl8852bs_write_be32(arp + 12, 0xc0a80102u);
+  k1_rtl8852bs_write_be32(arp + 16, 0xc0a801ceu);
+  echo = arp + K1_RTL8852BS_IPV4_HEADER_SIZE;
+  echo[0] = K1_RTL8852BS_ICMP_ECHO_REPLY;
+  k1_rtl8852bs_write_be16(echo + 4, K1_RTL8852BS_ICMP_ECHO_IDENTIFIER);
+  k1_rtl8852bs_write_be16(echo + 6, 2u);
+  echo_length = K1_RTL8852BS_ICMP_HEADER_SIZE +
+                K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE;
+  k1_rtl8852bs_write_be16(
+    echo + 2, k1_rtl8852bs_runtime_inet_fold(
+                k1_rtl8852bs_runtime_inet_sum(0u, echo, echo_length)));
+  length = body + K1_RTL8852BS_LLC_SNAP_HEADER_SIZE +
+           K1_RTL8852BS_IPV4_HEADER_SIZE + echo_length;
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, count);
+
+  if (count->net_frames != 7 || count->net_ipv4 != 2 ||
+      count->icmp_echo_replies != 1 || count->icmp_echo_reply_bad != 0 ||
+      count->icmp_echo_mask != 0x4u ||
+      count->icmp_echo_reply_src != 0xc0a80102u ||
+      count->icmp_echo_reply_id != K1_RTL8852BS_ICMP_ECHO_IDENTIFIER ||
+      count->icmp_echo_reply_seq != 2u)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Nine: the same answer carrying somebody else's identifier.  It has to be
+   * ignored outright -- not counted as an answer and not counted as a damaged
+   * one -- because another host's echo traffic on the same subnet would
+   * otherwise be read as this port's round trip completing.
+   */
+
+  k1_rtl8852bs_write_be16(echo + 4, 0x1234u);
+  k1_rtl8852bs_write_be16(echo + 2, 0u);
+  k1_rtl8852bs_write_be16(
+    echo + 2, k1_rtl8852bs_runtime_inet_fold(
+                k1_rtl8852bs_runtime_inet_sum(0u, echo, echo_length)));
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, count);
+
+  if (count->net_frames != 8 || count->net_ipv4 != 3 ||
+      count->icmp_echo_replies != 1 || count->icmp_echo_reply_bad != 0 ||
+      count->icmp_echo_mask != 0x4u)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Ten: this port's identifier put back while the checksum stage nine left
+   * behind stays, so the message no longer sums to zero.  This one is counted,
+   * and counted apart: an answer that arrives damaged says the round trip
+   * happened and that something on the way changed it, which is a different
+   * thing to look at than silence.
+   */
+
+  k1_rtl8852bs_write_be16(echo + 4, K1_RTL8852BS_ICMP_ECHO_IDENTIFIER);
+  k1_rtl8852bs_runtime_resident_observe_network(
+    payload, length, K1_RTL8852BS_IEEE80211_HEADER_SIZE, self, count);
+
+  if (count->net_frames != 9 || count->net_ipv4 != 4 ||
+      count->icmp_echo_replies != 1 || count->icmp_echo_reply_bad != 1 ||
+      count->icmp_echo_mask != 0x4u)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
+  /* Eleven, and the other direction: the echo request this port transmits,
+   * checked field by field before any of it is sent.  Both checksums in it
+   * are computed by this host and neither is checked by anything on the way
+   * out -- a peer that finds one wrong drops the datagram in silence, which
+   * is precisely what a peer that does not answer echoes looks like.
+   * Verifying them here is what keeps a silent round from having two
+   * explanations.
+   */
+
+  ret = k1_rtl8852bs_runtime_icmp_echo_build(
+    payload, K1_RTL8852BS_RESIDENT_FRAME_MAX, self, bssid, peer, 0xc0a801ceu,
+    0xc0a80102u, K1_RTL8852BS_ICMP_ECHO_IDENTIFIER, 5u, 0x222u, 9ull,
+    &built_length, &built_header);
+  if (ret < 0)
+    {
+      stage = __LINE__;
+      goto errout;
+    }
+
+  ipv4 = payload + K1_RTL8852BS_IEEE80211_HEADER_SIZE +
+         K1_RTL8852BS_CCMP_HEADER_SIZE +
+         K1_RTL8852BS_LLC_SNAP_HEADER_SIZE;
+  echo = ipv4 + K1_RTL8852BS_IPV4_HEADER_SIZE;
+  echo_length = K1_RTL8852BS_ICMP_HEADER_SIZE +
+                K1_RTL8852BS_ICMP_ECHO_PAYLOAD_SIZE;
+
+  if (built_length != (size_t)(echo - payload) + echo_length ||
+      built_header != K1_RTL8852BS_IEEE80211_HEADER_SIZE ||
+      k1_rtl8852bs_read_le16(payload) != K1_RTL8852BS_DATA_TODS_PROT_FC ||
+      memcmp(payload + 4, bssid, 6) != 0 ||
+      memcmp(payload + 10, self, 6) != 0 ||
+      memcmp(payload + 16, peer, 6) != 0 ||
+      k1_rtl8852bs_read_be16(ipv4 - 2) != K1_RTL8852BS_ETHERTYPE_IPV4 ||
+      ipv4[0] != K1_RTL8852BS_IPV4_VERSION_IHL ||
+      k1_rtl8852bs_read_be16(ipv4 + 2) !=
+      K1_RTL8852BS_IPV4_HEADER_SIZE + echo_length ||
+      ipv4[8] != K1_RTL8852BS_IPV4_TTL ||
+      ipv4[9] != K1_RTL8852BS_IPV4_PROTO_ICMP ||
+      k1_rtl8852bs_read_be32(ipv4 + 12) != 0xc0a801ceu ||
+      k1_rtl8852bs_read_be32(ipv4 + 16) != 0xc0a80102u ||
+      k1_rtl8852bs_runtime_inet_fold(
+        k1_rtl8852bs_runtime_inet_sum(
+          0u, ipv4, K1_RTL8852BS_IPV4_HEADER_SIZE)) != 0 ||
+      echo[0] != K1_RTL8852BS_ICMP_ECHO_REQUEST || echo[1] != 0 ||
+      k1_rtl8852bs_read_be16(echo + 4) !=
+      K1_RTL8852BS_ICMP_ECHO_IDENTIFIER ||
+      k1_rtl8852bs_read_be16(echo + 6) != 5u ||
+      k1_rtl8852bs_runtime_inet_fold(
+        k1_rtl8852bs_runtime_inet_sum(0u, echo, echo_length)) != 0)
+    {
+      ret = -EIO;
+      stage = __LINE__;
+      goto errout;
+    }
+
   ret = OK;
 
 errout:
@@ -28509,6 +29118,18 @@ errout:
   k1_early_puthex(count->arp_peer_target_ip);
   k1_early_puts(" ip-peer-ip=");
   k1_early_puthex(count->ipv4_peer_ip);
+  k1_early_puts(" serve=");
+  k1_early_puthex(count->arp_serve_requests);
+  k1_early_puts(" serve-ip=");
+  k1_early_puthex(count->arp_serve_peer_ip);
+  k1_early_puts(" echo=");
+  k1_early_puthex(count->icmp_echo_replies);
+  k1_early_puts(" echo-bad=");
+  k1_early_puthex(count->icmp_echo_reply_bad);
+  k1_early_puts(" echo-mask=");
+  k1_early_puthex(count->icmp_echo_mask);
+  k1_early_puts(" echo-seq=");
+  k1_early_puthex(count->icmp_echo_reply_seq);
   k1_early_puts(" stage=");
   k1_early_puthex((uintreg_t)stage);
   k1_early_puts(" status=");
@@ -28734,7 +29355,7 @@ static int k1_rtl8852bs_runtime_loopback_selftest(void)
 
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     plain, K1_RTL8852BS_RESIDENT_FRAME_MAX, self, bssid, peer, false,
-    0xc0a80101u, 0u, 0x222u, 5ull, &plain_length, &header_length);
+    0xc0a80101u, 0u, false, 0x222u, 5ull, &plain_length, &header_length);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -29977,7 +30598,7 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid,
     broadcast_form ? broadcast : target_mac, false, target_ip, sender_ip,
-    sequence, packet_number, &frame_length, &header_length);
+    false, sequence, packet_number, &frame_length, &header_length);
   if (ret < 0)
     {
       goto done;
@@ -30033,6 +30654,380 @@ static int k1_rtl8852bs_runtime_resident_arp_tx(
    * drained in, which for a frame whose answer arrives in milliseconds matters
    * more here than there.
    */
+
+  for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
+    {
+      if (k1_rtl8852bs_data_tx_resources_read(
+            K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &after_res) != OK ||
+          after_res.channel_used_pages == before_res.channel_used_pages)
+        {
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  ret = OK;
+
+done:
+  kmm_free(packet);
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_arp_serve_tx
+ *
+ * Description:
+ *   Answer one ARP request for the address a server acknowledged to this
+ *   station, with a protected ARP reply addressed back to the station that
+ *   asked.
+ *
+ *   Everything this port has transmitted until now has been a question.  This
+ *   is the first frame it sends because somebody else asked for one, and it is
+ *   what the rest of the network needs before it can start anything with this
+ *   station: RFC 826 requires a host to answer requests for an address it
+ *   holds, and a peer whose neighbour entry stays empty cannot address any
+ *   unicast datagram here at all.  run 66's window heard thirty-two ARP
+ *   requests, at least one of them for this station's own address, and
+ *   answered none of them.
+ *
+ *   The frame is the claimed round's frame with two fields changed: operation
+ *   two instead of one, and the target hardware address filled in with the
+ *   asker rather than left zero.  The distribution-system address is the asker
+ *   too, so the access point bridges the answer to exactly the station that
+ *   asked, and address 1 stays the access point, which is what makes the reply
+ *   protected with the pairwise key the claimed round has already proved works
+ *   in this direction.
+ *
+ * Input Parameters:
+ *   self_mac - the eFuse self MAC: address 2 and the sender hardware address
+ *   bssid    - the access point, which is address 1
+ *   count    - the window's counters, which hold the queued asker and record
+ *              what was transmitted
+ *
+ * Returned Value:
+ *   OK when the frame was written into the queue, a negated errno otherwise.
+ *   -EADDRNOTAVAIL when there is no queued asker or no acknowledged address to
+ *   answer from, neither of which is a failure of anything this function does.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_arp_serve_tx(
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  struct k1_rtl8852bs_tx_security_s security =
+    {
+      .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+      .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE
+    };
+
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_resources_s before_res;
+  struct k1_rtl8852bs_data_tx_resources_s after_res;
+  FAR uint8_t *packet;
+  size_t frame_length = 0;
+  unsigned int drained;
+  uint16_t sequence;
+  uint8_t header_length = 0;
+  int ret;
+
+  if (!count->arp_serve_pending || count->arp_serve_peer_ip == 0 ||
+      count->dhcp_ack_ip == 0 ||
+      !k1_rtl8852bs_addr_cam_mac_valid(count->arp_serve_mac))
+    {
+      return -EADDRNOTAVAIL;
+    }
+
+  packet = kmm_malloc(K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                      K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+  if (packet == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  memset(packet, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+
+  ret = k1_rtl8852bs_runtime_arp_probe_build(
+    packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid,
+    count->arp_serve_mac, false, count->arp_serve_peer_ip,
+    count->dhcp_ack_ip, true, sequence,
+    k1_rtl8852bs_runtime_tx_packet_number_next(), &frame_length,
+    &header_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, sequence, header_length,
+    K1_RTL8852BS_TXRPT_TAG_ARP_SERVE, &security, packet,
+    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  k1_rtl8852bs_runtime_sch_tx_en_data();
+
+  ret = k1_rtl8852bs_data_tx_resources_read(
+    K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &before_res);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  if (before_res.channel_used_pages +
+      layout.required_wde_pages > before_res.channel_max_pages ||
+      before_res.wp_available_pages <
+      layout.required_ple_pages + K1_RTL8852BS_DATA_TX_PLE_RESERVE)
+    {
+      ret = -ENOSPC;
+      goto done;
+    }
+
+  ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
+                           layout.transfer_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* The queue is cleared only once the frame is written.  A build or resource
+   * failure leaves the asker queued so the next iteration tries again, which
+   * is the behaviour that matters for a frame somebody is waiting on.
+   */
+
+  count->arp_serve_sent++;
+  count->arp_serve_bytes = (uint32_t)frame_length;
+  count->arp_serve_pending = false;
+
+  for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
+    {
+      if (k1_rtl8852bs_data_tx_resources_read(
+            K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &after_res) != OK ||
+          after_res.channel_used_pages == before_res.channel_used_pages)
+        {
+          break;
+        }
+
+      up_udelay(K1_RTL8852BS_MGMT_TX_DRAIN_USEC);
+    }
+
+  ret = OK;
+
+done:
+  kmm_free(packet);
+  return ret;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_icmp_tx
+ *
+ * Description:
+ *   Transmit one CCMP-protected ICMP echo request from the address a server
+ *   acknowledged, on the same queue and through the same submitter as every
+ *   other data frame this window sends.
+ *
+ *   This is the first frame whose answer has to be produced by a peer's IP
+ *   stack rather than by the access point or by a kernel's ARP module.  What
+ *   the port can already show is that a protected request leaves it, that the
+ *   access point decrypts it, that it reaches a host on the subnet and that
+ *   the host answers back to this station -- run 66 did that three times out
+ *   of three.  What it cannot show is that the address the server handed out
+ *   is usable, because ARP treats an address as an opaque field and any host
+ *   owning it answers no matter who was told to hold it.  An echo reply is the
+ *   smallest exchange that cannot happen without a peer accepting a datagram
+ *   addressed to this station's address and routing one back to it.
+ *
+ *   Two hosts are asked, on alternating attempts.  The even attempts go to the
+ *   host that served DHCP, whose address and hardware address both came out of
+ *   one received frame and which is a router, so answering an echo is a
+ *   function it implements; the odd ones go to the host that answered the
+ *   claimed ARP round, which is proved reachable in both directions but may be
+ *   any kind of station and may well drop echoes by policy.  Either address
+ *   alone would leave a silent round ambiguous between this port's own IP
+ *   layer and a host that does not answer; with both, and with the echo
+ *   sequence number coming back inside the reply, the mask says which of the
+ *   two answered and the ambiguity is gone.  When only one candidate exists
+ *   both parities use it rather than half the attempts being skipped.
+ *
+ * Input Parameters:
+ *   self_mac - the eFuse self MAC, address 2
+ *   bssid    - the access point, which is address 1
+ *   attempt  - which of the window's attempts this is.  It is also the echo
+ *              sequence number, which is what an answer carries back, and its
+ *              low bit chooses between the two hosts
+ *   count    - the window's counters, which hold both candidates and record
+ *              what was transmitted
+ *
+ * Returned Value:
+ *   OK when the frame was written into the queue, a negated errno otherwise.
+ *   -EADDRNOTAVAIL when no address has been acknowledged or no host is known
+ *   to ask, neither of which is a failure of anything this function does.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_icmp_tx(
+  FAR const uint8_t *self_mac, FAR const uint8_t *bssid, unsigned int attempt,
+  FAR struct k1_rtl8852bs_resident_count_s *count)
+{
+  struct k1_rtl8852bs_tx_security_s security =
+    {
+      .sec_type = K1_RTL8852BS_SEC_CAM_ENC_CCMP128,
+      .sec_cam_index = K1_RTL8852BS_SEC_CAM_INDEX_PAIRWISE
+    };
+
+  struct k1_rtl8852bs_data_tx_layout_s layout;
+  struct k1_rtl8852bs_data_tx_resources_s before_res;
+  struct k1_rtl8852bs_data_tx_resources_s after_res;
+  FAR const uint8_t *primary_mac = NULL;
+  FAR const uint8_t *alt_mac = NULL;
+  FAR const uint8_t *target_mac;
+  FAR uint8_t *packet;
+  size_t frame_length = 0;
+  unsigned int drained;
+  uint16_t sequence;
+  uint8_t header_length = 0;
+  uint32_t primary_ip = 0;
+  uint32_t alt_ip = 0;
+  uint32_t target_ip;
+  int ret;
+
+  if (count->dhcp_ack_ip == 0)
+    {
+      return -EADDRNOTAVAIL;
+    }
+
+  /* The DHCP server, taken as a pair out of one frame: its address from the
+   * datagram's source and its hardware address from that frame's third
+   * address.  Both halves have to come from the same frame, because an address
+   * learned from one place and a hardware address from another would be a
+   * guess that the two belong together.
+   */
+
+  if (count->dhcp_server_mac_valid && count->dhcp_server_source != 0 &&
+      k1_rtl8852bs_addr_cam_mac_valid(count->dhcp_server_mac))
+    {
+      primary_ip = count->dhcp_server_source;
+      primary_mac = count->dhcp_server_mac;
+    }
+
+  if (count->arp_reply_valid && count->arp_reply_ip != 0 &&
+      k1_rtl8852bs_addr_cam_mac_valid(count->arp_reply_mac))
+    {
+      alt_ip = count->arp_reply_ip;
+      alt_mac = count->arp_reply_mac;
+    }
+
+  if (primary_mac == NULL)
+    {
+      primary_ip = alt_ip;
+      primary_mac = alt_mac;
+    }
+  else if (alt_mac == NULL)
+    {
+      alt_ip = primary_ip;
+      alt_mac = primary_mac;
+    }
+
+  if (primary_mac == NULL)
+    {
+      return -EADDRNOTAVAIL;
+    }
+
+  if ((attempt & 1u) != 0)
+    {
+      target_ip = alt_ip;
+      target_mac = alt_mac;
+    }
+  else
+    {
+      target_ip = primary_ip;
+      target_mac = primary_mac;
+    }
+
+  if (target_ip == count->dhcp_ack_ip)
+    {
+      return -EADDRNOTAVAIL;
+    }
+
+  packet = kmm_malloc(K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                      K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+  if (packet == NULL)
+    {
+      return -ENOMEM;
+    }
+
+  memset(packet, 0, K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE +
+                    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX);
+
+  sequence = k1_rtl8852bs_runtime_mgmt_sequence_next();
+
+  ret = k1_rtl8852bs_runtime_icmp_echo_build(
+    packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
+    K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, target_mac,
+    count->dhcp_ack_ip, target_ip, K1_RTL8852BS_ICMP_ECHO_IDENTIFIER,
+    (uint16_t)attempt, sequence,
+    k1_rtl8852bs_runtime_tx_packet_number_next(), &frame_length,
+    &header_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  ret = k1_rtl8852bs_runtime_data_secure_tx_build(
+    frame_length, sequence, header_length,
+    K1_RTL8852BS_TXRPT_TAG_ICMP_ECHO, &security, packet,
+    K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE, &layout);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  k1_rtl8852bs_runtime_sch_tx_en_data();
+
+  ret = k1_rtl8852bs_data_tx_resources_read(
+    K1_RTL8852BS_DATA_TXD_CH_DMA_B0BE, &before_res);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  if (before_res.channel_used_pages +
+      layout.required_wde_pages > before_res.channel_max_pages ||
+      before_res.wp_available_pages <
+      layout.required_ple_pages + K1_RTL8852BS_DATA_TX_PLE_RESERVE)
+    {
+      ret = -ENOSPC;
+      goto done;
+    }
+
+  ret = k1_sdio_wifi_write(1, layout.fifo_address, false, packet,
+                           layout.transfer_length);
+  if (ret < 0)
+    {
+      goto done;
+    }
+
+  /* Both candidates are recorded once, with the first attempt, so the report
+   * names the pair that was asked even after later attempts have gone out.
+   */
+
+  if (count->icmp_echo_attempts == 0)
+    {
+      count->icmp_echo_target = primary_ip;
+      count->icmp_echo_alt = alt_ip;
+      memcpy(count->icmp_echo_mac, primary_mac, 6);
+    }
+
+  count->icmp_echo_attempts++;
+  count->icmp_echo_bytes = (uint32_t)frame_length;
+  count->icmp_echo_sequence = sequence;
 
   for (drained = 0; drained < K1_RTL8852BS_MGMT_TX_DRAIN_POLL; drained++)
     {
@@ -30588,7 +31583,7 @@ static int k1_rtl8852bs_runtime_loopback_downlink_probe(
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, bssid, true,
-    K1_RTL8852BS_LOOPBACK_TARGET_IP, 0u, sequence, packet_number,
+    K1_RTL8852BS_LOOPBACK_TARGET_IP, 0u, false, sequence, packet_number,
     &frame_length, &header_length);
   if (ret < 0)
     {
@@ -30921,8 +31916,8 @@ static int k1_rtl8852bs_runtime_secure_loopback_readback(
   ret = k1_rtl8852bs_runtime_arp_probe_build(
     packet + K1_RTL8852BS_MGMT_TX_DESCRIPTOR_SIZE,
     K1_RTL8852BS_DATA_SECURE_TX_FRAME_MAX, self_mac, bssid, broadcast,
-    false, K1_RTL8852BS_LOOPBACK_TARGET_IP, 0u, sequence, packet_number,
-    &frame_length, &header_length);
+    false, K1_RTL8852BS_LOOPBACK_TARGET_IP, 0u, false, sequence,
+    packet_number, &frame_length, &header_length);
   if (ret < 0)
     {
       stage = __LINE__;
@@ -31272,6 +32267,8 @@ static int k1_rtl8852bs_runtime_resident_window(
   clock_t request_deadline = 0;
   unsigned int claim_attempts = 0;
   clock_t claim_deadline = 0;
+  unsigned int ping_attempts = 0;
+  clock_t ping_deadline = 0;
   uint32_t arp_trip_seen = 0;
   int arp_trip_last = -1;
   bool arp_trip_last_claimed = false;
@@ -31733,6 +32730,94 @@ static int k1_rtl8852bs_runtime_resident_window(
             }
 
           claim_attempts++;
+        }
+
+      /* Answering, which nothing before this increment did.  This gate carries
+       * no timer of its own: a request is answered on the first iteration
+       * after the observer queued it, because an asker is waiting and the
+       * worth of the answer decays inside a second or two.  What is bounded is
+       * how many answers one window sends, not how fast it sends them.
+       */
+
+      if (g_k1_rtl8852bs_key_install.tk_installed &&
+          count.arp_serve_pending &&
+          count.arp_serve_sent < K1_RTL8852BS_RESIDENT_SERVE_MAX)
+        {
+          ret = k1_rtl8852bs_runtime_resident_arp_serve_tx(self_mac, bssid,
+                                                           &count);
+          count.arp_serve_status = ret;
+
+          k1_early_puts("K1 Wi-Fi GPL: resident arp serve tx bytes=");
+          k1_early_puthex(count.arp_serve_bytes);
+          k1_early_puts(" tag=");
+          k1_early_puthex(K1_RTL8852BS_TXRPT_TAG_ARP_SERVE);
+          k1_early_puts(" spa=");
+          k1_early_puthex(count.dhcp_ack_ip);
+          k1_early_puts(" tpa=");
+          k1_early_puthex(count.arp_serve_peer_ip);
+          k1_early_puts(" a3=");
+          k1_early_puthex(k1_rtl8852bs_read_be32(count.arp_serve_mac + 2));
+          k1_early_puts(" pn=");
+          k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
+          k1_early_puts(" requests=");
+          k1_early_puthex(count.arp_serve_requests);
+          k1_early_puts(" sent=");
+          k1_early_puthex(count.arp_serve_sent);
+          k1_early_puts(" status=");
+          k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts("\r\n");
+        }
+
+      /* And the first question asked above ARP.  It waits for the claimed
+       * round to finish -- or to be ruled out for want of a host to ask --
+       * because both rounds are read as rates out of one window, and frames of
+       * one round going out between attempts of the other would put the
+       * queue's own behaviour inside both measurements.  The claim gap has to
+       * have elapsed as well, which gives the last claimed request's answer
+       * the same time to come back as the two before it had.
+       */
+
+      if (g_k1_rtl8852bs_key_install.tk_installed &&
+          count.dhcp_ack_ip != 0 &&
+          (count.dhcp_server_mac_valid || count.arp_reply_valid) &&
+          (claim_attempts >= K1_RTL8852BS_RESIDENT_CLAIM_ATTEMPTS ||
+           !count.arp_trip_valid) &&
+          (claim_attempts == 0 ||
+           (sclock_t)(clock_systime_ticks() - claim_deadline) >= 0) &&
+          ping_attempts < K1_RTL8852BS_RESIDENT_PING_ATTEMPTS &&
+          (ping_attempts == 0 ||
+           (sclock_t)(clock_systime_ticks() - ping_deadline) >= 0))
+        {
+          ret = k1_rtl8852bs_runtime_resident_icmp_tx(self_mac, bssid,
+                                                      ping_attempts, &count);
+          count.icmp_echo_status = ret;
+          ping_deadline = clock_systime_ticks() +
+                          MSEC2TICK(K1_RTL8852BS_RESIDENT_PING_GAP_MSEC);
+
+          k1_early_puts("K1 Wi-Fi GPL: resident icmp echo tx sn=");
+          k1_early_puthex(count.icmp_echo_sequence);
+          k1_early_puts(" bytes=");
+          k1_early_puthex(count.icmp_echo_bytes);
+          k1_early_puts(" tag=");
+          k1_early_puthex(K1_RTL8852BS_TXRPT_TAG_ICMP_ECHO);
+          k1_early_puts(" src=");
+          k1_early_puthex(count.dhcp_ack_ip);
+          k1_early_puts(" dst=");
+          k1_early_puthex((ping_attempts & 1u) != 0 ?
+                          count.icmp_echo_alt : count.icmp_echo_target);
+          k1_early_puts(" seq=");
+          k1_early_puthex(ping_attempts);
+          k1_early_puts(" pn=");
+          k1_early_puthex((uintreg_t)g_k1_rtl8852bs_tx_packet_number);
+          k1_early_puts(" attempt=");
+          k1_early_puthex(ping_attempts + 1u);
+          k1_early_puts(" status=");
+          k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+          k1_early_puts(" replies=");
+          k1_early_puthex(count.icmp_echo_replies);
+          k1_early_puts("\r\n");
+
+          ping_attempts++;
         }
 
       ret = k1_rtl8852bs_runtime_rx_read(
@@ -32406,6 +33491,76 @@ static int k1_rtl8852bs_runtime_resident_window(
 
   k1_early_puts(" ip=");
   k1_early_puthex(count.arp_trip_ip);
+  k1_early_puts("\r\n");
+
+  /* What answering cost and whether it happened.  requests is how many times
+   * somebody on this subnet asked who holds this station's address -- a number
+   * that was already non-zero in run 66, when nothing answered -- and sent is
+   * how many answers went out.  requests zero with a non-zero window means
+   * nobody asked, which is a different reading from asking and being ignored,
+   * and the two must not collapse into one line.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window arp serve requests=");
+  k1_early_puthex(count.arp_serve_requests);
+  k1_early_puts(" sent=");
+  k1_early_puthex(count.arp_serve_sent);
+  k1_early_puts(" bytes=");
+  k1_early_puthex(count.arp_serve_bytes);
+  k1_early_puts(" peer-ip=");
+  k1_early_puthex(count.arp_serve_peer_ip);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(count.arp_serve_status < 0 ?
+                              -count.arp_serve_status : 0));
+  k1_early_puts(" mac=");
+  if (count.arp_serve_requests != 0)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.arp_serve_mac, 6);
+    }
+
+  k1_early_puts("\r\n");
+
+  /* And the round trip above ARP.  attempts against mask is the reading: one
+   * bit per echo sequence number, and because that number comes back inside
+   * the reply the bits say which host answered -- even ones target, odd ones
+   * alt.  bad counts answers that carried this port's identifier and failed
+   * their own checksum or named a sequence never sent, which is a finding of
+   * its own and not the same as silence.  src is where an answer came from,
+   * and it differing from both targets would mean something answered on
+   * another host's behalf.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window icmp echo attempts=");
+  k1_early_puthex(count.icmp_echo_attempts);
+  k1_early_puts(" mask=");
+  k1_early_puthex(count.icmp_echo_mask);
+  k1_early_puts(" replies=");
+  k1_early_puthex(count.icmp_echo_replies);
+  k1_early_puts(" bad=");
+  k1_early_puthex(count.icmp_echo_reply_bad);
+  k1_early_puts(" target=");
+  k1_early_puthex(count.icmp_echo_target);
+  k1_early_puts(" alt=");
+  k1_early_puthex(count.icmp_echo_alt);
+  k1_early_puts(" src=");
+  k1_early_puthex(count.icmp_echo_reply_src);
+  k1_early_puts(" id=");
+  k1_early_puthex(count.icmp_echo_reply_id);
+  k1_early_puts(" seq=");
+  k1_early_puthex(count.icmp_echo_reply_seq);
+  k1_early_puts(" sn=");
+  k1_early_puthex(count.icmp_echo_sequence);
+  k1_early_puts(" bytes=");
+  k1_early_puthex(count.icmp_echo_bytes);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(count.icmp_echo_status < 0 ?
+                              -count.icmp_echo_status : 0));
+  k1_early_puts(" a3=");
+  if (count.icmp_echo_attempts != 0)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.icmp_echo_mac, 6);
+    }
+
   k1_early_puts("\r\n");
 
   /* And the hardware addresses behind those three, each on its own line and

@@ -2436,6 +2436,169 @@ def main() -> int:
                         "line says nothing about the round trip",
                         file=sys.stderr)
 
+            # Whether anything asked for this station's own address, and
+            # whether it was answered.  run 66 heard thirty-two ARP requests
+            # in one window and answered none of them, at least one of which
+            # was asking who holds the address the server had just
+            # acknowledged -- and RFC 826 makes that answer the precondition
+            # for any peer sending this station a unicast datagram at all.
+            resident_serve_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window arp serve requests=(?:0x)?"
+                rb"([0-9a-fA-F]+) sent=(?:0x)?([0-9a-fA-F]+)"
+                rb" bytes=(?:0x)?([0-9a-fA-F]+)"
+                rb" peer-ip=(?:0x)?([0-9a-fA-F]+)"
+                rb" status=(?:0x)?([0-9a-fA-F]+)"
+                rb" mac=([0-9a-fA-F]*)",
+                resident,
+            )
+            if resident_serve_result is None:
+                missing.append(
+                    "RTL8852BS2 ARP answers for this station's own address")
+            else:
+                serve_mac = resident_serve_result.group(6).decode()
+                (serve_requests, serve_sent, serve_bytes, serve_peer_ip,
+                 serve_status) = (
+                     int(group, 16) for group in
+                     resident_serve_result.groups()[:5])
+
+                def serve_quad(value):
+                    return "{0}.{1}.{2}.{3}".format(
+                        (value >> 24) & 0xff, (value >> 16) & 0xff,
+                        (value >> 8) & 0xff, value & 0xff)
+
+                print(
+                    "[serial] ARP requests for this station: {0} asked, {1} "
+                    "answered ({2} bytes), last asker {3} at {4}, status {5}"
+                    .format(serve_requests, serve_sent, serve_bytes,
+                            serve_mac or "(none)",
+                            serve_quad(serve_peer_ip), serve_status or "ok"),
+                    file=sys.stderr)
+                if serve_sent:
+                    print(
+                        "[serial] this port answered an ARP request for its "
+                        "own address for the first time, so a peer that had "
+                        "no entry for this station can now address a unicast "
+                        "datagram to it",
+                        file=sys.stderr)
+                elif serve_requests:
+                    print(
+                        "[serial] somebody asked for this station's address "
+                        "and no answer went out, so the peer's neighbour "
+                        "entry stays empty and nothing it wants to send here "
+                        "can leave it -- the status above says whether the "
+                        "frame was built or the queue refused it",
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] nobody asked for this station's address "
+                        "inside the window, so this line says nothing about "
+                        "whether the answer works",
+                        file=sys.stderr)
+
+            # And the first round trip above ARP.  An ARP reply proves two
+            # stations reach each other and that the pairwise key works both
+            # ways; it says nothing about the address itself, because ARP
+            # carries it as an opaque field and any host owning it answers.
+            # An echo reply cannot be produced without a peer accepting a
+            # datagram addressed to this station and routing one back, so it
+            # is the first evidence the acknowledged address is usable.  The
+            # attempts alternate between two hosts and the echo sequence
+            # number comes back inside the reply, so the mask says which of
+            # the two answered: even bits the DHCP server, odd bits the host
+            # that answered the claimed ARP round.
+            resident_echo_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window icmp echo attempts=(?:0x)?"
+                rb"([0-9a-fA-F]+) mask=(?:0x)?([0-9a-fA-F]+)"
+                rb" replies=(?:0x)?([0-9a-fA-F]+)"
+                rb" bad=(?:0x)?([0-9a-fA-F]+)"
+                rb" target=(?:0x)?([0-9a-fA-F]+)"
+                rb" alt=(?:0x)?([0-9a-fA-F]+)"
+                rb" src=(?:0x)?([0-9a-fA-F]+)"
+                rb" id=(?:0x)?([0-9a-fA-F]+)"
+                rb" seq=(?:0x)?([0-9a-fA-F]+)"
+                rb" sn=(?:0x)?([0-9a-fA-F]+)"
+                rb" bytes=(?:0x)?([0-9a-fA-F]+)"
+                rb" status=(?:0x)?([0-9a-fA-F]+)"
+                rb" a3=([0-9a-fA-F]*)",
+                resident,
+            )
+            if resident_echo_result is None:
+                missing.append(
+                    "RTL8852BS2 ICMP echo round from the acknowledged address")
+            else:
+                echo_a3 = resident_echo_result.group(13).decode()
+                (echo_attempts, echo_mask, echo_replies, echo_bad,
+                 echo_target, echo_alt, echo_src, echo_id, echo_seq,
+                 echo_sn, echo_bytes, echo_status) = (
+                     int(group, 16) for group in
+                     resident_echo_result.groups()[:12])
+
+                def echo_quad(value):
+                    return "{0}.{1}.{2}.{3}".format(
+                        (value >> 24) & 0xff, (value >> 16) & 0xff,
+                        (value >> 8) & 0xff, value & 0xff)
+
+                echo_even = echo_mask & 0x55555555
+                echo_odd = echo_mask & 0xaaaaaaaa
+                print(
+                    "[serial] ICMP echo round: {0}/{1} answered "
+                    "(mask=0x{2:02x}, {3} damaged), {4} and {5} asked from "
+                    "{6}, {7} bytes, sn=0x{8:x}, status {9}"
+                    .format(echo_replies, echo_attempts, echo_mask, echo_bad,
+                            echo_quad(echo_target), echo_quad(echo_alt),
+                            echo_a3 or "(none)", echo_bytes, echo_sn,
+                            echo_status or "ok"),
+                    file=sys.stderr)
+                if echo_replies:
+                    print(
+                        "[serial] an echo reply came back from {0} carrying "
+                        "identifier 0x{1:04x} and sequence {2}, so this port "
+                        "completed its first IP round trip: a peer accepted a "
+                        "datagram addressed from the address the server "
+                        "acknowledged and routed one back to it"
+                        .format(echo_quad(echo_src), echo_id, echo_seq),
+                        file=sys.stderr)
+                    if echo_even and echo_odd:
+                        print(
+                            "[serial] both hosts answered, so the round trip "
+                            "is not a property of one peer",
+                            file=sys.stderr)
+                    elif echo_even:
+                        print(
+                            "[serial] only the DHCP server answered, which is "
+                            "the expected asymmetry: a router answers echoes "
+                            "and an arbitrary station often drops them",
+                            file=sys.stderr)
+                    elif echo_odd:
+                        print(
+                            "[serial] only the host that answered the claimed "
+                            "ARP round answered, so the server that handed "
+                            "out the address does not answer echoes",
+                            file=sys.stderr)
+                elif echo_bad:
+                    print(
+                        "[serial] every answer carried this port's identifier "
+                        "and failed its own checksum, so the round trip "
+                        "happened and the receive path handed up a damaged "
+                        "payload -- that is a receive-side finding, not a "
+                        "silent peer",
+                        file=sys.stderr)
+                elif echo_attempts:
+                    print(
+                        "[serial] neither host answered the echo, so what is "
+                        "left is either the datagram this port builds -- the "
+                        "two checksums, the header, the address it claims -- "
+                        "or an access point that does not forward an IPv4 "
+                        "unicast between stations, and the ARP rounds above "
+                        "already rule the key and the peer out",
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] no echo request was transmitted, so either "
+                        "no address was acknowledged or no host was known to "
+                        "ask, and this line says nothing about the round trip",
+                        file=sys.stderr)
+
             # Whether the receive filter was widened for the length of the
             # window, so a frame whose payload the security engine could not
             # verify is handed up instead of being dropped inside the receive
