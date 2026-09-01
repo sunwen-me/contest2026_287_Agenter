@@ -2181,9 +2181,7 @@ def main() -> int:
                         "[serial] the access point transmitted {0} frame(s) "
                         "carrying this station's own address as the source of "
                         "the payload inside them: the uplink was received, "
-                        "decrypted and forwarded, so what is missing is on "
-                        "the downlink -- an answer the access point produced "
-                        "and this station did not take in"
+                        "decrypted and forwarded"
                         .format(echo_frames),
                         file=sys.stderr)
                 else:
@@ -2542,8 +2540,9 @@ def main() -> int:
                 echo_odd = echo_mask & 0xaaaaaaaa
                 print(
                     "[serial] ICMP echo round: {0}/{1} answered "
-                    "(mask=0x{2:02x}, {3} damaged), {4} and {5} asked from "
-                    "{6}, {7} bytes, sn=0x{8:x}, status {9}"
+                    "(mask=0x{2:02x}, {3} damaged), {4} and {5} asked, first "
+                    "attempt addressed to {6}, {7} bytes, sn=0x{8:x}, "
+                    "status {9}"
                     .format(echo_replies, echo_attempts, echo_mask, echo_bad,
                             echo_quad(echo_target), echo_quad(echo_alt),
                             echo_a3 or "(none)", echo_bytes, echo_sn,
@@ -3043,13 +3042,23 @@ def main() -> int:
             # its offline model first.  It runs before the window's clock and
             # its numbers are fixed, so unlike everything else in the window
             # this one requirement cannot be affected by the air.
+            #
+            # Increment 4a took the model from six payloads to ten and added an
+            # eleventh stage that checks the echo request this port builds, so
+            # the counters below are the ten-payload totals and the serve and
+            # echo fields are the four stages 4a added.  stage=0 status=0 is
+            # the eleventh stage's verdict as well: it asserts internally and
+            # a mismatch there lands here as a nonzero status.
             arp_model_result = re.search(
-                rb"K1 Wi-Fi GPL: resident network selftest net=(?:0x)?0*5"
-                rb" arp=(?:0x)?0*3 ipv4=(?:0x)?0*1 other=(?:0x)?0*1"
-                rb" other-type=(?:0x)?0*86dd arp-req=(?:0x)?0*1"
+                rb"K1 Wi-Fi GPL: resident network selftest net=(?:0x)?0*9"
+                rb" arp=(?:0x)?0*4 ipv4=(?:0x)?0*4 other=(?:0x)?0*1"
+                rb" other-type=(?:0x)?0*86dd arp-req=(?:0x)?0*2"
                 rb" replies=(?:0x)?0*1 reply-ip=(?:0x)?0*c0a80109"
                 rb" peer-ip=(?:0x)?0*c0a80101 peer-tpa=(?:0x)?0*c0a8017b"
-                rb" ip-peer-ip=(?:0x)?0*c0a80105 stage=0x0*"
+                rb" ip-peer-ip=(?:0x)?0*c0a80105 serve=(?:0x)?0*1"
+                rb" serve-ip=(?:0x)?0*c0a8010a echo=(?:0x)?0*1"
+                rb" echo-bad=(?:0x)?0*1 echo-mask=(?:0x)?0*4"
+                rb" echo-seq=(?:0x)?0*2 stage=0x0*"
                 rb"(?![0-9a-fA-F]) status=0x0+(?![0-9a-fA-F])",
                 started,
             )
