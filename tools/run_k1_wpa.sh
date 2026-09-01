@@ -17,6 +17,11 @@
 # group, which is why this is an environment variable rather than a pass-through
 # argument.
 #
+# K1_BOOT_TIMEOUT is the seconds spent waiting for the U-Boot prompt, 300 by
+# default.  With --manual-reset that wait is a person walking over to the board,
+# so raise it (K1_BOOT_TIMEOUT=1800) rather than let the run give up with
+# "did not acquire U-Boot prompt" while the listener was the only thing ready.
+#
 # Usage: run_k1_wpa.sh [extra run_k1_wireless_smoke.py options]
 
 set -euo pipefail
@@ -26,9 +31,10 @@ CONTEST_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 WORKSPACE_ROOT="${OPENVELA_ROOT:-$(cd -- "${CONTEST_ROOT}/.." && pwd)}"
 PACKAGE_DIR="${K1_PACKAGE_DIR:-${WORKSPACE_ROOT}/out/k1-wpa}"
 RESET_MODE="${K1_RESET_MODE:---nsh-reboot}"
+BOOT_TIMEOUT="${K1_BOOT_TIMEOUT:-300}"
 
 exec python3 "${SCRIPT_DIR}/run_k1_wireless_smoke.py" \
-  --device auto "${RESET_MODE}" --gzip-payload --boot-timeout 300 \
+  --device auto "${RESET_MODE}" --gzip-payload --boot-timeout "${BOOT_TIMEOUT}" \
   --no-voice-prompt \
   --payload "${PACKAGE_DIR}/contest-nuttx-flat.bin" \
   --wrapper "${PACKAGE_DIR}/k1-go-wrapper.bin" \
