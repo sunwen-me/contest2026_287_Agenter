@@ -2598,6 +2598,98 @@ def main() -> int:
                         "ask, and this line says nothing about the round trip",
                         file=sys.stderr)
 
+            # And the direction 4a left open: whether a ping addressed to
+            # this station is answered.  Everything above is this port
+            # asking -- the ARP responder included, because it answers a
+            # question about an address rather than a datagram sent to it.
+            # This line is the first place the port owes a reply to an IP
+            # datagram somebody else chose to send, and it is the one part of
+            # the port a person can check without reading a log: ping the
+            # acknowledged address from any host on the subnet during the
+            # window.
+            #
+            # bad and long are refusals, not failures.  RFC 792 requires the
+            # request's identifier, sequence and data back unchanged, so a
+            # request whose own checksum failed is not answered and one
+            # carrying more data than the reply can hold is not answered
+            # short -- either answer would report a round trip that did not
+            # happen, which is worse for the person reading the ping output
+            # than silence.
+            resident_icmp_serve_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window icmp serve requests=(?:0x)?"
+                rb"([0-9a-fA-F]+) sent=(?:0x)?([0-9a-fA-F]+)"
+                rb" bad=(?:0x)?([0-9a-fA-F]+)"
+                rb" long=(?:0x)?([0-9a-fA-F]+)"
+                rb" bytes=(?:0x)?([0-9a-fA-F]+)"
+                rb" peer-ip=(?:0x)?([0-9a-fA-F]+)"
+                rb" id=(?:0x)?([0-9a-fA-F]+)"
+                rb" seq=(?:0x)?([0-9a-fA-F]+)"
+                rb" data=(?:0x)?([0-9a-fA-F]+)"
+                rb" status=(?:0x)?([0-9a-fA-F]+)"
+                rb" mac=([0-9a-fA-F]*)",
+                resident,
+            )
+            if resident_icmp_serve_result is None:
+                missing.append(
+                    "RTL8852BS2 ICMP echo answers for this station's own "
+                    "address")
+            else:
+                icmp_serve_mac = resident_icmp_serve_result.group(11).decode()
+                (icmp_serve_requests, icmp_serve_sent, icmp_serve_bad,
+                 icmp_serve_long, icmp_serve_bytes, icmp_serve_peer_ip,
+                 icmp_serve_id, icmp_serve_seq, icmp_serve_data,
+                 icmp_serve_status) = (
+                     int(group, 16) for group in
+                     resident_icmp_serve_result.groups()[:10])
+
+                def icmp_serve_quad(value):
+                    return "{0}.{1}.{2}.{3}".format(
+                        (value >> 24) & 0xff, (value >> 16) & 0xff,
+                        (value >> 8) & 0xff, value & 0xff)
+
+                print(
+                    "[serial] pings addressed to this station: {0} asked, {1} "
+                    "answered ({2} bytes), {3} refused for a checksum, {4} "
+                    "for a length, last asker {5} at {6} "
+                    "(id=0x{7:04x} seq={8} data={9}), status {10}"
+                    .format(icmp_serve_requests, icmp_serve_sent,
+                            icmp_serve_bytes, icmp_serve_bad, icmp_serve_long,
+                            icmp_serve_mac or "(none)",
+                            icmp_serve_quad(icmp_serve_peer_ip),
+                            icmp_serve_id, icmp_serve_seq, icmp_serve_data,
+                            icmp_serve_status or "ok"),
+                    file=sys.stderr)
+                if icmp_serve_sent:
+                    print(
+                        "[serial] this port answered a ping for its own "
+                        "address, so the acknowledged address is reachable "
+                        "from outside and not merely usable from inside: a "
+                        "host that chose to send a datagram here got one back",
+                        file=sys.stderr)
+                elif icmp_serve_requests:
+                    print(
+                        "[serial] a ping arrived for this station and no "
+                        "answer went out, so the address is reachable inbound "
+                        "and the reply is what failed -- the status above "
+                        "says whether the frame was built or the queue "
+                        "refused it",
+                        file=sys.stderr)
+                elif icmp_serve_bad or icmp_serve_long:
+                    print(
+                        "[serial] every ping for this station was refused "
+                        "before an answer was owed, so nothing here is a "
+                        "transmit finding: a broken checksum is a "
+                        "receive-path statement and an over-long request is "
+                        "the asking host's choice of payload size",
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] nobody pinged this station inside the "
+                        "window, so this line says nothing about whether the "
+                        "answer works -- run it again with a ping to the "
+                        "acknowledged address from a host on the same subnet",
+                        file=sys.stderr)
+
             # Whether the receive filter was widened for the length of the
             # window, so a frame whose payload the security engine could not
             # verify is handed up instead of being dropped inside the receive
@@ -3043,22 +3135,34 @@ def main() -> int:
             # its numbers are fixed, so unlike everything else in the window
             # this one requirement cannot be affected by the air.
             #
-            # Increment 4a took the model from six payloads to ten and added an
-            # eleventh stage that checks the echo request this port builds, so
-            # the counters below are the ten-payload totals and the serve and
-            # echo fields are the four stages 4a added.  stage=0 status=0 is
-            # the eleventh stage's verdict as well: it asserts internally and
-            # a mismatch there lands here as a nonzero status.
+            # Increment 4a took the model from six payloads to ten and added
+            # an eleventh stage that checks the echo request this port builds.
+            # 4b takes it to twelve payloads and fifteen stages: a ping
+            # addressed to this station, the same ping with its own checksum
+            # broken, one carrying more data than a reply can return, and the
+            # reply this port builds for the first of the three.  The totals
+            # below are the twelve-payload totals, and the echo-serve fields
+            # are what the three new payloads did -- one request accepted, one
+            # refused for its checksum, one refused for its length, with the
+            # accepted one's identifier, sequence and data length unchanged by
+            # either refusal.  stage=0 status=0 is the fifteenth stage's
+            # verdict as well: it asserts internally and a mismatch there
+            # lands here as a nonzero status.
             arp_model_result = re.search(
-                rb"K1 Wi-Fi GPL: resident network selftest net=(?:0x)?0*9"
-                rb" arp=(?:0x)?0*4 ipv4=(?:0x)?0*4 other=(?:0x)?0*1"
+                rb"K1 Wi-Fi GPL: resident network selftest net=(?:0x)?0*c"
+                rb" arp=(?:0x)?0*4 ipv4=(?:0x)?0*7 other=(?:0x)?0*1"
                 rb" other-type=(?:0x)?0*86dd arp-req=(?:0x)?0*2"
                 rb" replies=(?:0x)?0*1 reply-ip=(?:0x)?0*c0a80109"
                 rb" peer-ip=(?:0x)?0*c0a80101 peer-tpa=(?:0x)?0*c0a8017b"
                 rb" ip-peer-ip=(?:0x)?0*c0a80105 serve=(?:0x)?0*1"
                 rb" serve-ip=(?:0x)?0*c0a8010a echo=(?:0x)?0*1"
                 rb" echo-bad=(?:0x)?0*1 echo-mask=(?:0x)?0*4"
-                rb" echo-seq=(?:0x)?0*2 stage=0x0*"
+                rb" echo-seq=(?:0x)?0*2 echo-serve=(?:0x)?0*1"
+                rb" echo-serve-id=(?:0x)?0*1234"
+                rb" echo-serve-seq=(?:0x)?0*7"
+                rb" echo-serve-data=(?:0x)?0*28"
+                rb" echo-serve-bad=(?:0x)?0*1"
+                rb" echo-serve-long=(?:0x)?0*1 stage=0x0*"
                 rb"(?![0-9a-fA-F]) status=0x0+(?![0-9a-fA-F])",
                 started,
             )
