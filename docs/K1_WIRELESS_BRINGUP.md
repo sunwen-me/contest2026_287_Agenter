@@ -8926,3 +8926,29 @@ candidates are the same host"。这条把 run 67 起就一直挂着的保留意�
 run 68 那一窗也是 `attempts=0x3 acks=0x6`，当时把这个整数倍关系归给了重复帧或者网关的
 proxy ARP、说分不开；现在它有确定答案了，跟重复帧和 proxy ARP 都没关系。
 
+### 增量 4d：一个应答该记在谁头上——闩锁让 probe 轮次的确认位六跑全空
+
+run 72 印出 `arp claim attempts=0x3 acks=0x6 mask=0x3f`。这个组合本身就不成立：窗口里只
+有三条 claim 发送、`attempt=0x1`／`0x2`／`0x3` 且 status 全 0，掩码是一位一次尝试，最多
+只能亮 bit 0..2。同一窗还印了 `arp trip mask=0x0 uni-ack=0x0 bcast-ack=0x0`——这一条其实
+每一跑都是 0，之前一直当成"probe 轮次问不到答案"记着。
+
+两条读数是同一个缺陷。credit 辅助函数被 probe 轮和 claim 轮共用，靠调用方告诉它"最后发出
+去的那一发属于哪一轮"；但 `arp_trip_last_claimed` 只有 claim 发送处置 true，probe 发送处
+只更新 `arp_trip_last`、不动这个标志。于是第一条 claim 之后到达的每一个 ARP 应答都被记到
+claim 轮次，而 probe 的下标一旦超过 claim 轮次的尝试数，就去点亮根本不存在的 claim 位。
+probe 轮次自己的确认从此再也拿不到归属，这就是它的掩码在每份日志里都是 0 的原因——不是空
+口没答，是报表把答案记到别人账上了。
+
+修法两条。**标志由两个发送处都写**，这样它才真的表示"最后发送的是哪一轮"，也就是它名字说
+的那件事。**辅助函数再拒绝超出本轮尝试数的下标**，让 `acks <= attempts` 成为结构性的不变
+量；标志修对之后这条检查不改变任何数值，放在那里是为了这个缺陷不会再悄悄回来。
+
+离线验证：把辅助函数和两个发送处转写成 Python，按 run 70 和 run 72 日志里的发送／应答顺
+序回放。未打补丁的转写把两窗都精确复现了，包括 run 72 的 `acks=0x6 mask=0x3f` 和两窗的
+`trip mask=0x0`。打了补丁之后 run 70 一个数都不变——它那三条应答确实属于 claim 轮次——run
+72 变成 `claim attempts=0x3 acks=0x3 mask=0x7`，加上
+`trip mask=0x3e uni-ack=0x2 bcast-ack=0x3`：六次 probe 尝试里有五次一直是被答着的，只是
+报表没说。下一次上板要看的就是这两行，`acks` 不再多于 `attempts`，且 `trip mask` 第一次
+非零。
+

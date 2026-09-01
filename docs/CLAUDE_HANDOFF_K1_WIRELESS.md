@@ -1559,14 +1559,20 @@ ping 的重传。** 顺带修掉主机侧 ping 活不过三秒的问题：不是
 是精确总数，最后丢的序号 54、非 QoS。ping 脚本在窗口之前重启了 207 次，每次约 2.8 秒被
 EHOSTUNREACH 顶出去，板子起来之后那一个 invocation 自己活满。
 
-**待修（记账，下一个增量）：`arp_trip_last_claimed` 是个永不复位的闩锁。** run 72 印出
-`arp claim attempts=0x3 acks=0x6 mask=0x3f`——确认数比尝试数多，而窗内只有三条 claim 发送
-且 status 全 0，掩码最多只能亮 bit 0..2。claim 发送处把 `arp_trip_last_claimed` 置 true
-之后没有任何地方置回 false，probe 发送处只更新 `arp_trip_last`；于是第一条 claim 之后到
-达的每个 ARP 应答都记到 claim 轮次，probe 下标一过 2 就点亮不存在的 claim 位。这同时解释
-了两跑里都有的 `arp trip mask=0x0 uni-ack=0x0 bcast-ack=0x0`，也推翻了 run 68 条目里「大
-概是重复帧或网关 proxy ARP」的猜测。和增量 4c 第一部分同类：一个活得比它所描述的事情更久
-的闩锁。
+**已修（2026-09-02，增量 4d）：`arp_trip_last_claimed` 是个永不复位的闩锁，提交
+`5b07960`。** run 72 印出 `arp claim attempts=0x3 acks=0x6 mask=0x3f`——确认数比尝试数
+多，而窗内只有三条 claim 发送且 status 全 0，掩码最多只能亮 bit 0..2。claim 发送处把标志
+置 true 之后没有任何地方置回 false，probe 发送处只更新 `arp_trip_last`；于是第一条 claim
+之后到达的每个 ARP 应答都记到 claim 轮次，probe 下标一过 claim 的尝试数就点亮不存在的
+位。这同时解释了两跑里都有的 `arp trip mask=0x0 uni-ack=0x0 bcast-ack=0x0`——那不是"probe
+轮次问不到答案"，是它的确认被记到别人账上了；也推翻了 run 68 条目里"大概是重复帧或网关
+proxy ARP"的猜测。修法是两个发送处都写这个标志，再让辅助函数拒绝超出本轮尝试数的下标，使
+`acks <= attempts` 成为结构性不变量。离线把辅助函数和两个发送处转写成 Python、按 run 70
+／72 的发送应答顺序回放：未打补丁精确复现两窗（含 run 72 的 `acks=0x6 mask=0x3f`），打了
+补丁 run 70 一个数不变，run 72 变成 `claim acks=0x3 mask=0x7` 加
+`trip mask=0x3e uni-ack=0x2 bcast-ack=0x3`。**下一次上板要看这两行：`acks` 不再多于
+`attempts`，且 `trip mask` 第一次非零——六次 probe 尝试里有五次一直是被答着的。** 和增量
+4c 第一部分同类：一个活得比它所描述的事情更久的闩锁。
 
 **增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
