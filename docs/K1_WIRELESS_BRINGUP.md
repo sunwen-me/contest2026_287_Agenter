@@ -7953,6 +7953,73 @@ group=0xf hw-dec=0xd sw-dec=0x5 icv=0x0 crc=0x0 dec=0xd`，目标发来的 13 �
 留在代码和判据里。
 
 
+### 增量 3w：先别信那个「没有帧发给本站」——它是一个硬件位，而本端的接收过滤器不是原厂的
+
+3v 把问题压到了一句话：发往本站单播地址的帧，是 AP 根本没发，还是发了而本端硬件在进 RX
+FIFO 之前就丢了。往下走之前先查了一件事：**「没有帧发给本站」这个结论本身是怎么读出来的。**
+答案不太好看——它读的是接收描述符里的一个硬件位：
+
+```c
+frame->a1_match = (descriptor3 & K1_RTL8852BS_RXDESC_A1_MATCH) != 0;   /* 8073 行 */
+```
+
+而四次握手那边的 `data-self=0x4` 根本不是同一个东西，它是软件比较：
+
+```c
+if (k1_rtl8852bs_scanofld_is_self_mac(mgmt.addr1))                     /* 约 16396 行 */
+```
+
+也就是说，从 3q 到 3v，每一次「整窗没有任何一帧是发给本站的」都建立在一个硬件位上，而这个位
+在本端这种过滤器配置下到底报什么，从来没有独立验证过。
+
+**过滤器配置也确实不是原厂的。**run 62 自己的回读就写着：窗外 `ce20=0xf0170001`，窗内和扫
+描时 `ce20=0xf017000f`。按 mainline `reg.h` 逐位拆开（`B_AX_RX_FLTR_OPT`）：
+
+| 位 | 名字 | run 62 窗内 |
+| --- | --- | --- |
+| 0 | `SNIFFER_MODE` | **1** |
+| 1 | `A_A1_MATCH` | 1 |
+| 2 | `A_BC` | 1 |
+| 3 | `A_MC` | 1 |
+| 4 | `A_UC_CAM_MATCH` | **0** |
+| 5 | `A_BC_CAM_MATCH` | **0** |
+| 6 | `A_MC_LIST_CAM_MATCH` | 0 |
+| 7 | `A_BCN_CHK_EN` | **0** |
+| 10 | `A_PWR_MGNT` | **0** |
+| 11 | `A_CRC32_ERR` | 0 |
+| 12 | `A_UNSUP_PKT` | 0 |
+| 13 | `A_ERR_PKT` | **0** |
+| 21:16 | `RX_MPDU_MAX_LEN` | 0x17（`0x17` 个 2^11 字节）|
+
+mainline 从不置 `SNIFFER_MODE`（只在 WoW 里清它），而本端跑在 sniffer 模式、`UC_CAM_MATCH`
+和 `BC_CAM_MATCH` 都是零——因为本端的 `cmac_init()` 只复现了一个静态子集，跳过了
+`rx_fltr_init()`。sniffer 模式下描述符里的 `A1_MATCH` 按什么规则置位，手册里没有，也不能假
+设它还等于「A1 等于本站 MAC」。
+
+所以 3w 只做三件接收侧的仪器，**零新发送、零 H2C**：
+
+1. **软件问一遍 A1。**在 `k1_rtl8852bs_runtime_resident_observe_security()` 里，对每一帧组播
+   位为零的数据帧，用 `k1_rtl8852bs_scanofld_is_self_mac(payload + 4)` 直接比 A1，分成
+   `self`／`bssid`（别的站的上行）／`other` 三类计数，并把描述符那个位 `hw-a1=` 印在旁边。
+   `self` 为零时旁边的 `bssid`＋`other` 就是分母：它说明这一窗到底听到过多少单播。两个数不
+   一致，是关于这张过滤器的陈述，不是关于 AP 的。第一帧另印一行 `fc/len/flags/sec/a2/a3/
+   head`，因为「计数为 1」说的比「那一帧长什么样」少得多。
+2. **把解密失败的帧也放进来。**窗口期间置上 `B_AX_A_ERR_PKT`（`ce20` bit 13），让安全引擎校
+   验不过的帧交到主机，而不是在 RMAC 里静默丢掉。这正好覆盖「AP 发了单播、但本端 CAM 里的
+   成对密钥槽位或 A2 匹配不对导致解不开」这种情况——那种帧此前是无声消失的。bit 11
+   `B_AX_A_CRC32_ERR` 故意不置：FCS 错帧在这种环境下量很大，会把 RX FIFO 灌满，反而盖掉要
+   看的东西。窗口结束时既有的 `k1_rtl8852bs_scan_rx_filter_restore()` 把寄存器放回去，回读
+   不成功就打 `status=` 的 errno，免得把「没问成」读成零。
+3. **问 RMAC 自己丢没丢。**窗口进入和退出各采一次 RMAC 阶段计数器（复用 3l 就有的
+   `k1_rtl8852bs_scan_phy_counters_read/log`，phase 记 `resident-enter`／`resident-exit`），
+   打 `delta-recca`／`delta-rxdma`／`delta-pktfltr-drp`。`pktfltr-drp` 的增量是过滤器自己的
+   拒收数：**它为零，而这一窗又报告没有帧发给本站，那么这一帧就不是本端过滤器丢的**，问题
+   就被推到空口和 AP 那一侧去了；它不为零，那就是本端丢的，且丢在哪一级也一并读出来了。
+
+三条读数都挂在既有的 `--require-runtime-resident` 上，只要求这些行存在、不对任何数值设门
+槛——它们是判断依据，不是通过条件。判据总数仍然是 **40**。
+
+
 ### 工具：为什么按了 RST 也常常停不进 U-Boot——0 秒 autoboot ＋ 主机读数滞后
 
 这一段不是移植进度，是把一个从很早就在偶发、一直被当成「手速问题」的东西查清楚了，值得记下来

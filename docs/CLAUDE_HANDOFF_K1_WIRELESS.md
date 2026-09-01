@@ -1101,6 +1101,34 @@ dynamic management/calibration 仍缺，因此 TX 与 RSSI 精度还不可信。
   那帧单播 ARP Request 按协议必须换来一帧单播 ARP Reply。**于是问题被压到一句：发往本站单播地
   址的帧，是 AP 根本没发，还是发了而本站在进 RX FIFO 之前就被硬件丢掉了。
 
+- **已实现待上板（增量 3w）：先别信那个「没有帧发给本站」——它是一个硬件位，而本端的接收过滤
+  器不是原厂的。** 3v 把问题压到「AP 到底发没发单播给本站」之后，先查了这个结论自己是怎么读
+  出来的，结果不太好看：常驻窗口的 `a1-match` 读的是接收描述符里的硬件位
+  （`frame->a1_match = (descriptor3 & K1_RTL8852BS_RXDESC_A1_MATCH) != 0`，8073 行），而四次握
+  手那边的 `data-self=0x4` 是软件比较（`k1_rtl8852bs_scanofld_is_self_mac(mgmt.addr1)`，约
+  16396 行）——从 3q 到 3v，每一次「整窗没有一帧发给本站」都建立在一个从未独立验证过的硬件位
+  上。**过滤器也确实不是原厂的**：run 62 自己回读 `ce20=0xf017000f`（窗外 `0xf0170001`），按
+  mainline `reg.h` 拆开就是 `SNIFFER_MODE=1`、`A1_MATCH/BC/MC=1`，而 `UC_CAM_MATCH`、
+  `BC_CAM_MATCH`、`BCN_CHK_EN`、`PWR_MGNT` 和三个错误放行位全为 0——mainline 从不置
+  `SNIFFER_MODE`（只在 WoW 里清它），本端跑成这样是因为 `cmac_init()` 只复现了静态子集、跳过
+  了 `rx_fltr_init()`。sniffer 模式下描述符那个位按什么规则置位手册没写，不能假设它还等于
+  「A1 ＝ 本站 MAC」。于是 3w 只做三件接收侧仪器、**零新发送、零 H2C**：(1) 在
+  `k1_rtl8852bs_runtime_resident_observe_security()` 里用软件比 A1，分 `self`／`bssid`／
+  `other` 三类计数并把 `hw-a1=` 印在旁边（`self=0` 时 `bssid+other` 就是「这一窗听到多少单
+  播」的分母，两个数不一致是关于过滤器的陈述、不是关于 AP 的），第一帧另印
+  `fc/len/flags/sec/a2/a3/head` 一行；(2) 窗口期间置上 `B_AX_A_ERR_PKT`（`ce20` bit 13），让
+  安全引擎校验不过的帧交到主机而不是在 RMAC 里静默丢掉——这正好覆盖「AP 发了单播但本端解不
+  开」这种此前无声消失的情况，bit 11 `A_CRC32_ERR` 故意不置（FCS 错帧量太大会灌满 RX FIFO），
+  窗口结束由既有的 `scan_rx_filter_restore()` 放回，回读不成打 `status=` 的 errno；(3) 窗口进
+  出各采一次 RMAC 阶段计数器（复用 `scan_phy_counters_read/log`，phase `resident-enter`／
+  `resident-exit`），打 `delta-recca`／`delta-rxdma`／`delta-pktfltr-drp`——**`pktfltr-drp` 增
+  量为零而这一窗又报告没有帧发给本站，那这一帧就不是本端过滤器丢的**，问题被推到空口和 AP 那
+  一侧；不为零则是本端丢的，且丢在哪一级一并读出。三条读数挂在既有的
+  `--require-runtime-resident` 上、只要求存在、不对数值设门槛，判据仍是 **40**。已编译通过
+  （`text=815126 data=9768 bss=25296`，SHA256 `2b920aa5…`，无新增告警），风格基线不变（驱动
+  超 79 列 50 行、判据脚本 55 行，零 tab、零行尾空白，`ast.parse` 通过）。
+
+
 新增的几条硬结论（读日志/写发送路径之前先看）：
 
 - **Association Request 沉默的原因几乎总在请求内容里，不在发送路径里。** run 30 发了 6 次
@@ -1208,7 +1236,9 @@ Association Response ＋ AID 1（run 31 / 增量 3d）、WPA2-PSK 四次握手�
 报 `a1-match=0x1 hw-dec=0x1 icv=0x0 sec-cam=0x0 diff-bytes=0x0`——接收路径接得住发给自己的
 单播，成对密钥表项在接收方向上也命中并解对了，所以 (B2) 在 MAC/SEC 这一层排除。**
 **当前实际下一步（run 62 之后已经改写）：上行不再是问题，问题只剩「发往本站单播地址的下行帧
-是没发出来，还是发出来了而被本端硬件在进 RX FIFO 之前丢掉」。**增量 3v 把上行那一半彻底关
+是没发出来，还是发出来了而被本端硬件在进 RX FIFO 之前丢掉」。**这一问已经由增量 3w 落成三件
+接收侧仪器（软件比 A1、放行解密失败帧、RMAC 阶段计数器增量，见上面那条），代码已编译通过、等
+上板。**增量 3v 把上行那一半彻底关
 掉了（AP 把本站三帧广播一个不落地用 GTK 播回 BSS，见上面那条），连客户端隔离也一并排除；
 下面这几段是 run 62 之前的推理，其中「上行是否出去了」的那些顾虑已经作废，保留是因为它们
 记录了各条支路是怎么一条条被排掉的：

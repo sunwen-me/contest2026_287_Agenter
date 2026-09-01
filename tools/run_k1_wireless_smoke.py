@@ -303,7 +303,10 @@ def parse_args() -> argparse.Namespace:
               "register unchanged across it, the receive filter restored, and "
               "the target's traffic indication map read for this station's "
               "AID, and any of this port's own uplink frames the access "
-              "point sent back out counted"),
+              "point sent back out counted, and the frames addressed to "
+              "this station counted in software beside the descriptor "
+              "bit, with the error-packet filter widened and the "
+              "receive MAC stage counters read across the window"),
     )
     parser.add_argument(
         "--require-runtime-data-secure-tx", action="store_true",
@@ -2192,6 +2195,184 @@ def main() -> int:
                         "group-addressed frame back to the set it came from "
                         "reads the same, so this is not the opposite "
                         "statement",
+                        file=sys.stderr)
+
+            # Whether the receive filter was widened for the length of the
+            # window, so a frame whose payload the security engine could not
+            # verify is handed up instead of being dropped inside the receive
+            # MAC.  status is the errno the write-back check returned, and a
+            # nonzero one means every count below was taken under the narrow
+            # filter every earlier window ran.
+            resident_err_filter_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window rx-err-filter before="
+                rb"(?:0x)?([0-9a-fA-F]+) after=(?:0x)?([0-9a-fA-F]+)"
+                rb" status=(?:0x)?([0-9a-fA-F]+)",
+                resident,
+            )
+            if resident_err_filter_result is None:
+                missing.append(
+                    "RTL8852BS2 resident window error-packet receive filter")
+            else:
+                err_before = int(resident_err_filter_result.group(1), 16)
+                err_after = int(resident_err_filter_result.group(2), 16)
+                err_status = int(resident_err_filter_result.group(3), 16)
+                print(
+                    "[serial] resident receive filter: before=0x{0:08x} "
+                    "after=0x{1:08x} status={2}"
+                    .format(err_before, err_after, err_status),
+                    file=sys.stderr)
+                if err_status:
+                    print(
+                        "[serial] the error-packet admission bit could not be "
+                        "set, so a frame whose payload the security engine "
+                        "rejected was still dropped inside the receive MAC "
+                        "and nothing below rules that out",
+                        file=sys.stderr)
+
+            # The same question the receive descriptor's own A1_MATCH bit
+            # answers, asked in software.  self counts frames whose first
+            # address is this station's MAC by comparison; bssid and other are
+            # the two remaining unicast destinations, and they are here so
+            # that a self of zero is read next to how much unicast traffic the
+            # window heard from anybody.  hw-a1 repeats the descriptor bit:
+            # the two disagreeing is a statement about the filter this window
+            # runs under -- sniffer mode with the unicast address-CAM match
+            # bit clear -- and not about the access point.  The line is
+            # required to exist and no value in it is required.
+            resident_a1_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window data a1 self=(?:0x)?"
+                rb"([0-9a-fA-F]+) bssid=(?:0x)?([0-9a-fA-F]+)"
+                rb" other=(?:0x)?([0-9a-fA-F]+)"
+                rb" self-prot=(?:0x)?([0-9a-fA-F]+)"
+                rb" self-dec=(?:0x)?([0-9a-fA-F]+)"
+                rb" hw-a1=(?:0x)?([0-9a-fA-F]+)",
+                resident,
+            )
+            if resident_a1_result is None:
+                missing.append(
+                    "RTL8852BS2 software count of received frames addressed "
+                    "to this station")
+            else:
+                a1_self = int(resident_a1_result.group(1), 16)
+                a1_bssid = int(resident_a1_result.group(2), 16)
+                a1_other = int(resident_a1_result.group(3), 16)
+                a1_self_prot = int(resident_a1_result.group(4), 16)
+                a1_self_dec = int(resident_a1_result.group(5), 16)
+                a1_hw = int(resident_a1_result.group(6), 16)
+                print(
+                    "[serial] unicast destinations heard: self={0} "
+                    "(protected={1} decrypted={2}) to-bssid={3} "
+                    "to-others={4} descriptor-a1-match={5}"
+                    .format(a1_self, a1_self_prot, a1_self_dec, a1_bssid,
+                            a1_other, a1_hw),
+                    file=sys.stderr)
+                if a1_self and not a1_hw:
+                    print(
+                        "[serial] {0} frame(s) carrying this station's own "
+                        "address arrived while the descriptor's match bit "
+                        "stayed clear: the downlink exists, and the bit every "
+                        "earlier window read it through does not report it"
+                        .format(a1_self),
+                        file=sys.stderr)
+                elif a1_self:
+                    print(
+                        "[serial] {0} frame(s) addressed to this station "
+                        "arrived and the descriptor agrees, so the downlink "
+                        "exists and what is left is what became of the "
+                        "payload"
+                        .format(a1_self),
+                        file=sys.stderr)
+                elif a1_bssid or a1_other:
+                    print(
+                        "[serial] no frame in the window carried this "
+                        "station's address while {0} unicast frame(s) to "
+                        "other destinations did, so the receiver was taking "
+                        "unicast traffic in and none of it was addressed here"
+                        .format(a1_bssid + a1_other),
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] the window heard no unicast frame at all, "
+                        "so nothing here separates an access point that sent "
+                        "none from a receiver that admitted none",
+                        file=sys.stderr)
+
+            # And the first of those frames, because a count of one says less
+            # than the frame it counted.  flags is bit 0 hardware decrypted,
+            # bit 1 handed to software, bit 2 integrity check failed, bit 3
+            # CRC failed, bit 4 the descriptor's own A1_MATCH and bit 5 a long
+            # descriptor.  A length of zero is the no-such-frame case and the
+            # remaining fields are then empty by construction.
+            resident_a1_first_result = re.search(
+                rb"K1 Wi-Fi GPL: resident window data a1 first fc=(?:0x)?"
+                rb"([0-9a-fA-F]+) len=(?:0x)?([0-9a-fA-F]+)"
+                rb" flags=(?:0x)?([0-9a-fA-F]+)"
+                rb" sec=(?:0x)?([0-9a-fA-F]+)"
+                rb" a2=([0-9a-fA-F]*) a3=([0-9a-fA-F]*)"
+                rb" head=([0-9a-fA-F]*)",
+                resident,
+            )
+            if resident_a1_first_result is None:
+                missing.append(
+                    "RTL8852BS2 first received frame addressed to this "
+                    "station")
+            elif int(resident_a1_first_result.group(2), 16):
+                a1_first_fc = int(resident_a1_first_result.group(1), 16)
+                a1_first_len = int(resident_a1_first_result.group(2), 16)
+                a1_first_flags = int(resident_a1_first_result.group(3), 16)
+                a1_first_sec = int(resident_a1_first_result.group(4), 16)
+                print(
+                    "[serial] first frame addressed to this station: "
+                    "fc=0x{0:04x} len={1} flags=0x{2:02x} sec=0x{3:02x} "
+                    "a2={4} a3={5} head={6}"
+                    .format(a1_first_fc, a1_first_len, a1_first_flags,
+                            a1_first_sec,
+                            resident_a1_first_result.group(5).decode() or
+                            "(none)",
+                            resident_a1_first_result.group(6).decode() or
+                            "(none)",
+                            resident_a1_first_result.group(7).decode() or
+                            "(none)"),
+                    file=sys.stderr)
+
+            # Where the receive MAC lost a frame if it lost one at all.  The
+            # stage counters are sampled on entry and again at the end, and
+            # the exit line carries the deltas across the window.  A filter
+            # drop delta of zero in a window that reports nothing addressed to
+            # this station is a window in which the filter dropped nothing
+            # either, which moves the missing answer off this host.
+            resident_stage_result = re.search(
+                rb"K1 Wi-Fi GPL: scan PHY stage resident-exit "
+                rb"recca=[^\r\n]* delta-recca=(?:0x)?([0-9a-fA-F]+)"
+                rb" delta-rxdma=(?:0x)?([0-9a-fA-F]+)"
+                rb" delta-pktfltr-drp=(?:0x)?([0-9a-fA-F]+)",
+                resident,
+            )
+            if resident_stage_result is None:
+                missing.append(
+                    "RTL8852BS2 receive MAC stage counters across the "
+                    "resident window")
+            else:
+                stage_recca = int(resident_stage_result.group(1), 16)
+                stage_rxdma = int(resident_stage_result.group(2), 16)
+                stage_drop = int(resident_stage_result.group(3), 16)
+                print(
+                    "[serial] receive MAC across the window: recca+{0} "
+                    "rxdma+{1} filter-drop+{2}"
+                    .format(stage_recca, stage_rxdma, stage_drop),
+                    file=sys.stderr)
+                if stage_drop:
+                    print(
+                        "[serial] the receive filter rejected {0} frame(s) "
+                        "inside the window, which is where a frame addressed "
+                        "to this station would have gone if one was sent"
+                        .format(stage_drop),
+                        file=sys.stderr)
+                else:
+                    print(
+                        "[serial] the receive filter rejected nothing inside "
+                        "the window, so a frame addressed to this station was "
+                        "not dropped by it",
                         file=sys.stderr)
 
             # The transmit half.  The status of the Probe Request separates a

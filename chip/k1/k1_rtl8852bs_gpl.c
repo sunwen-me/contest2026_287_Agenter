@@ -1424,6 +1424,22 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_MAC_LOOPBACK_COUNT_SHIFT 16u
 #define K1_RTL8852BS_MAC_LOOPBACK_COUNT_MASK 0xffffu
 
+/* One more bit of R_AX_RX_FLTR_OPT, B_AX_A_ERR_PKT at bit 13 of the vendor
+ * register header, which tells the receive MAC to hand up a frame it found an
+ * error in instead of dropping it.  Every window so far has run with it
+ * clear, so a frame this station was addressed in but whose payload the
+ * security engine could not verify was dropped inside RMAC and left no trace
+ * anywhere -- neither in the frame counters nor in the icv counter, which can
+ * only count a frame that arrived.  The window sets it so that the two
+ * remaining explanations for a silent access point can be told apart.
+ *
+ * B_AX_A_CRC32_ERR at bit 11 is deliberately left alone.  A frame that fails
+ * its frame check sequence is not a frame whose decryption failed, and on a
+ * busy 2.4 GHz channel admitting them would fill the receive FIFO with noise
+ * for three seconds and could crowd out the frames the window is waiting for.
+ */
+
+#define K1_RTL8852BS_RX_FLTR_A_ERR_PKT       0x00002000u
 #define K1_RTL8852BS_SCAN_RX_FLTR_OPT_MASK   0x000000beu
 #define K1_RTL8852BS_SCAN_RX_FLTR_OPT_VALUE  0x0000000eu
 #define K1_RTL8852BS_SCAN_MGNT_FLTR_TO_HOST  0x55555555u
@@ -13936,6 +13952,59 @@ static int k1_rtl8852bs_rx_counter_read(uint8_t index, FAR uint16_t *value)
   return OK;
 }
 
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_resident_error_filter
+ *
+ * Description:
+ *   Set B_AX_A_ERR_PKT in the receive filter and read it back, so that a
+ *   frame the security engine could not verify reaches the host instead of
+ *   being dropped inside the receive MAC.  Both words are returned for the
+ *   report, and the caller's own filter restore puts the register back: this
+ *   only ever sets a bit in a word that has already been saved.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_resident_error_filter(
+  FAR uint32_t *before, FAR uint32_t *after)
+{
+  uint32_t value = 0;
+  int ret;
+
+  if (before == NULL || after == NULL)
+    {
+      return -EINVAL;
+    }
+
+  *before = 0;
+  *after = 0;
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_RX_FLTR_OPT, &value);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  *before = value;
+  ret = k1_rtl8852bs_mac_write32(K1_RTL8852BS_RX_FLTR_OPT,
+                                 value | K1_RTL8852BS_RX_FLTR_A_ERR_PKT);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_RX_FLTR_OPT, after);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  if ((*after & K1_RTL8852BS_RX_FLTR_A_ERR_PKT) == 0)
+    {
+      return -EIO;
+    }
+
+  return OK;
+}
+
 struct k1_rtl8852bs_scan_phy_counters_s
 {
   uint32_t crc_ok;
@@ -26397,6 +26466,7 @@ static void k1_rtl8852bs_runtime_assoc_attempt(
 #define K1_RTL8852BS_RESIDENT_TIM_FIXED         3u
 #define K1_RTL8852BS_RESIDENT_TIM_HEAD          8u
 #define K1_RTL8852BS_RESIDENT_ECHO_HEAD         8u
+#define K1_RTL8852BS_RESIDENT_SEC_A1_HEAD       8u
 
 /* The channel-defining registers of the three layers, as the vendor names
  * them.  cfg_mac_bw() owns the first two, halbb_ctrl_bw_ch_8852b() the
@@ -26528,6 +26598,44 @@ struct k1_rtl8852bs_resident_count_s
   uint8_t first_sec_header_length;
   bool first_sec_valid;
   bool first_sec_protected;
+
+  /* Whether any frame carrying this station's own unicast address in address
+   * 1 arrived at all, decided by comparing that address with this port's MAC
+   * in software instead of by reading the descriptor's A1_MATCH bit.
+   *
+   * Every window so far has reported a1-match=0x0, and that field is the
+   * descriptor bit.  The receive filter these windows run under is not the
+   * one rx_fltr_init() would program -- 0xce20 reads 0xf017000f, which is
+   * SNIFFER_MODE with A1_MATCH, A_BC and A_MC, and with UC_CAM_MATCH,
+   * BC_CAM_MATCH, PWR_MGNT and the beacon check all clear -- so what that
+   * bit reports about a unicast frame under this configuration has never
+   * been established, and the whole conclusion "nothing addressed to this
+   * station arrived" rests on it.  A software comparison carries no such
+   * question: if a frame with this station's address in address 1 reached
+   * the host, self is non-zero whatever the descriptor said about it.
+   *
+   * bssid and other are the same test for the two other unicast
+   * destinations a frame can carry -- another station's uplink to this BSS,
+   * and anything else -- so a self of zero can be read next to how much
+   * unicast traffic the window heard at all.  A window that hears nobody's
+   * unicast says nothing about this station's; a window that hears other
+   * stations' unicast and not one frame of its own is an access point that
+   * sent none.
+   */
+
+  uint32_t sec_a1_self;
+  uint32_t sec_a1_bssid;
+  uint32_t sec_a1_other;
+  uint32_t sec_a1_self_protected;
+  uint32_t sec_a1_self_decrypted;
+  uint16_t sec_a1_first_length;
+  uint16_t sec_a1_first_frame_control;
+  uint8_t sec_a1_first_flags;
+  uint8_t sec_a1_first_sec_type;
+  uint8_t sec_a1_first_a2[6];
+  uint8_t sec_a1_first_a3[6];
+  uint8_t sec_a1_first_head[K1_RTL8852BS_RESIDENT_SEC_A1_HEAD];
+  uint8_t sec_a1_first_head_length;
 
   /* The one protected data frame this window transmits, and the answer to it.
    *
@@ -27410,6 +27518,69 @@ static void k1_rtl8852bs_runtime_resident_observe_security(
     }
 
   header_length = k1_rtl8852bs_runtime_resident_header_length(frame_control);
+
+  /* The unicast destination test the counter block describes.  Address 1 is
+   * the receiver address and is never encrypted, so it can be read even when
+   * nothing else in the frame could be, and the first frame this station's
+   * own address turns up in is kept whole enough to say what it was.
+   */
+
+  if ((payload[4] & 0x01u) == 0)
+    {
+      if (k1_rtl8852bs_scanofld_is_self_mac(payload + 4))
+        {
+          count->sec_a1_self++;
+          if (protected_frame)
+            {
+              count->sec_a1_self_protected++;
+            }
+
+          if (frame->hw_dec && !frame->sw_dec && !frame->icv_error)
+            {
+              count->sec_a1_self_decrypted++;
+            }
+
+          if (count->sec_a1_first_length == 0 && payload_length <= 0xffffu)
+            {
+              count->sec_a1_first_length = (uint16_t)payload_length;
+              count->sec_a1_first_frame_control = frame_control;
+              count->sec_a1_first_sec_type = frame->descriptor_long ?
+                                             frame->sec_type : 0xffu;
+              count->sec_a1_first_flags =
+                (uint8_t)((frame->hw_dec ? 0x01u : 0u) |
+                          (frame->sw_dec ? 0x02u : 0u) |
+                          (frame->icv_error ? 0x04u : 0u) |
+                          (frame->crc_error ? 0x08u : 0u) |
+                          (frame->a1_match ? 0x10u : 0u) |
+                          (frame->descriptor_long ? 0x20u : 0u));
+              memcpy(count->sec_a1_first_a2, payload + 10, 6);
+              memcpy(count->sec_a1_first_a3, payload + 16, 6);
+
+              if (payload_length > header_length)
+                {
+                  size_t take = payload_length - header_length;
+
+                  if (take > K1_RTL8852BS_RESIDENT_SEC_A1_HEAD)
+                    {
+                      take = K1_RTL8852BS_RESIDENT_SEC_A1_HEAD;
+                    }
+
+                  memcpy(count->sec_a1_first_head, payload + header_length,
+                         take);
+                  count->sec_a1_first_head_length = (uint8_t)take;
+                }
+            }
+        }
+      else if (memcmp(payload + 4, bssid, 6) == 0)
+        {
+          count->sec_a1_bssid++;
+        }
+      else
+        {
+          count->sec_a1_other++;
+        }
+    }
+
   if (payload_length < header_length + 8u + sizeof(llc_snap))
     {
       /* Too short for either offset to be read.  Counted so that a zero in
@@ -30365,6 +30536,8 @@ static int k1_rtl8852bs_runtime_resident_window(
   FAR const uint8_t *ssid, uint8_t ssid_length, uint8_t channel)
 {
   struct k1_rtl8852bs_scan_rx_filter_state_s filter;
+  struct k1_rtl8852bs_scan_phy_counters_s phy_enter;
+  struct k1_rtl8852bs_scan_phy_counters_s phy_exit;
   struct k1_rtl8852bs_resident_channel_s enter;
   struct k1_rtl8852bs_resident_channel_s exit_state;
   struct k1_rtl8852bs_resident_count_s count;
@@ -30387,6 +30560,10 @@ static int k1_rtl8852bs_runtime_resident_window(
   int receive_ret = OK;
   int exit_ret = OK;
   int filter_ret = OK;
+  int error_filter_ret;
+  int phy_ret;
+  uint32_t error_filter_before = 0;
+  uint32_t error_filter_after = 0;
   int loopback_ret = OK;
   int verdict;
   int ret;
@@ -30510,6 +30687,42 @@ static int k1_rtl8852bs_runtime_resident_window(
       k1_early_puts("\r\n");
       kmm_free(buffer);
       return ret;
+    }
+
+  /* Frames the receive MAC found an error in are admitted for the length of
+   * this window, and the filter restore at the end puts the bit back.  The
+   * two words are printed so a window that could not set it says so instead
+   * of reporting a zero that means "never asked".
+   */
+
+  error_filter_ret = k1_rtl8852bs_runtime_resident_error_filter(
+                       &error_filter_before, &error_filter_after);
+  k1_early_puts("K1 Wi-Fi GPL: resident window rx-err-filter before=");
+  k1_early_puthex(error_filter_before);
+  k1_early_puts(" after=");
+  k1_early_puthex(error_filter_after);
+  k1_early_puts(" status=");
+  k1_early_puthex((uintreg_t)(error_filter_ret < 0 ? -error_filter_ret : 0));
+  k1_early_puts("\r\n");
+
+  /* The receive MAC's own stage counters, sampled here and again at the end.
+   * They say where a frame was lost when one was lost at all: pktfltr-drp is
+   * the filter's own rejections, invd, fulldrp and rxdma are losses after it.
+   * A window that reports nothing addressed to this station and a filter drop
+   * delta of zero is a window in which nothing was dropped either.
+   */
+
+  phy_ret = k1_rtl8852bs_scan_phy_counters_read(&phy_enter);
+  if (phy_ret < 0)
+    {
+      memset(&phy_enter, 0, sizeof(phy_enter));
+      k1_early_puts("K1 Wi-Fi GPL: resident phy counters error=");
+      k1_early_puthex((uintreg_t)-phy_ret);
+      k1_early_puts("\r\n");
+    }
+  else
+    {
+      k1_rtl8852bs_scan_phy_counters_log("resident-enter", &phy_enter, NULL);
     }
 
   /* The console is polled, and every command trace line inside the window is
@@ -30760,6 +30973,25 @@ static int k1_rtl8852bs_runtime_resident_window(
   exit_ret = k1_rtl8852bs_runtime_resident_channel_read("resident-exit",
                                                         &exit_state);
   exit_valid = exit_ret >= 0;
+
+  /* And the stage counters, for the same reason and in the same place: the
+   * deltas belong to the window's own filter configuration, not to the one
+   * the restore below puts back.
+   */
+
+  phy_ret = k1_rtl8852bs_scan_phy_counters_read(&phy_exit);
+  if (phy_ret < 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: resident phy counters error=");
+      k1_early_puthex((uintreg_t)-phy_ret);
+      k1_early_puts("\r\n");
+    }
+  else
+    {
+      k1_rtl8852bs_scan_phy_counters_log("resident-exit", &phy_exit,
+                                         &phy_enter);
+    }
+
   filter_ret = k1_rtl8852bs_scan_rx_filter_restore(&filter);
   kmm_free(buffer);
 
@@ -30943,6 +31175,68 @@ static int k1_rtl8852bs_runtime_resident_window(
   k1_early_puthex(count.sec_crc_error);
   k1_early_puts(" dec=");
   k1_early_puthex(count.sec_decrypted);
+  k1_early_puts("\r\n");
+
+  /* The same question as a1-match above, asked without the descriptor.  self
+   * counts frames whose address 1 is this station's own MAC by comparison in
+   * software; bssid and other are the two remaining unicast destinations, and
+   * they are here so that a self of zero is read next to how much unicast
+   * traffic the window heard from anybody.  hw-a1 repeats the descriptor bit
+   * beside it: the two disagreeing is a statement about the receive filter
+   * this window runs under, not about the access point.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window data a1 self=");
+  k1_early_puthex(count.sec_a1_self);
+  k1_early_puts(" bssid=");
+  k1_early_puthex(count.sec_a1_bssid);
+  k1_early_puts(" other=");
+  k1_early_puthex(count.sec_a1_other);
+  k1_early_puts(" self-prot=");
+  k1_early_puthex(count.sec_a1_self_protected);
+  k1_early_puts(" self-dec=");
+  k1_early_puthex(count.sec_a1_self_decrypted);
+  k1_early_puts(" hw-a1=");
+  k1_early_puthex(count.sec_a1_match);
+  k1_early_puts("\r\n");
+
+  /* And the first of those frames, because a count of one says less than the
+   * frame it counted.  flags is bit 0 hardware decrypted, bit 1 handed to
+   * software, bit 2 integrity check failed, bit 3 CRC failed, bit 4 the
+   * descriptor's own A1_MATCH and bit 5 a long descriptor; sec is the cipher
+   * the engine named, or 0xff when no long descriptor carried the field.
+   * head is the eight bytes at the end of the 802.11 header, which for a
+   * protected frame is the CCMP packet number header whether or not the
+   * frame was decrypted, and for an unprotected one is the LLC/SNAP header.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: resident window data a1 first fc=");
+  k1_early_puthex(count.sec_a1_first_frame_control);
+  k1_early_puts(" len=");
+  k1_early_puthex(count.sec_a1_first_length);
+  k1_early_puts(" flags=");
+  k1_early_puthex(count.sec_a1_first_flags);
+  k1_early_puts(" sec=");
+  k1_early_puthex(count.sec_a1_first_sec_type);
+  k1_early_puts(" a2=");
+  if (count.sec_a1_first_length != 0)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.sec_a1_first_a2, 6);
+    }
+
+  k1_early_puts(" a3=");
+  if (count.sec_a1_first_length != 0)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.sec_a1_first_a3, 6);
+    }
+
+  k1_early_puts(" head=");
+  if (count.sec_a1_first_head_length != 0)
+    {
+      k1_rtl8852bs_scanofld_log_bytes(count.sec_a1_first_head,
+                                      count.sec_a1_first_head_length);
+    }
+
   k1_early_puts("\r\n");
 
   /* llc-iv and llc-plain are the check that does not trust the descriptor: a
