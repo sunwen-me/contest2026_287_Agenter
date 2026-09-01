@@ -256,6 +256,26 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_EFUSE_RF_DEFAULT_RFE   0x01u
 #define K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED  0xffu
 
+/* Hidden eFuse window of the factory trims, from halrf_kfree_8852b.h.  These
+ * are physical eFuse addresses, not logical map offsets: the trims sit above
+ * the logical area and halrf reads them straight out of the physical image
+ * with halrf_phy_efuse_get_info(HIDE_EFUSE_START_ADDR_8852B, 0x40, ...).  The
+ * thermal and bias cells are whole bytes split into nibbles; the sixteen TSSI
+ * cells are one byte each and descend in address as the band ascends, 2 GHz
+ * low and high first and then the six 5 GHz sub bands.
+ */
+
+#define K1_RTL8852BS_EFUSE_HIDDEN_FIRST     0x05a0u
+#define K1_RTL8852BS_EFUSE_HIDDEN_LAST      0x05dfu
+#define K1_RTL8852BS_EFUSE_HIDDEN_SIZE      0x0040u
+#define K1_RTL8852BS_EFUSE_TRIM_THERMAL_A   0x05dfu
+#define K1_RTL8852BS_EFUSE_TRIM_THERMAL_B   0x05dcu
+#define K1_RTL8852BS_EFUSE_TRIM_PABIAS_A    0x05deu
+#define K1_RTL8852BS_EFUSE_TRIM_PABIAS_B    0x05dbu
+#define K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS  8u
+#define K1_RTL8852BS_EFUSE_TRIM_TSSI_PER_WORD 4u
+#define K1_RTL8852BS_EFUSE_TRIM_NIBBLE      0x0fu
+
 /* Chip cut version.  R_AX_SYS_CFG1 bits 15:12, i.e. the high nibble of the
  * byte at 0x00f1.  enum rtw_cv numbers CAV 0, CBV 1, CCV 2.
  */
@@ -1425,6 +1445,20 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RF_MODE_DACK            0x000337e1u
 #define K1_RTL8852BS_RF_REG_MODE_OPT         0x01u
 #define K1_RTL8852BS_RF_MODE_OPT_DACK        0x00000000u
+
+/* The two radio registers the factory trims land in, from
+ * _halrf_set_thermal_trim_8852b() and _halrf_set_pa_bias_trim_8852b().  The
+ * thermal meter trim is four bits of RF 0x43, and the bias trim is two
+ * separate nibbles of RF 0x60, one per band.  The vendor names neither
+ * register and writes both through its masked radio write, which shifts the
+ * value into the mask exactly as k1_rtl8852bs_rf_write() does.
+ */
+
+#define K1_RTL8852BS_RF_REG_THERMAL_TRIM     0x43u
+#define K1_RTL8852BS_RF_THERMAL_TRIM_MASK    0x000f0000u
+#define K1_RTL8852BS_RF_REG_PA_BIAS_TRIM     0x60u
+#define K1_RTL8852BS_RF_PA_BIAS_TRIM_2G_MASK 0x0000f000u
+#define K1_RTL8852BS_RF_PA_BIAS_TRIM_5G_MASK 0x000f0000u
 
 /* The per path control, result and offset words, then the four the two
  * paths share: the converter clock of each path, the receive FIFO and the
@@ -2713,6 +2747,8 @@ struct k1_rtl8852bs_rf_context_s
   uint8_t thermal_b;
   uint16_t tssi_de_programmed;
   uint8_t gain_k_programmed;
+  uint8_t hidden_programmed;
+  uint8_t hidden[K1_RTL8852BS_EFUSE_HIDDEN_SIZE];
 };
 
 /****************************************************************************
@@ -6454,6 +6490,20 @@ int k1_rtl8852bs_fwdl_rf_context_diagnostic(void)
     logical, K1_RTL8852BS_EFUSE_RF_GAIN_K_FIRST,
     K1_RTL8852BS_EFUSE_RF_GAIN_K_LAST);
 
+  /* The factory trim window comes out of the physical image rather than the
+   * logical map, and it has to be copied here rather than read where it is
+   * used: the eFuse read sequence drives the power cut and isolation
+   * registers, and the host indirect window stops returning live values once
+   * the WCPU owns the chip.  The vendor reads it at trim time because its
+   * host keeps that access; this port has one chance at it, which is now.
+   */
+
+  memcpy(context->hidden, &physical[K1_RTL8852BS_EFUSE_HIDDEN_FIRST],
+         K1_RTL8852BS_EFUSE_HIDDEN_SIZE);
+  context->hidden_programmed = (uint8_t)k1_rtl8852bs_rf_context_count(
+    physical, K1_RTL8852BS_EFUSE_HIDDEN_FIRST,
+    K1_RTL8852BS_EFUSE_HIDDEN_LAST);
+
   /* hal_rfe_type_chk() rejects an unprogrammed RFE cell unless the vendor
    * bypass_rfe_chk flag is set, in which case halrf falls back to its own
    * default RFE type.  Record which of the two the guard will use.
@@ -6501,6 +6551,26 @@ int k1_rtl8852bs_fwdl_rf_context_diagnostic(void)
   k1_early_puts("/0x4a rx_gain_k[0x2d4..0x2dd] programmed=");
   k1_early_puthex(context->gain_k_programmed);
   k1_early_puts("/0x0a\r\n");
+
+  k1_early_puts("K1 Wi-Fi GPL: RF context hidden[0x5a0..0x5df] programmed=");
+  k1_early_puthex(context->hidden_programmed);
+  k1_early_puts("/0x40 thermal_trim=");
+  k1_rtl8852bs_rf_context_byte(
+    "", context->hidden[K1_RTL8852BS_EFUSE_TRIM_THERMAL_A -
+                        K1_RTL8852BS_EFUSE_HIDDEN_FIRST], 0x00u);
+  k1_early_puts("/");
+  k1_rtl8852bs_rf_context_byte(
+    "", context->hidden[K1_RTL8852BS_EFUSE_TRIM_THERMAL_B -
+                        K1_RTL8852BS_EFUSE_HIDDEN_FIRST], 0x00u);
+  k1_early_puts(" pabias_trim=");
+  k1_rtl8852bs_rf_context_byte(
+    "", context->hidden[K1_RTL8852BS_EFUSE_TRIM_PABIAS_A -
+                        K1_RTL8852BS_EFUSE_HIDDEN_FIRST], 0x00u);
+  k1_early_puts("/");
+  k1_rtl8852bs_rf_context_byte(
+    "", context->hidden[K1_RTL8852BS_EFUSE_TRIM_PABIAS_B -
+                        K1_RTL8852BS_EFUSE_HIDDEN_FIRST], 0x00u);
+  k1_early_puts("\r\n");
 
   /* A blank RFE cell together with a blank TSSI de-emphasis and RX gain
    * range means this board ships without RF calibration data in the eFuse.
@@ -16919,6 +16989,328 @@ static void k1_rtl8852bs_rf_dack_trigger(void)
   k1_early_puts("\r\n");
 }
 
+/* The three factory trims of halrf_get_efuse_trim_8852b(), which
+ * halrf_dm_init() runs immediately after the converter calibration above.
+ * Three cells of the hidden eFuse window become two radio register writes
+ * per path, and sixteen more become a table the transmit power stage will
+ * need: the thermal meter trim, the power amplifier bias trim for each band,
+ * and the TSSI de-emphasis trims.
+ *
+ * One deviation, and it is forced rather than chosen.  The vendor reads the
+ * hidden window here, at trim time, with halrf_phy_efuse_get_info().  This
+ * port cannot.  The eFuse read sequence drives the power cut and isolation
+ * registers, and the host indirect window stops returning live values once
+ * the WCPU owns the chip, which it does long before the scan reaches this
+ * point; that is why the RF context stage has to run before the firmware
+ * download.  So the window is copied out of the physical image that stage
+ * already reads, and this function works from the copy.  The bytes are the
+ * same bytes, and the eFuse is read once instead of twice; only the moment
+ * of the read differs.
+ *
+ * The vendor's other wrapper, halrf_write_fwofld_start() and _end() around
+ * the two register writes, is an offload batching optimisation.  Every radio
+ * write in this port goes straight down the serial interface, the way the
+ * calibrations above do, so there is nothing to batch.
+ *
+ * Both of the vendor's "no PG" rules are kept exactly, because they are what
+ * makes a board without factory data land on the table defaults instead of
+ * on the trim that 0xff happens to encode.  A pair of trim cells that both
+ * read 0xff leaves its registers alone, and a TSSI table whose sixteen cells
+ * all read 0xff becomes sixteen zeroes rather than sixteen -1 corrections.
+ */
+
+struct k1_rtl8852bs_rf_trim_trace_s
+{
+  uint8_t thermal[K1_RTL8852BS_RF_PATHS];
+  uint8_t pabias[K1_RTL8852BS_RF_PATHS];
+  uint8_t code[K1_RTL8852BS_RF_PATHS];
+  uint8_t band_2g[K1_RTL8852BS_RF_PATHS];
+  uint8_t band_5g[K1_RTL8852BS_RF_PATHS];
+  uint32_t thermal_before[K1_RTL8852BS_RF_PATHS];
+  uint32_t thermal_after[K1_RTL8852BS_RF_PATHS];
+  uint32_t pabias_before[K1_RTL8852BS_RF_PATHS];
+  uint32_t pabias_after[K1_RTL8852BS_RF_PATHS];
+  uint8_t tssi[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS];
+  bool thermal_written;
+  bool pabias_written;
+  bool tssi_blank;
+};
+
+/* The hidden window addresses, one row per radio path.  The TSSI cells
+ * descend in address as the band ascends, which is why they are a table
+ * rather than a base plus an index.
+ */
+
+static const uint16_t g_k1_rtl8852bs_trim_thermal[K1_RTL8852BS_RF_PATHS] =
+{
+  K1_RTL8852BS_EFUSE_TRIM_THERMAL_A,
+  K1_RTL8852BS_EFUSE_TRIM_THERMAL_B,
+};
+
+static const uint16_t g_k1_rtl8852bs_trim_pabias[K1_RTL8852BS_RF_PATHS] =
+{
+  K1_RTL8852BS_EFUSE_TRIM_PABIAS_A,
+  K1_RTL8852BS_EFUSE_TRIM_PABIAS_B,
+};
+
+static const uint16_t
+  g_k1_rtl8852bs_trim_tssi[K1_RTL8852BS_RF_PATHS]
+                          [K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS] =
+{
+  {
+    0x05d6u, 0x05d5u, 0x05d4u, 0x05d3u,
+    0x05d2u, 0x05d1u, 0x05d0u, 0x05cfu
+  },
+  {
+    0x05abu, 0x05aau, 0x05a9u, 0x05a8u,
+    0x05a7u, 0x05a6u, 0x05a5u, 0x05a4u
+  },
+};
+
+/* _halrf_get_1byte_efuse_8852b(): one byte of the cached hidden window, or
+ * 0xff for an address outside it.  That is the same value an unprogrammed
+ * cell reads, so a caller cannot tell the two apart and does not need to:
+ * both mean there is no factory trim at that address.  The bounds check is
+ * the vendor's and is kept because the addresses are literals taken from a
+ * header this port does not include.
+ */
+
+static uint8_t k1_rtl8852bs_efuse_hidden_byte(uint16_t address)
+{
+  FAR const struct k1_rtl8852bs_rf_context_s *context;
+
+  context = &g_k1_rtl8852bs_rf_context;
+  if (!context->valid ||
+      address < K1_RTL8852BS_EFUSE_HIDDEN_FIRST ||
+      address > K1_RTL8852BS_EFUSE_HIDDEN_LAST)
+    {
+      return K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED;
+    }
+
+  return context->hidden[address - K1_RTL8852BS_EFUSE_HIDDEN_FIRST];
+}
+
+/* _halrf_set_thermal_trim_8852b()'s nibble swap.  The vendor writes it as
+ * ((v & 0x1) << 3) | (v >> 1) after masking to four bits, which rotates the
+ * nibble right by one: the bit that falls off the bottom comes back as the
+ * top bit of the four.  It is not a shift, and it is not the high/low nibble
+ * exchange _halrf_efuse_exchange_8852b() does for other chips.
+ */
+
+static uint8_t k1_rtl8852bs_trim_thermal_code(uint8_t value)
+{
+  uint8_t nibble = value & K1_RTL8852BS_EFUSE_TRIM_NIBBLE;
+
+  return (uint8_t)(((nibble & 0x1u) << 3) | (nibble >> 1));
+}
+
+static void k1_rtl8852bs_rf_efuse_trim_trigger(void)
+{
+  struct k1_rtl8852bs_rf_trim_trace_s trace;
+  unsigned int path;
+  unsigned int band;
+  unsigned int blank = 0;
+  uint32_t word;
+  int ret = OK;
+
+  memset(&trace, 0, sizeof(trace));
+
+  /* Without the cached window there is nothing to apply.  The RF context
+   * stage either did not run or failed, and inventing a trim is worse than
+   * leaving the radio on the defaults of its parameter image.
+   */
+
+  if (!g_k1_rtl8852bs_rf_context.valid)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RF TRIM skipped context=absent\r\n");
+      return;
+    }
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      trace.thermal[path] = k1_rtl8852bs_efuse_hidden_byte(
+        g_k1_rtl8852bs_trim_thermal[path]);
+      trace.pabias[path] = k1_rtl8852bs_efuse_hidden_byte(
+        g_k1_rtl8852bs_trim_pabias[path]);
+      trace.code[path] =
+        k1_rtl8852bs_trim_thermal_code(trace.thermal[path]);
+      trace.band_2g[path] = trace.pabias[path] &
+                            K1_RTL8852BS_EFUSE_TRIM_NIBBLE;
+      trace.band_5g[path] = (trace.pabias[path] >> 4) &
+                            K1_RTL8852BS_EFUSE_TRIM_NIBBLE;
+
+      for (band = 0; band < K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS; band++)
+        {
+          trace.tssi[path][band] = k1_rtl8852bs_efuse_hidden_byte(
+            g_k1_rtl8852bs_trim_tssi[path][band]);
+          if (trace.tssi[path][band] == K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED)
+            {
+              blank++;
+            }
+        }
+    }
+
+  /* _halrf_get_tssi_trim_8852b()'s rule is on the whole table, not on each
+   * cell: sixteen blank cells become sixteen zeroes, and a table with even
+   * one programmed cell keeps its blanks as the 0xff the eFuse read.  This
+   * writes no register.  The transmit power stage is what consumes it, and
+   * that stage is not ported yet, so the table is measured and printed here
+   * and read back out of the hidden window when it is needed.
+   */
+
+  trace.tssi_blank = blank == K1_RTL8852BS_RF_PATHS *
+                             K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS;
+  if (trace.tssi_blank)
+    {
+      memset(trace.tssi, 0, sizeof(trace.tssi));
+    }
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS && ret >= 0; path++)
+    {
+      ret = k1_rtl8852bs_rf_read((uint8_t)path,
+                                 K1_RTL8852BS_RF_REG_THERMAL_TRIM,
+                                 &trace.thermal_before[path], NULL);
+      if (ret >= 0)
+        {
+          ret = k1_rtl8852bs_rf_read((uint8_t)path,
+                                     K1_RTL8852BS_RF_REG_PA_BIAS_TRIM,
+                                     &trace.pabias_before[path], NULL);
+        }
+    }
+
+  /* The vendor's blank test is on the pair of paths, not on each path: one
+   * programmed cell writes both radios, and the blank one then gets the trim
+   * that 0xff encodes.  Keep it, because a board with one path programmed is
+   * a board the vendor treats this way too, and a port that split the test
+   * per path would apply a different trim than the driver this hardware was
+   * calibrated against.
+   */
+
+  if (ret >= 0 &&
+      !(trace.thermal[0] == K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED &&
+        trace.thermal[1] == K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED))
+    {
+      for (path = 0; path < K1_RTL8852BS_RF_PATHS && ret >= 0; path++)
+        {
+          ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                      K1_RTL8852BS_RF_REG_THERMAL_TRIM,
+                                      K1_RTL8852BS_RF_THERMAL_TRIM_MASK,
+                                      trace.code[path], NULL);
+        }
+
+      trace.thermal_written = ret >= 0;
+    }
+
+  if (ret >= 0 &&
+      !(trace.pabias[0] == K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED &&
+        trace.pabias[1] == K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED))
+    {
+      for (path = 0; path < K1_RTL8852BS_RF_PATHS && ret >= 0; path++)
+        {
+          ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                      K1_RTL8852BS_RF_REG_PA_BIAS_TRIM,
+                                      K1_RTL8852BS_RF_PA_BIAS_TRIM_2G_MASK,
+                                      trace.band_2g[path], NULL);
+          if (ret >= 0)
+            {
+              ret = k1_rtl8852bs_rf_write(
+                (uint8_t)path, K1_RTL8852BS_RF_REG_PA_BIAS_TRIM,
+                K1_RTL8852BS_RF_PA_BIAS_TRIM_5G_MASK,
+                trace.band_5g[path], NULL);
+            }
+        }
+
+      trace.pabias_written = ret >= 0;
+    }
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS && ret >= 0; path++)
+    {
+      ret = k1_rtl8852bs_rf_read((uint8_t)path,
+                                 K1_RTL8852BS_RF_REG_THERMAL_TRIM,
+                                 &trace.thermal_after[path], NULL);
+      if (ret >= 0)
+        {
+          ret = k1_rtl8852bs_rf_read((uint8_t)path,
+                                     K1_RTL8852BS_RF_REG_PA_BIAS_TRIM,
+                                     &trace.pabias_after[path], NULL);
+        }
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RF TRIM efuse thermal=");
+  k1_early_puthex(trace.thermal[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.thermal[1]);
+  k1_early_puts(" pabias=");
+  k1_early_puthex(trace.pabias[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.pabias[1]);
+  k1_early_puts(" tssi-blank=");
+  k1_early_puthex(blank);
+  k1_early_puts("/");
+  k1_early_puthex(K1_RTL8852BS_RF_PATHS *
+                  K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS);
+  k1_early_puts("\r\n");
+
+  k1_early_puts("K1 Wi-Fi GPL: RF TRIM code thermal=");
+  k1_early_puthex(trace.code[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.code[1]);
+  k1_early_puts(" pa2g=");
+  k1_early_puthex(trace.band_2g[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.band_2g[1]);
+  k1_early_puts(" pa5g=");
+  k1_early_puthex(trace.band_5g[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.band_5g[1]);
+  k1_early_puts(" wrote=");
+  k1_early_puthex(trace.thermal_written ? 1u : 0u);
+  k1_early_puts("/");
+  k1_early_puthex(trace.pabias_written ? 1u : 0u);
+  if (ret < 0)
+    {
+      k1_early_puts(" error=");
+      k1_early_puthex((uintreg_t)-ret);
+    }
+
+  k1_early_puts("\r\n");
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RF TRIM path=");
+      k1_early_puthex(path);
+      k1_early_puts(" ther=");
+      k1_early_puthex(trace.thermal_before[path]);
+      k1_early_puts("->");
+      k1_early_puthex(trace.thermal_after[path]);
+      k1_early_puts(" pab=");
+      k1_early_puthex(trace.pabias_before[path]);
+      k1_early_puts("->");
+      k1_early_puthex(trace.pabias_after[path]);
+      k1_early_puts(" tssi=");
+
+      /* Four cells to a word, low band first, so the sixteen bytes read as
+       * four printed words instead of sixteen sixteen-digit values.
+       */
+
+      word = 0;
+      for (band = 0; band < K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS; band++)
+        {
+          word = (word << 8) | trace.tssi[path][band];
+          if ((band % K1_RTL8852BS_EFUSE_TRIM_TSSI_PER_WORD) ==
+              K1_RTL8852BS_EFUSE_TRIM_TSSI_PER_WORD - 1)
+            {
+              k1_early_puthex(word);
+              k1_early_puts(band + 1 < K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS ?
+                            "/" : "");
+              word = 0;
+            }
+        }
+
+      k1_early_puts("\r\n");
+    }
+}
+
 struct k1_rtl8852bs_scan_rf_readback_s
 {
   uint32_t mode[K1_RTL8852BS_RF_PATHS];
@@ -21590,14 +21982,17 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
    * transmit half, which parks the radios a second time because the third
    * put them back: the vendor keeps one park across both halves, but nothing
    * receives during the vendor's, and the scan here has to keep receiving
-   * between the two.  The samples on either side then measure all four the
-   * same way they measure the reset.
+   * between the two.  The fifth is what the vendor runs next, the factory
+   * trims of the thermal meter and the amplifier bias, which are eFuse cells
+   * rather than a measurement and so need no park at all.  The samples on
+   * either side then measure all five the same way they measure the reset.
    */
 
   k1_rtl8852bs_rf_rck_trigger();
   k1_rtl8852bs_rf_drck_trigger();
   k1_rtl8852bs_rf_addck_trigger();
   k1_rtl8852bs_rf_dack_trigger();
+  k1_rtl8852bs_rf_efuse_trim_trigger();
 
   rf_readback_ret = k1_rtl8852bs_scan_rf_readback_read(&rf_readback);
   if (rf_readback_ret < 0)
