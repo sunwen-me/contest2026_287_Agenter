@@ -3767,9 +3767,10 @@ out:
 
 #ifdef CONFIG_K1_RTL8852BS2_RUNTIME_PHY_CR_FWOFLD_DIAGNOSTIC
 static int k1_rtl8852bs_runtime_phy_cr_offload_init(void);
+#endif
+
 static void k1_rtl8852bs_scanofld_log_bytes(FAR const uint8_t *data,
                                             size_t length);
-#endif
 
 int k1_rtl8852bs_runtime_phy_cr_init(void)
 {
@@ -16914,23 +16915,21 @@ static void k1_rtl8852bs_scanofld_log_rx(
   k1_early_puthex(match->self_probe_requests);
   k1_early_puts(" self-tx-fc=");
   k1_early_puthex(match->self_tx_frame_control);
+  /* Two hex digits a byte rather than k1_early_puthex's zero-padded register
+   * width, which spent eighteen characters on each of these eighteen bytes.
+   * The bssid= field above keeps the verbose form on purpose: the harness
+   * matches it with a pattern that requires a non-zero first nibble.
+   */
+
   k1_early_puts(" self-tx-a1=");
-  for (index = 0; index < sizeof(match->self_tx_a1); index++)
-    {
-      k1_early_puthex(match->self_tx_a1[index]);
-    }
-
+  k1_rtl8852bs_scanofld_log_bytes(match->self_tx_a1,
+                                  sizeof(match->self_tx_a1));
   k1_early_puts(" rsp-a1=");
-  for (index = 0; index < sizeof(match->probe_response_a1); index++)
-    {
-      k1_early_puthex(match->probe_response_a1[index]);
-    }
-
+  k1_rtl8852bs_scanofld_log_bytes(match->probe_response_a1,
+                                  sizeof(match->probe_response_a1));
   k1_early_puts(" rsp-a2=");
-  for (index = 0; index < sizeof(match->probe_response_a2); index++)
-    {
-      k1_early_puthex(match->probe_response_a2[index]);
-    }
+  k1_rtl8852bs_scanofld_log_bytes(match->probe_response_a2,
+                                  sizeof(match->probe_response_a2));
 
   k1_early_puts("\r\n");
 }
