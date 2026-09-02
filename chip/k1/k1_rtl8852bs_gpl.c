@@ -1015,6 +1015,47 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_PWR_BY_RATE_1SS_MAX      0xd2d8u
 #define K1_RTL8852BS_PWR_BY_RATE_MAX          0xd2e8u
 #define K1_RTL8852BS_MAC_TXPWR_FORCE_VALUE    0x00000040u
+
+/* The per rate tables themselves: the three contiguous register runs
+ * mac_write_pwr_by_rate_reg(), mac_write_pwr_limit_reg() and
+ * mac_write_pwr_limit_rua_reg() in mac_ax/outsrc.c fill, plus the mode
+ * offset word mac_write_pwr_ofst_mode() fills.  Forty three words from
+ * 0xd2c0 to 0xd368 with no gap in between, and the word after the last one
+ * starts the per station identifier limit table, which nothing here writes.
+ *
+ * Every field is a signed byte in half dBm.  The original divides the radio
+ * domain value by two on its way into the structure - halrf_get_power_by_rate
+ * (...) / 2 at halrf_set_pwr_table_8852b.c:906, and every line of
+ * halrf_get_power_limit_to_struct_20m_8852b() - and then
+ * halrf_modify_pwr_table_bitmask() (halrf_pwr_table.c:2745) masks each field
+ * to seven bits before the words go out.  Four fields pack into one word by
+ * BT_2_DW(), so one power for every rate is one byte repeated four times.
+ *
+ * The outer index of all three tables is the transmit stream count, not the
+ * radio path: the original loops to HAL_MAX_PATH, but the registers it walks
+ * are named _1NSS and _2NSS and the structure rows it reads are PW_LMT_PH_1T
+ * and PW_LMT_PH_2T.
+ */
+
+#define K1_RTL8852BS_PWR_RATE_OFST_CTRL       0xd204u
+#define K1_RTL8852BS_PWR_RATE_OFST_MODE_ALL   0x000fffffu
+#define K1_RTL8852BS_PWR_BY_RATE_LGCY_WORDS   3u
+#define K1_RTL8852BS_PWR_BY_RATE_NONLGCY      0xd2ccu
+#define K1_RTL8852BS_PWR_BY_RATE_NSS_WORDS    4u
+#define K1_RTL8852BS_PWR_BY_RATE_NSS_STRIDE   0x10u
+#define K1_RTL8852BS_PWR_LMT_TABLE0           0xd2ecu
+#define K1_RTL8852BS_PWR_LMT_NSS_WORDS        10u
+#define K1_RTL8852BS_PWR_LMT_NSS_STRIDE       0x28u
+#define K1_RTL8852BS_PWR_RU_LMT_TABLE0        0xd33cu
+#define K1_RTL8852BS_PWR_RU_LMT_NSS_WORDS     6u
+#define K1_RTL8852BS_PWR_RU_LMT_NSS_STRIDE    0x18u
+#define K1_RTL8852BS_PWR_NSS_COUNT            2u
+#define K1_RTL8852BS_PWR_TXAGC_MASK           0x7fu
+#define K1_RTL8852BS_PWR_TXAGC_HALF_DBM \
+  ((K1_RTL8852BS_BB_TXPWR_FORCE_DBM / 2u) & K1_RTL8852BS_PWR_TXAGC_MASK)
+#define K1_RTL8852BS_PWR_TXAGC_WORD \
+  (K1_RTL8852BS_PWR_TXAGC_HALF_DBM * 0x01010101u)
+
 /* RMAC per-PPDU-type receive counter window, the register pair behind the
  * original mac_rx_cnt().  Byte 0 selects one of 48 counters and the upper
  * half word returns its 16 bit value, so a read costs one selection write
@@ -24333,6 +24374,207 @@ static void k1_rtl8852bs_runtime_txpwr_log(
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_runtime_txpwr_table_block
+ *
+ * Description:
+ *   Write one contiguous run of transmit power table words, every word
+ *   verified by readback, and report the head word before and after so a log
+ *   says what the run held and what it holds now.  A run is one stream row of
+ *   one of the three blocks halrf_set_fix_power_to_struct_8852b() fills; the
+ *   caller walks the stream dimension itself so the block boundaries stay
+ *   visible in the code rather than collapsing into one flat sweep.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_txpwr_table_block(FAR const char *name,
+                                                  uint32_t address,
+                                                  unsigned int words,
+                                                  uint32_t value)
+{
+  uint32_t before;
+  uint32_t after;
+  unsigned int i;
+  int ret;
+
+  ret = k1_rtl8852bs_mac_read32(address, &before);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  for (i = 0; i < words; i++)
+    {
+      ret = k1_rtl8852bs_mac_update_field_checked(address + i * 4,
+                                                 0xffffffffu, value);
+      if (ret < 0)
+        {
+          k1_early_puts("K1 Wi-Fi GPL: TX power table ");
+          k1_early_puts(name);
+          k1_early_puts(" word=");
+          k1_early_puthex(address + i * 4);
+          k1_early_puts(" error=");
+          k1_early_puthex((uintreg_t)-ret);
+          k1_early_puts("\r\n");
+          return ret;
+        }
+    }
+
+  ret = k1_rtl8852bs_mac_read32(address, &after);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: TX power table ");
+  k1_early_puts(name);
+  k1_early_puts(" head=");
+  k1_early_puthex(address);
+  k1_early_puts(" words=");
+  k1_early_puthex((uintreg_t)words);
+  k1_early_puts(" ");
+  k1_early_puthex(before);
+  k1_early_puts("->");
+  k1_early_puthex(after);
+  k1_early_puts("\r\n");
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: k1_rtl8852bs_runtime_txpwr_table
+ *
+ * Description:
+ *   Fill the MAC per rate transmit power tables with one constant power, the
+ *   way halrf_set_fix_power_to_struct_8852b()
+ *   (halrf_set_pwr_table_8852b.c:162) does it when the driver asks for
+ *   PW_BY_RATE_ALL_SAME: the by rate table, the limit table and the resource
+ *   unit limit table all set to the same signed byte, and the five mode
+ *   offset nibbles zeroed.
+ *
+ *   The constant is the power this port already forces, expressed in the half
+ *   dBm the MAC tables use rather than the quarter dBm the reference and
+ *   force fields use.  That divide by two is the original's own, at
+ *   halrf_set_pwr_table_8852b.c:906.
+ *
+ *   Deviations from the original, all deliberate:
+ *
+ *   - halrf_set_power_by_rate_to_struct_8852b() is not ported.  It needs
+ *     halrf_get_power_by_rate() over the regulatory, country and channel
+ *     tables in halrf_pwr_table.c, and this port has no source of truth for
+ *     which regulatory domain the board is in.  Until it has one, one
+ *     constant for every rate is the honest table.
+ *   - _halrf_set_ext_power_diff_8852b() is not ported: it applies external
+ *     amplifier differences read out of the efuse, and with no differences it
+ *     degenerates to path A with no decrease.
+ *   - mac_write_pwr_limit_en() is not called, exactly as the original's fixed
+ *     power path does not call it, so the two limit enable bits keep whatever
+ *     they hold.
+ *   - Both power overrides stay on across this call.  The baseband force at
+ *     0x09a4/0x4594 and the MAC force by rate bit in 0xd200 short circuit the
+ *     tables, so this step changes the tables without changing what the
+ *     hardware transmits, and the log says whether the writes landed.  The
+ *     overrides come off in a later step, one at a time, because the last
+ *     time this port moved a power anchor and an override in one round it
+ *     cost sixteen dB and a whole board run to find out which one did it.
+ *
+ ****************************************************************************/
+
+static int k1_rtl8852bs_runtime_txpwr_table(void)
+{
+  uint32_t ofst;
+  unsigned int nss;
+  int ret;
+
+  /* Three legacy words first, four CCK rates and eight OFDM rates, then the
+   * non legacy words, four per transmit stream count, the way
+   * mac_write_pwr_by_rate_reg() walks them.
+   */
+
+  ret = k1_rtl8852bs_runtime_txpwr_table_block(
+    "by-rate-lgcy", K1_RTL8852BS_PWR_BY_RATE_TABLE0,
+    K1_RTL8852BS_PWR_BY_RATE_LGCY_WORDS, K1_RTL8852BS_PWR_TXAGC_WORD);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  for (nss = 0; nss < K1_RTL8852BS_PWR_NSS_COUNT; nss++)
+    {
+      ret = k1_rtl8852bs_runtime_txpwr_table_block(
+        "by-rate", K1_RTL8852BS_PWR_BY_RATE_NONLGCY +
+        nss * K1_RTL8852BS_PWR_BY_RATE_NSS_STRIDE,
+        K1_RTL8852BS_PWR_BY_RATE_NSS_WORDS, K1_RTL8852BS_PWR_TXAGC_WORD);
+      if (ret < 0)
+        {
+          return ret;
+        }
+    }
+
+  /* Then the limit table, ten words per stream count: CCK at twenty and
+   * forty megahertz, legacy, the eight twenty megahertz subchannels, the four
+   * forty megahertz ones, the two eighty megahertz ones, one hundred and
+   * sixty, and the two half and two and a half megahertz offsets.
+   */
+
+  for (nss = 0; nss < K1_RTL8852BS_PWR_NSS_COUNT; nss++)
+    {
+      ret = k1_rtl8852bs_runtime_txpwr_table_block(
+        "lmt", K1_RTL8852BS_PWR_LMT_TABLE0 +
+        nss * K1_RTL8852BS_PWR_LMT_NSS_STRIDE,
+        K1_RTL8852BS_PWR_LMT_NSS_WORDS, K1_RTL8852BS_PWR_TXAGC_WORD);
+      if (ret < 0)
+        {
+          return ret;
+        }
+    }
+
+  /* And the resource unit limit table, six words per stream count: two words
+   * each for the twenty six, fifty two and one hundred and six tone units.
+   */
+
+  for (nss = 0; nss < K1_RTL8852BS_PWR_NSS_COUNT; nss++)
+    {
+      ret = k1_rtl8852bs_runtime_txpwr_table_block(
+        "ru-lmt", K1_RTL8852BS_PWR_RU_LMT_TABLE0 +
+        nss * K1_RTL8852BS_PWR_RU_LMT_NSS_STRIDE,
+        K1_RTL8852BS_PWR_RU_LMT_NSS_WORDS, K1_RTL8852BS_PWR_TXAGC_WORD);
+      if (ret < 0)
+        {
+          return ret;
+        }
+    }
+
+  /* Last the five mode offsets, one signed nibble each for CCK, legacy, HT,
+   * VHT and HE, all of them read against the HT power.  The original zeroes
+   * them in the fixed power case, so nothing is added on top of the
+   * constant.
+   */
+
+  ret = k1_rtl8852bs_mac_update_field_checked(
+    K1_RTL8852BS_PWR_RATE_OFST_CTRL, K1_RTL8852BS_PWR_RATE_OFST_MODE_ALL, 0);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  ret = k1_rtl8852bs_mac_read32(K1_RTL8852BS_PWR_RATE_OFST_CTRL, &ofst);
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: TX power table dbm-half=");
+  k1_early_puthex(K1_RTL8852BS_PWR_TXAGC_HALF_DBM);
+  k1_early_puts(" word=");
+  k1_early_puthex(K1_RTL8852BS_PWR_TXAGC_WORD);
+  k1_early_puts(" ofst-mode=");
+  k1_early_puthex(ofst & K1_RTL8852BS_PWR_RATE_OFST_MODE_ALL);
+  k1_early_puts("\r\n");
+
+  return OK;
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_runtime_txpwr_force
  *
  * Description:
@@ -24343,11 +24585,13 @@ static void k1_rtl8852bs_runtime_txpwr_log(
  *   table is filled by RF code this port has not ported yet, and a constant
  *   overrides it in one register pair.
  *
- *   The field is nine signed bits and the original names it dBm without
- *   naming its scale, so the constant is chosen to be a usable transmit power
- *   under every scale the family uses: eight dBm if the step is an eighth of a
- *   dBm, sixteen if a quarter, and clamped by the amplifier above that.  It is
- *   a diagnostic constant, not a regulatory power setting, and the sweep it
+ *   The field is nine signed bits in quarter dBm, so the constant is sixteen
+ *   dBm.  Two independent readings pin that scale down.  The reference word
+ *   this port builds in k1_rtl8852bs_tpu_ref_word() only reproduces the
+ *   original tssi_16dBm_cw of 0x12c when the power argument is 64, and the
+ *   MAC tables next to this register hold the same power as a signed byte in
+ *   half dBm, which is where the original divide by two comes from.  It is a
+ *   diagnostic constant, not a regulatory power setting, and the sweep it
  *   serves transmits one Probe Request per channel dwell.
  *
  ****************************************************************************/
@@ -24837,6 +25081,11 @@ static void k1_rtl8852bs_runtime_tx_prerequisites(void)
 
   ret = k1_rtl8852bs_runtime_medium_access_init();
   k1_early_puts("K1 Wi-Fi GPL: medium init status=");
+  k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
+  k1_early_puts("\r\n");
+
+  ret = k1_rtl8852bs_runtime_txpwr_table();
+  k1_early_puts("K1 Wi-Fi GPL: TX power table status=");
   k1_early_puthex((uintreg_t)(ret < 0 ? -ret : 0));
   k1_early_puts("\r\n");
 
