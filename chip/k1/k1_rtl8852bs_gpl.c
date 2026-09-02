@@ -302,6 +302,20 @@ extern void k1_early_puthex(uintreg_t value);
  * reference of the same two paths, and the field is the low twenty-seven
  * bits of each.  The zero decibel code word is the only board-dependent
  * part, 0x27 for every radio front end type up to fifty and 0x21 above.
+ *
+ * The two reference powers deviate from the vendor on purpose.  The vendor
+ * anchors the reference at zero decibel milliwatts and lets the per rate
+ * power tables of halrf_set_power(), which this port has not reached yet,
+ * carry all of the transmit power on top of that anchor.  This port instead
+ * forces one power in the baseband, K1_RTL8852BS_BB_TXPWR_FORCE_DBM at
+ * 0x4594, and the baseband image had left the reference anchored to the
+ * same sixteen decibel milliwatts.  Writing the vendor's zero while the per
+ * rate tables are still absent moved the anchor sixteen decibels down, the
+ * code word from 0x1b8 to 0x138, which is the very pair of numbers the
+ * vendor comment in halbb_set_tx_pow_ref_8852b() works its example on, and
+ * the access point stopped answering this port's Probe Requests.  So the
+ * anchor stays where the forced power is until the per rate stage lands,
+ * and then both of these become K1_RTL8852BS_TPU_REF_POW_VENDOR together.
  */
 
 #define K1_RTL8852BS_BB_TXPWR_REF_OFDM_A    0x5804u
@@ -314,8 +328,9 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_TPU_BASE_CW_0DB_LOW    0x27u
 #define K1_RTL8852BS_TPU_BASE_CW_0DB_HIGH   0x21u
 #define K1_RTL8852BS_TPU_TSSI_16DBM_CW      0x012cu
-#define K1_RTL8852BS_TPU_REF_POW_OFDM       0
-#define K1_RTL8852BS_TPU_REF_POW_CCK        0
+#define K1_RTL8852BS_TPU_REF_POW_VENDOR     0
+#define K1_RTL8852BS_TPU_REF_POW_OFDM       K1_RTL8852BS_BB_TXPWR_FORCE_DBM
+#define K1_RTL8852BS_TPU_REF_POW_CCK        K1_RTL8852BS_BB_TXPWR_FORCE_DBM
 #define K1_RTL8852BS_TPU_REF_OFST           0
 #define K1_RTL8852BS_TPU_PW_CW_MAX          63
 #define K1_RTL8852BS_TPU_PW_CW_MIN          15
@@ -17630,6 +17645,19 @@ static void k1_rtl8852bs_rf_tssi_de_trigger(void)
  *   baseband image left behind and every frame sent so far was sent against
  *   that.  Which is why the old value of each is read and reported next to
  *   the new one instead of being written over silently.
+ *
+ *   Reading it first is what caught the one deviation this step carries.
+ *   The baseband image had left 0x04237040 in all four, which is this same
+ *   expression evaluated with a sixteen decibel milliwatt reference: code
+ *   word 0x1b8, sensor offset 0x108.  Writing the vendor's zero decibel
+ *   milliwatt reference took the code word to 0x138 and cost this port the
+ *   Probe Response it needs to associate, because the per rate tables that
+ *   are supposed to put the power back on top of a zero anchor are not
+ *   ported yet.  So the reference powers here are the power this port
+ *   forces at 0x4594 rather than the vendor's zero, and the only field this
+ *   step now moves is the sensor offset, from the image's 0x108 to the
+ *   vendor's 0x12c basis, which nothing reads until transmit power sensor
+ *   tracking is ported.
  *
  ****************************************************************************/
 
