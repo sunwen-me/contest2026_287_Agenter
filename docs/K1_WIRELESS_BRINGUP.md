@@ -9506,3 +9506,110 @@ TXGAPK）、`set_enable_bb_rf(hal, 0)`、五张 `init_rf_reg` 存储表，以及
 `phy_reg_gain`。DPK 那一件要记住用 `gs=0x7f`，不是默认的 `0x5b`，因为这块板的 backoff 早
 就搬进基带了。
 
+
+### run 80 的判决：增量 5c-4 把发射功率打低了十六分贝，而且它不是那个已登记的抖动
+
+run 80（`out/k1-serial/k1-wpa-20260902T044448Z.log`）三遍 bring-up 全部死在主动扫描上：
+`active scan probe response error=0x3d`（ENODATA），最后 `bring-up failed: -61`。第一遍
+收得很好——`beacon=0x19 bss=0x1 channel=0x3 ssid-len=0x2 bssid=64:13:ab:db:f6:28`，第二遍
+`beacon=0x12 bss=0x1`，只有第三遍是空窗口 `beacon=0x0 bss=0x0 self-tx=0xd
+self-preq=0xd`。收得好却发不出去，所以出问题的一定是发射侧。
+
+第三遍那一行和文档里登记过的抖动指纹（run 69，本文第 7669 行和第 8827 行）一模一样，我一
+开始就是照抖动读的。把它翻过来的是这个端口自己早就有的一行诊断：
+
+```
+前四次真机：TX power after-sweep force-en=0x1 force-dbm=0x40 cck-idx-a=0x1b8 cck-idx-b=0x1b8 txinfo-dbm=0x1ba
+run 80    ：TX power after-sweep force-en=0x1 force-dbm=0x40 cck-idx-a=0x138 cck-idx-b=0x138 txinfo-dbm=0x1aa
+```
+
+`cck-idx` 是 0x5808/0x7808 的 bit 17:9，也就是基带的发射功率码字。它在之前四次真机跑
+（`k1-wpa-20260901T211016Z`、`200704Z`、`191959Z`、`182629Z`）里每一次都是 `0x1b8`，那四
+次 `probe-enodata=0 wait-enodata=0`、四次都走完了四路握手；run 80 是第一次读到 `0x138`，
+也是第一次出现 `probe-enodata=1 wait-enodata=2`。0x1b8 是 440，0x138 是 312，差 128 个八
+分之一分贝单位，正好十六分贝。最终发射信息里的功率字段（0x1804 bit 26:18）跟着一起掉，
+`0x1ba → 0x1aa`。**抖动是收不到，这一次是发不出去，两回事。**
+
+原因在 5c-4 本身。基带镜像原本在 0x5804/0x7804/0x5808/0x7808 四个寄存器里留下的是
+`0x04237040`，用原厂自己的打包法拆开是：`tssi_ofst_cw = (val >> 18) & 0x1ff = 0x108`，
+`pw_cw = (val >> 9) & 0x1ff = 0x1b8`，参考功率 `= val & 0x1ff = 0x40`，即 64 个四分之一
+分贝 = 16 dBm。5c-4 照 `halrf_set_ref_power_to_struct_8852b()` 写了原厂的初始值，那里明
+明白白写着 `ref_pow_ofdm = 0; ref_pow_cck = 0; /*0dBm*/`，于是四个寄存器变成
+`0x02b27000`， `pw_cw = 0x138`。
+
+**原厂敢用 0 dBm 当锚点，是因为它有另外一半机制，而这个端口没有。** 原厂在
+`halrf_set_power(PWR_BY_RATE)` 里用逐速率、逐信道、逐法规限值的功率表把整个发射功率重新
+堆回这个零锚点之上；那一步还没移植。这个端口手里只有一个强制功率——`0x09a4` bit 16 打开、
+`0x4594` bit 30:22 写 `K1_RTL8852BS_BB_TXPWR_FORCE_DBM = 0x40`，也就是 16 dBm，正好是镜
+像那个参考被锚在的同一个数。把锚点写成 0 而逐速率表还不存在，等于整条链路凭空少了十六分
+贝。
+
+顺带一提，`halbb_set_tx_pow_ref_8852b()`（`halbb_8852b_api.c:2306`）自己的注释就是 `172
+= 300 - (55 - 39) * 8;`——55 和 39 正是 0x1b8/8 和 0x138/8，原厂拿来举例的那一对数，就是
+这块板这一次挪动的那一对。
+
+修法（提交 `ce022c4`，只改四个字）：把参考锚在这个端口自己强制的功率上，而不是原厂的零。
+
+```c
+#define K1_RTL8852BS_TPU_REF_POW_VENDOR     0
+#define K1_RTL8852BS_TPU_REF_POW_OFDM       K1_RTL8852BS_BB_TXPWR_FORCE_DBM
+#define K1_RTL8852BS_TPU_REF_POW_CCK        K1_RTL8852BS_BB_TXPWR_FORCE_DBM
+```
+
+这样 `pw_cw` 留在 0x1b8 不动，5c-4 唯一还会挪的字段就剩发射功率传感器偏移， `0x108 →
+0x12c`（原厂 `tssi_16dBm_cw` 的基准），而在 TSSI 跟踪移植进来之前没有任何东西读它。
+Python 复核：`pw=0x40 → val=0x04b37040 cw=0x1b8 tssi=0x12c`。**下一轮应当读到 `RF
+TXPWR-REF path=0x0/0x1 ofdm=0x04237040->0x04b37040`，两条路径都是。** 退出条件写在代码注
+释里：等 `halrf_set_power(PWR_BY_RATE)` 落地，这两个宏一起变回
+`K1_RTL8852BS_TPU_REF_POW_VENDOR`。这也把逐速率功率表的优先级提上来了——它现在是一处已记
+录偏离的退出条件，不再只是"以后再说"。
+
+前一轮我给 5c-4 写下的判决条件是"如果这一轮关联退化，唯一嫌疑就是这四个字，回退也只回退
+它们"。关联确实退化了，嫌疑确实是那四个字，`ce022c4` 也确实只改了它们。
+
+### 5c-3 的真机结果：推导出来的上界对上了
+
+`RF TSSI-DE window=0x2d/0x4a cells=0x32 blank=0x5 usable=0x1`。上一节事先推的是"空格子最
+多二十九个，离五十个差得远，所以 `usable=0x1` 是算出来的不是猜的"，实测五个。两条路径的
+格子逐条对过头文件地址表，路径 0 `cck=0x0c080707/0x0700 mcs2g=0x00050505/0xfe
+mcs5g=0xfdfdfbff/0xfdfdfcfc/0xf8fdfffe/0xfbf6`，路径 1 `cck=0x0d08050d/0x0807
+mcs2g=0x03030206/0x03 mcs5g=0x00ff0000/0xfe000000/0xff000200/0xfffc`；手数 0xff 格子是路
+径 0 两个加路径 1 三个，正好五个。
+
+### 增量 5d-1：接收通路直流消除，唯一一个 platform-init 阶段的射频校准
+
+`halrf_rx_dck_8852b()`（`halrf_8852b.c:613`），加上 `halrf_set_rx_dck_8852b()`、
+`halrf_rx_dck_check_8852b()`、`halrf_rx_dck_mode_table_8852b()`，入口是
+`halrf_rx_dck_trigger()`（`halrf.c:222`）。它的位置很特别：`halrf_chl_rfk_trigger()` 把
+别的校准类型都送进常规链，唯独 `RFK_TYPE_PLATFORM_INIT` 只跑这一个。所以调用点排在
+`halrf_dm_init()` 那六步**之后**，不是插在中间。
+
+这颗芯片把难的一半省掉了：`halrf_rx_dck_trigger()` 在 8852B 分支里传给
+`halrf_rx_dck_8852b()` 的 `is_afe` 是**字面量 false**，不是它自己收到的参数，所以整个模
+拟前端分支在这颗芯片上是死代码，测量本身只有四次射频写加六百微秒：0x93 的来源选择切到射
+频链、0x92 的触发位落下再抬起、然后 30 × 20 µs。
+
+难的全在外围。每条路径：存 0x05 和 0x92 的 tune 位，两个都清零；2.4 GHz 上换入接收模式表
+（0xee/0x33/0x3e/0x3f），把 0x84 的三个接收增益位清零，把路径 A 的信道字挪到十四，让测量
+离开频段边缘；把模式字强制成接收；测量；然后校验——模式寄存器的 code 字段走四个低增益码
+（0x00/0x0d/0x0e/0x0f）和四个高增益码（0x10/0x1d/0x1e/0x1f），每个码从 0x92 读同相值、从
+0x93 读正交值，某一组里只要有一个后续读数跟这组第一个差六或以上就算失败；失败就隔五毫秒
+重测，最多三次。最后把存下来的全部写回去。
+
+两处原厂有而这里没有，都写在函数注释里。一是原厂在校准前后做的 MAC 层发射暂停：这一步跑
+在第一次扫描之前，那时候没有任何东西在发，不需要。二是原厂的 `support_ability` 能力掩
+码，这个端口不建模它（它把整套校准全开），所以门只有按信道校准映射 `chlk_map` 一个，新增
+`K1_RTL8852BS_RF_CHLK_MAP_RXDCK = BIT(8)`，对应原厂的 `HAL_RF_RXDCK`。发射功率传感器的暂
+停保留，由校准自初始化已经发布的那个逐路径标志驱动，所以传感器模式将来一到它自己就开始工
+作。
+
+一处顺序改动，也写在注释里：四个要存的字（0x05、0x92 的 tune 位、0x84、路径 A 的 0x18）
+都在动手写之前读完，而不是照原厂那样读到序列中间。两个位置之间没有任何东西碰这两个寄存
+器，值是同一个；先读完的好处是任何一条失败路径都能把射频恢复成发现时的样子，而不是写回一
+个它从来没读到过的零。校验走过的 code 字段不恢复——原厂也不恢复，它是个读选择，它上面的模
+式字由 0x05 一起恢复。
+
+提交 `01960fe`，`-fsyntax-only` 干净（用的是构建库里这个文件的真实编译命令，`-Wall
+-Wshadow -Wstrict-prototypes -Wundef`，不碰构建目录，因为 run 81 还在飞）。真机验证等
+run 81 之后那一轮。
+
