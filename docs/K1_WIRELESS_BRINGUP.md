@@ -9682,3 +9682,60 @@ txinfo-dbm  出现  其中失败
 run 80 一份是 `0x138`，run 81 又回到 `0x1b8`。上一节的那句话已经就地改掉，代码里没有任何
 东西依赖这个字段，`ce022c4` 不受影响。
 
+### run 82：5d-1 在真机上通过，而且重测这条路真的被走到了
+
+`out/k1-serial/k1-wpa-20260902T100954Z.log`，4453 行，末尾 `PASS: K1 wireless RAM image
+reached NSH`。`probe response error=0x3d` 0 次，`bring-up failed` 0 次，`RF RX-DCK
+skipped` 0 次——最后这一条说明 `chlk_map & BIT(8)` 这道门从来没关上过。
+
+十三组 platform-init，每一组的汇总行都是 `RF RX-DCK map=0x100 tssi-mode=0x0/0x0
+fail=0x0/0x0 error=0x0`。`map=0x100` 就是新加的 `K1_RTL8852BS_RF_CHLK_MAP_RXDCK`；
+`tssi-mode=0x0/0x0` 说明两条路径的发射功率传感器都不在需要暂停的模式里，那两次暂停按预期
+整个跳过了（传感器跟踪还没移植，校准自初始化发布的标志就是 0）。
+
+真正值得记的是重测的分布：十组 `rek=0x0/0x0`，两组 `rek=0x1/0x0`，一组 `rek=0x1/0x1`。二
+十六次逐路径测量里有四次用掉了一次 5 ms 重测（250 × 20 µs），没有一次用满三次，也没有任
+何一条路径以失败收场。**失败判据和重测循环都在真机上被走过，不是只跑通了顺风路径。** 打
+印出来的格子值取自最后一次校验，所以第一组里路径 0 那两行就是重测之后被接受的那一组值：
+
+```
+575: RF RX-DCK map=0x100 tssi-mode=0x0/0x0 rek=0x1/0x0 fail=0x0/0x0 error=0x0
+576: RF RX-DCK path=0x0 standby=0x11 tune=0x0 gain=0x0 ch=0x1001
+577: RF RX-DCK path=0x0 low i=0x20/0x20/0x21/0x20 q=0x1c/0x1b/0x1c/0x1b
+578: RF RX-DCK path=0x0 high i=0x20/0x21/0x20/0x21 q=0x22/0x22/0x22/0x22
+579: RF RX-DCK path=0x1 standby=0x11 tune=0x0 gain=0x0 ch=0x1001
+580: RF RX-DCK path=0x1 low i=0x21/0x22/0x21/0x22 q=0x23/0x23/0x23/0x23
+581: RF RX-DCK path=0x1 high i=0x1d/0x1c/0x1d/0x1c q=0x1c/0x1c/0x1c/0x1c
+```
+
+八个码字（低增益 0x00/0x0d/0x0e/0x0f、高增益 0x10/0x1d/0x1e/0x1f）读回来的同相与正交值，
+组内最大差是 1，判据是 6，余量很大。行数对得上：13 汇总 + 13 路径 0 存档 + 13 路径 1 存
+档 + 26 低增益 + 26 高增益 = 91 行 `RF RX-DCK`。
+
+两条路径的 `ch=0x1001` 一模一样，这是设计如此不是漏洞：`k1_rtl8852bs_rf_rxdck_save()` 存
+的和 `_restore()` 写的都是路径 0 的 0x18（原厂也只挪路径 A 的信道字），而路径 0 的信道字
+在路径 1 存档之前就已经恢复了，两次快照自然读到同一个值。
+
+调用点的位置又多了一条原厂自己的证据：`halrf_init.c:724` 在 `halrf_dack_trigger(rf,
+false)` 后面留着 `/*RX DCK move to halrf_chl_rfk_trigger RFK_TYPE_PLATFORM_INIT*/`，紧跟
+一行被注释掉的 `//halrf_rx_dck_trigger(rf, HW_PHY_0, true);`——原厂就是把它从
+`halrf_dm_init()` 里搬进分派器的。顺带记一条读这段码容易踩的坑：`halrf.c:29` 才是分派器
+（`RFK_TYPE_PLATFORM_INIT` → 只跑 `halrf_rx_dck_trigger()`），`halrf.c:55` 那个长函数是
+`halrf_chl_rfk_trigger_traditional()`，它里面 `halrf_is_under_cac() || RFK_TYPE_ECSA` 那
+个单校准分支说的是 CAC 与 ECSA，跟 platform-init 无关。
+
+5c-4 在这一轮继续成立：十三组 `RF TXPWR-REF`，第一组两条路径写
+`0x04237040->0x04b37040`，其余二十四次全是 `0x04b37040->0x04b37040`；`cck-idx-a=0x1b8
+cck-idx-b=0x1b8` 稳住，`txinfo-dbm` 又读到 `0x1aa`（按上一节的更正，这个字段不参与判
+据）。
+
+链路其余部分：被动扫描 `bss=0x1 channel=0x6 ssid-len=0x2 bssid=50:4f:3b:e2:e6:d2`；
+`active scan probe response complete`（1511 行）；`station WPA2 four-way handshake
+complete`（3687 行）；DHCP `ip=0xc0a801ce mask=0xffffff00 router=0xc0a80102 lease=0xa8c0
+xid=0x8eec1070`；ICMP 回显四次收四个回复（`id=0x8852 bad=0x0`）；受保护数据 `total=0x1d
+prot=0x1b hw-dec=0x1b sw-dec=0x0 icv=0x0 crc=0x0`——二十七帧受保护帧全部由硬件解密，比
+run 81 的 22/24 更干净；`wlan0` 那条扫描接口报了 7 个 BSS。
+
+至此 5d-1 从"待真机验证"转为"已验证"。platform-init 阶段的射频校准全部落地：RCK、DACK 自
+初始化、发射功率传感器修调与格子、参考功率锚点、接收通路直流消除。
+
