@@ -293,6 +293,33 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_TSSI_DE_CELLS          50u
 #define K1_RTL8852BS_TSSI_DE_PER_WORD       4u
 
+/* Transmit power reference.  halrf_set_ref_power_to_struct_8852b() of
+ * halrf_set_pwr_table_8852b.c:1039 puts these constants into the transmit
+ * power unit struct and halbb_set_tx_pow_ref_8852b() of
+ * halbb_8852b_api.c:2306 packs them into one word per modulation: 0x5804 and
+ * 0x7804 are the orthogonal frequency division multiplexing reference of
+ * path A and path B, 0x5808 and 0x7808 the complementary code keying
+ * reference of the same two paths, and the field is the low twenty-seven
+ * bits of each.  The zero decibel code word is the only board-dependent
+ * part, 0x27 for every radio front end type up to fifty and 0x21 above.
+ */
+
+#define K1_RTL8852BS_BB_TXPWR_REF_OFDM_A    0x5804u
+#define K1_RTL8852BS_BB_TXPWR_REF_OFDM_B    0x7804u
+#define K1_RTL8852BS_BB_TXPWR_REF_CCK_A     0x5808u
+#define K1_RTL8852BS_BB_TXPWR_REF_CCK_B     0x7808u
+#define K1_RTL8852BS_BB_TXPWR_REF_MASK      0x07ffffffu
+#define K1_RTL8852BS_BB_TXPWR_REF_KINDS     2u
+#define K1_RTL8852BS_TPU_RFE_TYPE_SPLIT     50u
+#define K1_RTL8852BS_TPU_BASE_CW_0DB_LOW    0x27u
+#define K1_RTL8852BS_TPU_BASE_CW_0DB_HIGH   0x21u
+#define K1_RTL8852BS_TPU_TSSI_16DBM_CW      0x012cu
+#define K1_RTL8852BS_TPU_REF_POW_OFDM       0
+#define K1_RTL8852BS_TPU_REF_POW_CCK        0
+#define K1_RTL8852BS_TPU_REF_OFST           0
+#define K1_RTL8852BS_TPU_PW_CW_MAX          63
+#define K1_RTL8852BS_TPU_PW_CW_MIN          15
+
 /* Chip cut version.  R_AX_SYS_CFG1 bits 15:12, i.e. the high nibble of the
  * byte at 0x00f1.  enum rtw_cv numbers CAV 0, CBV 1, CCV 2.
  */
@@ -17566,6 +17593,199 @@ static void k1_rtl8852bs_rf_tssi_de_trigger(void)
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_rf_txpwr_ref_trigger
+ *
+ * Description:
+ *   halrf_set_ref_power_to_struct() of halrf.c:3963, which on this chip is
+ *   halrf_set_ref_power_to_struct_8852b() of
+ *   halrf_set_pwr_table_8852b.c:1039.  The vendor runs it on the second line
+ *   of halrf_dm_init(), before the command parser, before the radio images
+ *   and long before every calibration this port already carries.
+ *
+ *   Its own body is four assignments into the transmit power unit struct:
+ *   both halves of the reference offset are zeroed, the zero decibel code
+ *   word is 0x27 for every radio front end type up to fifty and 0x21 above
+ *   that, the code word that stands for sixteen decibel milliwatts is 0x12c,
+ *   and both reference powers, orthogonal frequency division multiplexing
+ *   and complementary code keying, are zero decibel milliwatts.  Then it
+ *   calls halrf_bb_set_tx_pow_ref(), which is halbb_set_tx_pow_ref_8852b()
+ *   of halbb_8852b_api.c:2306, and that is the half that reaches the chip.
+ *
+ *   The baseband half is one expression per modulation.  The power in half
+ *   decibel steps is doubled, the reference offset is added, and the zero
+ *   decibel code word times eight is added, giving a signed value in ten
+ *   point three format.  Its upper six bits are the radio code word and are
+ *   clamped to the range fifteen to sixty-three, plus and minus twenty-four
+ *   decibel milliwatts, keeping the lower three bits of baseband fraction.
+ *   A transmit power sensor offset is the sixteen decibel milliwatt code
+ *   word plus the doubled power minus a hundred and twenty-eight.  The three
+ *   fields are packed sensor offset at bit eighteen, code word at bit nine
+ *   and the signed power in the low nine bits, and the twenty-seven bit
+ *   result is written to the same address of both paths.
+ *
+ *   Nothing here depends on a channel, which is why the vendor can run it
+ *   once at init: the reference is the anchor that every later per rate, per
+ *   channel and per regulatory limit correction is measured against.  This
+ *   port has never written it, so the four registers hold whatever the
+ *   baseband image left behind and every frame sent so far was sent against
+ *   that.  Which is why the old value of each is read and reported next to
+ *   the new one instead of being written over silently.
+ *
+ ****************************************************************************/
+
+struct k1_rtl8852bs_rf_txpwr_ref_trace_s
+{
+  uint8_t base_cw_0db;
+  uint16_t code_word[K1_RTL8852BS_BB_TXPWR_REF_KINDS];
+  uint32_t word[K1_RTL8852BS_BB_TXPWR_REF_KINDS];
+  uint32_t before[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_TXPWR_REF_KINDS];
+  uint32_t after[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_TXPWR_REF_KINDS];
+  int error;
+};
+
+static uint32_t k1_rtl8852bs_tpu_ref_word(int16_t pw_dbm,
+                                          uint8_t base_cw_0db,
+                                          FAR uint16_t *code_word)
+{
+  int16_t pw_s10_3;
+  int16_t rf_pw_cw;
+  uint32_t tssi_ofst_cw;
+  uint32_t pw_cw;
+
+  pw_s10_3 = (int16_t)(pw_dbm * 2 + K1_RTL8852BS_TPU_REF_OFST +
+                       (int16_t)base_cw_0db * 8);
+  pw_cw = (uint32_t)(int32_t)pw_s10_3;
+  rf_pw_cw = (int16_t)((pw_s10_3 & 0x01f8) >> 3);
+
+  /* The clamp is on the radio half of the code word alone; the baseband
+   * fraction in the low three bits survives it either way.
+   */
+
+  if (rf_pw_cw > K1_RTL8852BS_TPU_PW_CW_MAX)
+    {
+      pw_cw = (K1_RTL8852BS_TPU_PW_CW_MAX << 3) | (pw_s10_3 & 0x7);
+    }
+  else if (rf_pw_cw < K1_RTL8852BS_TPU_PW_CW_MIN)
+    {
+      pw_cw = (K1_RTL8852BS_TPU_PW_CW_MIN << 3) | (pw_s10_3 & 0x7);
+    }
+
+  tssi_ofst_cw = (uint32_t)((int32_t)K1_RTL8852BS_TPU_TSSI_16DBM_CW +
+                            pw_dbm * 2 - 16 * 8);
+
+  *code_word = (uint16_t)pw_cw;
+  return ((tssi_ofst_cw << 18) | (pw_cw << 9) |
+          (uint32_t)(pw_dbm & 0x01ff)) & K1_RTL8852BS_BB_TXPWR_REF_MASK;
+}
+
+static void k1_rtl8852bs_rf_txpwr_ref_trigger(void)
+{
+  static const uint32_t
+    addresses[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_BB_TXPWR_REF_KINDS] =
+  {
+    {K1_RTL8852BS_BB_TXPWR_REF_OFDM_A, K1_RTL8852BS_BB_TXPWR_REF_CCK_A},
+    {K1_RTL8852BS_BB_TXPWR_REF_OFDM_B, K1_RTL8852BS_BB_TXPWR_REF_CCK_B},
+  };
+
+  static const int16_t powers[K1_RTL8852BS_BB_TXPWR_REF_KINDS] =
+  {
+    K1_RTL8852BS_TPU_REF_POW_OFDM, K1_RTL8852BS_TPU_REF_POW_CCK
+  };
+
+  struct k1_rtl8852bs_rf_txpwr_ref_trace_s trace;
+  unsigned int path;
+  unsigned int kind;
+  uint8_t rfe_type;
+  int ret;
+
+  memset(&trace, 0, sizeof(trace));
+
+  /* The zero decibel code word is the only board-dependent part of this, and
+   * an absent context is no reason to skip the write: the vendor default
+   * radio front end type is one, which is what this board's eFuse holds too,
+   * and every type up to fifty takes the same code word anyway.
+   */
+
+  rfe_type = g_k1_rtl8852bs_rf_context.valid ?
+             g_k1_rtl8852bs_rf_context.rfe_type :
+             K1_RTL8852BS_EFUSE_RF_DEFAULT_RFE;
+
+  trace.base_cw_0db = rfe_type > K1_RTL8852BS_TPU_RFE_TYPE_SPLIT ?
+                      K1_RTL8852BS_TPU_BASE_CW_0DB_HIGH :
+                      K1_RTL8852BS_TPU_BASE_CW_0DB_LOW;
+
+  for (kind = 0; kind < K1_RTL8852BS_BB_TXPWR_REF_KINDS; kind++)
+    {
+      trace.word[kind] = k1_rtl8852bs_tpu_ref_word(powers[kind],
+                                                   trace.base_cw_0db,
+                                                   &trace.code_word[kind]);
+    }
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      for (kind = 0; kind < K1_RTL8852BS_BB_TXPWR_REF_KINDS; kind++)
+        {
+          ret = k1_rtl8852bs_bb_read32(addresses[path][kind],
+                                       &trace.before[path][kind]);
+          if (ret < 0)
+            {
+              trace.error = ret;
+              continue;
+            }
+
+          ret = k1_rtl8852bs_bb_update_field(addresses[path][kind],
+                                             K1_RTL8852BS_BB_TXPWR_REF_MASK,
+                                             trace.word[kind]);
+          if (ret < 0)
+            {
+              trace.error = ret;
+              continue;
+            }
+
+          ret = k1_rtl8852bs_bb_read32(addresses[path][kind],
+                                       &trace.after[path][kind]);
+          if (ret < 0)
+            {
+              trace.error = ret;
+            }
+        }
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RF TXPWR-REF rfe=");
+  k1_early_puthex(rfe_type);
+  k1_early_puts(" base_cw=");
+  k1_early_puthex(trace.base_cw_0db);
+  k1_early_puts(" tssi16=");
+  k1_early_puthex(K1_RTL8852BS_TPU_TSSI_16DBM_CW);
+  k1_early_puts(" ofdm=");
+  k1_early_puthex(trace.word[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.code_word[0]);
+  k1_early_puts(" cck=");
+  k1_early_puthex(trace.word[1]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.code_word[1]);
+  k1_early_puts(" error=");
+  k1_early_puthex((uintreg_t)-trace.error);
+  k1_early_puts("\r\n");
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RF TXPWR-REF path=");
+      k1_early_puthex(path);
+      k1_early_puts(" ofdm=");
+      k1_early_puthex(trace.before[path][0]);
+      k1_early_puts("->");
+      k1_early_puthex(trace.after[path][0]);
+      k1_early_puts(" cck=");
+      k1_early_puthex(trace.before[path][1]);
+      k1_early_puts("->");
+      k1_early_puthex(trace.after[path][1]);
+      k1_early_puts("\r\n");
+    }
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_rf_self_init_trigger
  *
  * Description:
@@ -22436,6 +22656,16 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
     {
       k1_rtl8852bs_scan_rf_readback_log("pre-si-reset", &rf_readback);
     }
+
+  /* halrf_dm_init() sets the transmit power reference on its second line,
+   * before everything the block below carries, and this port has never set
+   * it at all.  It writes four baseband registers and reads no radio
+   * register, so it changes nothing the sample above just measured and
+   * nothing the sample below will.  A failure is reported and then ignored
+   * like the samples themselves.
+   */
+
+  k1_rtl8852bs_rf_txpwr_ref_trigger();
 
   /* Run the two steps halrf_dm_init() has here between the two samples.
    * The first is the calibration self init, the software state every later
