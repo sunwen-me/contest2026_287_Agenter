@@ -9519,16 +9519,18 @@ self-preq=0xd`。收得好却发不出去，所以出问题的一定是发射侧
 开始就是照抖动读的。把它翻过来的是这个端口自己早就有的一行诊断：
 
 ```
-前四次真机：TX power after-sweep force-en=0x1 force-dbm=0x40 cck-idx-a=0x1b8 cck-idx-b=0x1b8 txinfo-dbm=0x1ba
-run 80    ：TX power after-sweep force-en=0x1 force-dbm=0x40 cck-idx-a=0x138 cck-idx-b=0x138 txinfo-dbm=0x1aa
+前四次真机：TX power after-sweep force-en=0x1 force-dbm=0x40 cck-idx-a=0x1b8 cck-idx-b=0x1b8
+run 80    ：TX power after-sweep force-en=0x1 force-dbm=0x40 cck-idx-a=0x138 cck-idx-b=0x138
 ```
 
 `cck-idx` 是 0x5808/0x7808 的 bit 17:9，也就是基带的发射功率码字。它在之前四次真机跑
 （`k1-wpa-20260901T211016Z`、`200704Z`、`191959Z`、`182629Z`）里每一次都是 `0x1b8`，那四
 次 `probe-enodata=0 wait-enodata=0`、四次都走完了四路握手；run 80 是第一次读到 `0x138`，
 也是第一次出现 `probe-enodata=1 wait-enodata=2`。0x1b8 是 440，0x138 是 312，差 128 个八
-分之一分贝单位，正好十六分贝。最终发射信息里的功率字段（0x1804 bit 26:18）跟着一起掉，
-`0x1ba → 0x1aa`。**抖动是收不到，这一次是发不出去，两回事。**
+分之一分贝单位，正好十六分贝。同一行里的 `txinfo-dbm`（0x1804 bit 26:18）**不参与这个判
+据**：那是最近一帧发射信息的功率字段快照，前四次真机自己就在 `0x1ba` 和 `0x1aa` 之间来回
+（`211016Z`/`191959Z` 读 0x1ba，`200704Z`/`182629Z` 读 0x1aa），统计见后文 run 81 那一
+节。**抖动是收不到，这一次是发不出去，两回事。**
 
 原因在 5c-4 本身。基带镜像原本在 0x5804/0x7804/0x5808/0x7808 四个寄存器里留下的是
 `0x04237040`，用原厂自己的打包法拆开是：`tssi_ofst_cw = (val >> 18) & 0x1ff = 0x108`，
@@ -9612,4 +9614,71 @@ mcs2g=0x03030206/0x03 mcs5g=0x00ff0000/0xfe000000/0xff000200/0xfffc`；手数 0x
 提交 `01960fe`，`-fsyntax-only` 干净（用的是构建库里这个文件的真实编译命令，`-Wall
 -Wshadow -Wstrict-prototypes -Wundef`，不碰构建目录，因为 run 81 还在飞）。真机验证等
 run 81 之后那一轮。
+
+### run 81：`ce022c4` 在真机上逐字对上，一遍过
+
+`out/k1-serial/k1-wpa-20260902T054214Z.log`，4267 行。上一节的预测是"下一轮应当读到 `RF
+TXPWR-REF path=0x0/0x1 ofdm=0x04237040->0x04b37040`，两条路径都是"，回来的就是这个：
+
+```
+536: RF TXPWR-REF rfe=0x1 base_cw=0x27 tssi16=0x12c ofdm=0x04b37040/0x1b8 cck=0x04b37040/0x1b8 error=0x0
+537: RF TXPWR-REF path=0x0 ofdm=0x04237040->0x04b37040 cck=0x04237040->0x04b37040
+538: RF TXPWR-REF path=0x1 ofdm=0x04237040->0x04b37040 cck=0x04237040->0x04b37040
+```
+
+这三行在一轮里出现十四次（platform-init 每跑一次就是一组），只有第一次是
+`0x04237040->0x04b37040`，第二次起全是 `0x04b37040->0x04b37040`——**这一步是幂等的**，重
+复进 platform-init 不会再动镜像。头一行的 `tssi16=0x12c` 是原厂 `tssi_16dBm_cw` 的 300，
+`base_cw=0x27` 是 0x9e/4，`error=0x0`。发射功率码字回到了每一次通过的跑都读到的那个值：
+`TX power after-sweep force-en=0x1 force-dbm=0x40 cck-idx-a=0x1b8 cck-idx-b=0x1b8`。
+
+关联链一遍就过，没有第二遍：被动扫描 `bss=0x1 channel=0x6 ssid-len=0x2
+bssid=50:4f:3b:e2:e6:d2`（冒烟脚本自己那张表报了 6 个 BSS，`SB` 在 6 信道）；`RTL8852BS2
+active scan probe response complete`（1487 行）；`probe response error=0x3d` 一次都没有
+出现（run 80 是 5 次），`bring-up failed` 0 次；`RTL8852BS2 station WPA2 four-way
+handshake complete`（3528 行）；DHCP 确认 `ip=0xc0a801ce mask=0xffffff00
+router=0xc0a80102 lease=0xa8c0 xid=0x8e0bd076`；ARP 声明 3/3、ARP 往返 6 次收 3 个回复、
+代答 1/1；ICMP 回显 4 次收 4 个回复（`id=0x8852`，`bad=0x0`）；受保护数据 `total=0x18
+prot=0x18 hw-dec=0x16 sw-dec=0x2 icv=0x0 crc=0x0`，即二十四帧里二十二帧是硬件解密的；下
+行环回 `verdict=0x4 a1-match=0x1 hw-dec=0x1`。四十个 `--require-*` 判据的集体结论就是末
+尾那一行 `PASS: K1 wireless RAM image reached NSH`。
+
+5c-3 那五个空格子也逐字复现，十四组 `RF TSSI-DE window=0x2d/0x4a cells=0x32 blank=0x5
+usable=0x1` 一模一样，两条路径的十行格子值也一个字节不差。
+
+### 一处需要更正：`txinfo-dbm` 不是配置，是上一帧的快照
+
+上一节我把 `txinfo-dbm=0x1aa` 记成了"跟着功率一起掉下来、还没回去的残留"。这是错的，同一
+轮日志里就有反证：
+
+```
+802 : TX power before     force-en=0x0 force-dbm=0x0  cck-idx-a=0x1b8 txinfo-dbm=0x0
+816 : TX power after      force-en=0x1 force-dbm=0x40 cck-idx-a=0x1b8 txinfo-dbm=0x0
+1484: TX power after-sweep force-en=0x1 force-dbm=0x40 cck-idx-a=0x1b8 txinfo-dbm=0x1aa
+```
+
+把强制功率写进去的那一刻（816 行）这个字段仍然是 0，直到主动扫描真的发出去过帧之后（1484
+行）才变成非零。**0x1804 bit 26:18 是最近一次发射信息里的功率字段，是个只读快照，不是这
+个端口写过的状态。** 而且发射描述符的功率在强制模式下来自 0x4594（两轮都是 `0x40`），所
+以它本来就不可能跟着参考镜像或 CCK 码字动——run 80 的 `pw_cw=0x138`、run 81 的 `0x1b8`，
+两轮读到同一个 `0x1aa`，这不是"卡住"，是它根本不看那个字段。
+
+二十份日志的统计（`out/k1-serial/k1-wpa-2026090*.log`，判据是 `probe response
+error=0x3d` 与 `bring-up failed`）：
+
+```
+txinfo-dbm  出现  其中失败
+0x1ba        5      0
+0x1aa        7      2       ← run 80 与 run 81 都在这一行
+0x13a        1      0
+0x12a        2      0
+0x40         1      0
+0x3a         3      1
+0x38         1      0
+```
+
+七个不同的值，`0x1aa` 有五次通过两次失败，`0x3a` 有两次通过一次失败——和成败毫无相关，它
+只随采样时刚发完的那一帧走。真正的判别量只有 `cck-idx`：十八份日志清一色 `0x1b8`，只有
+run 80 一份是 `0x138`，run 81 又回到 `0x1b8`。上一节的那句话已经就地改掉，代码里没有任何
+东西依赖这个字段，`ce022c4` 不受影响。
 
