@@ -251,6 +251,7 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_EFUSE_RF_THERMAL_B     0x02d1u  /* default 0x22 */
 #define K1_RTL8852BS_EFUSE_RF_TSSI_DE_FIRST 0x0210u  /* default 0x00 */
 #define K1_RTL8852BS_EFUSE_RF_TSSI_DE_LAST  0x0259u
+#define K1_RTL8852BS_EFUSE_RF_TSSI_DE_SIZE  0x004au
 #define K1_RTL8852BS_EFUSE_RF_GAIN_K_FIRST  0x02d4u  /* default 0x0f */
 #define K1_RTL8852BS_EFUSE_RF_GAIN_K_LAST   0x02ddu
 #define K1_RTL8852BS_EFUSE_RF_DEFAULT_RFE   0x01u
@@ -275,6 +276,22 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_EFUSE_TRIM_TSSI_BANDS  8u
 #define K1_RTL8852BS_EFUSE_TRIM_TSSI_PER_WORD 4u
 #define K1_RTL8852BS_EFUSE_TRIM_NIBBLE      0x0fu
+
+/* TSSI de-emphasis cells of the logical eFuse, from the address enumeration
+ * of halrf_efuse_8852b.h.  halrf_tssi_get_efuse_8852b() walks four ranges of
+ * the EFUSE_INFO_RF_* enumeration, six code cells and nineteen modulation
+ * cells per radio path, and the enumeration is contiguous where the eFuse is
+ * not: path A jumps 0x21a to 0x222 between its 2 GHz and 5 GHz modulation
+ * cells and path B jumps 0x244 to 0x24c, so these too are a table rather
+ * than a base plus an index.  Fifty cells in a seventy-four byte window; the
+ * twenty-four bytes the enumeration skips belong to no cell.
+ */
+
+#define K1_RTL8852BS_TSSI_DE_CCK_CELLS      6u
+#define K1_RTL8852BS_TSSI_DE_MCS_CELLS      19u
+#define K1_RTL8852BS_TSSI_DE_MCS_2G_CELLS   5u
+#define K1_RTL8852BS_TSSI_DE_CELLS          50u
+#define K1_RTL8852BS_TSSI_DE_PER_WORD       4u
 
 /* Chip cut version.  R_AX_SYS_CFG1 bits 15:12, i.e. the high nibble of the
  * byte at 0x00f1.  enum rtw_cv numbers CAV 0, CBV 1, CCV 2.
@@ -2772,6 +2789,7 @@ struct k1_rtl8852bs_rf_context_s
   uint8_t gain_k_programmed;
   uint8_t hidden_programmed;
   uint8_t hidden[K1_RTL8852BS_EFUSE_HIDDEN_SIZE];
+  uint8_t tssi_de[K1_RTL8852BS_EFUSE_RF_TSSI_DE_SIZE];
 };
 
 /****************************************************************************
@@ -6509,6 +6527,15 @@ int k1_rtl8852bs_fwdl_rf_context_diagnostic(void)
   context->tssi_de_programmed = (uint16_t)k1_rtl8852bs_rf_context_count(
     logical, K1_RTL8852BS_EFUSE_RF_TSSI_DE_FIRST,
     K1_RTL8852BS_EFUSE_RF_TSSI_DE_LAST);
+
+  /* The de-emphasis window is copied for the same reason the trim window is,
+   * one paragraph down: the logical map is decoded here and freed here, and
+   * the transmit power stage that reads these cells runs long after the
+   * firmware owns the chip.
+   */
+
+  memcpy(context->tssi_de, &logical[K1_RTL8852BS_EFUSE_RF_TSSI_DE_FIRST],
+         K1_RTL8852BS_EFUSE_RF_TSSI_DE_SIZE);
   context->gain_k_programmed = (uint8_t)k1_rtl8852bs_rf_context_count(
     logical, K1_RTL8852BS_EFUSE_RF_GAIN_K_FIRST,
     K1_RTL8852BS_EFUSE_RF_GAIN_K_LAST);
@@ -17335,6 +17362,210 @@ static void k1_rtl8852bs_rf_efuse_trim_trigger(void)
 }
 
 /****************************************************************************
+ * Name: k1_rtl8852bs_rf_tssi_de_trigger
+ *
+ * Description:
+ *   halrf_tssi_get_efuse_ex() of halrf.c:3791, which on this chip is
+ *   halrf_tssi_get_efuse_8852b() of halrf_tssi_8852b.c:2821, plus the
+ *   validity rule halrf_tssi_check_efuse_data_8852b() puts immediately
+ *   after it.  The vendor runs the get in halrf_dm_init() one line below
+ *   the factory trims, and it is the last use that stage makes of the
+ *   eFuse.
+ *
+ *   Fifty cells, twenty five per radio path: six for the code rates and
+ *   nineteen for the modulated ones, of those nineteen five 2 GHz and
+ *   fourteen 5 GHz.  Each cell is one signed byte of de-emphasis for a
+ *   channel group, and no register is written here.  The transmit power
+ *   stage is what consumes them, and it consumes them added to the TSSI
+ *   trims the previous function read: the vendor computes cell + trim per
+ *   path and writes the sum into the code rate and modulation de-emphasis
+ *   registers.  That stage is not ported, so this reads what the board
+ *   carries, reports it, and leaves every register alone.
+ *
+ *   The validity rule is the vendor's and is kept whole.  A cell counts as
+ *   blank when its low byte is 0xff, and only fifty blank cells make the
+ *   table unusable; one programmed cell keeps the rest, blanks included,
+ *   exactly as the eFuse read them.  Nothing in the vendor subset calls
+ *   the check, its caller sits above halrf, so here the verdict is
+ *   reported rather than branched on.
+ *
+ *   The cells come from the copy of the window the RF context stage took,
+ *   for the reason that stage documents: the logical map is decoded before
+ *   the firmware download and freed there, and the host indirect window
+ *   stops returning live values once the WCPU owns the chip.
+ *
+ ****************************************************************************/
+
+struct k1_rtl8852bs_rf_tssi_de_trace_s
+{
+  uint8_t cck[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_TSSI_DE_CCK_CELLS];
+  uint8_t mcs[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_TSSI_DE_MCS_CELLS];
+  uint8_t blank;
+  bool usable;
+};
+
+/* The cell addresses, one row per radio path.  Code rates first, then the
+ * modulated cells with their 2 GHz five and 5 GHz fourteen laid end to end
+ * the way the vendor's single loop indexes them.
+ */
+
+static const uint16_t
+  g_k1_rtl8852bs_tssi_de_cck[K1_RTL8852BS_RF_PATHS]
+                            [K1_RTL8852BS_TSSI_DE_CCK_CELLS] =
+{
+  {0x0210u, 0x0211u, 0x0212u, 0x0213u, 0x0214u, 0x0215u},
+  {0x023au, 0x023bu, 0x023cu, 0x023du, 0x023eu, 0x023fu},
+};
+
+static const uint16_t
+  g_k1_rtl8852bs_tssi_de_mcs[K1_RTL8852BS_RF_PATHS]
+                            [K1_RTL8852BS_TSSI_DE_MCS_CELLS] =
+{
+  {
+    0x0216u, 0x0217u, 0x0218u, 0x0219u, 0x021au,
+    0x0222u, 0x0223u, 0x0224u, 0x0225u, 0x0226u, 0x0227u, 0x0228u,
+    0x0229u, 0x022au, 0x022bu, 0x022cu, 0x022du, 0x022eu, 0x022fu
+  },
+  {
+    0x0240u, 0x0241u, 0x0242u, 0x0243u, 0x0244u,
+    0x024cu, 0x024du, 0x024eu, 0x024fu, 0x0250u, 0x0251u, 0x0252u,
+    0x0253u, 0x0254u, 0x0255u, 0x0256u, 0x0257u, 0x0258u, 0x0259u
+  },
+};
+
+/* One cell of the cached de-emphasis window, or 0xff for an address outside
+ * it.  Same reasoning as the hidden window reader above: 0xff is what an
+ * unprogrammed cell reads, so a caller cannot tell a bad address from a
+ * blank cell and does not need to.
+ */
+
+static uint8_t k1_rtl8852bs_efuse_tssi_de_byte(uint16_t address)
+{
+  FAR const struct k1_rtl8852bs_rf_context_s *context;
+
+  context = &g_k1_rtl8852bs_rf_context;
+  if (!context->valid ||
+      address < K1_RTL8852BS_EFUSE_RF_TSSI_DE_FIRST ||
+      address > K1_RTL8852BS_EFUSE_RF_TSSI_DE_LAST)
+    {
+      return K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED;
+    }
+
+  return context->tssi_de[address - K1_RTL8852BS_EFUSE_RF_TSSI_DE_FIRST];
+}
+
+/* Four cells to a word, low group first, so a path's cells read as a few
+ * printed words instead of twenty five separate values.  A group shorter
+ * than four flushes what it has.
+ */
+
+static void k1_rtl8852bs_tssi_de_puthex(FAR const uint8_t *cells,
+                                        unsigned int count)
+{
+  uint32_t word = 0;
+  unsigned int i;
+
+  for (i = 0; i < count; i++)
+    {
+      word = (word << 8) | cells[i];
+      if ((i % K1_RTL8852BS_TSSI_DE_PER_WORD) ==
+          K1_RTL8852BS_TSSI_DE_PER_WORD - 1 || i + 1 == count)
+        {
+          k1_early_puthex(word);
+          k1_early_puts(i + 1 < count ? "/" : "");
+          word = 0;
+        }
+    }
+}
+
+static void k1_rtl8852bs_rf_tssi_de_trigger(void)
+{
+  struct k1_rtl8852bs_rf_tssi_de_trace_s trace;
+  unsigned int path;
+  unsigned int cell;
+  unsigned int blank = 0;
+
+  memset(&trace, 0, sizeof(trace));
+
+  /* Without the cached window there is nothing to read.  The RF context
+   * stage either did not run or failed, and a table of invented offsets is
+   * worse than no table at all.
+   */
+
+  if (!g_k1_rtl8852bs_rf_context.valid)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RF TSSI-DE skipped context=absent\r\n");
+      return;
+    }
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      for (cell = 0; cell < K1_RTL8852BS_TSSI_DE_CCK_CELLS; cell++)
+        {
+          trace.cck[path][cell] = k1_rtl8852bs_efuse_tssi_de_byte(
+            g_k1_rtl8852bs_tssi_de_cck[path][cell]);
+          if (trace.cck[path][cell] == K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED)
+            {
+              blank++;
+            }
+        }
+
+      for (cell = 0; cell < K1_RTL8852BS_TSSI_DE_MCS_CELLS; cell++)
+        {
+          trace.mcs[path][cell] = k1_rtl8852bs_efuse_tssi_de_byte(
+            g_k1_rtl8852bs_tssi_de_mcs[path][cell]);
+          if (trace.mcs[path][cell] == K1_RTL8852BS_EFUSE_RF_UNPROGRAMMED)
+            {
+              blank++;
+            }
+        }
+    }
+
+  trace.blank = (uint8_t)blank;
+  trace.usable = blank != K1_RTL8852BS_TSSI_DE_CELLS;
+
+  /* The window count comes from the RF context stage and covers all seventy
+   * four bytes, the twenty four that belong to no cell included, so the two
+   * numbers are not meant to agree.  Printing both is what shows the fifty
+   * addresses landed inside the window the earlier stage measured.
+   */
+
+  k1_early_puts("K1 Wi-Fi GPL: RF TSSI-DE window=");
+  k1_early_puthex(g_k1_rtl8852bs_rf_context.tssi_de_programmed);
+  k1_early_puts("/");
+  k1_early_puthex(K1_RTL8852BS_EFUSE_RF_TSSI_DE_SIZE);
+  k1_early_puts(" cells=");
+  k1_early_puthex(K1_RTL8852BS_TSSI_DE_CELLS);
+  k1_early_puts(" blank=");
+  k1_early_puthex(trace.blank);
+  k1_early_puts(" usable=");
+  k1_early_puthex(trace.usable ? 1u : 0u);
+  k1_early_puts("\r\n");
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RF TSSI-DE path=");
+      k1_early_puthex(path);
+      k1_early_puts(" cck=");
+      k1_rtl8852bs_tssi_de_puthex(trace.cck[path],
+                                  K1_RTL8852BS_TSSI_DE_CCK_CELLS);
+      k1_early_puts(" mcs2g=");
+      k1_rtl8852bs_tssi_de_puthex(trace.mcs[path],
+                                  K1_RTL8852BS_TSSI_DE_MCS_2G_CELLS);
+      k1_early_puts("\r\n");
+
+      k1_early_puts("K1 Wi-Fi GPL: RF TSSI-DE path=");
+      k1_early_puthex(path);
+      k1_early_puts(" mcs5g=");
+      k1_rtl8852bs_tssi_de_puthex(
+        &trace.mcs[path][K1_RTL8852BS_TSSI_DE_MCS_2G_CELLS],
+        K1_RTL8852BS_TSSI_DE_MCS_CELLS -
+        K1_RTL8852BS_TSSI_DE_MCS_2G_CELLS);
+      k1_early_puts("\r\n");
+    }
+}
+
+/****************************************************************************
  * Name: k1_rtl8852bs_rf_self_init_trigger
  *
  * Description:
@@ -22243,8 +22474,11 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
    * receives during the vendor's, and the scan here has to keep receiving
    * between the two.  The fifth is what the vendor runs next, the factory
    * trims of the thermal meter and the amplifier bias, which are eFuse cells
-   * rather than a measurement and so need no park at all.  The samples on
-   * either side then measure all five the same way they measure the reset.
+   * rather than a measurement and so need no park at all.  The sixth is what
+   * the vendor runs on the line below that one, the transmit power
+   * de-emphasis cells of the same eFuse, which are read and reported and
+   * write nothing.  The samples on either side then measure all six the same
+   * way they measure the reset.
    */
 
   k1_rtl8852bs_rf_rck_trigger();
@@ -22252,6 +22486,7 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
   k1_rtl8852bs_rf_addck_trigger();
   k1_rtl8852bs_rf_dack_trigger();
   k1_rtl8852bs_rf_efuse_trim_trigger();
+  k1_rtl8852bs_rf_tssi_de_trigger();
 
   rf_readback_ret = k1_rtl8852bs_scan_rf_readback_read(&rf_readback);
   if (rf_readback_ret < 0)
