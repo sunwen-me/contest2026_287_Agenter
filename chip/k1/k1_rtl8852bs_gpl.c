@@ -1541,6 +1541,64 @@ extern void k1_early_puthex(uintreg_t value);
 #define K1_RTL8852BS_RF_DPK_TXAGC_MAX        0x3fu
 #define K1_RTL8852BS_RF_RXBB_BW_INVALID      0xffu
 #define K1_RTL8852BS_RF_CHLK_MAP_ALL         0xffffffffu
+#define K1_RTL8852BS_RF_CHLK_MAP_RXDCK       0x00000100u
+
+/* Receive path direct current cancellation, the one calibration
+ * halrf_chl_rfk_trigger() runs on its own for RFK_TYPE_PLATFORM_INIT.  These
+ * are radio registers, not baseband ones: 0x05 holds the standby bit the
+ * vendor clears, 0x92 the tune bit and the trigger bit and the measured in
+ * phase value, 0x93 the source select and the measured quadrature value,
+ * 0x84 the three receive gain bits that are zeroed for the measurement, 0x18
+ * the channel word of path A which the vendor moves to fourteen while it
+ * measures, and 0xee, 0x33, 0x3e and 0x3f are the mode table the vendor
+ * swaps in and back out again on 2.4 GHz.  The measurement itself is read
+ * back through the mode register's code field, four codes for the low gain
+ * group and four for the high one, and a group fails when any of its three
+ * later readings differ from its first by six or more.  The mode register and
+ * the standby register already have names from the resistor capacitor
+ * calibration, K1_RTL8852BS_RF_REG_MODE and K1_RTL8852BS_RF_REG_MODE_SAVE,
+ * and the standby bit is the mask that one passes as
+ * K1_RTL8852BS_RF_MODE_SAVE_RUN, so those three are used rather than named
+ * again here.
+ */
+
+#define K1_RTL8852BS_RF_RXDCK_REG_CHANNEL    0x18u
+#define K1_RTL8852BS_RF_RXDCK_REG_TABLE_SEL  0x33u
+#define K1_RTL8852BS_RF_RXDCK_REG_TABLE_LOW  0x3eu
+#define K1_RTL8852BS_RF_RXDCK_REG_TABLE_HIGH 0x3fu
+#define K1_RTL8852BS_RF_RXDCK_REG_GAIN       0x84u
+#define K1_RTL8852BS_RF_RXDCK_REG_I          0x92u
+#define K1_RTL8852BS_RF_RXDCK_REG_Q          0x93u
+#define K1_RTL8852BS_RF_RXDCK_REG_TABLE_EN   0xeeu
+#define K1_RTL8852BS_RF_RXDCK_TRIGGER_BIT    0x00000001u
+#define K1_RTL8852BS_RF_RXDCK_TUNE_BIT       0x00000002u
+#define K1_RTL8852BS_RF_RXDCK_SOURCE_MASK    0x0000000fu
+#define K1_RTL8852BS_RF_RXDCK_SOURCE_RFC     0x00000000u
+#define K1_RTL8852BS_RF_RXDCK_GAIN_MASK      0x00070000u
+#define K1_RTL8852BS_RF_RXDCK_CHANNEL_MASK   0x000000ffu
+#define K1_RTL8852BS_RF_RXDCK_CHANNEL_K      0x0000000eu
+#define K1_RTL8852BS_RF_RXDCK_CODE_MASK      0x00007c00u
+#define K1_RTL8852BS_RF_RXDCK_VALUE_MASK     0x0000fc00u
+#define K1_RTL8852BS_RF_RXDCK_VALUE_SHIFT    10
+#define K1_RTL8852BS_RF_RXDCK_TABLE_ENABLE   0x00080000u
+#define K1_RTL8852BS_RF_RXDCK_TABLE_DISABLE  0x00000000u
+#define K1_RTL8852BS_RF_RXDCK_TABLE_SELECT   0x00000003u
+#define K1_RTL8852BS_RF_RXDCK_TABLE_LOW_A    0x000000c4u
+#define K1_RTL8852BS_RF_RXDCK_TABLE_LOW_B    0x00000031u
+#define K1_RTL8852BS_RF_RXDCK_TABLE_K_A      0x00003de7u
+#define K1_RTL8852BS_RF_RXDCK_TABLE_K_B      0x00000f79u
+#define K1_RTL8852BS_RF_RXDCK_TABLE_IDLE_A   0x000035e7u
+#define K1_RTL8852BS_RF_RXDCK_TABLE_IDLE_B   0x00000d79u
+#define K1_RTL8852BS_RF_RXDCK_GROUPS         2u
+#define K1_RTL8852BS_RF_RXDCK_CODES          4u
+#define K1_RTL8852BS_RF_RXDCK_THRESHOLD      6u
+#define K1_RTL8852BS_RF_RXDCK_RETRY_MAX      3u
+#define K1_RTL8852BS_RF_RXDCK_STEP_USEC      20u
+#define K1_RTL8852BS_RF_RXDCK_SETTLE_STEPS   30u
+#define K1_RTL8852BS_RF_RXDCK_RETRY_STEPS    250u
+#define K1_RTL8852BS_BB_RXDCK_TSSI_PAUSE_S0  0x5818u
+#define K1_RTL8852BS_BB_RXDCK_TSSI_PAUSE_S1  0x7818u
+#define K1_RTL8852BS_BB_RXDCK_TSSI_PAUSE_BIT 0x40000000u
 
 /* The per path control, result and offset words, then the four the two
  * paths share: the converter clock of each path, the receive FIFO and the
@@ -18043,6 +18101,547 @@ static void k1_rtl8852bs_rf_self_init_trigger(void)
   k1_early_puts("\r\n");
 }
 
+/****************************************************************************
+ * Name: k1_rtl8852bs_rf_rxdck_trigger
+ *
+ * Description:
+ *   halrf_rx_dck_8852b() of halrf_8852b.c:613, reached through
+ *   halrf_rx_dck_trigger() of halrf.c:222.  This is the whole of what the
+ *   vendor runs for RFK_TYPE_PLATFORM_INIT: halrf_chl_rfk_trigger() sends
+ *   every other calibration type through the traditional chain, and sends
+ *   this one type to receive path direct current cancellation alone.  The
+ *   line above the call in halrf_init.c:724 says so in a comment, over a
+ *   commented out call of the same function.
+ *
+ *   The chip decides the easy half.  halrf_rx_dck_trigger() passes a literal
+ *   false for is_afe on 8852B, not the argument it was given, so the entire
+ *   analogue front end branch of halrf_set_rx_dck_8852b() is dead code here
+ *   and the measurement is four radio writes: the source select of 0x93 goes
+ *   to the radio chain, the trigger bit of 0x92 falls and rises, and six
+ *   hundred microseconds later the hardware has written its own correction.
+ *
+ *   The care is all in what surrounds it.  Per path the vendor saves 0x05 and
+ *   the tune bit of 0x92, clears the standby bit and the tune bit, and on
+ *   2.4 GHz swaps in a receive mode table, zeroes the three receive gain
+ *   bits of 0x84 and moves the channel word of path A to fourteen so the
+ *   measurement is taken away from the band edge.  Then it puts the radio in
+ *   receive mode, measures, and checks: the mode register's code field walks
+ *   four low gain codes and four high gain ones, each reading the in phase
+ *   value out of 0x92 and the quadrature value out of 0x93, and a group
+ *   fails when any of its three later readings differs from its first by six
+ *   or more.  A failure is measured again, up to three times, five
+ *   milliseconds apart.  Then everything saved is put back.
+ *
+ *   One reordering.  The vendor reads the receive gain register and the path
+ *   A channel word in the middle of the sequence, after it has cleared the
+ *   standby and the tune bit and swapped the mode table in; this port reads
+ *   all four saved words before it writes anything.  Nothing between the two
+ *   positions touches either register, so they are the same values, and
+ *   reading them first is what lets every failure path put the radio back
+ *   the way it was found instead of writing back a zero it never read.  The
+ *   code field the check walks is not restored, by the vendor either: it is
+ *   a read select, and the mode word above it is restored with 0x05.
+ *
+ *   Two things the vendor has and this port does not need here.  The vendor
+ *   pauses transmit at the medium access controller around the calibration;
+ *   nothing in this port transmits between the power on sequence and the
+ *   first scan, which is where this runs.  And the vendor reads the band and
+ *   the channel out of a channel definition; this port is 2.4 GHz only and
+ *   never selects channel fourteen, so both of the vendor's conditions are
+ *   taken as written.  The transmit power sensor pause is kept, driven by
+ *   the same per path flag the calibration self init publishes, so it starts
+ *   working by itself when sensor mode arrives.
+ *
+ ****************************************************************************/
+
+struct k1_rtl8852bs_rf_rxdck_trace_s
+{
+  uint8_t  i[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_RF_RXDCK_GROUPS]
+            [K1_RTL8852BS_RF_RXDCK_CODES];
+  uint8_t  q[K1_RTL8852BS_RF_PATHS][K1_RTL8852BS_RF_RXDCK_GROUPS]
+            [K1_RTL8852BS_RF_RXDCK_CODES];
+  uint32_t standby[K1_RTL8852BS_RF_PATHS];
+  uint32_t gain[K1_RTL8852BS_RF_PATHS];
+  uint32_t channel[K1_RTL8852BS_RF_PATHS];
+  uint8_t  tune[K1_RTL8852BS_RF_PATHS];
+  uint8_t  rek[K1_RTL8852BS_RF_PATHS];
+  uint8_t  fail[K1_RTL8852BS_RF_PATHS];
+  int      error;
+};
+
+static int k1_rtl8852bs_rf_rxdck_mode_table(unsigned int path, bool is_k)
+{
+  uint32_t low;
+  uint32_t high;
+  int ret;
+
+  low = path == 0 ? K1_RTL8852BS_RF_RXDCK_TABLE_LOW_A :
+                    K1_RTL8852BS_RF_RXDCK_TABLE_LOW_B;
+
+  if (is_k)
+    {
+      high = path == 0 ? K1_RTL8852BS_RF_RXDCK_TABLE_K_A :
+                         K1_RTL8852BS_RF_RXDCK_TABLE_K_B;
+    }
+  else
+    {
+      high = path == 0 ? K1_RTL8852BS_RF_RXDCK_TABLE_IDLE_A :
+                         K1_RTL8852BS_RF_RXDCK_TABLE_IDLE_B;
+    }
+
+  ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                              K1_RTL8852BS_RF_RXDCK_REG_TABLE_EN,
+                              K1_RTL8852BS_RF_MASK,
+                              K1_RTL8852BS_RF_RXDCK_TABLE_ENABLE, NULL);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_TABLE_SEL,
+                                 K1_RTL8852BS_RF_MASK,
+                                 K1_RTL8852BS_RF_RXDCK_TABLE_SELECT, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_TABLE_LOW,
+                                 K1_RTL8852BS_RF_MASK, low, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_TABLE_HIGH,
+                                 K1_RTL8852BS_RF_MASK, high, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_TABLE_EN,
+                                 K1_RTL8852BS_RF_MASK,
+                                 K1_RTL8852BS_RF_RXDCK_TABLE_DISABLE, NULL);
+    }
+
+  return ret;
+}
+
+static int k1_rtl8852bs_rf_rxdck_measure(unsigned int path)
+{
+  unsigned int step;
+  int ret;
+
+  ret = k1_rtl8852bs_rf_write((uint8_t)path, K1_RTL8852BS_RF_RXDCK_REG_Q,
+                              K1_RTL8852BS_RF_RXDCK_SOURCE_MASK,
+                              K1_RTL8852BS_RF_RXDCK_SOURCE_RFC, NULL);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_I,
+                                 K1_RTL8852BS_RF_RXDCK_TRIGGER_BIT, 0, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_I,
+                                 K1_RTL8852BS_RF_RXDCK_TRIGGER_BIT, 1, NULL);
+    }
+
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  for (step = 0; step < K1_RTL8852BS_RF_RXDCK_SETTLE_STEPS; step++)
+    {
+      up_udelay(K1_RTL8852BS_RF_RXDCK_STEP_USEC);
+    }
+
+  return OK;
+}
+
+static uint8_t k1_rtl8852bs_rf_rxdck_diff(uint8_t a, uint8_t b)
+{
+  return a > b ? (uint8_t)(a - b) : (uint8_t)(b - a);
+}
+
+static bool k1_rtl8852bs_rf_rxdck_check(unsigned int path,
+                                        FAR struct
+                                        k1_rtl8852bs_rf_rxdck_trace_s *trace)
+{
+  static const uint8_t codes[K1_RTL8852BS_RF_RXDCK_GROUPS]
+                            [K1_RTL8852BS_RF_RXDCK_CODES] =
+  {
+    {
+      0x00, 0x0d, 0x0e, 0x0f
+    },
+    {
+      0x10, 0x1d, 0x1e, 0x1f
+    }
+  };
+
+  unsigned int group;
+  unsigned int code;
+  uint32_t value;
+  bool fail = false;
+  int ret;
+
+  for (group = 0; group < K1_RTL8852BS_RF_RXDCK_GROUPS; group++)
+    {
+      for (code = 0; code < K1_RTL8852BS_RF_RXDCK_CODES; code++)
+        {
+          ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                      K1_RTL8852BS_RF_REG_MODE,
+                                      K1_RTL8852BS_RF_RXDCK_CODE_MASK,
+                                      codes[group][code], NULL);
+          if (ret >= 0)
+            {
+              ret = k1_rtl8852bs_rf_read((uint8_t)path,
+                                        K1_RTL8852BS_RF_RXDCK_REG_I,
+                                        &value, NULL);
+            }
+
+          if (ret < 0)
+            {
+              trace->error = ret;
+              return true;
+            }
+
+          trace->i[path][group][code] = (uint8_t)
+            ((value & K1_RTL8852BS_RF_RXDCK_VALUE_MASK) >>
+             K1_RTL8852BS_RF_RXDCK_VALUE_SHIFT);
+
+          ret = k1_rtl8852bs_rf_read((uint8_t)path,
+                                     K1_RTL8852BS_RF_RXDCK_REG_Q,
+                                     &value, NULL);
+          if (ret < 0)
+            {
+              trace->error = ret;
+              return true;
+            }
+
+          trace->q[path][group][code] = (uint8_t)
+            ((value & K1_RTL8852BS_RF_RXDCK_VALUE_MASK) >>
+             K1_RTL8852BS_RF_RXDCK_VALUE_SHIFT);
+        }
+    }
+
+  for (group = 0; group < K1_RTL8852BS_RF_RXDCK_GROUPS; group++)
+    {
+      for (code = 1; code < K1_RTL8852BS_RF_RXDCK_CODES; code++)
+        {
+          if (k1_rtl8852bs_rf_rxdck_diff(trace->i[path][group][code],
+                                         trace->i[path][group][0]) >=
+              K1_RTL8852BS_RF_RXDCK_THRESHOLD ||
+              k1_rtl8852bs_rf_rxdck_diff(trace->q[path][group][code],
+                                         trace->q[path][group][0]) >=
+              K1_RTL8852BS_RF_RXDCK_THRESHOLD)
+            {
+              fail = true;
+            }
+        }
+    }
+
+  return fail;
+}
+
+static int k1_rtl8852bs_rf_rxdck_save(unsigned int path,
+                                      FAR struct
+                                      k1_rtl8852bs_rf_rxdck_trace_s *trace)
+{
+  uint32_t value;
+  int ret;
+
+  ret = k1_rtl8852bs_rf_read((uint8_t)path, K1_RTL8852BS_RF_REG_MODE_SAVE,
+                             &trace->standby[path], NULL);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_read((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_I, &value, NULL);
+    }
+
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  trace->tune[path] = (value & K1_RTL8852BS_RF_RXDCK_TUNE_BIT) != 0 ?
+                      1 : 0;
+
+  ret = k1_rtl8852bs_rf_read((uint8_t)path, K1_RTL8852BS_RF_RXDCK_REG_GAIN,
+                             &trace->gain[path], NULL);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_read(0, K1_RTL8852BS_RF_RXDCK_REG_CHANNEL,
+                                 &trace->channel[path], NULL);
+    }
+
+  return ret;
+}
+
+static int k1_rtl8852bs_rf_rxdck_prepare(unsigned int path)
+{
+  int ret;
+
+  ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                              K1_RTL8852BS_RF_REG_MODE_SAVE,
+                              K1_RTL8852BS_RF_MODE_SAVE_RUN, 0, NULL);
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_I,
+                                 K1_RTL8852BS_RF_RXDCK_TUNE_BIT, 0, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_rxdck_mode_table(path, true);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                                 K1_RTL8852BS_RF_RXDCK_REG_GAIN,
+                                 K1_RTL8852BS_RF_RXDCK_GAIN_MASK, 0, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write(0, K1_RTL8852BS_RF_RXDCK_REG_CHANNEL,
+                                 K1_RTL8852BS_RF_RXDCK_CHANNEL_MASK,
+                                 K1_RTL8852BS_RF_RXDCK_CHANNEL_K, NULL);
+    }
+
+  if (ret >= 0)
+    {
+      ret = k1_rtl8852bs_rf_write((uint8_t)path, K1_RTL8852BS_RF_REG_MODE,
+                                 K1_RTL8852BS_RF_MODE_MASK,
+                                 K1_RTL8852BS_RF_MODE_RX, NULL);
+    }
+
+  return ret;
+}
+
+static int k1_rtl8852bs_rf_rxdck_restore(unsigned int path,
+                                         FAR const struct
+                                         k1_rtl8852bs_rf_rxdck_trace_s *trace)
+{
+  int ret;
+  int first;
+
+  first = k1_rtl8852bs_rf_rxdck_mode_table(path, false);
+
+  ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                              K1_RTL8852BS_RF_RXDCK_REG_GAIN,
+                              K1_RTL8852BS_RF_MASK, trace->gain[path], NULL);
+  if (first >= 0)
+    {
+      first = ret;
+    }
+
+  ret = k1_rtl8852bs_rf_write(0, K1_RTL8852BS_RF_RXDCK_REG_CHANNEL,
+                              K1_RTL8852BS_RF_RXDCK_CHANNEL_MASK,
+                              trace->channel[path] &
+                              K1_RTL8852BS_RF_RXDCK_CHANNEL_MASK, NULL);
+  if (first >= 0)
+    {
+      first = ret;
+    }
+
+  ret = k1_rtl8852bs_rf_write((uint8_t)path, K1_RTL8852BS_RF_RXDCK_REG_I,
+                              K1_RTL8852BS_RF_RXDCK_TUNE_BIT,
+                              trace->tune[path], NULL);
+  if (first >= 0)
+    {
+      first = ret;
+    }
+
+  ret = k1_rtl8852bs_rf_write((uint8_t)path,
+                              K1_RTL8852BS_RF_REG_MODE_SAVE,
+                              K1_RTL8852BS_RF_MASK, trace->standby[path],
+                              NULL);
+  if (first >= 0)
+    {
+      first = ret;
+    }
+
+  return first;
+}
+
+static void k1_rtl8852bs_rf_rxdck_trigger(void)
+{
+  struct k1_rtl8852bs_rf_rxdck_trace_s trace;
+  FAR struct k1_rtl8852bs_rfk_self_s *self;
+  unsigned int path;
+  unsigned int group;
+  unsigned int code;
+  unsigned int step;
+  uint32_t pause;
+  bool fail;
+  int ret;
+
+  memset(&trace, 0, sizeof(trace));
+  self = &g_k1_rtl8852bs_rfk_self;
+
+  /* The vendor gates this on two words of its own state: the per channel
+   * calibration map, which this port publishes, and the supported ability
+   * mask, which it does not model because it enables the whole calibration
+   * set.  So the map is the gate, and the calibration self init has to have
+   * run for the map to mean anything.
+   */
+
+  if (!self->valid ||
+      (self->chlk_map & K1_RTL8852BS_RF_CHLK_MAP_RXDCK) == 0)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RF RX-DCK skipped valid=");
+      k1_early_puthex(self->valid);
+      k1_early_puts(" map=");
+      k1_early_puthex(self->chlk_map);
+      k1_early_puts("\r\n");
+      return;
+    }
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      pause = path == 0 ? K1_RTL8852BS_BB_RXDCK_TSSI_PAUSE_S0 :
+                          K1_RTL8852BS_BB_RXDCK_TSSI_PAUSE_S1;
+
+      ret = k1_rtl8852bs_rf_rxdck_save(path, &trace);
+      if (ret < 0)
+        {
+          trace.error = ret;
+          continue;
+        }
+
+      if (self->tssi_mode[path])
+        {
+          ret = k1_rtl8852bs_bb_update_field(pause,
+                  K1_RTL8852BS_BB_RXDCK_TSSI_PAUSE_BIT,
+                  K1_RTL8852BS_BB_RXDCK_TSSI_PAUSE_BIT);
+          if (ret < 0)
+            {
+              trace.error = ret;
+            }
+        }
+
+      ret = k1_rtl8852bs_rf_rxdck_prepare(path);
+      if (ret < 0)
+        {
+          trace.error = ret;
+        }
+      else
+        {
+          ret = k1_rtl8852bs_rf_rxdck_measure(path);
+          if (ret < 0)
+            {
+              trace.error = ret;
+            }
+
+          fail = k1_rtl8852bs_rf_rxdck_check(path, &trace);
+
+          while (fail && trace.rek[path] < K1_RTL8852BS_RF_RXDCK_RETRY_MAX)
+            {
+              for (step = 0; step < K1_RTL8852BS_RF_RXDCK_RETRY_STEPS; step++)
+                {
+                  up_udelay(K1_RTL8852BS_RF_RXDCK_STEP_USEC);
+                }
+
+              ret = k1_rtl8852bs_rf_rxdck_measure(path);
+              if (ret < 0)
+                {
+                  trace.error = ret;
+                }
+
+              trace.rek[path]++;
+              fail = k1_rtl8852bs_rf_rxdck_check(path, &trace);
+            }
+
+          trace.fail[path] = fail ? 1 : 0;
+        }
+
+      ret = k1_rtl8852bs_rf_rxdck_restore(path, &trace);
+      if (ret < 0)
+        {
+          trace.error = ret;
+        }
+
+      if (self->tssi_mode[path])
+        {
+          ret = k1_rtl8852bs_bb_update_field(pause,
+                  K1_RTL8852BS_BB_RXDCK_TSSI_PAUSE_BIT, 0);
+          if (ret < 0)
+            {
+              trace.error = ret;
+            }
+        }
+    }
+
+  k1_early_puts("K1 Wi-Fi GPL: RF RX-DCK map=");
+  k1_early_puthex(self->chlk_map & K1_RTL8852BS_RF_CHLK_MAP_RXDCK);
+  k1_early_puts(" tssi-mode=");
+  k1_early_puthex(self->tssi_mode[0]);
+  k1_early_puts("/");
+  k1_early_puthex(self->tssi_mode[1]);
+  k1_early_puts(" rek=");
+  k1_early_puthex(trace.rek[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.rek[1]);
+  k1_early_puts(" fail=");
+  k1_early_puthex(trace.fail[0]);
+  k1_early_puts("/");
+  k1_early_puthex(trace.fail[1]);
+  k1_early_puts(" error=");
+  k1_early_puthex((uintreg_t)-trace.error);
+  k1_early_puts("\r\n");
+
+  for (path = 0; path < K1_RTL8852BS_RF_PATHS; path++)
+    {
+      k1_early_puts("K1 Wi-Fi GPL: RF RX-DCK path=");
+      k1_early_puthex(path);
+      k1_early_puts(" standby=");
+      k1_early_puthex(trace.standby[path]);
+      k1_early_puts(" tune=");
+      k1_early_puthex(trace.tune[path]);
+      k1_early_puts(" gain=");
+      k1_early_puthex(trace.gain[path]);
+      k1_early_puts(" ch=");
+      k1_early_puthex(trace.channel[path]);
+      k1_early_puts("\r\n");
+
+      for (group = 0; group < K1_RTL8852BS_RF_RXDCK_GROUPS; group++)
+        {
+          k1_early_puts("K1 Wi-Fi GPL: RF RX-DCK path=");
+          k1_early_puthex(path);
+          k1_early_puts(group == 0 ? " low i=" : " high i=");
+
+          for (code = 0; code < K1_RTL8852BS_RF_RXDCK_CODES; code++)
+            {
+              if (code != 0)
+                {
+                  k1_early_puts("/");
+                }
+
+              k1_early_puthex(trace.i[path][group][code]);
+            }
+
+          k1_early_puts(" q=");
+
+          for (code = 0; code < K1_RTL8852BS_RF_RXDCK_CODES; code++)
+            {
+              if (code != 0)
+                {
+                  k1_early_puts("/");
+                }
+
+              k1_early_puthex(trace.q[path][group][code]);
+            }
+
+          k1_early_puts("\r\n");
+        }
+    }
+}
+
 struct k1_rtl8852bs_scan_rf_readback_s
 {
   uint32_t mode[K1_RTL8852BS_RF_PATHS];
@@ -22735,8 +23334,12 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
    * rather than a measurement and so need no park at all.  The sixth is what
    * the vendor runs on the line below that one, the transmit power
    * de-emphasis cells of the same eFuse, which are read and reported and
-   * write nothing.  The samples on either side then measure all six the same
-   * way they measure the reset.
+   * write nothing.  The seventh is the odd one out: receive path direct
+   * current cancellation is not part of halrf_dm_init() at all, it is the
+   * one calibration halrf_chl_rfk_trigger() runs by itself for
+   * RFK_TYPE_PLATFORM_INIT, so it goes after the six rather than among
+   * them.  The samples on either side then measure all seven the same way
+   * they measure the reset.
    */
 
   k1_rtl8852bs_rf_rck_trigger();
@@ -22745,6 +23348,7 @@ static int k1_rtl8852bs_fwdl_runtime_scanofld_passive_diagnostic_common(
   k1_rtl8852bs_rf_dack_trigger();
   k1_rtl8852bs_rf_efuse_trim_trigger();
   k1_rtl8852bs_rf_tssi_de_trigger();
+  k1_rtl8852bs_rf_rxdck_trigger();
 
   rf_readback_ret = k1_rtl8852bs_scan_rf_readback_read(&rf_readback);
   if (rf_readback_ret < 0)
