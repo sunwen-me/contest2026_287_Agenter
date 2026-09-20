@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "team_id": "contest2026_287_Agenter",
+  "github_login": "sunwen-me",
+  "generator": "claude-code-collector@1.2.0",
+  "updated_at": "2026-09-20T15:04:34.855Z",
+  "sessions": [
+    {
+      "session_id": "36ad39fb-42f3-444d-b1e7-1bf0da5628a4",
+      "tool": "claude-code",
+      "started_at": "2026-09-20T15:04:31.013Z",
+      "last_event_at": "2026-09-20T15:04:31.013Z",
+      "event_count": 24072,
+      "raw_event_count": 38225,
+      "file_path": "logs/sunwen-me/2026-09-20/claude-code__36ad39fb-42f3-444d-b1e7-1bf0da5628a4.jsonl",
+      "collection_mode": "cli",
+      "health": "ok",
+      "model": "claude-opus-5"
+    }
+  ]
+}
