@@ -149,8 +149,9 @@ K1 BSP 侧：
 - 已使用 wrapper + U-Boot `go` 在 MUSE Pi Pro 实板启动 RV64 S-mode NSH；
   `bootelf -p` 不是当前固件上的可用路径。
 
-当前构建通过只证明芯片层、板级层和 NSH 已完成编译链接闭环，不代表 openvela
-已经在 K1 实板上启动。
+当前已通过主机构建、U-Boot RAM-only 上板和串口验收：openvela/NuttX 已在
+MUSE Pi Pro K1 实板以 RV64 S-mode 启动并进入交互式 NSH。Wi-Fi/蓝牙各项能力
+仍以对应串口日志中的明确验收标记为准，未通过的阶段不作已完成声明。
 
 ## 第一阶段目标
 
@@ -164,17 +165,18 @@ BootROM -> FSBL -> OpenSBI -> U-Boot -> openvela/NuttX (S-mode)
 
 验收条件：
 
-1. U-Boot 能从 SD 卡加载 openvela/NuttX 镜像和 MUSE Pi Pro DTB；
+1. U-Boot 能通过串口 `loadx` 将 openvela/NuttX 镜像临时加载到 RAM；
 2. payload 在 S-mode 运行，保留 OpenSBI 服务；
 3. 串口输出 NuttX 启动日志；
 4. 进入交互式 NSH；
-5. 构建、写卡和启动步骤可由文档复现。
+5. 构建、RAM-only 加载和启动步骤可由文档复现，不需要写入 eMMC、SPI 或
+   eFuse。
 
 ## 目录结构
 
 ```text
-board/k1/muse_pi_pro/       MUSE Pi Pro 板级支持包
-chip/k1/                    K1 RISC-V 自定义芯片层
+vendor/spacemit/boards/k1/muse_pi_pro/ MUSE Pi Pro 板级支持包
+vendor/spacemit/chips/k1/              K1 RISC-V 自定义芯片层
 docs/K1_BOOT_INVENTORY.md   启动资料、硬件参数、风险和验证清单
 docs/K1_MUSE_PI_PRO_OFFICIAL_HARDWARE.md 官方硬件接口、Type-C、UART 和首板操作
 docs/K1_UBOOT_BRINGUP.md     U-Boot 首启、故障定位和恢复手册
@@ -258,15 +260,36 @@ tools/build_k1.sh --clean --package --jobs 8
 ./build.sh vendor/spacemit/boards/k1/muse_pi_pro/configs/nsh --cmake -j8
 ```
 
-2026-07-30 已完成干净构建验证，成功标志为：
+2026-09-20 已完成 `wireless` 配置的干净构建和实板 RAM-only 验证，成功标志为：
 
 ```text
 #### build completed successfully
 ```
 
-ELF 位于 `cmake_out/muse_pi_pro_nsh/nuttx`，上板包位于
-`out/k1-bringup/`。无板阶段使用 `tools/ci_k1.sh --jobs 8` 做完整回归；拿到板后
-由 U-Boot 手工加载该 ELF，采集入口/handoff、异常寄存器、timer 和 NSH 日志。
+当前构建命令：
+
+```bash
+tools/build_k1.sh \
+  --config vendor/spacemit/boards/k1/muse_pi_pro/configs/wireless \
+  --build-dir cmake_out/k1-wireless \
+  --package --package-dir out/k1-wireless \
+  --no-check --jobs 8
+```
+
+上板包由工作区根目录的 `out/k1-wireless/` 生成。使用 USB-TTL 串口监听并
+短按一次板上 `RST` 后，通过 U-Boot `loadx + go` 临时加载，不执行 `saveenv`、
+eMMC/SPI 写入、FDL、fastboot 或 eFuse 写入：
+
+```bash
+python3 tools/run_k1_wireless_smoke.py \
+  --manual-reset --device auto --boot-timeout 1800 \
+  --wrapper /home/sw/Dev/k1-workspace/out/k1-wireless/k1-go-wrapper.bin \
+  --payload /home/sw/Dev/k1-workspace/out/k1-wireless/contest-nuttx-flat.bin \
+  --no-voice-prompt
+```
+
+串口出现 `NuttShell (NSH)` 和 `nsh>` 即表示 NSH 上板链路通过。完整串口日志
+保存到 `out/k1-serial/`。无板阶段仍使用 `tools/ci_k1.sh --jobs 8` 做完整回归。
 
 DDS simulator 可使用一个命令完成启动、3 发 3 收和退出资源检查：
 
